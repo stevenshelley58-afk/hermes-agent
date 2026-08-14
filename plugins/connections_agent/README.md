@@ -33,10 +33,18 @@ Hermes receives these credentials only from its runtime environment:
   plugin settings are the fallback when the corresponding env var is absent.
 - `HERMES_CONNECTIONS_AGENT_KEY` authenticates Hermes-to-Frank action/receipt
   requests.
-- `HERMES_CONNECTIONS_BROKER_KEY` authenticates Frank-to-Hermes broker
-  requests. `HERMES_VAULT_BROKER_KEY` is accepted only as a legacy fallback.
+- `HERMES_VAULT_BROKER_KEY` authenticates Frank-to-Hermes broker requests.
+  This is the only broker credential name.
 - `HERMES_CONNECTIONS_INFISICAL_TOKEN` authenticates the fixed-scope
-  Infisical CE v4 client.
+  Infisical CE v4 client as a deliberate static-token alternative.
+- Preferred durable machine identity uses
+  `HERMES_CONNECTIONS_INFISICAL_CLIENT_ID` and
+  `HERMES_CONNECTIONS_INFISICAL_CLIENT_SECRET`, with optional
+  `HERMES_CONNECTIONS_INFISICAL_ORGANIZATION_SLUG`. Hermes exchanges these
+  in memory at `POST /api/v1/auth/universal-auth/login`, keeps the short-lived
+  access token only in memory with an expiry skew, and refreshes once after a
+  401. Client secrets, access tokens, and upstream response bodies are never
+  persisted, logged, or returned.
 
 The broker URL is:
 

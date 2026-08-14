@@ -47,6 +47,7 @@ RESEND_CAPABILITIES = ("email.send", "email.status")
 RESEND_MCP_PACKAGE = "resend-mcp@2.13.0"
 RESEND_MCP_TOOL_NAMES = ("send-email", "get-email")
 SUCCESS_OUTCOMES = frozenset({"created", "updated", "verified", "synced", "revoked", "deleted"})
+PLAN_ACTIONS = frozenset({"discover", "create", "update", "verify", "sync", "revoke", "delete"})
 ERROR_CATEGORIES = frozenset({"auth", "configuration", "network", "not_found", "permission_denied", "rate_limited", "timeout", "unavailable", "validation", "unknown"})
 ERROR_CODES = frozenset({
     "auth_failed", "confirmation_required", "infisical_unavailable", "invalid_completion",
@@ -62,14 +63,17 @@ _SAFE_METADATA_FIELDS = {
     "secretPath", "createdAt", "updatedAt", "secretValueHidden",
     "isRotatedSecret", "rotationId", "folderId",
 }
-_OPAQUE_RECEIPT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$")
-_SAFE_ACTION_IDENTIFIERS = frozenset({
-    "action_id", "connection_id", "provider", "provider_id", "capability",
-    "operation", "profile", "plan_id", "confirmation_token",
+_OPAQUE_RECEIPT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{7,255}$")
+_PROVIDER_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
+_SAFE_TARGET_FIELDS = frozenset({"provider", "connection_id", "consumer", "project", "environment"})
+_SAFE_BODY_FIELDS = frozenset({
+    "provider", "name", "scope_kind", "scope_id", "status", "connection_ref",
+    "credential_ref", "admin_url", "capabilities", "notes", "last_verified_at",
 })
-_COMPLETION_FIELDS = frozenset({
-    "outcome", "provider_receipt", "provider_error_code", "provider_error_category",
-})
+_SAFE_PROVIDERS = frozenset({"resend", "stripe", "activepieces", "mcp", "api"})
+_SAFE_SCOPES = frozenset({"global", "project", "tool", "agent", "service"})
+_SAFE_STATUSES = frozenset({"setup_needed", "connected", "verified", "error"})
+_SAFE_REFERENCE_FIELDS = frozenset({"connection_ref", "credential_ref"})
 _SENSITIVE_FIELD_RE = re.compile(
     r"(?:secret|token|auth|password|credential|api[_-]?key|payment|card|cvv|private[_-]?key|bearer)",
     re.IGNORECASE,
@@ -78,6 +82,34 @@ _SECRET_LIKE_VALUE_RE = re.compile(
     r"(?:\b(?:re|sk|rk|pk)_[A-Za-z0-9_-]{8,}\b|\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b|\b(?:api[_-]?key|secret|token|password)\s*[:=])",
     re.IGNORECASE,
 )
+_PAYMENT_LIKE_VALUE_RE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+_SAFE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,239}$")
+_VAULT_REFERENCE_RE = re.compile(
+    r"^(?:vault|openbao|bitwarden|1password|pass|keyring|secret)://[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]*$",
+    re.IGNORECASE,
+)
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
+def _open_no_redirect(request: urllib.request.Request):
+    try:
+        response = _NO_REDIRECT_OPENER.open(request, timeout=15)
+        status = response.getcode()
+        if status is not None and 300 <= status < 400:
+            response.close()
+            raise ConnectionsError("redirects are not accepted for authenticated requests")
+        return response
+    except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise ConnectionsError("redirects are not accepted for authenticated requests") from exc
+        raise
 
 CONNECTIONS_STATUS_SCHEMA = {
     "name": "connections_agent_status",
@@ -91,7 +123,35 @@ CONNECTIONS_REQUEST_SCHEMA = {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": ["plan", "apply"]},
-            "request": {"type": "object"},
+            "request": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": sorted(PLAN_ACTIONS)},
+                            "target": {"type": "object"},
+                            "body": {"type": "object"},
+                            "connection_id": {"type": "string", "minLength": 8, "maxLength": 256},
+                            "expected_revision": {"type": "integer", "minimum": 0},
+                        },
+                        "required": ["action"],
+                        "additionalProperties": False,
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "plan_id": {"type": "string", "minLength": 8, "maxLength": 256},
+                            "confirmation_token": {"type": "string", "minLength": 8, "maxLength": 256},
+                            "provider_receipt": {"type": "string", "minLength": 8, "maxLength": 256},
+                            "provider_outcome": {"type": "string", "enum": [*sorted(SUCCESS_OUTCOMES), "failed"]},
+                            "provider_error_code": {"type": "string", "pattern": r"^[a-z][a-z0-9_.:-]{0,63}$"},
+                            "provider_error_category": {"type": "string", "enum": sorted(ERROR_CATEGORIES)},
+                        },
+                        "required": ["plan_id"],
+                        "additionalProperties": False,
+                    },
+                ],
+            },
             "plan_id": {"type": "string", "minLength": 8, "maxLength": 256},
             "idempotency_key": {"type": "string", "minLength": 8, "maxLength": 128},
         },
@@ -126,6 +186,9 @@ class ConnectionsSettings:
     agent_key: str
     broker_key: str
     infisical_token: str
+    infisical_client_id: str = ""
+    infisical_client_secret: str = ""
+    infisical_organization_slug: str = ""
 
 
 def _truthy(value: Any) -> bool:
@@ -175,8 +238,11 @@ def load_settings(ctx: Any = None) -> ConnectionsSettings:
         secret_path=path,
         resend_secret_name=secret_name,
         agent_key=os.environ.get("HERMES_CONNECTIONS_AGENT_KEY", "").strip(),
-        broker_key=os.environ.get("HERMES_CONNECTIONS_BROKER_KEY", os.environ.get("HERMES_VAULT_BROKER_KEY", "")).strip(),
+        broker_key=os.environ.get("HERMES_VAULT_BROKER_KEY", "").strip(),
         infisical_token=os.environ.get("HERMES_CONNECTIONS_INFISICAL_TOKEN", "").strip(),
+        infisical_client_id=os.environ.get("HERMES_CONNECTIONS_INFISICAL_CLIENT_ID", "").strip(),
+        infisical_client_secret=os.environ.get("HERMES_CONNECTIONS_INFISICAL_CLIENT_SECRET", "").strip(),
+        infisical_organization_slug=os.environ.get("HERMES_CONNECTIONS_INFISICAL_ORGANIZATION_SLUG", "").strip(),
     )
 
 
@@ -213,7 +279,7 @@ def _reject_sensitive_payload(value: Any, *, path: tuple[str, ...] = ()) -> None
             key = str(raw_key)
             lowered = key.lower()
             if _SENSITIVE_FIELD_RE.search(key):
-                if not (not path and lowered == "confirmation_token"):
+                if not (not path and lowered == "confirmation_token") and lowered not in _SAFE_REFERENCE_FIELDS:
                     raise ConnectionsError("sensitive fields are not accepted by the agent action tool")
             _reject_sensitive_payload(nested, path=path + (lowered,))
         return
@@ -223,6 +289,8 @@ def _reject_sensitive_payload(value: Any, *, path: tuple[str, ...] = ()) -> None
         return
     if isinstance(value, str) and _SECRET_LIKE_VALUE_RE.search(value):
         raise ConnectionsError("secret-like values are not accepted by the agent action tool")
+    if isinstance(value, str) and _PAYMENT_LIKE_VALUE_RE.search(value):
+        raise ConnectionsError("payment-like values are not accepted by the agent action tool")
 
 
 def build_resend_mcp_config(secret_value: str) -> dict[str, Any]:
@@ -286,80 +354,294 @@ def failure_payload(exc: BaseException, *, provider: str = "infisical-ce", provi
     }
 
 
+def _safe_text(value: Any, label: str, *, max_length: int = 240, opaque: bool = False) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ConnectionsError(f"{label} must be text")
+    text = " ".join(value.split()).strip()
+    if not text or len(text) > max_length:
+        raise ConnectionsError(f"{label} is invalid")
+    if _SECRET_LIKE_VALUE_RE.search(text) or _PAYMENT_LIKE_VALUE_RE.search(text):
+        raise ConnectionsError(f"{label} contains unsafe data")
+    if opaque and not _OPAQUE_RECEIPT_RE.fullmatch(text):
+        raise ConnectionsError(f"{label} is not opaque")
+    return text
+
+
+def _safe_ref(value: Any, label: str, *, vault: bool = False) -> str:
+    text = _safe_text(value, label, max_length=300)
+    if vault:
+        if not _VAULT_REFERENCE_RE.fullmatch(text):
+            raise ConnectionsError(f"{label} is not an opaque vault reference")
+    elif not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,299}", text):
+        raise ConnectionsError(f"{label} is not an opaque reference")
+    return text
+
+
+def _safe_target(value: Any) -> dict[str, str]:
+    if value in (None, {}):
+        return {}
+    if not isinstance(value, Mapping) or set(value) - _SAFE_TARGET_FIELDS:
+        raise ConnectionsError("target contains unsupported fields")
+    result: dict[str, str] = {}
+    for field in sorted(_SAFE_TARGET_FIELDS):
+        if field not in value or value[field] in (None, ""):
+            continue
+        text = _safe_text(value[field], f"target.{field}", max_length=240)
+        if field == "provider":
+            text = text.lower()
+            if text not in _SAFE_PROVIDERS:
+                raise ConnectionsError("target.provider is invalid")
+        elif field == "connection_id":
+            if not _OPAQUE_RECEIPT_RE.fullmatch(text):
+                raise ConnectionsError("target.connection_id is not opaque")
+        elif not _SAFE_ID_RE.fullmatch(text.lower()):
+            raise ConnectionsError(f"target.{field} is invalid")
+        result[field] = text
+    return result
+
+
+def _safe_capabilities(value: Any) -> list[str]:
+    if not isinstance(value, list) or len(value) > 24:
+        raise ConnectionsError("body.capabilities must be a short list")
+    result = []
+    for capability in value:
+        text = _safe_text(capability, "body.capability", max_length=80).lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._:-]{0,79}", text):
+            raise ConnectionsError("body.capabilities contains an invalid value")
+        result.append(text)
+    return sorted(set(result))
+
+
+def _safe_body(value: Any) -> dict[str, Any]:
+    if value in (None, {}):
+        return {}
+    if not isinstance(value, Mapping) or set(value) - _SAFE_BODY_FIELDS:
+        raise ConnectionsError("body contains unsupported fields")
+    result: dict[str, Any] = {}
+    for field, raw in value.items():
+        if field == "capabilities":
+            result[field] = _safe_capabilities(raw)
+        elif raw is None:
+            raise ConnectionsError(f"body.{field} must be text")
+        elif raw == "":
+            result[field] = ""
+        elif field == "provider":
+            provider = _safe_text(raw, "body.provider").lower()
+            if provider not in _SAFE_PROVIDERS:
+                raise ConnectionsError("body.provider is invalid")
+            result[field] = provider
+        elif field == "scope_kind":
+            scope = _safe_text(raw, "body.scope_kind").lower()
+            if scope not in _SAFE_SCOPES:
+                raise ConnectionsError("body.scope_kind is invalid")
+            result[field] = scope
+        elif field == "status":
+            status = _safe_text(raw, "body.status").lower()
+            if status not in _SAFE_STATUSES:
+                raise ConnectionsError("body.status is invalid")
+            result[field] = status
+        elif field == "connection_ref":
+            result[field] = _safe_ref(raw, field)
+        elif field == "credential_ref":
+            result[field] = _safe_ref(raw, field, vault=True)
+        elif field == "admin_url":
+            text = _safe_text(raw, field, max_length=300)
+            parsed = urllib.parse.urlparse(text)
+            if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+                raise ConnectionsError("admin_url must be an https URL without credentials")
+            result[field] = text
+        elif field in {"scope_id"}:
+            if raw in (None, ""):
+                result[field] = ""
+                continue
+            text = _safe_text(raw, field).lower()
+            if not _SAFE_ID_RE.fullmatch(text):
+                raise ConnectionsError(f"body.{field} is invalid")
+            result[field] = text
+        else:
+            result[field] = _safe_text(raw, f"body.{field}", max_length=600 if field == "notes" else 240)
+    return result
+
+
+def _safe_provider_error_code(value: Any) -> str:
+    text = _safe_text(value, "provider_error_code", max_length=64).lower()
+    if not _PROVIDER_ERROR_CODE_RE.fullmatch(text):
+        raise ConnectionsError("provider_error_code is invalid")
+    return text
+
+
 def sanitize_action_request(body: Mapping[str, Any]) -> dict[str, Any]:
-    """Strip provider prose and enforce the completion outcome vocabulary."""
+    """Validate the explicit Frank plan/apply request shapes."""
     if not isinstance(body, Mapping):
         raise ConnectionsError("action request must be an object")
     _reject_sensitive_payload(body)
-    allowed = _SAFE_ACTION_IDENTIFIERS | _COMPLETION_FIELDS
-    unknown = {str(key) for key in body if str(key) not in allowed}
-    if unknown:
-        raise ConnectionsError("action request fields are not allowlisted")
-    cleaned: dict[str, Any] = {}
-    for key, value in body.items():
-        name = str(key)
-        if name == "provider_receipt":
-            receipt = _opaque_receipt(value)
-            if receipt is None:
-                raise ConnectionsError("provider receipt is not opaque")
-            cleaned[name] = receipt
-        elif name == "profile":
-            if value != PROFILE_NAME:
-                raise ConnectionsError("profile must be default")
-            cleaned[name] = PROFILE_NAME
-        elif name == "confirmation_token":
-            if not isinstance(value, str) or not _OPAQUE_RECEIPT_RE.fullmatch(value.strip()):
-                raise ConnectionsError("confirmation_token is not opaque")
-            cleaned[name] = value.strip()
-        else:
-            if not isinstance(value, str) or not 1 <= len(value) <= 256:
-                raise ConnectionsError(f"{name} must be a bounded identifier")
-            cleaned[name] = value
+    keys = {str(key) for key in body}
+    plan_keys = {"action", "target", "body", "expected_revision", "connection_id"}
+    apply_keys = {"plan_id", "confirmation_token", "provider_receipt", "provider_outcome", "provider_error_code", "provider_error_category"}
+    if "action" in keys:
+        if keys - plan_keys:
+            raise ConnectionsError("plan request fields are not allowlisted")
+        action = str(body.get("action") or "").strip().lower()
+        if action not in PLAN_ACTIONS:
+            raise ConnectionsError("plan action is not allowlisted")
+        target = _safe_target(body.get("target"))
+        if body.get("connection_id") not in (None, ""):
+            connection_id = _safe_text(body["connection_id"], "connection_id", opaque=True)
+            target.setdefault("connection_id", connection_id)
+        expected_revision = body.get("expected_revision")
+        if expected_revision is not None and (isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 0):
+            raise ConnectionsError("expected_revision must be a non-negative integer")
+        metadata = _safe_body(body.get("body"))
+        if action in {"create", "update"} and not metadata:
+            raise ConnectionsError(f"{action} plan requires safe metadata body")
+        if action == "create" and not metadata.get("name"):
+            raise ConnectionsError("create plan requires body.name")
+        if action not in {"create", "update"} and metadata:
+            raise ConnectionsError(f"{action} plan does not accept a metadata body")
+        if action in {"update", "verify", "sync", "revoke", "delete"} and not target.get("connection_id"):
+            raise ConnectionsError(f"{action} plan requires connection_id")
+        result: dict[str, Any] = {"action": action}
+        if target:
+            result["target"] = target
+        if metadata:
+            result["body"] = metadata
+        if expected_revision is not None:
+            result["expected_revision"] = expected_revision
+        return result
+    if keys - apply_keys or "plan_id" not in keys:
+        raise ConnectionsError("apply request fields are not allowlisted")
+    result = {"plan_id": _safe_text(body["plan_id"], "plan_id", opaque=True)}
+    for field in ("confirmation_token", "provider_receipt"):
+        if field in body:
+            result[field] = _safe_text(body[field], field, opaque=True)
+    if "provider_outcome" in body:
+        outcome = _safe_text(body["provider_outcome"], "provider_outcome").lower()
+        if outcome != "failed" and outcome not in SUCCESS_OUTCOMES:
+            raise ConnectionsError("provider_outcome is not allowlisted")
+        result["provider_outcome"] = outcome
+    if "provider_error_code" in body:
+        result["provider_error_code"] = _safe_provider_error_code(body["provider_error_code"])
+    if "provider_error_category" in body:
+        result["provider_error_category"] = _safe_error_category(body["provider_error_category"])
+    if result.get("provider_outcome") == "failed":
+        if not result.get("provider_receipt") or "provider_error_code" not in result or "provider_error_category" not in result:
+            raise ConnectionsError("failed completion requires provider receipt, error code, and category")
+    elif any(field in result for field in ("provider_error_code", "provider_error_category")):
+        raise ConnectionsError("provider error fields require failed completion")
+    return result
 
-    outcome = cleaned.get("outcome")
-    if outcome is not None:
-        outcome = str(outcome).strip().lower()
-        if outcome == "failed":
-            cleaned["outcome"] = "failed"
-            if set(cleaned) - (_SAFE_ACTION_IDENTIFIERS | {"outcome", "provider_receipt", "provider_error_code", "provider_error_category"}):
-                raise ConnectionsError("failed completion contains unsupported fields")
-            cleaned["provider_error_code"] = _safe_error_code(cleaned.get("provider_error_code"), "unknown_error")
-            cleaned["provider_error_category"] = _safe_error_category(cleaned.get("provider_error_category"), "unknown")
-            cleaned.pop("error_code", None)
-            cleaned.pop("error_category", None)
-            if "provider_receipt" not in cleaned:
-                raise ConnectionsError("failed completion requires provider_receipt")
-        elif outcome in SUCCESS_OUTCOMES:
-            cleaned["outcome"] = outcome
-            if "error_code" in cleaned or "error_category" in cleaned or "provider_error_code" in cleaned or "provider_error_category" in cleaned:
-                raise ConnectionsError("error fields are allowed only for failed completion")
-        else:
-            raise ConnectionsError("completion outcome is not allowlisted")
-    return cleaned
+
+def _safe_result_projection(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    allowed = {"connection_id", "provider", "status", "revision", "count", "matched", "changed", "removed", "verified_at", "action", "mode", "outcome", "pending", "reason", "provider_receipt", "local_metadata", "error_code", "error_category"}
+    result: dict[str, Any] = {}
+    for field in allowed:
+        if field not in value:
+            continue
+        raw = value[field]
+        if field == "provider_receipt":
+            if raw:
+                result[field] = _safe_text(raw, field, opaque=True)
+        elif field in {"error_code"}:
+            result[field] = _safe_provider_error_code(raw)
+        elif field in {"error_category"}:
+            result[field] = _safe_error_category(raw)
+        elif field == "connection_id" and raw is not None:
+            result[field] = _safe_text(raw, field, opaque=True)
+        elif field == "provider" and raw is not None:
+            provider = _safe_text(raw, field).lower()
+            if provider not in _SAFE_PROVIDERS:
+                raise ConnectionsError("response provider is invalid")
+            result[field] = provider
+        elif field in {"status", "action", "mode", "outcome", "reason", "verified_at"} and raw is not None:
+            result[field] = _safe_text(raw, field, max_length=240)
+        elif field in {"revision", "count"} and isinstance(raw, int) and not isinstance(raw, bool):
+            result[field] = raw
+        elif field in {"matched", "changed", "removed", "pending", "local_metadata"} and isinstance(raw, bool):
+            result[field] = raw
+    return result
+
+
+def _safe_action_projection(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for field in ("schema", "sequence", "receipt_id", "correlation_id", "source", "actor", "action", "state", "started_at", "completed_at"):
+        if field not in value:
+            continue
+        raw = value[field]
+        if field in {"sequence", "started_at", "completed_at"} and isinstance(raw, int):
+            result[field] = raw
+        elif raw is not None:
+            result[field] = _safe_text(raw, field, opaque=field in {"receipt_id", "correlation_id"})
+    if "target" in value:
+        result["target"] = _safe_target(value.get("target"))
+    if "progress" in value and isinstance(value["progress"], Mapping):
+        progress = value["progress"]
+        safe_progress: dict[str, Any] = {}
+        if isinstance(progress.get("percent"), int):
+            safe_progress["percent"] = progress["percent"]
+        if progress.get("step") is not None:
+            safe_progress["step"] = _safe_text(progress["step"], "progress.step")
+        result["progress"] = safe_progress
+    if "result" in value:
+        result["result"] = _safe_result_projection(value.get("result"))
+    return result
+
+
+def _safe_connection_projection(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    allowed = _SAFE_BODY_FIELDS | {"id", "created_at", "updated_at", "revision"}
+    candidate = {field: value[field] for field in allowed if field in value}
+    try:
+        result = _safe_body({field: value[field] for field in candidate if field in _SAFE_BODY_FIELDS})
+    except ConnectionsError:
+        return None
+    for field in ("id", "created_at", "updated_at", "revision"):
+        if field == "id" and candidate.get(field) is not None:
+            result[field] = _safe_text(candidate[field], "connection.id", opaque=True)
+        elif field in candidate and isinstance(candidate[field], int) and not isinstance(candidate[field], bool):
+            result[field] = candidate[field]
+    return result
 
 
 def sanitize_action_response(payload: Mapping[str, Any], *, action: str) -> dict[str, Any]:
-    """Return safe Frank response metadata and redact provider error prose."""
-    outcome = str(payload.get("outcome") or "").strip().lower()
-    if outcome == "failed":
-        return failure_payload(
-            ConnectionsError("Frank returned a failed completion"),
-            provider=str(payload.get("provider") or "frank") if isinstance(payload.get("provider"), str) else "frank",
-            provider_receipt=payload.get("provider_receipt"),
-        ) | {
-            "error_code": _safe_error_code(payload.get("provider_error_code")),
-            "error_category": _safe_error_category(payload.get("provider_error_category")),
-        }
-    if outcome and outcome not in SUCCESS_OUTCOMES:
-        return failure_payload(ConnectionsError("Frank returned an invalid completion"), provider="frank")
-    allowed = {"schema", "outcome", "action_id", "connection_id", "provider", "capability", "plan_id", "receipt_id", "provider_receipt", "created_at", "updated_at", "state", "status"}
-    result = {key: value for key, value in payload.items() if key in allowed}
-    if "provider_receipt" in result:
-        result["provider_receipt"] = _opaque_receipt(result["provider_receipt"])
-        if result["provider_receipt"] is None:
-            result.pop("provider_receipt")
-    if action == "apply" and not outcome:
-        return failure_payload(ConnectionsError("Frank returned no completion outcome"), provider="frank")
+    """Project Frank's nested plan/action/connection envelope to safe metadata."""
+    if not isinstance(payload, Mapping):
+        return failure_payload(ConnectionsError("Frank returned an invalid response"), provider="frank")
+    result: dict[str, Any] = {}
+    if isinstance(payload.get("plan"), Mapping):
+        plan = payload["plan"]
+        safe_plan: dict[str, Any] = {}
+        for field in ("plan_id", "action", "source", "actor", "state", "expected_revision", "confirmation_required", "confirmation_token", "confirmation_consumed", "created_at", "expires_at"):
+            if field not in plan:
+                continue
+            raw = plan[field]
+            if field == "expected_revision" and isinstance(raw, int) and not isinstance(raw, bool):
+                safe_plan[field] = raw
+            elif field in {"confirmation_required", "confirmation_consumed"} and isinstance(raw, bool):
+                safe_plan[field] = raw
+            elif raw is not None:
+                safe_plan[field] = _safe_text(raw, f"plan.{field}", opaque=field in {"plan_id", "confirmation_token"})
+        if isinstance(plan.get("target"), Mapping):
+            safe_plan["target"] = _safe_target(plan["target"])
+        result["plan"] = safe_plan
+    if isinstance(payload.get("action"), Mapping):
+        result["action"] = _safe_action_projection(payload["action"])
+    connection = _safe_connection_projection(payload.get("connection"))
+    if connection is not None:
+        result["connection"] = connection
+    for field in ("replayed", "pending", "provider_failed"):
+        if isinstance(payload.get(field), bool):
+            result[field] = payload[field]
+    if action == "plan" and not result.get("plan"):
+        return failure_payload(ConnectionsError("Frank returned no plan"), provider="frank")
+    if action == "apply" and not result.get("action"):
+        return failure_payload(ConnectionsError("Frank returned no action"), provider="frank")
     return result
 
 
@@ -367,9 +649,15 @@ class InfisicalClient:
     """Fixed-scope Infisical CE v4 client; never exposes its response body."""
 
     def __init__(self, settings: ConnectionsSettings):
-        if not settings.infisical_url or not settings.project_id or not settings.infisical_token:
+        universal_auth = bool(settings.infisical_client_id and settings.infisical_client_secret)
+        static_auth = bool(settings.infisical_token)
+        if not settings.infisical_url or not settings.project_id or not (universal_auth or static_auth):
             raise SetupNeeded("Infisical CE is not configured on Hermes")
         self.settings = settings
+        self._universal_auth = universal_auth
+        self._access_token = settings.infisical_token if not universal_auth else ""
+        self._token_expires_at = 0.0
+        self._token_lock = threading.Lock()
 
     def _url(self, secret_name: str | None = None, *, include_value: bool = False) -> str:
         base = self.settings.infisical_url + "/api/v4/secrets"
@@ -388,20 +676,68 @@ class InfisicalClient:
         return base + "?" + urllib.parse.urlencode(query)
 
     def _request(self, method: str, url: str, body: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        return self._request_with_refresh(method, url, body, allow_refresh=True)
+
+    def _authenticate(self) -> str:
+        payload = {
+            "clientId": self.settings.infisical_client_id,
+            "clientSecret": self.settings.infisical_client_secret,
+        }
+        if self.settings.infisical_organization_slug:
+            payload["organizationSlug"] = self.settings.infisical_organization_slug
+        request = urllib.request.Request(
+            self.settings.infisical_url + "/api/v1/auth/universal-auth/login",
+            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            method="POST",
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+        )
+        try:
+            with _open_no_redirect(request) as response:
+                result = json.loads(response.read(_MAX_REQUEST_BYTES).decode("utf-8"))
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, OSError, ConnectionsError) as exc:
+            raise ConnectionsError("Infisical universal auth failed") from exc
+        token = result.get("accessToken") if isinstance(result, Mapping) else None
+        expires_in = result.get("expiresIn") if isinstance(result, Mapping) else None
+        if not isinstance(token, str) or not token or not isinstance(expires_in, (int, float)):
+            raise ConnectionsError("Infisical universal auth returned invalid metadata")
+        with self._token_lock:
+            self._access_token = token
+            self._token_expires_at = time.monotonic() + max(1.0, float(expires_in) - 30.0)
+        return token
+
+    def _token(self) -> str:
+        if not self._universal_auth:
+            return self._access_token
+        with self._token_lock:
+            if self._access_token and time.monotonic() < self._token_expires_at:
+                return self._access_token
+        return self._authenticate()
+
+    def _invalidate_token(self) -> None:
+        with self._token_lock:
+            self._access_token = ""
+            self._token_expires_at = 0.0
+
+    def _request_with_refresh(self, method: str, url: str, body: Optional[dict[str, Any]], *, allow_refresh: bool) -> dict[str, Any]:
         raw = None if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
         request = urllib.request.Request(
             url,
             data=raw,
             method=method,
             headers={
-                "Authorization": f"Bearer {self.settings.infisical_token}",
+                "Authorization": f"Bearer {self._token()}",
                 "Accept": "application/json",
                 **({"Content-Type": "application/json"} if raw is not None else {}),
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:
+            with _open_no_redirect(request) as response:
                 payload = json.loads(response.read(_MAX_REQUEST_BYTES).decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401 and self._universal_auth and allow_refresh:
+                self._invalidate_token()
+                return self._request_with_refresh(method, url, body, allow_refresh=False)
+            raise ConnectionsError(f"Infisical CE request failed ({method})") from exc
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
             raise ConnectionsError(f"Infisical CE request failed ({method})") from exc
         return payload if isinstance(payload, dict) else {}
@@ -593,7 +929,7 @@ class ConnectionsRuntime:
 
     def status(self) -> dict[str, Any]:
         provider_state = _resend_provider_state(self.settings)
-        configured = bool(self.settings.infisical_url and self.settings.project_id and self.settings.infisical_token)
+        configured = bool(self.settings.infisical_url and self.settings.project_id and (self.settings.infisical_token or (self.settings.infisical_client_id and self.settings.infisical_client_secret)))
         return {
             "schema": SCHEMA_VERSION,
             "profile": PROFILE_NAME,
@@ -657,11 +993,12 @@ class ConnectionsRuntime:
                 raise ConnectionsError("secret or token fields are not accepted by the agent action tool")
             endpoint = f"{self.settings.frank_url}/api/connections/agent/{action}"
             result = self._frank_request(endpoint, body, key)
-            returned_plan_id = str(result.get("plan_id") or plan_id).strip()
+            returned_plan_id = str((result.get("plan") or {}).get("plan_id") or plan_id).strip() if isinstance(result.get("plan"), Mapping) else plan_id
             if action == "plan" and _OPAQUE_RECEIPT_RE.fullmatch(returned_plan_id):
                 self._plan_idempotency_keys[returned_plan_id] = key
-            if action == "apply" and result.get("outcome") == "verified" and result.get("provider") in {"resend", "resend-mcp"}:
-                _record_resend_verification(self.settings, result)
+            action_result = ((result.get("action") or {}).get("result") if isinstance(result.get("action"), Mapping) else None)
+            if action == "apply" and isinstance(action_result, Mapping) and action_result.get("outcome") == "verified" and action_result.get("provider") in {"resend", "resend-mcp"}:
+                _record_resend_verification(self.settings, action_result)
             return tool_result(result)
         except ConnectionsError as exc:
             return tool_error(str(exc))
@@ -680,7 +1017,7 @@ class ConnectionsRuntime:
             "Idempotency-Key": idempotency_key,
         })
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:
+            with _open_no_redirect(request) as response:
                 payload = json.loads(response.read(_MAX_REQUEST_BYTES).decode("utf-8"))
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
             raise ConnectionsError("Frank action request failed") from exc
@@ -689,15 +1026,15 @@ class ConnectionsRuntime:
         return sanitize_action_response(payload, action=endpoint.rsplit("/", 1)[-1])
 
     def broker_health(self) -> dict[str, Any]:
-        configured = bool(self.settings.infisical_url and self.settings.project_id and self.settings.infisical_token)
+        configured = bool(self.settings.infisical_url and self.settings.project_id and (self.settings.infisical_token or (self.settings.infisical_client_id and self.settings.infisical_client_secret)))
         base = {"schema": SCHEMA_VERSION, "profile": PROFILE_NAME, "broker": "connections-agent", "secret_values": False, "infisical": {"configured": configured, "reachable": False, "verified": False}}
         if not configured:
-            return base | {"ok": False, "state": "setup_needed"}
+            return base | {"ok": False, "status": "setup_needed", "state": "setup_needed"}
         try:
             InfisicalClient(self.settings).list_metadata()
         except ConnectionsError:
-            return base | {"ok": False, "state": "error", "outcome": "failed", "error_code": "infisical_unavailable", "error_category": "unavailable"}
-        return base | {"ok": True, "state": "verified", "outcome": "verified", "infisical": {"configured": True, "reachable": True, "verified": True}}
+            return base | {"ok": False, "status": "unavailable", "state": "error", "outcome": "failed", "error_code": "infisical_unavailable", "error_category": "unavailable"}
+        return base | {"ok": True, "status": "verified", "state": "verified", "outcome": "verified", "infisical": {"configured": True, "reachable": True, "verified": True}}
 
     def broker_list_metadata(self, *, principal: str) -> dict[str, Any]:
         client = InfisicalClient(self.settings)
