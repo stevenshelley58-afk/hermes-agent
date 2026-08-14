@@ -22,10 +22,15 @@ Hermes profile, agent runtime, database, or memory store.
 1. Discover and verify provider state before proposing a change. Safe actions
    are discovery, verification, planning, and metadata sync.
 2. Manual and agent mutations go through Frank's action/receipt contract. Use
-   the Connections tool to send `plan` first, then `apply` only with the
-   returned `plan_id`. Apply/completion must use a new idempotency key, distinct
+   the Connections tool to send an inner provider `action` (`discover`,
+   `create`, `update`, `verify`, `sync`, `revoke`, or `delete`) inside the
+   transport `plan` request, then apply with the returned nested
+   `plan.plan_id`. Apply/completion must use a new idempotency key, distinct
    from the plan request key. Include the literal profile `default` and
-   preserve the actor/receipt fields returned by Frank.
+   preserve the nested action/connection receipt metadata returned by Frank.
+   The apply body accepts only `plan_id`, an optional confirmation token, and
+   provider evidence fields `provider_receipt`, `provider_outcome`,
+   `provider_error_code`, and `provider_error_category`.
 3. A destructive revoke or delete requires a Frank-issued confirmation token
    and a provider receipt. Never synthesize either value. If either is absent,
    stop at a safe refusal.
@@ -63,6 +68,14 @@ requests set `viewSecretValue=false` and
 `expandSecretReferences=false`. No enterprise sync endpoint, secret reveal
 route, generic proxy, arbitrary project/path, or credential forwarding is
 allowed.
+
+The broker prefers Infisical Universal Auth using the Hermes environment
+variables `HERMES_CONNECTIONS_INFISICAL_CLIENT_ID` and
+`HERMES_CONNECTIONS_INFISICAL_CLIENT_SECRET`, with optional
+`HERMES_CONNECTIONS_INFISICAL_ORGANIZATION_SLUG`. It exchanges them in
+memory, refreshes the short-lived token once after expiry or HTTP 401, and
+never persists or returns credentials. `HERMES_CONNECTIONS_INFISICAL_TOKEN`
+is a deliberate static-token alternative.
 
 When a provider operation succeeds, send its safe provider receipt through
 Frank's `apply` action before reporting completion. If the provider is

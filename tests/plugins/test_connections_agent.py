@@ -3,9 +3,10 @@ import json
 import os
 import sys
 import tempfile
+import urllib.error
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -47,17 +48,20 @@ class ConnectionsRuntimeTests(unittest.TestCase):
         missing = runtime.ConnectionsRuntime(self.settings(infisical_url="", project_id="", infisical_token=""))
         missing_health = missing.broker_health()
         self.assertFalse(missing_health["infisical"]["configured"])
+        self.assertEqual(missing_health["status"], "setup_needed")
         self.assertNotEqual(missing_health.get("outcome"), "verified")
 
         with patch.object(runtime.InfisicalClient, "list_metadata", side_effect=runtime.ConnectionsError("Infisical CE request failed (GET)")):
             failed = runtime.ConnectionsRuntime(self.settings()).broker_health()
         self.assertEqual(failed["state"], "error")
+        self.assertEqual(failed["status"], "unavailable")
         self.assertFalse(failed["infisical"]["verified"])
         self.assertNotEqual(failed.get("outcome"), "verified")
 
         with patch.object(runtime.InfisicalClient, "list_metadata", return_value=[]):
             verified = runtime.ConnectionsRuntime(self.settings()).broker_health()
         self.assertEqual(verified["outcome"], "verified")
+        self.assertEqual(verified["status"], "verified")
         self.assertTrue(verified["infisical"]["verified"])
 
     def test_create_delete_lifecycle_is_truthful_and_never_stores_values(self):
@@ -111,11 +115,30 @@ class ConnectionsRuntimeTests(unittest.TestCase):
 
     def test_nested_sensitive_payloads_are_rejected_before_transport(self):
         with self.assertRaises(runtime.ConnectionsError):
-            runtime.sanitize_action_request({"connection_id": "c1", "metadata": {"nested": {"api_key": "secret"}}})
+            runtime.sanitize_action_request({"action": "create", "target": {"provider": "resend"}, "body": {"name": "Resend", "notes": {"nested": {"api_key": "secret"}}}})
         with self.assertRaises(runtime.ConnectionsError):
-            runtime.sanitize_action_request({"connection_id": "c1", "metadata": [{"auth": {"token": "secret"}}]})
+            runtime.sanitize_action_request({"action": "create", "target": {"provider": "resend"}, "body": {"name": "Resend", "capabilities": [{"auth": {"token": "secret"}}]}})
         with self.assertRaises(runtime.ConnectionsError):
-            runtime.sanitize_action_request({"connection_id": "c1", "capability": "email.send", "provider": "resend", "operation": "send", "profile": "default", "confirmation_token": "Bearer secret-token-value"})
+            runtime.sanitize_action_request({"plan_id": "plan-1234", "confirmation_token": "Bearer secret-token-value"})
+
+    def test_plan_schema_accepts_frank_connection_metadata_for_create_and_update(self):
+        create = runtime.sanitize_action_request({
+            "action": "create", "target": {"provider": "resend", "project": "connections"},
+            "body": {
+                "provider": "resend", "name": "Resend", "scope_kind": "global", "status": "connected",
+                "connection_ref": "resend://default", "credential_ref": "openbao://frank/resend",
+                "capabilities": ["email.send", "email.status"], "notes": "safe metadata",
+            }, "expected_revision": 0,
+        })
+        self.assertEqual(create["action"], "create")
+        self.assertEqual(create["body"]["capabilities"], ["email.send", "email.status"])
+        update = runtime.sanitize_action_request({
+            "action": "update", "target": {"provider": "resend", "connection_id": "connection-1234"},
+            "body": {"name": "Resend updated", "scope_kind": "project", "scope_id": "demo", "status": "connected", "capabilities": ["email.send"]},
+            "expected_revision": 2,
+        })
+        self.assertEqual(update["target"]["connection_id"], "connection-1234")
+        self.assertEqual(update["expected_revision"], 2)
 
     def test_delete_requires_frank_confirmation_and_provider_receipt(self):
         client = unittest.mock.Mock()
@@ -152,41 +175,109 @@ class ConnectionsRuntimeTests(unittest.TestCase):
 
     def test_completion_contract_redacts_provider_error_text(self):
         request = runtime.sanitize_action_request({
-            "connection_id": "c1",
-            "outcome": "failed",
-            "provider_receipt": {"receipt_id": "receipt-1234"},
+            "plan_id": "plan-1234",
+            "provider_outcome": "failed",
+            "provider_receipt": "receipt-1234",
             "provider_error_code": "provider_rejected",
             "provider_error_category": "unavailable",
         })
-        self.assertEqual(request["outcome"], "failed")
-        self.assertEqual(request["provider_receipt"], {"receipt_id": "receipt-1234"})
+        self.assertEqual(request["provider_outcome"], "failed")
+        self.assertEqual(request["provider_receipt"], "receipt-1234")
         self.assertEqual(request["provider_error_category"], "unavailable")
         self.assertNotIn("error", request)
-        self.assertNotIn("raw_error", request["provider_receipt"])
+        with self.assertRaises(runtime.ConnectionsError):
+            runtime.sanitize_action_request({"plan_id": "plan-1234", "outcome": "failed"})
 
         response = runtime.sanitize_action_response({
-            "outcome": "failed",
-            "provider": "resend",
-            "provider_receipt": {"receipt_id": "receipt-1234", "message": "secret"},
-            "provider_error_code": "not-allowlisted",
-            "provider_error_category": "not-allowlisted",
-            "error": "Authorization: Bearer secret",
+            "action": {"action": "verify", "state": "failed", "result": {
+                "outcome": "failed", "provider": "resend", "provider_receipt": "receipt-1234",
+                "error_code": "provider_rejected", "error_category": "unavailable", "message": "Authorization: Bearer secret",
+            }, "unsafe": "drop"},
+            "connection": {"id": "connection-1234", "provider": "resend", "status": "error", "secretValue": "drop"},
+            "unsafe": "drop",
         }, action="apply")
-        self.assertEqual(response["outcome"], "failed")
-        self.assertEqual(response["error_code"], "unknown_error")
-        self.assertEqual(response["error_category"], "unknown")
-        self.assertNotEqual(response["provider_receipt"], {"receipt_id": "receipt-1234"})
-        self.assertNotIn("error", response)
-        self.assertEqual(set(response), {"schema", "outcome", "provider_receipt", "error_code", "error_category"})
+        self.assertEqual(response["action"]["result"]["outcome"], "failed")
+        self.assertEqual(response["action"]["result"]["error_category"], "unavailable")
+        self.assertNotIn("message", json.dumps(response))
+        self.assertNotIn("secretValue", json.dumps(response))
 
     def test_apply_requires_plan_id_and_new_idempotency_key(self):
         runtime_instance = runtime.ConnectionsRuntime(self.settings())
-        with patch.object(runtime_instance, "_frank_request", return_value={"plan_id": "plan-1234"}):
-            runtime_instance.request_tool({"action": "plan", "request": {"connection_id": "c1", "profile": "default"}, "idempotency_key": "plan-key-1"})
-        same_key = runtime_instance.request_tool({"action": "apply", "plan_id": "plan-1234", "request": {"connection_id": "c1", "profile": "default"}, "idempotency_key": "plan-key-1"})
+        plan_response = {"plan": {"plan_id": "plan-1234", "action": "verify", "state": "planned"}, "action": {"action": "verify", "state": "running"}}
+        with patch.object(runtime_instance, "_frank_request", return_value=plan_response):
+            runtime_instance.request_tool({"action": "plan", "request": {"action": "verify", "target": {"connection_id": "connection-1234"}}, "idempotency_key": "plan-key-1"})
+        same_key = runtime_instance.request_tool({"action": "apply", "plan_id": "plan-1234", "request": {"plan_id": "plan-1234"}, "idempotency_key": "plan-key-1"})
         self.assertIn("new idempotency_key", same_key)
-        missing_plan = runtime_instance.request_tool({"action": "apply", "request": {"connection_id": "c1", "profile": "default"}, "idempotency_key": "apply-key-1"})
+        missing_plan = runtime_instance.request_tool({"action": "apply", "request": {"plan_id": "short"}, "idempotency_key": "apply-key-1"})
         self.assertIn("plan_id", missing_plan)
+
+    def test_mocked_frank_plan_then_apply_preserves_nested_contract(self):
+        runtime_instance = runtime.ConnectionsRuntime(self.settings())
+        responses = [
+            {"plan": {"plan_id": "plan-verify-1234", "action": "verify", "state": "planned", "target": {"provider": "resend", "connection_id": "connection-1234"}}, "action": {"action": "verify", "state": "running"}},
+            {"action": {"action": "verify", "state": "completed", "result": {"outcome": "verified", "provider": "resend", "provider_receipt": "hermes://receipt/verify-1234", "connection_id": "connection-1234", "status": "verified"}}, "connection": {"id": "connection-1234", "provider": "resend", "name": "Resend", "scope_kind": "global", "scope_id": "", "status": "verified", "capabilities": ["email.send"], "credential_ref": "openbao://frank/resend"}},
+        ]
+        with patch.object(runtime_instance, "_frank_request", side_effect=responses) as request:
+            planned = runtime_instance.request_tool({"action": "plan", "request": {"action": "verify", "target": {"provider": "resend", "connection_id": "connection-1234"}, "expected_revision": 1}, "idempotency_key": "plan-verify-0001"})
+            self.assertIn("plan-verify-1234", planned)
+            applied = runtime_instance.request_tool({"action": "apply", "plan_id": "plan-verify-1234", "request": {"plan_id": "plan-verify-1234", "provider_receipt": "hermes://receipt/verify-1234", "provider_outcome": "verified"}, "idempotency_key": "apply-verify-0001"})
+        self.assertIn("verified", applied)
+        self.assertEqual(request.call_args_list[1].args[1]["provider_outcome"], "verified")
+        self.assertNotIn("profile", request.call_args_list[0].args[1])
+
+    def test_authenticated_requests_reject_same_and_cross_host_redirects(self):
+        for location in ("https://infisical.invalid/api/v4/secrets", "https://attacker.invalid/steal"):
+            error = urllib.error.HTTPError(location, 302, "redirect", {"Location": location}, None)
+            with patch.object(runtime._NO_REDIRECT_OPENER, "open", side_effect=error) as opener:
+                with self.assertRaises(runtime.ConnectionsError):
+                    runtime.InfisicalClient(self.settings())._request("GET", "https://infisical.invalid/api/v4/secrets")
+                self.assertEqual(opener.call_count, 1)
+                self.assertEqual(opener.call_args.args[0].get_header("Authorization"), "Bearer token")
+            error = urllib.error.HTTPError(location, 302, "redirect", {"Location": location}, None)
+            with patch.object(runtime._NO_REDIRECT_OPENER, "open", side_effect=error) as opener:
+                with self.assertRaises(runtime.ConnectionsError):
+                    runtime.ConnectionsRuntime(self.settings())._frank_request("https://frank.invalid/api/connections/agent/plan", {"action": "discover"}, "frank-key-0001")
+                self.assertEqual(opener.call_count, 1)
+                self.assertEqual(opener.call_args.args[0].get_header("Authorization"), "Bearer " + ("a" * 40))
+
+    def test_infisical_universal_auth_is_in_memory_and_refreshes_once_after_401(self):
+        settings = self.settings(infisical_token="", infisical_client_id="client-id", infisical_client_secret="client-secret", infisical_organization_slug="org")
+
+        def response(payload):
+            item = MagicMock()
+            item.__enter__.return_value = item
+            item.__exit__.return_value = False
+            item.read.return_value = json.dumps(payload).encode("utf-8")
+            item.getcode.return_value = 200
+            return item
+
+        first_login = response({"accessToken": "access-token-one", "expiresIn": 3600, "accessTokenMaxTTL": 3600, "tokenType": "Bearer"})
+        second_login = response({"accessToken": "access-token-two", "expiresIn": 3600, "accessTokenMaxTTL": 3600, "tokenType": "Bearer"})
+        metadata = response({"secrets": []})
+        unauthorized = urllib.error.HTTPError("https://infisical.invalid/api/v4/secrets", 401, "unauthorized", {}, None)
+        with patch.object(runtime._NO_REDIRECT_OPENER, "open", side_effect=[first_login, metadata]):
+            client = runtime.InfisicalClient(settings)
+            self.assertEqual(client.list_metadata(), [])
+        third_login = response({"accessToken": "access-token-three", "expiresIn": 3600, "accessTokenMaxTTL": 3600, "tokenType": "Bearer"})
+        metadata_again = response({"secrets": []})
+        with patch.object(runtime._NO_REDIRECT_OPENER, "open", side_effect=[first_login, unauthorized, second_login, metadata, third_login, metadata_again]) as opener:
+            client = runtime.InfisicalClient(settings)
+            self.assertEqual(client.list_metadata(), [])
+            client._token_expires_at = 0
+            self.assertEqual(client.list_metadata(), [])
+            self.assertEqual(opener.call_count, 6)
+            login_request = opener.call_args_list[0].args[0]
+            self.assertNotIn("access-token-one", login_request.data.decode("utf-8"))
+            metadata_request = opener.call_args_list[1].args[0]
+            refreshed_request = opener.call_args_list[3].args[0]
+            self.assertEqual(metadata_request.get_header("Authorization"), "Bearer access-token-one")
+            self.assertEqual(refreshed_request.get_header("Authorization"), "Bearer access-token-two")
+            self.assertEqual(json.loads(login_request.data.decode("utf-8"))["clientId"], "client-id")
+
+    def test_only_canonical_vault_broker_key_is_loaded(self):
+        with patch.dict(os.environ, {"HERMES_VAULT_BROKER_KEY": "canonical-key", "HERMES_CONNECTIONS_BROKER_KEY": "alias-key"}, clear=False):
+            settings = runtime.load_settings()
+        self.assertEqual(settings.broker_key, "canonical-key")
 
     def test_plugin_api_uses_authoritative_env_scope_without_ctx_or_secret_status(self):
         api_path = ROOT / "plugins" / "connections_agent" / "dashboard" / "plugin_api.py"
@@ -199,7 +290,7 @@ class ConnectionsRuntimeTests(unittest.TestCase):
             "HERMES_CONNECTIONS_INFISICAL_SECRET_PATH": "/connections",
             "HERMES_CONNECTIONS_RESEND_SECRET_NAME": "RESEND_API_KEY",
             "HERMES_CONNECTIONS_AGENT_KEY": "agent-secret-never-status",
-            "HERMES_CONNECTIONS_BROKER_KEY": "broker-secret-never-status",
+            "HERMES_VAULT_BROKER_KEY": "broker-secret-never-status",
             "HERMES_CONNECTIONS_INFISICAL_TOKEN": "infisical-secret-never-status",
         }
         module_name = "connections_api_env_test"
