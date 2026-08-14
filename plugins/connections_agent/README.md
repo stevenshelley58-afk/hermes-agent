@@ -37,8 +37,11 @@ Its fixed endpoints are `GET /health`, `POST /secrets/list-metadata`, and
 `POST /secrets/create`, `/rotate`, and `/delete`. Mutation requests require an
 `Idempotency-Key`; delete additionally requires a Frank confirmation token and
 provider receipt. Responses are safe metadata receipts and never secret
-values. Infisical project, environment, path, and secret name are fixed by
-Hermes settings, not accepted from Frank.
+values. Action completion outcomes are limited to `created`, `updated`,
+`verified`, `synced`, `revoked`, `deleted`, and `failed`; failed completions
+carry only an opaque provider receipt plus safe error code/category. Infisical
+project, environment, path, and secret name are fixed by Hermes settings, not
+accepted from Frank.
 
 The first adapter is the official Resend local MCP server. It is held at
 `setup_needed` until the Frank rotation flow records a new rotation for

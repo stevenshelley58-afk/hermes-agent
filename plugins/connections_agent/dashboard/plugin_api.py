@@ -16,6 +16,7 @@ try:
         BROKER_BASE_PATH,
         ConnectionsError,
         ConnectionsRuntime,
+        failure_payload,
         load_settings,
     )
 except ImportError:  # pragma: no cover - direct plugin-api import
@@ -31,6 +32,7 @@ except ImportError:  # pragma: no cover - direct plugin-api import
     BROKER_BASE_PATH = _mod.BROKER_BASE_PATH
     ConnectionsError = _mod.ConnectionsError
     ConnectionsRuntime = _mod.ConnectionsRuntime
+    failure_payload = _mod.failure_payload
     load_settings = _mod.load_settings
 
 router = APIRouter() if APIRouter is not None else None
@@ -78,7 +80,7 @@ if router is not None:
         try:
             return _json(_runtime.broker_list_metadata(principal=principal))
         except ConnectionsError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+            return _json(failure_payload(exc), status=503)
 
     async def _mutate(request: Request, operation: str, idempotency_key: str | None):
         principal = _principal(request)
@@ -89,7 +91,7 @@ if router is not None:
             return _json(_runtime.broker_mutate(operation, payload, principal=principal, idempotency_key=idempotency_key))
         except ConnectionsError as exc:
             status = 409 if "Idempotency-Key" in str(exc) else 400
-            raise HTTPException(status_code=status, detail=str(exc)) from exc
+            return _json(failure_payload(exc, provider_receipt=payload.get("provider_receipt")), status=status)
 
     @router.post("/vault-broker/secrets/create")
     async def create(request: Request, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
