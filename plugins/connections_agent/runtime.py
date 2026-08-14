@@ -44,8 +44,10 @@ PROFILE_NAME = "default"
 SESSION_NAME = "Connections Agent"
 RESEND_SERVER_NAME = "resend"
 RESEND_CAPABILITIES = ("email.send", "email.status")
+RESEND_MCP_PACKAGE = "resend-mcp@2.13.0"
+RESEND_MCP_TOOL_NAMES = ("send-email", "get-email")
 SUCCESS_OUTCOMES = frozenset({"created", "updated", "verified", "synced", "revoked", "deleted"})
-ERROR_CATEGORIES = frozenset({"auth", "configuration", "network", "rate_limit", "provider", "validation", "timeout", "policy", "protocol", "unknown"})
+ERROR_CATEGORIES = frozenset({"auth", "configuration", "network", "not_found", "permission_denied", "rate_limited", "timeout", "unavailable", "validation", "unknown"})
 ERROR_CODES = frozenset({
     "auth_failed", "confirmation_required", "infisical_unavailable", "invalid_completion",
     "invalid_request", "mcp_unavailable", "provider_error", "provider_rejected",
@@ -61,6 +63,21 @@ _SAFE_METADATA_FIELDS = {
     "isRotatedSecret", "rotationId", "folderId",
 }
 _OPAQUE_RECEIPT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$")
+_SAFE_ACTION_IDENTIFIERS = frozenset({
+    "action_id", "connection_id", "provider", "provider_id", "capability",
+    "operation", "profile", "plan_id", "confirmation_token",
+})
+_COMPLETION_FIELDS = frozenset({
+    "outcome", "provider_receipt", "provider_error_code", "provider_error_category",
+})
+_SENSITIVE_FIELD_RE = re.compile(
+    r"(?:secret|token|auth|password|credential|api[_-]?key|payment|card|cvv|private[_-]?key|bearer)",
+    re.IGNORECASE,
+)
+_SECRET_LIKE_VALUE_RE = re.compile(
+    r"(?:\b(?:re|sk|rk|pk)_[A-Za-z0-9_-]{8,}\b|\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b|\b(?:api[_-]?key|secret|token|password)\s*[:=])",
+    re.IGNORECASE,
+)
 
 CONNECTIONS_STATUS_SCHEMA = {
     "name": "connections_agent_status",
@@ -75,6 +92,7 @@ CONNECTIONS_REQUEST_SCHEMA = {
         "properties": {
             "action": {"type": "string", "enum": ["plan", "apply"]},
             "request": {"type": "object"},
+            "plan_id": {"type": "string", "minLength": 8, "maxLength": 256},
             "idempotency_key": {"type": "string", "minLength": 8, "maxLength": 128},
         },
         "required": ["action", "request", "idempotency_key"],
@@ -121,25 +139,43 @@ def _setting(ctx: Any, key: str, default: Any) -> Any:
         return default
 
 
+def _env_or_setting(ctx: Any, key: str, default: Any, env_name: str, *aliases: str) -> Any:
+    """Use the same environment-backed settings source in tools and API."""
+    for name in (env_name, *aliases):
+        if name in os.environ:
+            return os.environ[name]
+    return _setting(ctx, key, default) if ctx is not None else default
+
+
 def load_settings(ctx: Any = None) -> ConnectionsSettings:
-    """Read non-secret settings from the plugin namespace and credentials env."""
-    get = lambda key, default: _setting(ctx, key, default) if ctx is not None else default
-    secret_name = str(get("resend_secret_name", "RESEND_API_KEY") or "RESEND_API_KEY").strip()
+    """Read one authoritative settings surface: env, then plugin config, then defaults.
+
+    The environment names are intentionally usable by both plugin registration
+    and dashboard API import, which has no PluginContext. Credentials are
+    environment-only; the legacy broker-key alias remains accepted for rollout.
+    """
+    enabled = _env_or_setting(ctx, "enabled", False, "HERMES_CONNECTIONS_ENABLED")
+    frank_url = _env_or_setting(ctx, "frank_url", "", "HERMES_CONNECTIONS_FRANK_URL")
+    infisical_url = _env_or_setting(ctx, "infisical_url", "", "HERMES_CONNECTIONS_INFISICAL_URL")
+    project_id = _env_or_setting(ctx, "infisical_project_id", "", "HERMES_CONNECTIONS_INFISICAL_PROJECT_ID")
+    environment = _env_or_setting(ctx, "infisical_environment", "dev", "HERMES_CONNECTIONS_INFISICAL_ENVIRONMENT")
+    path_value = _env_or_setting(ctx, "secret_path", "/connections", "HERMES_CONNECTIONS_INFISICAL_SECRET_PATH")
+    secret_name = str(_env_or_setting(ctx, "resend_secret_name", "RESEND_API_KEY", "HERMES_CONNECTIONS_RESEND_SECRET_NAME") or "RESEND_API_KEY").strip()
     if not _SECRET_NAME_RE.fullmatch(secret_name):
         secret_name = "RESEND_API_KEY"
-    path = str(get("secret_path", "/connections") or "/connections").strip()
+    path = str(path_value or "/connections").strip()
     if not path.startswith("/") or ".." in path:
         path = "/connections"
     return ConnectionsSettings(
-        enabled=_truthy(get("enabled", False)),
-        frank_url=str(get("frank_url", "") or "").strip().rstrip("/"),
-        infisical_url=str(get("infisical_url", "") or "").strip().rstrip("/"),
-        project_id=str(get("infisical_project_id", "") or "").strip(),
-        environment=str(get("infisical_environment", "dev") or "dev").strip(),
+        enabled=_truthy(enabled),
+        frank_url=str(frank_url or "").strip().rstrip("/"),
+        infisical_url=str(infisical_url or "").strip().rstrip("/"),
+        project_id=str(project_id or "").strip(),
+        environment=str(environment or "dev").strip(),
         secret_path=path,
         resend_secret_name=secret_name,
         agent_key=os.environ.get("HERMES_CONNECTIONS_AGENT_KEY", "").strip(),
-        broker_key=os.environ.get("HERMES_VAULT_BROKER_KEY", "").strip(),
+        broker_key=os.environ.get("HERMES_CONNECTIONS_BROKER_KEY", os.environ.get("HERMES_VAULT_BROKER_KEY", "")).strip(),
         infisical_token=os.environ.get("HERMES_CONNECTIONS_INFISICAL_TOKEN", "").strip(),
     )
 
@@ -162,10 +198,44 @@ def _opaque_receipt(value: Any) -> dict[str, str] | None:
     if isinstance(value, str) and _OPAQUE_RECEIPT_RE.fullmatch(value.strip()):
         return {"receipt_id": value.strip()}
     if isinstance(value, Mapping):
+        if set(value) != {"receipt_id"}:
+            return None
         receipt_id = value.get("receipt_id") or value.get("id")
         if isinstance(receipt_id, str) and _OPAQUE_RECEIPT_RE.fullmatch(receipt_id.strip()):
             return {"receipt_id": receipt_id.strip()}
     return None
+
+
+def _reject_sensitive_payload(value: Any, *, path: tuple[str, ...] = ()) -> None:
+    """Reject nested credential-shaped keys and values before transport."""
+    if isinstance(value, Mapping):
+        for raw_key, nested in value.items():
+            key = str(raw_key)
+            lowered = key.lower()
+            if _SENSITIVE_FIELD_RE.search(key):
+                if not (not path and lowered == "confirmation_token"):
+                    raise ConnectionsError("sensitive fields are not accepted by the agent action tool")
+            _reject_sensitive_payload(nested, path=path + (lowered,))
+        return
+    if isinstance(value, (list, tuple)):
+        for index, nested in enumerate(value):
+            _reject_sensitive_payload(nested, path=path + (str(index),))
+        return
+    if isinstance(value, str) and _SECRET_LIKE_VALUE_RE.search(value):
+        raise ConnectionsError("secret-like values are not accepted by the agent action tool")
+
+
+def build_resend_mcp_config(secret_value: str) -> dict[str, Any]:
+    """Build the pinned, capability-filtered stdio config in memory only."""
+    if not isinstance(secret_value, str) or not secret_value:
+        raise SetupNeeded("Resend secret is unavailable")
+    return {
+        "command": "npx",
+        "args": ["-y", RESEND_MCP_PACKAGE],
+        "env": {"RESEND_API_KEY": secret_value},
+        "tools": {"include": list(RESEND_MCP_TOOL_NAMES)},
+        "supports_parallel_tool_calls": False,
+    }
 
 
 def _safe_error_code(value: Any, fallback: str = "unknown_error") -> str:
@@ -184,17 +254,17 @@ def classify_failure(exc: BaseException) -> tuple[str, str]:
     if isinstance(exc, SetupNeeded) or "configured" in text or "setup_needed" in text:
         return "setup_needed", "configuration"
     if "idempotency" in text or "request rate" in text:
-        return "rate_limited", "rate_limit"
+        return "rate_limited", "rate_limited"
     if "confirmation" in text:
-        return "confirmation_required", "policy"
+        return "confirmation_required", "permission_denied"
     if "receipt" in text:
-        return "receipt_missing", "policy"
+        return "receipt_missing", "validation"
     if "timeout" in text:
         return "timeout", "timeout"
     if "infisical" in text:
         return "infisical_unavailable", "network"
     if "frank action" in text:
-        return "provider_error", "network"
+        return "provider_error", "unavailable"
     return "unknown_error", "unknown"
 
 
@@ -218,19 +288,32 @@ def failure_payload(exc: BaseException, *, provider: str = "infisical-ce", provi
 
 def sanitize_action_request(body: Mapping[str, Any]) -> dict[str, Any]:
     """Strip provider prose and enforce the completion outcome vocabulary."""
-    forbidden = {"error", "errors", "message", "detail", "reason", "trace", "traceback", "response", "body"}
+    if not isinstance(body, Mapping):
+        raise ConnectionsError("action request must be an object")
+    _reject_sensitive_payload(body)
+    allowed = _SAFE_ACTION_IDENTIFIERS | _COMPLETION_FIELDS
+    unknown = {str(key) for key in body if str(key) not in allowed}
+    if unknown:
+        raise ConnectionsError("action request fields are not allowlisted")
     cleaned: dict[str, Any] = {}
     for key, value in body.items():
         name = str(key)
-        lowered = name.lower()
-        if lowered in forbidden or lowered.endswith("_error") or lowered.endswith("_message"):
-            continue
         if name == "provider_receipt":
             receipt = _opaque_receipt(value)
             if receipt is None:
                 raise ConnectionsError("provider receipt is not opaque")
             cleaned[name] = receipt
+        elif name == "profile":
+            if value != PROFILE_NAME:
+                raise ConnectionsError("profile must be default")
+            cleaned[name] = PROFILE_NAME
+        elif name == "confirmation_token":
+            if not isinstance(value, str) or not _OPAQUE_RECEIPT_RE.fullmatch(value.strip()):
+                raise ConnectionsError("confirmation_token is not opaque")
+            cleaned[name] = value.strip()
         else:
+            if not isinstance(value, str) or not 1 <= len(value) <= 256:
+                raise ConnectionsError(f"{name} must be a bounded identifier")
             cleaned[name] = value
 
     outcome = cleaned.get("outcome")
@@ -238,14 +321,18 @@ def sanitize_action_request(body: Mapping[str, Any]) -> dict[str, Any]:
         outcome = str(outcome).strip().lower()
         if outcome == "failed":
             cleaned["outcome"] = "failed"
-            cleaned["error_code"] = _safe_error_code(cleaned.get("error_code"), "unknown_error")
-            cleaned["error_category"] = _safe_error_category(cleaned.get("error_category"), "unknown")
+            if set(cleaned) - (_SAFE_ACTION_IDENTIFIERS | {"outcome", "provider_receipt", "provider_error_code", "provider_error_category"}):
+                raise ConnectionsError("failed completion contains unsupported fields")
+            cleaned["provider_error_code"] = _safe_error_code(cleaned.get("provider_error_code"), "unknown_error")
+            cleaned["provider_error_category"] = _safe_error_category(cleaned.get("provider_error_category"), "unknown")
+            cleaned.pop("error_code", None)
+            cleaned.pop("error_category", None)
             if "provider_receipt" not in cleaned:
                 raise ConnectionsError("failed completion requires provider_receipt")
-            # Failure completions contain only safe completion fields in
-            # addition to the caller's non-secret identifiers.
         elif outcome in SUCCESS_OUTCOMES:
             cleaned["outcome"] = outcome
+            if "error_code" in cleaned or "error_category" in cleaned or "provider_error_code" in cleaned or "provider_error_category" in cleaned:
+                raise ConnectionsError("error fields are allowed only for failed completion")
         else:
             raise ConnectionsError("completion outcome is not allowlisted")
     return cleaned
@@ -260,12 +347,12 @@ def sanitize_action_response(payload: Mapping[str, Any], *, action: str) -> dict
             provider=str(payload.get("provider") or "frank") if isinstance(payload.get("provider"), str) else "frank",
             provider_receipt=payload.get("provider_receipt"),
         ) | {
-            "error_code": _safe_error_code(payload.get("error_code")),
-            "error_category": _safe_error_category(payload.get("error_category")),
+            "error_code": _safe_error_code(payload.get("provider_error_code")),
+            "error_category": _safe_error_category(payload.get("provider_error_category")),
         }
     if outcome and outcome not in SUCCESS_OUTCOMES:
         return failure_payload(ConnectionsError("Frank returned an invalid completion"), provider="frank")
-    allowed = {"schema", "outcome", "action_id", "connection_id", "provider", "capability", "receipt_id", "provider_receipt", "created_at", "updated_at", "state", "status"}
+    allowed = {"schema", "outcome", "action_id", "connection_id", "provider", "capability", "plan_id", "receipt_id", "provider_receipt", "created_at", "updated_at", "state", "status"}
     result = {key: value for key, value in payload.items() if key in allowed}
     if "provider_receipt" in result:
         result["provider_receipt"] = _opaque_receipt(result["provider_receipt"])
@@ -408,28 +495,63 @@ def _state_path() -> Path:
     return get_hermes_home() / "plugin-data" / "connections-agent" / "resend-state.json"
 
 
-def _resend_was_rotated(settings: ConnectionsSettings) -> bool:
+def _resend_provider_state(settings: ConnectionsSettings) -> str:
     try:
         data = json.loads(_state_path().read_text(encoding="utf-8"))
-        return data.get("secret_name") == settings.resend_secret_name and data.get("operation") == "rotate"
+        if data.get("secret_name") != settings.resend_secret_name:
+            return "setup_needed"
+        state = data.get("state")
+        if state in {"configured", "connected-awaiting-verification", "verified"}:
+            return state
+        if data.get("operation") == "rotate":
+            return "configured"
     except (OSError, ValueError, TypeError):
-        return False
+        pass
+    return "setup_needed"
 
 
-def _record_resend_rotation(settings: ConnectionsSettings, metadata: Mapping[str, Any]) -> None:
+def _resend_was_rotated(settings: ConnectionsSettings) -> bool:
+    return _resend_provider_state(settings) != "setup_needed"
+
+
+def _write_resend_state(settings: ConnectionsSettings, *, state: str, operation: str, metadata: Mapping[str, Any]) -> None:
     path = _state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     safe = {
         "schema": SCHEMA_VERSION,
         "secret_name": settings.resend_secret_name,
-        "operation": "rotate",
+        "operation": operation,
+        "state": state,
         "updated_at": int(time.time()),
         "provider": "resend-mcp",
-        "metadata": _safe_metadata(metadata),
+        "metadata": dict(metadata),
     }
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(safe, sort_keys=True), encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _record_resend_rotation(settings: ConnectionsSettings, metadata: Mapping[str, Any]) -> None:
+    _write_resend_state(settings, state="configured", operation="rotate", metadata=_safe_metadata(metadata))
+
+
+def _record_resend_create(settings: ConnectionsSettings, metadata: Mapping[str, Any]) -> None:
+    _write_resend_state(settings, state="configured", operation="create", metadata=_safe_metadata(metadata))
+
+
+def _record_resend_deleted(settings: ConnectionsSettings, metadata: Mapping[str, Any]) -> None:
+    _write_resend_state(settings, state="setup_needed", operation="delete", metadata=_safe_metadata(metadata))
+
+
+def _record_resend_connection(settings: ConnectionsSettings, tool_names: list[str]) -> None:
+    _write_resend_state(settings, state="connected-awaiting-verification", operation="mcp-connect", metadata={"tool_count": len(tool_names)})
+
+
+def _record_resend_verification(settings: ConnectionsSettings, result: Mapping[str, Any]) -> None:
+    receipt = _opaque_receipt(result.get("provider_receipt"))
+    if receipt is None:
+        raise ConnectionsError("provider verification requires an opaque receipt")
+    _write_resend_state(settings, state="verified", operation="provider-verify", metadata=receipt)
 
 
 class ConnectionsTokenProvider(DashboardAuthProvider):
@@ -467,18 +589,20 @@ class ConnectionsTokenProvider(DashboardAuthProvider):
 class ConnectionsRuntime:
     def __init__(self, settings: ConnectionsSettings):
         self.settings = settings
+        self._plan_idempotency_keys: dict[str, str] = {}
 
     def status(self) -> dict[str, Any]:
-        ready = _resend_was_rotated(self.settings)
+        provider_state = _resend_provider_state(self.settings)
+        configured = bool(self.settings.infisical_url and self.settings.project_id and self.settings.infisical_token)
         return {
             "schema": SCHEMA_VERSION,
             "profile": PROFILE_NAME,
             "session_name": SESSION_NAME,
             "plugin": "connections-agent",
             "enabled": self.settings.enabled,
-            "infisical": {"configured": bool(self.settings.infisical_url and self.settings.project_id and self.settings.infisical_token), "mode": "ce-v4-fixed-scope"},
-            "providers": [{"id": "resend-mcp", "state": "ready" if ready else "setup_needed", "capabilities": list(RESEND_CAPABILITIES)}],
-            "mcp": {"server": RESEND_SERVER_NAME, "command": "npx", "args": ["-y", "resend-mcp"], "secret_source": "hermes-infisical", "secret_name": self.settings.resend_secret_name} if ready else {"server": RESEND_SERVER_NAME, "state": "setup_needed"},
+            "infisical": {"configured": configured, "reachable": None, "verified": None, "mode": "ce-v4-fixed-scope"},
+            "providers": [{"id": "resend-mcp", "state": provider_state, "capabilities": list(RESEND_CAPABILITIES)}],
+            "mcp": {"server": RESEND_SERVER_NAME, "command": "npx", "args": ["-y", RESEND_MCP_PACKAGE], "secret_source": "hermes-infisical", "secret_name": self.settings.resend_secret_name, "state": provider_state} if provider_state != "setup_needed" else {"server": RESEND_SERVER_NAME, "state": "setup_needed"},
         }
 
     def status_tool(self, _args: Mapping[str, Any]) -> str:
@@ -495,19 +619,14 @@ class ConnectionsRuntime:
             secret_value = client.read_value(self.settings.resend_secret_name)
             from tools.mcp_tool import register_mcp_servers
 
-            names = register_mcp_servers({
-                RESEND_SERVER_NAME: {
-                    "command": "npx",
-                    "args": ["-y", "resend-mcp"],
-                    "env": {"RESEND_API_KEY": secret_value},
-                    "tools": {"include": ["sendEmail", "getEmail"]},
-                    "supports_parallel_tool_calls": False,
-                }
-            })
+            names = register_mcp_servers({RESEND_SERVER_NAME: build_resend_mcp_config(secret_value)})
+            if not names:
+                return tool_result(failure_payload(ConnectionsError("Resend MCP discovery returned no allowlisted tools"), provider="resend-mcp"))
+            _record_resend_connection(self.settings, names)
             return tool_result({
                 "schema": SCHEMA_VERSION,
                 "server": RESEND_SERVER_NAME,
-                "state": "ready" if names else "setup_needed",
+                "state": "connected-awaiting-verification",
                 "registered_tools": list(names),
                 "capabilities": list(RESEND_CAPABILITIES),
             })
@@ -523,6 +642,13 @@ class ConnectionsRuntime:
                 raise SetupNeeded("Frank action transport is not configured on Hermes")
             key = str(args.get("idempotency_key") or "").strip()
             body = sanitize_action_request(dict(args["request"]))
+            plan_id = str(args.get("plan_id") or body.get("plan_id") or "").strip()
+            if action == "apply":
+                if not _OPAQUE_RECEIPT_RE.fullmatch(plan_id):
+                    raise ConnectionsError("apply requires an opaque plan_id")
+                if self._plan_idempotency_keys.get(plan_id) == key:
+                    raise ConnectionsError("apply requires a new idempotency_key")
+                body["plan_id"] = plan_id
             if any(
                 "secret" in str(k).lower()
                 or ("token" in str(k).lower() and str(k).lower() != "confirmation_token")
@@ -530,7 +656,13 @@ class ConnectionsRuntime:
             ):
                 raise ConnectionsError("secret or token fields are not accepted by the agent action tool")
             endpoint = f"{self.settings.frank_url}/api/connections/agent/{action}"
-            return tool_result(self._frank_request(endpoint, body, key))
+            result = self._frank_request(endpoint, body, key)
+            returned_plan_id = str(result.get("plan_id") or plan_id).strip()
+            if action == "plan" and _OPAQUE_RECEIPT_RE.fullmatch(returned_plan_id):
+                self._plan_idempotency_keys[returned_plan_id] = key
+            if action == "apply" and result.get("outcome") == "verified" and result.get("provider") in {"resend", "resend-mcp"}:
+                _record_resend_verification(self.settings, result)
+            return tool_result(result)
         except ConnectionsError as exc:
             return tool_error(str(exc))
 
@@ -557,7 +689,15 @@ class ConnectionsRuntime:
         return sanitize_action_response(payload, action=endpoint.rsplit("/", 1)[-1])
 
     def broker_health(self) -> dict[str, Any]:
-        return {"schema": SCHEMA_VERSION, "ok": True, "outcome": "verified", "profile": PROFILE_NAME, "broker": "connections-agent", "secret_values": False}
+        configured = bool(self.settings.infisical_url and self.settings.project_id and self.settings.infisical_token)
+        base = {"schema": SCHEMA_VERSION, "profile": PROFILE_NAME, "broker": "connections-agent", "secret_values": False, "infisical": {"configured": configured, "reachable": False, "verified": False}}
+        if not configured:
+            return base | {"ok": False, "state": "setup_needed"}
+        try:
+            InfisicalClient(self.settings).list_metadata()
+        except ConnectionsError:
+            return base | {"ok": False, "state": "error", "outcome": "failed", "error_code": "infisical_unavailable", "error_category": "unavailable"}
+        return base | {"ok": True, "state": "verified", "outcome": "verified", "infisical": {"configured": True, "reachable": True, "verified": True}}
 
     def broker_list_metadata(self, *, principal: str) -> dict[str, Any]:
         client = InfisicalClient(self.settings)
@@ -584,8 +724,11 @@ class ConnectionsRuntime:
                 metadata = client.mutate(operation, secret_name, value)
                 if operation == "rotate":
                     _record_resend_rotation(self.settings, metadata)
+                else:
+                    _record_resend_create(self.settings, metadata)
             else:
                 metadata = client.delete(secret_name)
+                _record_resend_deleted(self.settings, metadata)
             result = {"schema": SCHEMA_VERSION, "operation": operation, "outcome": {"create": "created", "rotate": "updated", "delete": "deleted"}[operation], "receipt": {"id": str(uuid.uuid4()), "provider": "infisical-ce", "status": "completed", "secret_name": secret_name}, "metadata": metadata}
             _LEDGER.finish(principal, operation, idempotency_key, body, result)
             return result

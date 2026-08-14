@@ -38,20 +38,20 @@ Hermes profile, agent runtime, database, or memory store.
 1. Discover and verify provider state before proposing a change. Safe actions
    are discovery, verification, planning, and metadata sync.
 2. Manual and agent mutations go through Frank's action/receipt contract. Use
-   the Connections tool to send `plan` first, then `apply` only with the
-   returned action id and the exact idempotency key. Include the literal
-   profile `default` and preserve the actor/receipt fields returned by Frank.
+   the Connections tool to send `plan` first, then `apply` with the returned
+   `plan_id` and a new idempotency key. Include the literal profile `default`
+   and preserve the actor/receipt fields returned by Frank.
 3. A destructive revoke or delete requires a Frank-issued confirmation token
    and a provider receipt. Never synthesize either value. If either is absent,
    stop at a safe refusal.
-4. Return only safe metadata: provider, capability, state, action id, receipt
+4. Return only safe metadata: provider, capability, state, plan id, receipt
    id, timestamps, and error class. Never return, quote, log, or persist a
    secret, bearer token, Infisical credential, request body, or MCP environment.
 5. Completion outcomes are allowlisted: `created`, `updated`, `verified`,
    `synced`, `revoked`, `deleted`, or `failed`. A `failed` completion must
-   contain only an opaque `provider_receipt`, an allowlisted `error_code`, and
-   an allowlisted `error_category`; never forward provider error text, bodies,
-   traces, or messages to Frank.
+   contain only an opaque `provider_receipt`, an allowlisted
+   `provider_error_code`, and an allowlisted `provider_error_category`; never
+   forward provider error text, bodies, traces, or messages to Frank.
 
 ## Resend MCP first adapter
 
@@ -60,11 +60,14 @@ Frank. Do not ask for, accept, or repeat the previously exposed key. Frank's
 fixed rotate flow sends the new value to Hermes; Hermes writes it to the
 configured Infisical CE project and records only safe rotation metadata.
 
-After the rotation receipt is complete, activate the official Resend MCP
-server with `npx -y resend-mcp`. Its runtime secret comes from Infisical on
-Hermes and is injected only into the MCP subprocess. Expose only the approved
-capabilities `email.send` and `email.status`; do not expose a general Resend
-or generic secret proxy.
+After the create/rotation receipt is complete, activate the official Resend
+MCP server with pinned `npx -y resend-mcp@2.13.0`. Its runtime secret comes
+from Infisical on Hermes and is injected only into the MCP subprocess. Expose
+only the approved capabilities `email.send` and `email.status`, mapped to the
+exact MCP tools `send-email` and `get-email`. Registration is only
+`connected-awaiting-verification`; report `verified` only after an
+authenticated provider operation returns an opaque receipt, never after
+package registration alone.
 
 ## Infisical CE boundary
 
