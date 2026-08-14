@@ -1,0 +1,9 @@
+{
+  "name": "connections-agent",
+  "label": "Connections",
+  "description": "Private provider connection status and vault broker.",
+  "icon": "Link",
+  "version": "0.1.0",
+  "tab": { "path": "/connections", "hidden": true },
+  "api": "plugin_api.py"
+}
