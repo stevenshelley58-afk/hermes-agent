@@ -24,7 +24,7 @@ def register(ctx) -> None:
         schema=CONNECTIONS_STATUS_SCHEMA,
         handler=lambda args, **_: runtime.status_tool(args),
         description="Show safe Connections Agent and adapter readiness metadata.",
-        emoji="🔗",
+        emoji="[link]",
     )
     ctx.register_tool(
         name="connections_agent_request",
@@ -32,7 +32,7 @@ def register(ctx) -> None:
         schema=CONNECTIONS_REQUEST_SCHEMA,
         handler=lambda args, **_: runtime.request_tool(args),
         description="Send a non-secret Connections action through Frank's receipt contract.",
-        emoji="🧭",
+        emoji="[compass]",
     )
     ctx.register_tool(
         name="connections_agent_resend_mcp",
@@ -40,7 +40,7 @@ def register(ctx) -> None:
         schema=CONNECTIONS_RESEND_SCHEMA,
         handler=lambda args, **_: runtime.resend_mcp_tool(args),
         description="Activate the restricted Resend MCP adapter after a recorded rotation.",
-        emoji="✉️",
+        emoji="[mail]",
     )
 
     broker_key = settings.broker_key
