@@ -1,0 +1,12 @@
+name: connections-agent
+version: 0.1.0
+description: "Private provider-connection workflow with a narrow Hermes vault broker."
+author: Steven Shelley (stevenshelley58-afk), Hermes Agent
+kind: backend
+provides_tools:
+  - connections_agent_status
+  - connections_agent_request
+  - connections_agent_resend_mcp
+requires_env:
+  - HERMES_VAULT_BROKER_KEY
+  - HERMES_CONNECTIONS_INFISICAL_TOKEN
