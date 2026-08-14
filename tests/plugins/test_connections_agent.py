@@ -52,6 +52,17 @@ class ConnectionsRuntimeTests(unittest.TestCase):
                     "delete", {"secret_name": "RESEND_API_KEY"}, principal="frank-vault-broker", idempotency_key="delete-key-1"
                 )
 
+    def test_broker_mutations_emit_action_specific_outcomes_without_values(self):
+        client = unittest.mock.Mock()
+        client.mutate.return_value = {"id": "safe"}
+        with patch.object(runtime, "InfisicalClient", return_value=client), patch.object(runtime, "_record_resend_rotation"):
+            result = runtime.ConnectionsRuntime(self.settings()).broker_mutate(
+                "rotate", {"secret_name": "RESEND_API_KEY", "secret_value": "new-key-never-returned"},
+                principal="frank-vault-broker", idempotency_key="rotate-key-1",
+            )
+        self.assertEqual(result["outcome"], "updated")
+        self.assertNotIn("new-key-never-returned", json.dumps(result))
+
     def test_token_provider_uses_constant_time_match_and_fixed_principal(self):
         provider = runtime.ConnectionsTokenProvider(secret="b" * 40)
         principal = provider.verify_token(token="b" * 40)
@@ -64,6 +75,35 @@ class ConnectionsRuntimeTests(unittest.TestCase):
                 result = runtime.ConnectionsRuntime(self.settings()).resend_mcp_tool({})
                 self.assertIn("setup_needed", result)
                 client_cls.assert_not_called()
+
+    def test_completion_contract_redacts_provider_error_text(self):
+        request = runtime.sanitize_action_request({
+            "connection_id": "c1",
+            "outcome": "failed",
+            "provider_receipt": {"receipt_id": "receipt-1234", "raw_error": "token=do-not-forward"},
+            "error_code": "provider_rejected",
+            "error_category": "provider",
+            "error": "secret provider response must not cross the boundary",
+        })
+        self.assertEqual(request["outcome"], "failed")
+        self.assertEqual(request["provider_receipt"], {"receipt_id": "receipt-1234"})
+        self.assertNotIn("error", request)
+        self.assertNotIn("raw_error", request["provider_receipt"])
+
+        response = runtime.sanitize_action_response({
+            "outcome": "failed",
+            "provider": "resend",
+            "provider_receipt": {"receipt_id": "receipt-1234", "message": "secret"},
+            "error_code": "not-allowlisted",
+            "error_category": "not-allowlisted",
+            "error": "Authorization: Bearer secret",
+        }, action="apply")
+        self.assertEqual(response["outcome"], "failed")
+        self.assertEqual(response["error_code"], "unknown_error")
+        self.assertEqual(response["error_category"], "unknown")
+        self.assertEqual(response["provider_receipt"], {"receipt_id": "receipt-1234"})
+        self.assertNotIn("error", response)
+        self.assertEqual(set(response), {"schema", "outcome", "provider_receipt", "error_code", "error_category"})
 
 
 if __name__ == "__main__":

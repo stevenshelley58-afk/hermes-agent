@@ -47,6 +47,11 @@ Hermes profile, agent runtime, database, or memory store.
 4. Return only safe metadata: provider, capability, state, action id, receipt
    id, timestamps, and error class. Never return, quote, log, or persist a
    secret, bearer token, Infisical credential, request body, or MCP environment.
+5. Completion outcomes are allowlisted: `created`, `updated`, `verified`,
+   `synced`, `revoked`, `deleted`, or `failed`. A `failed` completion must
+   contain only an opaque `provider_receipt`, an allowlisted `error_code`, and
+   an allowlisted `error_category`; never forward provider error text, bodies,
+   traces, or messages to Frank.
 
 ## Resend MCP first adapter
 

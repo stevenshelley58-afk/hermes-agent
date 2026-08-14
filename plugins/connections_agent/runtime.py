@@ -44,6 +44,13 @@ PROFILE_NAME = "default"
 SESSION_NAME = "Connections Agent"
 RESEND_SERVER_NAME = "resend"
 RESEND_CAPABILITIES = ("email.send", "email.status")
+SUCCESS_OUTCOMES = frozenset({"created", "updated", "verified", "synced", "revoked", "deleted"})
+ERROR_CATEGORIES = frozenset({"auth", "configuration", "network", "rate_limit", "provider", "validation", "timeout", "policy", "protocol", "unknown"})
+ERROR_CODES = frozenset({
+    "auth_failed", "confirmation_required", "infisical_unavailable", "invalid_completion",
+    "invalid_request", "mcp_unavailable", "provider_error", "provider_rejected",
+    "rate_limited", "receipt_missing", "setup_needed", "timeout", "unknown_error",
+})
 _SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 _MAX_REQUEST_BYTES = 64 * 1024
@@ -53,6 +60,7 @@ _SAFE_METADATA_FIELDS = {
     "secretPath", "createdAt", "updatedAt", "secretValueHidden",
     "isRotatedSecret", "rotationId", "folderId",
 }
+_OPAQUE_RECEIPT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$")
 
 CONNECTIONS_STATUS_SCHEMA = {
     "name": "connections_agent_status",
@@ -147,6 +155,125 @@ def _secret_name(value: Any) -> str:
     if not _SECRET_NAME_RE.fullmatch(name):
         raise ConnectionsError("secret_name is invalid")
     return name
+
+
+def _opaque_receipt(value: Any) -> dict[str, str] | None:
+    """Keep only a token-shaped receipt id; never forward provider payloads."""
+    if isinstance(value, str) and _OPAQUE_RECEIPT_RE.fullmatch(value.strip()):
+        return {"receipt_id": value.strip()}
+    if isinstance(value, Mapping):
+        receipt_id = value.get("receipt_id") or value.get("id")
+        if isinstance(receipt_id, str) and _OPAQUE_RECEIPT_RE.fullmatch(receipt_id.strip()):
+            return {"receipt_id": receipt_id.strip()}
+    return None
+
+
+def _safe_error_code(value: Any, fallback: str = "unknown_error") -> str:
+    candidate = str(value or "").strip().lower()
+    return candidate if candidate in ERROR_CODES else fallback
+
+
+def _safe_error_category(value: Any, fallback: str = "unknown") -> str:
+    candidate = str(value or "").strip().lower()
+    return candidate if candidate in ERROR_CATEGORIES else fallback
+
+
+def classify_failure(exc: BaseException) -> tuple[str, str]:
+    """Map internal errors to the allowlisted, non-text failure contract."""
+    text = str(exc).lower()
+    if isinstance(exc, SetupNeeded) or "configured" in text or "setup_needed" in text:
+        return "setup_needed", "configuration"
+    if "idempotency" in text or "request rate" in text:
+        return "rate_limited", "rate_limit"
+    if "confirmation" in text:
+        return "confirmation_required", "policy"
+    if "receipt" in text:
+        return "receipt_missing", "policy"
+    if "timeout" in text:
+        return "timeout", "timeout"
+    if "infisical" in text:
+        return "infisical_unavailable", "network"
+    if "frank action" in text:
+        return "provider_error", "network"
+    return "unknown_error", "unknown"
+
+
+def failure_payload(exc: BaseException, *, provider: str = "infisical-ce", provider_receipt: Any = None) -> dict[str, Any]:
+    """Build the only failure shape allowed across the integration boundary."""
+    error_code, error_category = classify_failure(exc)
+    receipt = _opaque_receipt(provider_receipt)
+    if receipt is None:
+        # This is a broker failure receipt, not a claim that the provider
+        # completed the requested operation. It gives Frank a stable opaque
+        # reference without copying an upstream response or error string.
+        receipt = {"receipt_id": str(uuid.uuid4())}
+    return {
+        "schema": SCHEMA_VERSION,
+        "outcome": "failed",
+        "provider_receipt": receipt,
+        "error_code": error_code,
+        "error_category": error_category,
+    }
+
+
+def sanitize_action_request(body: Mapping[str, Any]) -> dict[str, Any]:
+    """Strip provider prose and enforce the completion outcome vocabulary."""
+    forbidden = {"error", "errors", "message", "detail", "reason", "trace", "traceback", "response", "body"}
+    cleaned: dict[str, Any] = {}
+    for key, value in body.items():
+        name = str(key)
+        lowered = name.lower()
+        if lowered in forbidden or lowered.endswith("_error") or lowered.endswith("_message"):
+            continue
+        if name == "provider_receipt":
+            receipt = _opaque_receipt(value)
+            if receipt is None:
+                raise ConnectionsError("provider receipt is not opaque")
+            cleaned[name] = receipt
+        else:
+            cleaned[name] = value
+
+    outcome = cleaned.get("outcome")
+    if outcome is not None:
+        outcome = str(outcome).strip().lower()
+        if outcome == "failed":
+            cleaned["outcome"] = "failed"
+            cleaned["error_code"] = _safe_error_code(cleaned.get("error_code"), "unknown_error")
+            cleaned["error_category"] = _safe_error_category(cleaned.get("error_category"), "unknown")
+            if "provider_receipt" not in cleaned:
+                raise ConnectionsError("failed completion requires provider_receipt")
+            # Failure completions contain only safe completion fields in
+            # addition to the caller's non-secret identifiers.
+        elif outcome in SUCCESS_OUTCOMES:
+            cleaned["outcome"] = outcome
+        else:
+            raise ConnectionsError("completion outcome is not allowlisted")
+    return cleaned
+
+
+def sanitize_action_response(payload: Mapping[str, Any], *, action: str) -> dict[str, Any]:
+    """Return safe Frank response metadata and redact provider error prose."""
+    outcome = str(payload.get("outcome") or "").strip().lower()
+    if outcome == "failed":
+        return failure_payload(
+            ConnectionsError("Frank returned a failed completion"),
+            provider=str(payload.get("provider") or "frank") if isinstance(payload.get("provider"), str) else "frank",
+            provider_receipt=payload.get("provider_receipt"),
+        ) | {
+            "error_code": _safe_error_code(payload.get("error_code")),
+            "error_category": _safe_error_category(payload.get("error_category")),
+        }
+    if outcome and outcome not in SUCCESS_OUTCOMES:
+        return failure_payload(ConnectionsError("Frank returned an invalid completion"), provider="frank")
+    allowed = {"schema", "outcome", "action_id", "connection_id", "provider", "capability", "receipt_id", "provider_receipt", "created_at", "updated_at", "state", "status"}
+    result = {key: value for key, value in payload.items() if key in allowed}
+    if "provider_receipt" in result:
+        result["provider_receipt"] = _opaque_receipt(result["provider_receipt"])
+        if result["provider_receipt"] is None:
+            result.pop("provider_receipt")
+    if action == "apply" and not outcome:
+        return failure_payload(ConnectionsError("Frank returned no completion outcome"), provider="frank")
+    return result
 
 
 class InfisicalClient:
@@ -395,7 +522,7 @@ class ConnectionsRuntime:
             if not self.settings.frank_url or not self.settings.agent_key:
                 raise SetupNeeded("Frank action transport is not configured on Hermes")
             key = str(args.get("idempotency_key") or "").strip()
-            body = dict(args["request"])
+            body = sanitize_action_request(dict(args["request"]))
             if any(
                 "secret" in str(k).lower()
                 or ("token" in str(k).lower() and str(k).lower() != "confirmation_token")
@@ -425,14 +552,16 @@ class ConnectionsRuntime:
                 payload = json.loads(response.read(_MAX_REQUEST_BYTES).decode("utf-8"))
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
             raise ConnectionsError("Frank action request failed") from exc
-        return payload if isinstance(payload, dict) else {"ok": True}
+        if not isinstance(payload, dict):
+            raise ConnectionsError("Frank returned an invalid response")
+        return sanitize_action_response(payload, action=endpoint.rsplit("/", 1)[-1])
 
     def broker_health(self) -> dict[str, Any]:
-        return {"schema": SCHEMA_VERSION, "ok": True, "profile": PROFILE_NAME, "broker": "connections-agent", "secret_values": False}
+        return {"schema": SCHEMA_VERSION, "ok": True, "outcome": "verified", "profile": PROFILE_NAME, "broker": "connections-agent", "secret_values": False}
 
     def broker_list_metadata(self, *, principal: str) -> dict[str, Any]:
         client = InfisicalClient(self.settings)
-        return {"schema": SCHEMA_VERSION, "operation": "list-metadata", "receipt": {"id": str(uuid.uuid4()), "provider": "infisical-ce", "status": "completed"}, "secrets": client.list_metadata()}
+        return {"schema": SCHEMA_VERSION, "operation": "list-metadata", "outcome": "verified", "receipt": {"id": str(uuid.uuid4()), "provider": "infisical-ce", "status": "completed"}, "secrets": client.list_metadata()}
 
     def broker_mutate(self, operation: str, body: Mapping[str, Any], *, principal: str, idempotency_key: str) -> dict[str, Any]:
         secret_name = _secret_name(body.get("secret_name") or self.settings.resend_secret_name)
@@ -457,7 +586,7 @@ class ConnectionsRuntime:
                     _record_resend_rotation(self.settings, metadata)
             else:
                 metadata = client.delete(secret_name)
-            result = {"schema": SCHEMA_VERSION, "operation": operation, "receipt": {"id": str(uuid.uuid4()), "provider": "infisical-ce", "status": "completed", "secret_name": secret_name}, "metadata": metadata}
+            result = {"schema": SCHEMA_VERSION, "operation": operation, "outcome": {"create": "created", "rotate": "updated", "delete": "deleted"}[operation], "receipt": {"id": str(uuid.uuid4()), "provider": "infisical-ce", "status": "completed", "secret_name": secret_name}, "metadata": metadata}
             _LEDGER.finish(principal, operation, idempotency_key, body, result)
             return result
         except Exception:
