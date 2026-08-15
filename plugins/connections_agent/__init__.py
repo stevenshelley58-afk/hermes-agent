@@ -5,6 +5,7 @@ from .runtime import (
     CONNECTIONS_STATUS_SCHEMA,
     CONNECTIONS_REQUEST_SCHEMA,
     CONNECTIONS_RESEND_SCHEMA,
+    CONNECTIONS_INSPECT_SCHEMA,
     ConnectionsRuntime,
     ConnectionsTokenProvider,
     load_settings,
@@ -41,6 +42,14 @@ def register(ctx) -> None:
         handler=lambda args, **_: runtime.resend_mcp_tool(args),
         description="Activate the restricted Resend MCP adapter after a recorded rotation.",
         emoji="[mail]",
+    )
+    ctx.register_tool(
+        name="connections_agent_inspect",
+        toolset="connections",
+        schema=CONNECTIONS_INSPECT_SCHEMA,
+        handler=lambda args, **_: runtime.inspect_tool(args),
+        description="Inspect Frank's bounded private Connections projection before planning.",
+        emoji="[search]",
     )
 
     broker_key = settings.broker_key
