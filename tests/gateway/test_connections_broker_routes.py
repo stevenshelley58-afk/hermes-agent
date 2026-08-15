@@ -95,3 +95,18 @@ class ConnectionsBrokerRouteTests(unittest.IsolatedAsyncioTestCase):
             exc = ConnectionsError("upstream body must not cross", error_code="infisical_unavailable", error_category=category)
             self.assertEqual(adapter._connections_error_status(exc), status)
             self.assertNotIn("upstream body", str(failure_payload(exc)))
+
+        for code in ("idempotency_conflict", "idempotency_uncertain"):
+            exc = ConnectionsError(
+                "Idempotency-Key cannot be replayed",
+                error_code=code,
+                error_category="unavailable",
+            )
+            self.assertEqual(adapter._connections_error_status(exc), 409)
+
+        invalid = ConnectionsError(
+            "Idempotency-Key is invalid",
+            error_code="invalid_request",
+            error_category="validation",
+        )
+        self.assertEqual(adapter._connections_error_status(invalid), 400)

@@ -1857,6 +1857,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _connections_error_status(exc: BaseException) -> int:
+        error_code = getattr(exc, "error_code", None)
+        if error_code in {"idempotency_conflict", "idempotency_uncertain"}:
+            return 409
+        if error_code == "invalid_request":
+            return 400
         category = getattr(exc, "error_category", None)
         if category == "auth":
             return 401

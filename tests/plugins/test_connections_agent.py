@@ -21,6 +21,19 @@ SPEC.loader.exec_module(runtime)
 
 
 class ConnectionsRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self._temp_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp_home.cleanup)
+        self._home_patch = patch.object(
+            runtime,
+            "get_hermes_home",
+            return_value=Path(self._temp_home.name),
+        )
+        self._home_patch.start()
+        self.addCleanup(self._home_patch.stop)
+        runtime._LEDGER = runtime._MutationLedger()
+        runtime._RATE_LIMITER = runtime._MutationRateLimiter()
+
     def settings(self, **overrides):
         values = dict(
             enabled=True,
@@ -86,6 +99,109 @@ class ConnectionsRuntimeTests(unittest.TestCase):
                 )
                 self.assertEqual(deleted["outcome"], "deleted")
                 self.assertEqual(runtime.ConnectionsRuntime(self.settings()).status()["providers"][0]["state"], "setup_needed")
+
+    def test_completed_mutation_replays_after_ledger_reinstantiation_without_raw_data(self):
+        client = unittest.mock.Mock()
+        client.mutate.return_value = {"id": "safe-id", "version": 3}
+        body = {
+            "secret_name": "RESEND_API_KEY",
+            "secret_value": "restart-value-never-persisted",
+        }
+        with patch.object(runtime, "InfisicalClient", return_value=client):
+            first = runtime.ConnectionsRuntime(self.settings()).broker_mutate(
+                "create",
+                body,
+                principal="frank-vault-broker",
+                idempotency_key="restart-create-key-0001",
+            )
+            runtime._LEDGER = runtime._MutationLedger()
+            replay = runtime.ConnectionsRuntime(self.settings()).broker_mutate(
+                "create",
+                body,
+                principal="frank-vault-broker",
+                idempotency_key="restart-create-key-0001",
+            )
+        self.assertEqual(replay, first)
+        client.mutate.assert_called_once()
+        persisted = runtime._LEDGER._path().read_text(encoding="utf-8")
+        self.assertNotIn("restart-create-key-0001", persisted)
+        self.assertNotIn("restart-value-never-persisted", persisted)
+
+    def test_reinstantiated_ledger_rejects_same_key_with_mismatched_body(self):
+        client = unittest.mock.Mock()
+        client.mutate.return_value = {"id": "safe-id"}
+        with patch.object(runtime, "InfisicalClient", return_value=client):
+            runtime.ConnectionsRuntime(self.settings()).broker_mutate(
+                "rotate",
+                {"secret_name": "RESEND_API_KEY", "secret_value": "first-value-never-persisted"},
+                principal="frank-vault-broker",
+                idempotency_key="restart-mismatch-key-0001",
+            )
+            runtime._LEDGER = runtime._MutationLedger()
+            with self.assertRaises(runtime.ConnectionsError) as raised:
+                runtime.ConnectionsRuntime(self.settings()).broker_mutate(
+                    "rotate",
+                    {"secret_name": "RESEND_API_KEY", "secret_value": "second-value-never-persisted"},
+                    principal="frank-vault-broker",
+                    idempotency_key="restart-mismatch-key-0001",
+                )
+        self.assertEqual(raised.exception.error_code, "idempotency_conflict")
+        client.mutate.assert_called_once()
+        persisted = runtime._LEDGER._path().read_text(encoding="utf-8")
+        self.assertNotIn("restart-mismatch-key-0001", persisted)
+        self.assertNotIn("first-value-never-persisted", persisted)
+        self.assertNotIn("second-value-never-persisted", persisted)
+
+    def test_post_provider_failure_persists_uncertain_state_and_blocks_restart_replay(self):
+        client = unittest.mock.Mock()
+        client.mutate.return_value = {"id": "safe-id"}
+        body = {
+            "secret_name": "RESEND_API_KEY",
+            "secret_value": "uncertain-value-never-persisted",
+        }
+        with patch.object(runtime, "InfisicalClient", return_value=client), patch.object(
+            runtime,
+            "_record_resend_rotation",
+            side_effect=OSError("simulated post-provider state failure"),
+        ):
+            with self.assertRaises(runtime.ConnectionsError) as first_failure:
+                runtime.ConnectionsRuntime(self.settings()).broker_mutate(
+                    "rotate",
+                    body,
+                    principal="frank-vault-broker",
+                    idempotency_key="restart-uncertain-key-0001",
+                )
+            self.assertEqual(first_failure.exception.error_code, "idempotency_uncertain")
+            runtime._LEDGER = runtime._MutationLedger()
+            with self.assertRaises(runtime.ConnectionsError) as raised:
+                runtime.ConnectionsRuntime(self.settings()).broker_mutate(
+                    "rotate",
+                    body,
+                    principal="frank-vault-broker",
+                    idempotency_key="restart-uncertain-key-0001",
+                )
+        self.assertEqual(raised.exception.error_code, "idempotency_uncertain")
+        client.mutate.assert_called_once()
+        persisted = runtime._LEDGER._path().read_text(encoding="utf-8")
+        self.assertIn('"state":"uncertain"', persisted)
+        self.assertNotIn("restart-uncertain-key-0001", persisted)
+        self.assertNotIn("uncertain-value-never-persisted", persisted)
+
+    def test_corrupt_durable_ledger_fails_closed_before_provider_mutation(self):
+        path = runtime._LEDGER._path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"schema":"wrong","entries":{}}', encoding="utf-8")
+        client = unittest.mock.Mock()
+        with patch.object(runtime, "InfisicalClient", return_value=client):
+            with self.assertRaises(runtime.ConnectionsError) as raised:
+                runtime.ConnectionsRuntime(self.settings()).broker_mutate(
+                    "create",
+                    {"secret_name": "RESEND_API_KEY", "secret_value": "must-not-run"},
+                    principal="frank-vault-broker",
+                    idempotency_key="corrupt-ledger-key-0001",
+                )
+        self.assertEqual(raised.exception.error_code, "idempotency_store_unavailable")
+        client.mutate.assert_not_called()
 
     def test_failed_create_and_delete_leave_prior_truth_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(runtime, "get_hermes_home", return_value=Path(tmp)):
@@ -433,35 +549,6 @@ class ConnectionsRuntimeTests(unittest.TestCase):
         with patch.dict(os.environ, {"HERMES_VAULT_BROKER_KEY": "canonical-key", "HERMES_CONNECTIONS_BROKER_KEY": "alias-key"}, clear=False):
             settings = runtime.load_settings()
         self.assertEqual(settings.broker_key, "canonical-key")
-
-    def test_plugin_api_uses_canonical_config_scope_without_ctx_or_secret_status(self):
-        api_path = ROOT / "plugins" / "connections_agent" / "dashboard" / "plugin_api.py"
-        env = {
-            "HERMES_CONNECTIONS_AGENT_KEY": "agent-secret-never-status",
-            "HERMES_VAULT_BROKER_KEY": "broker-secret-never-status",
-            "HERMES_CONNECTIONS_INFISICAL_TOKEN": "infisical-secret-never-status",
-        }
-        config = {"plugins": {"entries": {"connections-agent": {"settings": {
-            "enabled": True, "frank_url": "https://frank.example.invalid",
-            "infisical_url": "https://infisical.example.invalid", "infisical_project_id": "project-fixed",
-            "infisical_environment": "production", "secret_path": "/connections", "resend_secret_name": "RESEND_API_KEY",
-        }}}}}
-        module_name = "connections_api_env_test"
-        with patch.dict(os.environ, env, clear=False), patch("hermes_cli.config.load_config_readonly", return_value=config):
-            api_spec = importlib.util.spec_from_file_location(module_name, api_path)
-            api_module = importlib.util.module_from_spec(api_spec)
-            assert api_spec and api_spec.loader
-            sys.modules[module_name] = api_module
-            api_spec.loader.exec_module(api_module)
-            settings = api_module._runtime.settings
-            self.assertEqual(settings.project_id, "project-fixed")
-            self.assertEqual(settings.environment, "production")
-            self.assertEqual(settings.secret_path, "/connections")
-            status = api_module._runtime.status()
-            status_text = json.dumps(status)
-            self.assertNotIn("agent-secret-never-status", status_text)
-            self.assertNotIn("broker-secret-never-status", status_text)
-            self.assertNotIn("infisical-secret-never-status", status_text)
 
     def test_nonsecret_environment_settings_are_not_authoritative(self):
         with patch.dict(os.environ, {"HERMES_CONNECTIONS_FRANK_URL": "https://attacker.invalid"}, clear=False), patch.object(runtime, "_config_setting_without_context", side_effect=lambda key, default: {"frank_url": "https://canonical.invalid"}.get(key, default)):

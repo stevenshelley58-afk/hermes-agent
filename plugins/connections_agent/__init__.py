@@ -7,7 +7,6 @@ from .runtime import (
     CONNECTIONS_RESEND_SCHEMA,
     CONNECTIONS_INSPECT_SCHEMA,
     ConnectionsRuntime,
-    ConnectionsTokenProvider,
     load_settings,
 )
 
@@ -51,9 +50,3 @@ def register(ctx) -> None:
         description="Inspect Frank's bounded private Connections projection before planning.",
         emoji="[search]",
     )
-
-    broker_key = settings.broker_key
-    if broker_key:
-        ctx.register_dashboard_auth_provider(
-            ConnectionsTokenProvider(secret=broker_key)
-        )

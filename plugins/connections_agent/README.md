@@ -23,9 +23,9 @@ plugins:
 
 The non-secret settings above are authoritative in
 `plugins.entries.connections-agent.settings` in the active `default` profile.
-They are read by both plugin registration and dashboard broker startup;
-request payloads cannot override the fixed project, environment, path, URL, or
-secret name. They are not behavioral environment-variable configuration.
+They are read by both plugin registration and main API broker startup; request
+payloads cannot override the fixed project, environment, path, URL, or secret
+name. They are not behavioral environment-variable configuration.
 
 Hermes receives credentials only from its runtime environment:
 - `HERMES_CONNECTIONS_AGENT_KEY` authenticates Hermes-to-Frank action/receipt
