@@ -20,17 +20,20 @@ Hermes profile, agent runtime, database, or memory store.
 ## Operating contract
 
 1. Discover and verify provider state before proposing a change. Safe actions
-   are discovery, verification, planning, and metadata sync.
+   are discovery, verification, planning, and metadata sync. Start with the
+   bounded private Frank inspect projection (`activity_limit` 1..50) when
+   current connection, attention, or activity state is needed.
 2. Manual and agent mutations go through Frank's action/receipt contract. Use
    the Connections tool to send an inner provider `action` (`discover`,
    `create`, `update`, `verify`, `sync`, `revoke`, or `delete`) inside the
    transport `plan` request, then apply with the returned nested
    `plan.plan_id`. Apply/completion must use a new idempotency key, distinct
    from the plan request key. Include the literal profile `default` and
-   preserve the nested action/connection receipt metadata returned by Frank.
-   The apply body accepts only `plan_id`, an optional confirmation token, and
-   provider evidence fields `provider_receipt`, `provider_outcome`,
-   `provider_error_code`, and `provider_error_category`.
+   preserve the nested action/connection metadata returned by Frank. The
+   model-facing apply body accepts only `plan_id` and an optional confirmation
+   token. Provider receipts, outcomes, and provider error fields are never
+   model-supplied; only an executed Hermes adapter may create server-bound
+   evidence for completion.
 3. A destructive revoke or delete requires a Frank-issued confirmation token
    and a provider receipt. Never synthesize either value. If either is absent,
    stop at a safe refusal.
@@ -77,7 +80,8 @@ memory, refreshes the short-lived token once after expiry or HTTP 401, and
 never persists or returns credentials. `HERMES_CONNECTIONS_INFISICAL_TOKEN`
 is a deliberate static-token alternative.
 
-When a provider operation succeeds, send its safe provider receipt through
-Frank's `apply` action before reporting completion. If the provider is
-unavailable, keep the state unchanged and report `setup_needed` or a safe
-verification failure.
+When a provider operation succeeds, an internal Hermes adapter must bind its
+safe provider receipt to the Frank plan/action before completion. Resend
+verification, sync, revoke, and delete remain non-success until such an
+adapter operation exists. If the provider is unavailable, keep the state
+unchanged and report `setup_needed` or a safe verification failure.

@@ -1831,6 +1831,104 @@ class APIServerAdapter(BasePlatformAdapter):
             status=401,
         )
 
+    def _connections_broker_auth(self, request: "web.Request"):
+        """Authenticate only the fixed Hermes vault-broker credential."""
+        if _api_request_profile.get() not in (None, "default"):
+            return None, web.json_response({"error": "Unknown or unconfigured profile"}, status=404, headers=self._connections_headers())
+        if request.headers.get("X-Hermes-Profile", "") != "default":
+            return None, web.json_response({"error": "Invalid Hermes profile"}, status=401, headers=self._connections_headers())
+        try:
+            from plugins.connections_agent.runtime import ConnectionsTokenProvider, ConnectionsRuntime, load_settings
+            settings = load_settings()
+            if not settings.enabled or not settings.broker_key:
+                return None, web.json_response({"error": "Connections broker unavailable"}, status=503, headers=self._connections_headers())
+            header = request.headers.get("Authorization", "")
+            token = header[7:].strip() if header.startswith("Bearer ") else ""
+            principal = ConnectionsTokenProvider(secret=settings.broker_key).verify_token(token=token)
+            if principal is None:
+                return None, web.json_response({"error": "Unauthorized"}, status=401, headers=self._connections_headers())
+            return ConnectionsRuntime(settings), None
+        except Exception:
+            return None, web.json_response({"error": "Connections broker unavailable"}, status=503, headers=self._connections_headers())
+
+    @staticmethod
+    def _connections_headers() -> dict[str, str]:
+        return {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"}
+
+    @staticmethod
+    def _connections_error_status(exc: BaseException) -> int:
+        category = getattr(exc, "error_category", None)
+        if category == "auth":
+            return 401
+        if category == "permission_denied":
+            return 403
+        if category == "not_found":
+            return 404
+        if category == "rate_limited":
+            return 429
+        if category in {"network", "timeout", "unavailable"}:
+            return 503
+        if "Idempotency-Key" in str(exc):
+            return 409
+        return 400
+
+    async def _handle_connections_health(self, request: "web.Request"):
+        runtime, error = self._connections_broker_auth(request)
+        if error:
+            return error
+        payload = await asyncio.to_thread(runtime.broker_health)
+        return web.json_response(payload, headers=self._connections_headers())
+
+    async def _handle_connections_list_metadata(self, request: "web.Request"):
+        runtime, error = self._connections_broker_auth(request)
+        if error:
+            return error
+        try:
+            raw = await request.read()
+            if len(raw) > 64 * 1024:
+                return web.json_response({"error": "Request too large"}, status=413, headers=self._connections_headers())
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+            if not isinstance(payload, dict):
+                return web.json_response({"error": "JSON object required"}, status=400, headers=self._connections_headers())
+            result = await asyncio.to_thread(runtime.broker_list_metadata, principal="frank-vault-broker")
+            return web.json_response(result, headers=self._connections_headers())
+        except Exception as exc:
+            from plugins.connections_agent.runtime import ConnectionsError, failure_payload
+            if not isinstance(exc, ConnectionsError):
+                return web.json_response({"error": "Connections broker unavailable"}, status=503, headers=self._connections_headers())
+            return web.json_response(failure_payload(exc), status=self._connections_error_status(exc), headers=self._connections_headers())
+
+    async def _handle_connections_mutation(self, request: "web.Request", operation: str):
+        runtime, error = self._connections_broker_auth(request)
+        if error:
+            return error
+        key = request.headers.get("Idempotency-Key", "")
+        if not key:
+            return web.json_response({"error": "Idempotency-Key is required"}, status=400, headers=self._connections_headers())
+        try:
+            raw = await request.read()
+            if len(raw) > 64 * 1024:
+                return web.json_response({"error": "Request too large"}, status=413, headers=self._connections_headers())
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("object required")
+            result = await asyncio.to_thread(runtime.broker_mutate, operation, payload, principal="frank-vault-broker", idempotency_key=key)
+            return web.json_response(result, headers=self._connections_headers())
+        except Exception as exc:
+            from plugins.connections_agent.runtime import ConnectionsError, failure_payload
+            if not isinstance(exc, ConnectionsError):
+                return web.json_response({"error": "Invalid broker request"}, status=400, headers=self._connections_headers())
+            return web.json_response(failure_payload(exc), status=self._connections_error_status(exc), headers=self._connections_headers())
+
+    async def _handle_connections_create(self, request: "web.Request"):
+        return await self._handle_connections_mutation(request, "create")
+
+    async def _handle_connections_rotate(self, request: "web.Request"):
+        return await self._handle_connections_mutation(request, "rotate")
+
+    async def _handle_connections_delete(self, request: "web.Request"):
+        return await self._handle_connections_mutation(request, "delete")
+
     @staticmethod
     def _normalize_callback_platform(value: str) -> str:
         normalized = (value or "").strip().lower().replace("-", "_")
@@ -2056,6 +2154,15 @@ class APIServerAdapter(BasePlatformAdapter):
         routes: List[tuple] = [
             ("GET", "/health", self._handle_health),
             ("GET", "/health/detailed", self._handle_health_detailed),
+            # Private Frank-to-Hermes Connections broker. These routes are
+            # authenticated by HERMES_VAULT_BROKER_KEY, not API_SERVER_KEY,
+            # and are mirrored under /p/{profile} only for the canonical
+            # default profile middleware (non-default profiles fail closed).
+            ("GET", "/api/plugins/connections-agent/vault-broker/health", self._handle_connections_health),
+            ("POST", "/api/plugins/connections-agent/vault-broker/secrets/list-metadata", self._handle_connections_list_metadata),
+            ("POST", "/api/plugins/connections-agent/vault-broker/secrets/create", self._handle_connections_create),
+            ("POST", "/api/plugins/connections-agent/vault-broker/secrets/rotate", self._handle_connections_rotate),
+            ("POST", "/api/plugins/connections-agent/vault-broker/secrets/delete", self._handle_connections_delete),
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),

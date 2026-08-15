@@ -21,16 +21,13 @@ plugins:
         resend_secret_name: RESEND_API_KEY
 ```
 
-Hermes receives these credentials only from its runtime environment:
+The non-secret settings above are authoritative in
+`plugins.entries.connections-agent.settings` in the active `default` profile.
+They are read by both plugin registration and dashboard broker startup;
+request payloads cannot override the fixed project, environment, path, URL, or
+secret name. They are not behavioral environment-variable configuration.
 
-- `HERMES_CONNECTIONS_ENABLED`, `HERMES_CONNECTIONS_FRANK_URL`,
-  `HERMES_CONNECTIONS_INFISICAL_URL`,
-  `HERMES_CONNECTIONS_INFISICAL_PROJECT_ID`,
-  `HERMES_CONNECTIONS_INFISICAL_ENVIRONMENT`,
-  `HERMES_CONNECTIONS_INFISICAL_SECRET_PATH`, and
-  `HERMES_CONNECTIONS_RESEND_SECRET_NAME` are the authoritative runtime
-  settings. They take precedence over the namespaced plugin settings above;
-  plugin settings are the fallback when the corresponding env var is absent.
+Hermes receives credentials only from its runtime environment:
 - `HERMES_CONNECTIONS_AGENT_KEY` authenticates Hermes-to-Frank action/receipt
   requests.
 - `HERMES_VAULT_BROKER_KEY` authenticates Frank-to-Hermes broker requests.
@@ -46,9 +43,10 @@ Hermes receives these credentials only from its runtime environment:
   401. Client secrets, access tokens, and upstream response bodies are never
   persisted, logged, or returned.
 
-The broker URL is:
+The broker URL is served by Hermes's authenticated main API listener (the
+bridge-reachable gateway on port `8642`), not the dashboard listener:
 
-`https://<hermes-host>/api/plugins/connections-agent/vault-broker`
+`http://<hermes-container>:8642/api/plugins/connections-agent/vault-broker`
 
 Its fixed endpoints are `GET /health`, `POST /secrets/list-metadata`, and
 `POST /secrets/create`, `/rotate`, and `/delete`. Mutation requests require an
@@ -66,4 +64,29 @@ for `RESEND_API_KEY`; activation uses pinned
 `npx -y resend-mcp@2.13.0` with only the exact current `send-email` and
 `get-email` tools registered into Hermes's MCP surface. Registration reports
 `connected-awaiting-verification`; only a later authenticated provider
-operation with an opaque receipt can produce `verified`.
+operation with server-bound adapter evidence can produce `verified`. The
+model-facing apply request cannot provide provider receipts or outcomes.
+
+Before planning, the private Connections Agent calls only
+`GET /api/connections/agent/inspect?activity_limit=N` on Frank, with `N` in
+the bounded range 1..50. Hermes accepts only the allowlisted connection,
+attention, and activity metadata projection and rejects unrelated paths,
+queries, secrets, and raw errors.
+
+Deployment contract: configure Frank's broker base URL to the Hermes container
+name or bridge address on port `8642`, never `127.0.0.1` from inside Frank's
+container. After both containers restart, the Frank-container canary is:
+
+```sh
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer $HERMES_VAULT_BROKER_KEY" \
+  -H "X-Hermes-Profile: default" \
+  http://hermes:8642/api/plugins/connections-agent/vault-broker/health
+```
+
+The response must be non-secret and must report `configured`, `reachable`, and
+`verified` truthfully. A failed canary is setup/unavailable; it is not a
+permission to fall back to the dashboard port. The versioned deployment is the
+single Hermes revision containing the gateway route table and plugin runtime;
+restart must recreate that same route and re-read the fixed `default` profile
+config.

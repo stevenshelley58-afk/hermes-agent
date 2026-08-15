@@ -50,8 +50,9 @@ SUCCESS_OUTCOMES = frozenset({"created", "updated", "verified", "synced", "revok
 PLAN_ACTIONS = frozenset({"discover", "create", "update", "verify", "sync", "revoke", "delete"})
 ERROR_CATEGORIES = frozenset({"auth", "configuration", "network", "not_found", "permission_denied", "rate_limited", "timeout", "unavailable", "validation", "unknown"})
 ERROR_CODES = frozenset({
-    "auth_failed", "confirmation_required", "infisical_unavailable", "invalid_completion",
-    "invalid_request", "mcp_unavailable", "provider_error", "provider_rejected",
+    "auth_failed", "confirmation_required", "infisical_auth_failed", "infisical_not_found",
+    "infisical_permission_denied", "infisical_unavailable", "infisical_rate_limited", "invalid_completion",
+    "invalid_request", "mcp_unavailable", "provider_evidence_required", "provider_error", "provider_rejected",
     "rate_limited", "receipt_missing", "setup_needed", "timeout", "unknown_error",
 })
 _SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -64,6 +65,8 @@ _SAFE_METADATA_FIELDS = {
     "isRotatedSecret", "rotationId", "folderId",
 }
 _OPAQUE_RECEIPT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{7,255}$")
+_FRANK_CONFIRMATION_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
+_FRANK_PROVIDER_RECEIPT_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _PROVIDER_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
 _SAFE_TARGET_FIELDS = frozenset({"provider", "connection_id", "consumer", "project", "environment"})
 _SAFE_BODY_FIELDS = frozenset({
@@ -74,6 +77,19 @@ _SAFE_PROVIDERS = frozenset({"resend", "stripe", "activepieces", "mcp", "api"})
 _SAFE_SCOPES = frozenset({"global", "project", "tool", "agent", "service"})
 _SAFE_STATUSES = frozenset({"setup_needed", "connected", "verified", "error"})
 _SAFE_REFERENCE_FIELDS = frozenset({"connection_ref", "credential_ref"})
+_INSPECT_TOP_FIELDS = frozenset({"schema", "connections", "attention", "activity"})
+_INSPECT_CONNECTION_FIELDS = frozenset({
+    "id", "name", "provider", "status", "scope_kind", "scope_id", "connection_ref",
+    "credential_ref", "last_verified_at", "capabilities", "revision",
+})
+_INSPECT_ACTION_FIELDS = frozenset({
+    "sequence", "receipt_id", "correlation_id", "source", "actor", "action", "state",
+    "progress", "started_at", "updated_at", "completed_at", "target", "result",
+})
+_INSPECT_RESULT_FIELDS = frozenset({
+    "connection_id", "provider", "status", "revision", "removed", "verified_at", "outcome",
+    "pending", "provider_receipt", "error_code", "error_category",
+})
 _SENSITIVE_FIELD_RE = re.compile(
     r"(?:secret|token|auth|password|credential|api[_-]?key|payment|card|cvv|private[_-]?key|bearer)",
     re.IGNORECASE,
@@ -142,10 +158,6 @@ CONNECTIONS_REQUEST_SCHEMA = {
                         "properties": {
                             "plan_id": {"type": "string", "minLength": 8, "maxLength": 256},
                             "confirmation_token": {"type": "string", "minLength": 8, "maxLength": 256},
-                            "provider_receipt": {"type": "string", "minLength": 8, "maxLength": 256},
-                            "provider_outcome": {"type": "string", "enum": [*sorted(SUCCESS_OUTCOMES), "failed"]},
-                            "provider_error_code": {"type": "string", "pattern": r"^[a-z][a-z0-9_.:-]{0,63}$"},
-                            "provider_error_category": {"type": "string", "enum": sorted(ERROR_CATEGORIES)},
                         },
                         "required": ["plan_id"],
                         "additionalProperties": False,
@@ -164,10 +176,24 @@ CONNECTIONS_RESEND_SCHEMA = {
     "description": "Activate the restricted Resend MCP adapter after a recorded rotation.",
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
+CONNECTIONS_INSPECT_SCHEMA = {
+    "name": "connections_agent_inspect",
+    "description": "Inspect Frank's bounded private Connections projection before planning.",
+    "parameters": {
+        "type": "object",
+        "properties": {"activity_limit": {"type": "integer", "minimum": 1, "maximum": 50}},
+        "additionalProperties": False,
+    },
+}
 
 
 class ConnectionsError(RuntimeError):
     """Safe, user-facing error whose text contains no remote response body."""
+
+    def __init__(self, message: str, *, error_code: str | None = None, error_category: str | None = None):
+        super().__init__(message)
+        self.error_code = error_code
+        self.error_category = error_category
 
 
 class SetupNeeded(ConnectionsError):
@@ -202,28 +228,35 @@ def _setting(ctx: Any, key: str, default: Any) -> Any:
         return default
 
 
-def _env_or_setting(ctx: Any, key: str, default: Any, env_name: str, *aliases: str) -> Any:
-    """Use the same environment-backed settings source in tools and API."""
-    for name in (env_name, *aliases):
-        if name in os.environ:
-            return os.environ[name]
-    return _setting(ctx, key, default) if ctx is not None else default
+def _config_setting_without_context(key: str, default: Any) -> Any:
+    """Read the canonical default-profile plugin settings for dashboard startup."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly() or {}
+        plugins = config.get("plugins") if isinstance(config, Mapping) else None
+        entries = plugins.get("entries") if isinstance(plugins, Mapping) else None
+        entry = entries.get("connections-agent") if isinstance(entries, Mapping) else None
+        settings = entry.get("settings") if isinstance(entry, Mapping) else None
+        if isinstance(settings, Mapping) and key in settings:
+            return settings[key]
+    except Exception:
+        pass
+    return default
+
+
+def _canonical_setting(ctx: Any, key: str, default: Any) -> Any:
+    return _setting(ctx, key, default) if ctx is not None else _config_setting_without_context(key, default)
 
 
 def load_settings(ctx: Any = None) -> ConnectionsSettings:
-    """Read one authoritative settings surface: env, then plugin config, then defaults.
-
-    The environment names are intentionally usable by both plugin registration
-    and dashboard API import, which has no PluginContext. Credentials are
-    environment-only; the legacy broker-key alias remains accepted for rollout.
-    """
-    enabled = _env_or_setting(ctx, "enabled", False, "HERMES_CONNECTIONS_ENABLED")
-    frank_url = _env_or_setting(ctx, "frank_url", "", "HERMES_CONNECTIONS_FRANK_URL")
-    infisical_url = _env_or_setting(ctx, "infisical_url", "", "HERMES_CONNECTIONS_INFISICAL_URL")
-    project_id = _env_or_setting(ctx, "infisical_project_id", "", "HERMES_CONNECTIONS_INFISICAL_PROJECT_ID")
-    environment = _env_or_setting(ctx, "infisical_environment", "dev", "HERMES_CONNECTIONS_INFISICAL_ENVIRONMENT")
-    path_value = _env_or_setting(ctx, "secret_path", "/connections", "HERMES_CONNECTIONS_INFISICAL_SECRET_PATH")
-    secret_name = str(_env_or_setting(ctx, "resend_secret_name", "RESEND_API_KEY", "HERMES_CONNECTIONS_RESEND_SECRET_NAME") or "RESEND_API_KEY").strip()
+    """Read namespaced config.yaml settings; credentials remain env-only."""
+    enabled = _canonical_setting(ctx, "enabled", False)
+    frank_url = _canonical_setting(ctx, "frank_url", "")
+    infisical_url = _canonical_setting(ctx, "infisical_url", "")
+    project_id = _canonical_setting(ctx, "infisical_project_id", "")
+    environment = _canonical_setting(ctx, "infisical_environment", "dev")
+    path_value = _canonical_setting(ctx, "secret_path", "/connections")
+    secret_name = str(_canonical_setting(ctx, "resend_secret_name", "RESEND_API_KEY") or "RESEND_API_KEY").strip()
     if not _SECRET_NAME_RE.fullmatch(secret_name):
         secret_name = "RESEND_API_KEY"
     path = str(path_value or "/connections").strip()
@@ -306,6 +339,43 @@ def build_resend_mcp_config(secret_value: str) -> dict[str, Any]:
     }
 
 
+def _resend_registered_tool_names(mcp_module: Any) -> list[str]:
+    """Read only the attributable Resend server registration.
+
+    ``register_mcp_servers`` returns the process-wide MCP registry, so its
+    return value cannot establish Resend readiness. The private server record
+    is the authoritative attribution seam; missing or changed seams fail
+    closed instead of accepting unrelated tools.
+    """
+    servers = getattr(mcp_module, "_servers", None)
+    server = servers.get(RESEND_SERVER_NAME) if isinstance(servers, Mapping) else None
+    if server is None:
+        return []
+    ready = getattr(server, "_ready", None)
+    task = getattr(server, "_task", None)
+    if (
+        getattr(server, "_error", None) is not None
+        or getattr(server, "session", None) is None
+        or ready is None
+        or not callable(getattr(ready, "is_set", None))
+        or not ready.is_set()
+        or task is None
+        or not callable(getattr(task, "done", None))
+        or task.done()
+    ):
+        return []
+    raw_names = {str(getattr(tool, "name", "")) for tool in getattr(server, "_tools", ())}
+    registered_names = {str(name) for name in getattr(server, "_registered_tool_names", ())}
+    expected_raw = set(RESEND_MCP_TOOL_NAMES)
+    expected_registered = {
+        f"mcp__{RESEND_SERVER_NAME}__send_email",
+        f"mcp__{RESEND_SERVER_NAME}__get_email",
+    }
+    if not expected_raw.issubset(raw_names) or not expected_registered.issubset(registered_names):
+        return []
+    return list(RESEND_MCP_TOOL_NAMES)
+
+
 def _safe_error_code(value: Any, fallback: str = "unknown_error") -> str:
     candidate = str(value or "").strip().lower()
     return candidate if candidate in ERROR_CODES else fallback
@@ -316,8 +386,23 @@ def _safe_error_category(value: Any, fallback: str = "unknown") -> str:
     return candidate if candidate in ERROR_CATEGORIES else fallback
 
 
+def _infisical_http_failure(status: int) -> ConnectionsError:
+    mapping = {
+        401: ("infisical_auth_failed", "auth"),
+        403: ("infisical_permission_denied", "permission_denied"),
+        404: ("infisical_not_found", "not_found"),
+        429: ("infisical_rate_limited", "rate_limited"),
+    }
+    code, category = mapping.get(status, ("infisical_unavailable", "unavailable"))
+    return ConnectionsError("Infisical CE request failed", error_code=code, error_category=category)
+
+
 def classify_failure(exc: BaseException) -> tuple[str, str]:
     """Map internal errors to the allowlisted, non-text failure contract."""
+    explicit_code = getattr(exc, "error_code", None)
+    explicit_category = getattr(exc, "error_category", None)
+    if explicit_code or explicit_category:
+        return _safe_error_code(explicit_code), _safe_error_category(explicit_category)
     text = str(exc).lower()
     if isinstance(exc, SetupNeeded) or "configured" in text or "setup_needed" in text:
         return "setup_needed", "configuration"
@@ -330,7 +415,7 @@ def classify_failure(exc: BaseException) -> tuple[str, str]:
     if "timeout" in text:
         return "timeout", "timeout"
     if "infisical" in text:
-        return "infisical_unavailable", "network"
+        return "infisical_unavailable", "unavailable"
     if "frank action" in text:
         return "provider_error", "unavailable"
     return "unknown_error", "unknown"
@@ -479,7 +564,9 @@ def sanitize_action_request(body: Mapping[str, Any]) -> dict[str, Any]:
     _reject_sensitive_payload(body)
     keys = {str(key) for key in body}
     plan_keys = {"action", "target", "body", "expected_revision", "connection_id"}
-    apply_keys = {"plan_id", "confirmation_token", "provider_receipt", "provider_outcome", "provider_error_code", "provider_error_category"}
+    # Provider evidence is deliberately absent from the model-facing schema.
+    # Only an executed Hermes adapter may create evidence for Frank apply.
+    apply_keys = {"plan_id", "confirmation_token"}
     if "action" in keys:
         if keys - plan_keys:
             raise ConnectionsError("plan request fields are not allowlisted")
@@ -513,23 +600,9 @@ def sanitize_action_request(body: Mapping[str, Any]) -> dict[str, Any]:
     if keys - apply_keys or "plan_id" not in keys:
         raise ConnectionsError("apply request fields are not allowlisted")
     result = {"plan_id": _safe_text(body["plan_id"], "plan_id", opaque=True)}
-    for field in ("confirmation_token", "provider_receipt"):
+    for field in ("confirmation_token",):
         if field in body:
             result[field] = _safe_text(body[field], field, opaque=True)
-    if "provider_outcome" in body:
-        outcome = _safe_text(body["provider_outcome"], "provider_outcome").lower()
-        if outcome != "failed" and outcome not in SUCCESS_OUTCOMES:
-            raise ConnectionsError("provider_outcome is not allowlisted")
-        result["provider_outcome"] = outcome
-    if "provider_error_code" in body:
-        result["provider_error_code"] = _safe_provider_error_code(body["provider_error_code"])
-    if "provider_error_category" in body:
-        result["provider_error_category"] = _safe_error_category(body["provider_error_category"])
-    if result.get("provider_outcome") == "failed":
-        if not result.get("provider_receipt") or "provider_error_code" not in result or "provider_error_category" not in result:
-            raise ConnectionsError("failed completion requires provider receipt, error code, and category")
-    elif any(field in result for field in ("provider_error_code", "provider_error_category")):
-        raise ConnectionsError("provider error fields require failed completion")
     return result
 
 
@@ -544,7 +617,10 @@ def _safe_result_projection(value: Any) -> dict[str, Any]:
         raw = value[field]
         if field == "provider_receipt":
             if raw:
-                result[field] = _safe_text(raw, field, opaque=True)
+                receipt = _opaque_receipt(raw)
+                if receipt is None:
+                    raise ConnectionsError("response provider receipt is invalid")
+                result[field] = receipt
         elif field in {"error_code"}:
             result[field] = _safe_provider_error_code(raw)
         elif field in {"error_category"}:
@@ -642,6 +718,125 @@ def sanitize_action_response(payload: Mapping[str, Any], *, action: str) -> dict
         return failure_payload(ConnectionsError("Frank returned no plan"), provider="frank")
     if action == "apply" and not result.get("action"):
         return failure_payload(ConnectionsError("Frank returned no action"), provider="frank")
+    action_result = result.get("action", {}).get("result") if isinstance(result.get("action"), Mapping) else None
+    if action == "apply" and isinstance(action_result, Mapping) and action_result.get("outcome") in SUCCESS_OUTCOMES:
+        # The model-facing transport cannot submit provider evidence. Until a
+        # Hermes adapter executes and binds evidence server-side, a provider
+        # success echoed by Frank is not trusted or projected as verified.
+        return failure_payload(ConnectionsError(
+            "provider evidence is unavailable",
+            error_code="provider_evidence_required",
+            error_category="unavailable",
+        ), provider="frank")
+    return result
+
+
+def _safe_inspect_connection(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping) or set(value) - _INSPECT_CONNECTION_FIELDS:
+        return None
+    result: dict[str, Any] = {}
+    for field in sorted(value):
+        raw = value[field]
+        if field in {"id", "connection_id", "receipt_id"} and raw is not None:
+            result[field] = _safe_text(raw, field, opaque=True)
+        elif field == "provider" and raw is not None:
+            provider = _safe_text(raw, field).lower()
+            if provider not in _SAFE_PROVIDERS:
+                return None
+            result[field] = provider
+        elif field in {"name", "scope_id", "scope_kind", "status", "last_verified_at"} and raw is not None:
+            result[field] = _safe_text(raw, field)
+        elif field in {"state", "action", "outcome", "error_code", "error_category", "severity", "kind", "message_code", "created_at", "updated_at", "started_at", "completed_at"} and raw is not None:
+            if field == "error_code":
+                result[field] = _safe_provider_error_code(raw)
+            elif field == "error_category":
+                result[field] = _safe_error_category(raw)
+            else:
+                result[field] = _safe_text(raw, field)
+        elif field in {"sequence", "revision"} and isinstance(raw, int) and not isinstance(raw, bool):
+            result[field] = raw
+        elif field in {"pending", "resolved", "attention"} and isinstance(raw, bool):
+            result[field] = raw
+        elif field == "capabilities":
+            result[field] = _safe_capabilities(raw)
+        elif field == "connection_ref" and raw is not None:
+            result[field] = _safe_ref(raw, field)
+        elif field == "credential_ref" and raw is not None:
+            result[field] = _safe_ref(raw, field, vault=True)
+    return result
+
+
+def _safe_inspect_action(value: Any) -> dict[str, Any] | None:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) - _INSPECT_ACTION_FIELDS
+        or not {"action", "state"}.issubset(value)
+    ):
+        return None
+    result: dict[str, Any] = {}
+    for field in _INSPECT_ACTION_FIELDS:
+        if field not in value:
+            continue
+        if field == "target":
+            target = _safe_target(value[field])
+            if not target:
+                return None
+            result[field] = target
+        elif field == "result":
+            raw = value[field]
+            if not isinstance(raw, Mapping) or set(raw) - _INSPECT_RESULT_FIELDS:
+                return None
+            result[field] = _safe_result_projection(raw)
+        elif field == "progress":
+            raw = value[field]
+            if not isinstance(raw, Mapping) or set(raw) - {"percent", "step"}:
+                return None
+            progress: dict[str, Any] = {}
+            if "percent" in raw:
+                if not isinstance(raw["percent"], int) or isinstance(raw["percent"], bool) or not 0 <= raw["percent"] <= 100:
+                    return None
+                progress["percent"] = raw["percent"]
+            if "step" in raw:
+                progress["step"] = _safe_text(raw["step"], "progress.step")
+            result[field] = progress
+        elif field == "sequence":
+            if not isinstance(value[field], int) or isinstance(value[field], bool):
+                return None
+            result[field] = value[field]
+        elif value[field] is not None:
+            result[field] = _safe_text(value[field], field, opaque=field in {"receipt_id", "correlation_id"})
+    return result
+
+
+def sanitize_inspect_response(payload: Mapping[str, Any], *, activity_limit: int) -> dict[str, Any]:
+    """Project only the dedicated Frank private inspect envelope."""
+    if not isinstance(payload, Mapping) or set(payload) != _INSPECT_TOP_FIELDS:
+        return failure_payload(ConnectionsError("Frank inspect returned an invalid response"), provider="frank")
+    result: dict[str, Any] = {}
+    if payload.get("schema") != "schema://frank.connections-agent-inspect/v1":
+        return failure_payload(ConnectionsError("Frank inspect returned an invalid schema"), provider="frank")
+    result["schema"] = payload["schema"]
+    connections = payload.get("connections")
+    if not isinstance(connections, list):
+        return failure_payload(ConnectionsError("Frank inspect returned invalid connections"), provider="frank")
+    safe_connections = [_safe_inspect_connection(raw) for raw in connections]
+    if any(item is None for item in safe_connections):
+        return failure_payload(ConnectionsError("Frank inspect returned unsafe connection metadata"), provider="frank")
+    result["connections"] = safe_connections
+    attention = payload.get("attention")
+    if not isinstance(attention, list):
+        return failure_payload(ConnectionsError("Frank inspect returned invalid attention"), provider="frank")
+    safe_attention = [_safe_inspect_action(raw) for raw in attention]
+    if any(item is None for item in safe_attention):
+        return failure_payload(ConnectionsError("Frank inspect returned unsafe attention metadata"), provider="frank")
+    result["attention"] = safe_attention
+    activity = payload.get("activity")
+    if not isinstance(activity, list) or len(activity) > activity_limit:
+        return failure_payload(ConnectionsError("Frank inspect returned invalid activity"), provider="frank")
+    safe_activity = [_safe_inspect_action(raw) for raw in activity]
+    if any(item is None for item in safe_activity):
+        return failure_payload(ConnectionsError("Frank inspect returned unsafe activity metadata"), provider="frank")
+    result["activity"] = safe_activity
     return result
 
 
@@ -694,8 +889,16 @@ class InfisicalClient:
         try:
             with _open_no_redirect(request) as response:
                 result = json.loads(response.read(_MAX_REQUEST_BYTES).decode("utf-8"))
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, OSError, ConnectionsError) as exc:
-            raise ConnectionsError("Infisical universal auth failed") from exc
+        except urllib.error.HTTPError as exc:
+            raise _infisical_http_failure(exc.code) from exc
+        except TimeoutError as exc:
+            raise ConnectionsError("Infisical universal auth failed", error_code="timeout", error_category="timeout") from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise ConnectionsError("Infisical universal auth failed", error_code="infisical_unavailable", error_category="unavailable") from exc
+        except (ValueError, ConnectionsError) as exc:
+            if isinstance(exc, ConnectionsError):
+                raise
+            raise ConnectionsError("Infisical universal auth returned invalid metadata", error_code="invalid_completion", error_category="validation") from exc
         token = result.get("accessToken") if isinstance(result, Mapping) else None
         expires_in = result.get("expiresIn") if isinstance(result, Mapping) else None
         if not isinstance(token, str) or not token or not isinstance(expires_in, (int, float)):
@@ -737,15 +940,21 @@ class InfisicalClient:
             if exc.code == 401 and self._universal_auth and allow_refresh:
                 self._invalidate_token()
                 return self._request_with_refresh(method, url, body, allow_refresh=False)
-            raise ConnectionsError(f"Infisical CE request failed ({method})") from exc
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
-            raise ConnectionsError(f"Infisical CE request failed ({method})") from exc
+            raise _infisical_http_failure(exc.code) from exc
+        except TimeoutError as exc:
+            raise ConnectionsError("Infisical CE request timed out", error_code="timeout", error_category="timeout") from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise ConnectionsError("Infisical CE request unavailable", error_code="infisical_unavailable", error_category="unavailable") from exc
+        except ValueError as exc:
+            raise ConnectionsError("Infisical CE returned invalid metadata", error_code="invalid_completion", error_category="validation") from exc
         return payload if isinstance(payload, dict) else {}
 
     def list_metadata(self) -> list[dict[str, Any]]:
         payload = self._request("GET", self._url())
         entries = payload.get("secrets")
-        return [_safe_metadata(item) for item in entries if isinstance(item, Mapping)] if isinstance(entries, list) else []
+        if not isinstance(entries, list):
+            raise ConnectionsError("Infisical CE returned invalid metadata")
+        return [_safe_metadata(item) for item in entries if isinstance(item, Mapping)]
 
     def read_value(self, secret_name: str) -> str:
         payload = self._request("GET", self._url(secret_name, include_value=True))
@@ -767,7 +976,7 @@ class InfisicalClient:
         }
         method = "POST" if operation == "create" else "PATCH"
         payload = self._request(method, self._url(secret_name), body)
-        return _safe_metadata(payload.get("secret"))
+        return self._safe_secret_metadata(payload)
 
     def delete(self, secret_name: str) -> dict[str, Any]:
         payload = self._request("DELETE", self._url(secret_name), {
@@ -776,7 +985,17 @@ class InfisicalClient:
             "secretPath": self.settings.secret_path,
             "type": "shared",
         })
-        return _safe_metadata(payload.get("secret"))
+        return self._safe_secret_metadata(payload)
+
+    @staticmethod
+    def _safe_secret_metadata(payload: Mapping[str, Any]) -> dict[str, Any]:
+        secret = payload.get("secret") if isinstance(payload, Mapping) else None
+        if not isinstance(secret, Mapping):
+            raise ConnectionsError("Infisical CE returned invalid secret metadata")
+        safe = _safe_metadata(secret)
+        if not safe:
+            raise ConnectionsError("Infisical CE returned empty secret metadata")
+        return safe
 
 
 class _MutationLedger:
@@ -926,9 +1145,47 @@ class ConnectionsRuntime:
     def __init__(self, settings: ConnectionsSettings):
         self.settings = settings
         self._plan_idempotency_keys: dict[str, str] = {}
+        self._resend_process_tool_names: tuple[str, ...] = ()
+        self._resend_restore_error = False
+
+    def _activate_resend_mcp(self) -> list[str]:
+        """Restore or activate Resend and prove its tools in this process."""
+        if not _resend_was_rotated(self.settings):
+            raise SetupNeeded("Resend remains setup_needed until Frank records a new rotation")
+        from tools import mcp_tool
+
+        names = _resend_registered_tool_names(mcp_tool)
+        if set(names) != set(RESEND_MCP_TOOL_NAMES):
+            client = InfisicalClient(self.settings)
+            # The value is used only as an in-memory child-process environment
+            # value. It is absent from state, responses, and logs.
+            secret_value = client.read_value(self.settings.resend_secret_name)
+            mcp_tool.register_mcp_servers({RESEND_SERVER_NAME: build_resend_mcp_config(secret_value)})
+            names = _resend_registered_tool_names(mcp_tool)
+        if set(names) != set(RESEND_MCP_TOOL_NAMES):
+            raise SetupNeeded("Resend MCP discovery did not prove the pinned Resend server")
+        self._resend_process_tool_names = tuple(RESEND_MCP_TOOL_NAMES)
+        self._resend_restore_error = False
+        _record_resend_connection(self.settings, list(names))
+        return list(names)
 
     def status(self) -> dict[str, Any]:
-        provider_state = _resend_provider_state(self.settings)
+        persisted_state = _resend_provider_state(self.settings)
+        try:
+            from tools import mcp_tool
+            process_tools = _resend_registered_tool_names(mcp_tool)
+        except Exception:
+            process_tools = []
+        if set(process_tools) == set(RESEND_MCP_TOOL_NAMES):
+            self._resend_process_tool_names = tuple(RESEND_MCP_TOOL_NAMES)
+        elif persisted_state in {"connected-awaiting-verification", "verified"}:
+            try:
+                self._activate_resend_mcp()
+            except ConnectionsError:
+                self._resend_restore_error = True
+        provider_state = persisted_state
+        if persisted_state in {"connected-awaiting-verification", "verified"}:
+            provider_state = "connected-awaiting-verification" if self._resend_process_tool_names else "error"
         configured = bool(self.settings.infisical_url and self.settings.project_id and (self.settings.infisical_token or (self.settings.infisical_client_id and self.settings.infisical_client_secret)))
         return {
             "schema": SCHEMA_VERSION,
@@ -938,7 +1195,7 @@ class ConnectionsRuntime:
             "enabled": self.settings.enabled,
             "infisical": {"configured": configured, "reachable": None, "verified": None, "mode": "ce-v4-fixed-scope"},
             "providers": [{"id": "resend-mcp", "state": provider_state, "capabilities": list(RESEND_CAPABILITIES)}],
-            "mcp": {"server": RESEND_SERVER_NAME, "command": "npx", "args": ["-y", RESEND_MCP_PACKAGE], "secret_source": "hermes-infisical", "secret_name": self.settings.resend_secret_name, "state": provider_state} if provider_state != "setup_needed" else {"server": RESEND_SERVER_NAME, "state": "setup_needed"},
+            "mcp": {"server": RESEND_SERVER_NAME, "command": "npx", "args": ["-y", RESEND_MCP_PACKAGE], "secret_source": "hermes-infisical", "secret_name": self.settings.resend_secret_name, "state": provider_state} if provider_state not in {"setup_needed", "error"} else {"server": RESEND_SERVER_NAME, "state": provider_state},
         }
 
     def status_tool(self, _args: Mapping[str, Any]) -> str:
@@ -946,19 +1203,7 @@ class ConnectionsRuntime:
 
     def resend_mcp_tool(self, _args: Mapping[str, Any]) -> str:
         try:
-            if not _resend_was_rotated(self.settings):
-                raise SetupNeeded("Resend remains setup_needed until Frank records a new rotation")
-            client = InfisicalClient(self.settings)
-            # The value is used only as an in-memory child-process environment
-            # value. It is intentionally absent from the returned result,
-            # plugin state, config files, and logs.
-            secret_value = client.read_value(self.settings.resend_secret_name)
-            from tools.mcp_tool import register_mcp_servers
-
-            names = register_mcp_servers({RESEND_SERVER_NAME: build_resend_mcp_config(secret_value)})
-            if not names:
-                return tool_result(failure_payload(ConnectionsError("Resend MCP discovery returned no allowlisted tools"), provider="resend-mcp"))
-            _record_resend_connection(self.settings, names)
+            names = self._activate_resend_mcp()
             return tool_result({
                 "schema": SCHEMA_VERSION,
                 "server": RESEND_SERVER_NAME,
@@ -966,6 +1211,19 @@ class ConnectionsRuntime:
                 "registered_tools": list(names),
                 "capabilities": list(RESEND_CAPABILITIES),
             })
+        except ConnectionsError as exc:
+            return tool_error(str(exc))
+
+    def inspect_tool(self, args: Mapping[str, Any]) -> str:
+        try:
+            if not isinstance(args, Mapping) or set(args) - {"activity_limit"}:
+                raise ConnectionsError("inspect accepts only activity_limit")
+            raw_limit = args.get("activity_limit", 20)
+            if isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or not 1 <= raw_limit <= 50:
+                raise ConnectionsError("activity_limit must be between 1 and 50")
+            if not self.settings.frank_url or not self.settings.agent_key:
+                raise SetupNeeded("Frank inspect transport is not configured on Hermes")
+            return tool_result(self._frank_inspect_request(raw_limit))
         except ConnectionsError as exc:
             return tool_error(str(exc))
 
@@ -997,8 +1255,8 @@ class ConnectionsRuntime:
             if action == "plan" and _OPAQUE_RECEIPT_RE.fullmatch(returned_plan_id):
                 self._plan_idempotency_keys[returned_plan_id] = key
             action_result = ((result.get("action") or {}).get("result") if isinstance(result.get("action"), Mapping) else None)
-            if action == "apply" and isinstance(action_result, Mapping) and action_result.get("outcome") == "verified" and action_result.get("provider") in {"resend", "resend-mcp"}:
-                _record_resend_verification(self.settings, action_result)
+            if action == "apply" and isinstance(action_result, Mapping) and action_result.get("outcome") in SUCCESS_OUTCOMES:
+                raise ConnectionsError("provider evidence is unavailable", error_code="provider_evidence_required", error_category="unavailable")
             return tool_result(result)
         except ConnectionsError as exc:
             return tool_error(str(exc))
@@ -1025,6 +1283,24 @@ class ConnectionsRuntime:
             raise ConnectionsError("Frank returned an invalid response")
         return sanitize_action_response(payload, action=endpoint.rsplit("/", 1)[-1])
 
+    def _frank_inspect_request(self, activity_limit: int) -> dict[str, Any]:
+        if not 1 <= activity_limit <= 50:
+            raise ConnectionsError("activity_limit is invalid")
+        endpoint = f"{self.settings.frank_url}/api/connections/agent/inspect?activity_limit={activity_limit}"
+        request = urllib.request.Request(endpoint, method="GET", headers={
+            "Authorization": f"Bearer {self.settings.agent_key}",
+            "Accept": "application/json",
+            "X-Hermes-Profile": PROFILE_NAME,
+        })
+        try:
+            with _open_no_redirect(request) as response:
+                payload = json.loads(response.read(_MAX_REQUEST_BYTES).decode("utf-8"))
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+            raise ConnectionsError("Frank inspect request failed") from exc
+        if not isinstance(payload, dict):
+            raise ConnectionsError("Frank inspect returned an invalid response")
+        return sanitize_inspect_response(payload, activity_limit=activity_limit)
+
     def broker_health(self) -> dict[str, Any]:
         configured = bool(self.settings.infisical_url and self.settings.project_id and (self.settings.infisical_token or (self.settings.infisical_client_id and self.settings.infisical_client_secret)))
         base = {"schema": SCHEMA_VERSION, "profile": PROFILE_NAME, "broker": "connections-agent", "secret_values": False, "infisical": {"configured": configured, "reachable": False, "verified": False}}
@@ -1032,8 +1308,11 @@ class ConnectionsRuntime:
             return base | {"ok": False, "status": "setup_needed", "state": "setup_needed"}
         try:
             InfisicalClient(self.settings).list_metadata()
-        except ConnectionsError:
-            return base | {"ok": False, "status": "unavailable", "state": "error", "outcome": "failed", "error_code": "infisical_unavailable", "error_category": "unavailable"}
+        except ConnectionsError as exc:
+            safe = failure_payload(exc)
+            category = safe["error_category"]
+            status = "permission_denied" if category == "permission_denied" else "error" if category in {"auth", "validation", "configuration"} else "unavailable"
+            return base | {"ok": False, "status": status, "state": "error", "outcome": "failed", "error_code": safe["error_code"], "error_category": category}
         return base | {"ok": True, "status": "verified", "state": "verified", "outcome": "verified", "infisical": {"configured": True, "reachable": True, "verified": True}}
 
     def broker_list_metadata(self, *, principal: str) -> dict[str, Any]:
@@ -1051,22 +1330,28 @@ class ConnectionsRuntime:
             if operation == "delete":
                 confirmation = str(body.get("confirmation_token") or "").strip()
                 receipt = body.get("provider_receipt")
-                if len(confirmation) < 16 or not isinstance(receipt, Mapping) or not receipt.get("receipt_id"):
+                if (
+                    not _FRANK_CONFIRMATION_TOKEN_RE.fullmatch(confirmation)
+                    or not isinstance(receipt, Mapping)
+                    or set(receipt) != {"receipt_id"}
+                    or not isinstance(receipt.get("receipt_id"), str)
+                    or not _FRANK_PROVIDER_RECEIPT_ID_RE.fullmatch(receipt["receipt_id"])
+                ):
                     raise ConnectionsError("delete requires a Frank confirmation token and provider receipt")
             client = InfisicalClient(self.settings)
             if operation in {"create", "rotate"}:
                 value = body.get("secret_value")
                 if not isinstance(value, str) or not value:
                     raise ConnectionsError("secret_value is required for this fixed mutation")
-                metadata = client.mutate(operation, secret_name, value)
+                metadata = _safe_metadata(client.mutate(operation, secret_name, value))
                 if operation == "rotate":
                     _record_resend_rotation(self.settings, metadata)
                 else:
                     _record_resend_create(self.settings, metadata)
             else:
-                metadata = client.delete(secret_name)
+                metadata = _safe_metadata(client.delete(secret_name))
                 _record_resend_deleted(self.settings, metadata)
-            result = {"schema": SCHEMA_VERSION, "operation": operation, "outcome": {"create": "created", "rotate": "updated", "delete": "deleted"}[operation], "receipt": {"id": str(uuid.uuid4()), "provider": "infisical-ce", "status": "completed", "secret_name": secret_name}, "metadata": metadata}
+            result = {"schema": SCHEMA_VERSION, "operation": operation, "outcome": {"create": "created", "rotate": "updated", "delete": "deleted"}[operation], "receipt": {"id": str(uuid.uuid4()), "provider": "infisical-ce", "status": "completed", "secret_name": secret_name}, "secret": metadata}
             _LEDGER.finish(principal, operation, idempotency_key, body, result)
             return result
         except Exception:
