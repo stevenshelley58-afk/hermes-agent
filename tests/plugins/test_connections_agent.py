@@ -203,6 +203,71 @@ class ConnectionsRuntimeTests(unittest.TestCase):
         self.assertEqual(raised.exception.error_code, "idempotency_store_unavailable")
         client.mutate.assert_not_called()
 
+    def test_ledger_at_capacity_preserves_completed_replay_and_conflict_before_blocking_new_key(self):
+        client = unittest.mock.Mock()
+        client.mutate.return_value = {"id": "safe-id"}
+        body = {"secret_name": "RESEND_API_KEY", "secret_value": "capacity-value-never-persisted"}
+        with patch.object(runtime._MutationLedger, "_MAX_ENTRIES", 1), patch.object(
+            runtime, "InfisicalClient", return_value=client
+        ):
+            first = runtime.ConnectionsRuntime(self.settings()).broker_mutate(
+                "create",
+                body,
+                principal="frank-vault-broker",
+                idempotency_key="capacity-existing-key-0001",
+            )
+            runtime._LEDGER = runtime._MutationLedger()
+            replay = runtime.ConnectionsRuntime(self.settings()).broker_mutate(
+                "create",
+                body,
+                principal="frank-vault-broker",
+                idempotency_key="capacity-existing-key-0001",
+            )
+            with self.assertRaises(runtime.ConnectionsError) as conflict:
+                runtime.ConnectionsRuntime(self.settings()).broker_mutate(
+                    "create",
+                    {"secret_name": "RESEND_API_KEY", "secret_value": "different-value-never-persisted"},
+                    principal="frank-vault-broker",
+                    idempotency_key="capacity-existing-key-0001",
+                )
+            with self.assertRaises(runtime.ConnectionsError) as full:
+                runtime.ConnectionsRuntime(self.settings()).broker_mutate(
+                    "create",
+                    body,
+                    principal="frank-vault-broker",
+                    idempotency_key="capacity-new-key-0002",
+                )
+        self.assertEqual(replay, first)
+        self.assertEqual(conflict.exception.error_code, "idempotency_conflict")
+        self.assertEqual(full.exception.error_code, "idempotency_store_unavailable")
+        self.assertEqual(full.exception.error_category, "unavailable")
+        client.mutate.assert_called_once()
+        payload = json.loads(runtime._LEDGER._path().read_text(encoding="utf-8"))
+        self.assertEqual(len(payload["entries"]), 1)
+
+    def test_ledger_at_capacity_preserves_uncertain_check_and_blocks_new_key(self):
+        existing_body = {"secret_name": "RESEND_API_KEY", "secret_value": "uncertain-at-cap-never-persisted"}
+        with patch.object(runtime._MutationLedger, "_MAX_ENTRIES", 1):
+            runtime._LEDGER.begin(
+                "frank-vault-broker", "rotate", "capacity-uncertain-key-0001", existing_body
+            )
+            runtime._LEDGER.mark_uncertain(
+                "frank-vault-broker", "rotate", "capacity-uncertain-key-0001", existing_body
+            )
+            runtime._LEDGER = runtime._MutationLedger()
+            with self.assertRaises(runtime.ConnectionsError) as uncertain:
+                runtime._LEDGER.begin(
+                    "frank-vault-broker", "rotate", "capacity-uncertain-key-0001", existing_body
+                )
+            with self.assertRaises(runtime.ConnectionsError) as full:
+                runtime._LEDGER.begin(
+                    "frank-vault-broker", "rotate", "capacity-new-key-0002", existing_body
+                )
+        self.assertEqual(uncertain.exception.error_code, "idempotency_uncertain")
+        self.assertEqual(full.exception.error_code, "idempotency_store_unavailable")
+        payload = json.loads(runtime._LEDGER._path().read_text(encoding="utf-8"))
+        self.assertEqual(len(payload["entries"]), 1)
+
     def test_failed_create_and_delete_leave_prior_truth_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(runtime, "get_hermes_home", return_value=Path(tmp)):
             settings = self.settings()
