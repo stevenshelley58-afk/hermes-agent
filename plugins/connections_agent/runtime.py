@@ -1010,6 +1010,8 @@ class _MutationLedger:
 
     _SCHEMA = "hermes.connections.mutation-idempotency.v1"
     _DIGEST_RE = re.compile(r"^[a-f0-9]{64}$")
+    # Replay evidence is never evicted; new keys fail closed at this ceiling.
+    _MAX_ENTRIES = 4096
 
     def __init__(self, path: Path | None = None) -> None:
         self._lock = threading.Lock()
@@ -1174,6 +1176,12 @@ class _MutationLedger:
                         error_category="unavailable",
                     )
                 return dict(existing["result"])
+            if len(entries) >= self._MAX_ENTRIES:
+                raise ConnectionsError(
+                    "Connections idempotency store cannot accept a new mutation",
+                    error_code="idempotency_store_unavailable",
+                    error_category="unavailable",
+                )
             now = int(time.time())
             entries[entry_key] = {
                 "request_fingerprint": fingerprint,
