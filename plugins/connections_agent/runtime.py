@@ -30,6 +30,7 @@ from hermes_cli.dashboard_auth import (
     TokenPrincipal,
 )
 from tools.registry import tool_error, tool_result
+from utils import atomic_json_write
 
 try:
     from hermes_constants import get_hermes_home
@@ -52,7 +53,8 @@ ERROR_CATEGORIES = frozenset({"auth", "configuration", "network", "not_found", "
 ERROR_CODES = frozenset({
     "auth_failed", "confirmation_required", "infisical_auth_failed", "infisical_not_found",
     "infisical_permission_denied", "infisical_unavailable", "infisical_rate_limited", "invalid_completion",
-    "invalid_request", "mcp_unavailable", "provider_evidence_required", "provider_error", "provider_rejected",
+    "idempotency_conflict", "idempotency_store_unavailable", "idempotency_uncertain", "invalid_request",
+    "mcp_unavailable", "provider_evidence_required", "provider_error", "provider_rejected",
     "rate_limited", "receipt_missing", "setup_needed", "timeout", "unknown_error",
 })
 _SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -999,51 +1001,248 @@ class InfisicalClient:
 
 
 class _MutationLedger:
-    """Bounded in-memory idempotency and rate-limit ledger."""
+    """Durable, profile-scoped idempotency ledger for vault mutations.
 
-    def __init__(self) -> None:
+    Only cryptographic digests, state, timestamps, and already-sanitized
+    completion responses cross the persistence boundary. Client keys and
+    mutation request bodies (including secret values) are never stored.
+    """
+
+    _SCHEMA = "hermes.connections.mutation-idempotency.v1"
+    _DIGEST_RE = re.compile(r"^[a-f0-9]{64}$")
+
+    def __init__(self, path: Path | None = None) -> None:
         self._lock = threading.Lock()
-        self._entries: dict[str, tuple[float, str, dict[str, Any]]] = {}
-        self._hits: dict[str, list[float]] = {}
+        self._path_override = path
+
+    def _path(self) -> Path:
+        return self._path_override or (
+            get_hermes_home()
+            / "plugin-data"
+            / "connections-agent"
+            / "mutation-idempotency.json"
+        )
+
+    @staticmethod
+    def _key_digest(principal: str, route: str, key: str) -> str:
+        material = json.dumps(
+            [principal, route, key],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(material).hexdigest()
+
+    @staticmethod
+    def _request_fingerprint(body: Mapping[str, Any]) -> str:
+        material = json.dumps(
+            body,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(material).hexdigest()
+
+    def _empty(self) -> dict[str, Any]:
+        return {"schema": self._SCHEMA, "entries": {}}
+
+    def _load(self) -> dict[str, Any]:
+        path = self._path()
+        try:
+            raw_payload = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return self._empty()
+        except OSError as exc:
+            raise ConnectionsError(
+                "Connections idempotency store is unavailable",
+                error_code="idempotency_store_unavailable",
+                error_category="unavailable",
+            ) from exc
+        try:
+            payload = json.loads(raw_payload)
+        except (ValueError, TypeError) as exc:
+            raise ConnectionsError(
+                "Connections idempotency store is unavailable",
+                error_code="idempotency_store_unavailable",
+                error_category="unavailable",
+            ) from exc
+        if (
+            not isinstance(payload, Mapping)
+            or set(payload) != {"schema", "entries"}
+            or payload.get("schema") != self._SCHEMA
+            or not isinstance(payload.get("entries"), Mapping)
+        ):
+            raise ConnectionsError(
+                "Connections idempotency store is unavailable",
+                error_code="idempotency_store_unavailable",
+                error_category="unavailable",
+            )
+        entries: dict[str, Any] = {}
+        for digest, raw in payload["entries"].items():
+            if not isinstance(digest, str) or not self._DIGEST_RE.fullmatch(digest):
+                raise ConnectionsError(
+                    "Connections idempotency store is unavailable",
+                    error_code="idempotency_store_unavailable",
+                    error_category="unavailable",
+                )
+            if not isinstance(raw, Mapping):
+                raise ConnectionsError(
+                    "Connections idempotency store is unavailable",
+                    error_code="idempotency_store_unavailable",
+                    error_category="unavailable",
+                )
+            state = raw.get("state")
+            fingerprint = raw.get("request_fingerprint")
+            expected_fields = {
+                "request_fingerprint",
+                "state",
+                "created_at",
+                "updated_at",
+            } | ({"result"} if state == "completed" else set())
+            if (
+                set(raw) != expected_fields
+                or state not in {"in_progress", "uncertain", "completed"}
+                or not isinstance(fingerprint, str)
+                or not self._DIGEST_RE.fullmatch(fingerprint)
+                or isinstance(raw.get("created_at"), bool)
+                or not isinstance(raw.get("created_at"), int)
+                or isinstance(raw.get("updated_at"), bool)
+                or not isinstance(raw.get("updated_at"), int)
+            ):
+                raise ConnectionsError(
+                    "Connections idempotency store is unavailable",
+                    error_code="idempotency_store_unavailable",
+                    error_category="unavailable",
+                )
+            result = raw.get("result")
+            if state == "completed":
+                if not isinstance(result, Mapping):
+                    raise ConnectionsError(
+                        "Connections idempotency store is unavailable",
+                        error_code="idempotency_store_unavailable",
+                        error_category="unavailable",
+                    )
+            elif "result" in raw:
+                raise ConnectionsError(
+                    "Connections idempotency store is unavailable",
+                    error_code="idempotency_store_unavailable",
+                    error_category="unavailable",
+                )
+            entries[digest] = dict(raw)
+        return {"schema": self._SCHEMA, "entries": entries}
+
+    def _save(self, payload: Mapping[str, Any]) -> None:
+        try:
+            atomic_json_write(
+                self._path(),
+                dict(payload),
+                indent=None,
+                mode=0o600,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except Exception as exc:
+            raise ConnectionsError(
+                "Connections idempotency store is unavailable",
+                error_code="idempotency_store_unavailable",
+                error_category="unavailable",
+            ) from exc
 
     def begin(self, principal: str, route: str, key: str, body: Mapping[str, Any]) -> Optional[dict[str, Any]]:
         if not _IDEMPOTENCY_RE.fullmatch(key):
-            raise ConnectionsError("Idempotency-Key is required and invalid")
-        now = time.monotonic()
-        fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        entry_key = f"{principal}:{route}:{key}"
+            raise ConnectionsError(
+                "Idempotency-Key is required and invalid",
+                error_code="invalid_request",
+                error_category="validation",
+            )
+        fingerprint = self._request_fingerprint(body)
+        entry_key = self._key_digest(principal, route, key)
         with self._lock:
-            self._entries = {k: v for k, v in self._entries.items() if v[0] > now}
-            hits = [item for item in self._hits.get(principal, []) if item > now - 60]
-            if len(hits) >= 30:
-                raise ConnectionsError("request rate limit exceeded")
-            self._hits[principal] = hits + [now]
-            existing = self._entries.get(entry_key)
+            payload = self._load()
+            entries = payload["entries"]
+            existing = entries.get(entry_key)
             if existing:
-                if existing[1] != fingerprint:
-                    raise ConnectionsError("Idempotency-Key was reused with a different request")
-                if not existing[2]:
-                    raise ConnectionsError("request with this Idempotency-Key is still in progress")
-                return dict(existing[2])
-            self._entries[entry_key] = (now + 300, fingerprint, {})
+                if existing["request_fingerprint"] != fingerprint:
+                    raise ConnectionsError(
+                        "Idempotency-Key was reused with a different request",
+                        error_code="idempotency_conflict",
+                        error_category="validation",
+                    )
+                if existing["state"] != "completed":
+                    raise ConnectionsError(
+                        "Idempotency-Key outcome is uncertain; manual reconciliation is required",
+                        error_code="idempotency_uncertain",
+                        error_category="unavailable",
+                    )
+                return dict(existing["result"])
+            now = int(time.time())
+            entries[entry_key] = {
+                "request_fingerprint": fingerprint,
+                "state": "in_progress",
+                "created_at": now,
+                "updated_at": now,
+            }
+            self._save(payload)
         return None
 
-    def abort(self, principal: str, route: str, key: str, body: Mapping[str, Any]) -> None:
-        fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    def mark_uncertain(self, principal: str, route: str, key: str, body: Mapping[str, Any]) -> None:
+        fingerprint = self._request_fingerprint(body)
+        entry_key = self._key_digest(principal, route, key)
         with self._lock:
-            entry_key = f"{principal}:{route}:{key}"
-            existing = self._entries.get(entry_key)
-            if existing and existing[1] == fingerprint and not existing[2]:
-                self._entries.pop(entry_key, None)
+            payload = self._load()
+            existing = payload["entries"].get(entry_key)
+            if not existing or existing["request_fingerprint"] != fingerprint:
+                raise ConnectionsError(
+                    "Connections idempotency store is unavailable",
+                    error_code="idempotency_store_unavailable",
+                    error_category="unavailable",
+                )
+            if existing["state"] == "completed":
+                return
+            existing["state"] = "uncertain"
+            existing["updated_at"] = int(time.time())
+            existing.pop("result", None)
+            self._save(payload)
 
     def finish(self, principal: str, route: str, key: str, body: Mapping[str, Any], result: dict[str, Any]) -> None:
-        fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        fingerprint = self._request_fingerprint(body)
+        entry_key = self._key_digest(principal, route, key)
         with self._lock:
-            entry_key = f"{principal}:{route}:{key}"
-            self._entries[entry_key] = (time.monotonic() + 300, fingerprint, dict(result))
+            payload = self._load()
+            existing = payload["entries"].get(entry_key)
+            if not existing or existing["request_fingerprint"] != fingerprint:
+                raise ConnectionsError(
+                    "Connections idempotency store is unavailable",
+                    error_code="idempotency_store_unavailable",
+                    error_category="unavailable",
+                )
+            existing["state"] = "completed"
+            existing["updated_at"] = int(time.time())
+            existing["result"] = dict(result)
+            self._save(payload)
+
+
+class _MutationRateLimiter:
+    """Small process-local request-rate guard, independent of replay state."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._hits: dict[str, list[float]] = {}
+
+    def check(self, principal: str) -> None:
+        now = time.monotonic()
+        with self._lock:
+            hits = [item for item in self._hits.get(principal, []) if item > now - 60]
+            if len(hits) >= 30:
+                raise ConnectionsError(
+                    "request rate limit exceeded",
+                    error_code="rate_limited",
+                    error_category="rate_limited",
+                )
+            self._hits[principal] = hits + [now]
 
 
 _LEDGER = _MutationLedger()
+_RATE_LIMITER = _MutationRateLimiter()
 
 
 def _state_path() -> Path:
@@ -1320,29 +1519,33 @@ class ConnectionsRuntime:
         return {"schema": SCHEMA_VERSION, "operation": "list-metadata", "outcome": "verified", "receipt": {"id": str(uuid.uuid4()), "provider": "infisical-ce", "status": "completed"}, "secrets": client.list_metadata()}
 
     def broker_mutate(self, operation: str, body: Mapping[str, Any], *, principal: str, idempotency_key: str) -> dict[str, Any]:
+        if operation not in {"create", "rotate", "delete"}:
+            raise ConnectionsError("broker mutation operation is invalid")
         secret_name = _secret_name(body.get("secret_name") or self.settings.resend_secret_name)
         if secret_name != self.settings.resend_secret_name:
             raise ConnectionsError("only the configured Resend secret is in scope")
+        if operation == "delete":
+            confirmation = str(body.get("confirmation_token") or "").strip()
+            receipt = body.get("provider_receipt")
+            if (
+                not _FRANK_CONFIRMATION_TOKEN_RE.fullmatch(confirmation)
+                or not isinstance(receipt, Mapping)
+                or set(receipt) != {"receipt_id"}
+                or not isinstance(receipt.get("receipt_id"), str)
+                or not _FRANK_PROVIDER_RECEIPT_ID_RE.fullmatch(receipt["receipt_id"])
+            ):
+                raise ConnectionsError("delete requires a Frank confirmation token and provider receipt")
+        else:
+            value = body.get("secret_value")
+            if not isinstance(value, str) or not value:
+                raise ConnectionsError("secret_value is required for this fixed mutation")
+        client = InfisicalClient(self.settings)
+        _RATE_LIMITER.check(principal)
         cached = _LEDGER.begin(principal, operation, idempotency_key, body)
-        if cached:
+        if cached is not None:
             return cached
         try:
-            if operation == "delete":
-                confirmation = str(body.get("confirmation_token") or "").strip()
-                receipt = body.get("provider_receipt")
-                if (
-                    not _FRANK_CONFIRMATION_TOKEN_RE.fullmatch(confirmation)
-                    or not isinstance(receipt, Mapping)
-                    or set(receipt) != {"receipt_id"}
-                    or not isinstance(receipt.get("receipt_id"), str)
-                    or not _FRANK_PROVIDER_RECEIPT_ID_RE.fullmatch(receipt["receipt_id"])
-                ):
-                    raise ConnectionsError("delete requires a Frank confirmation token and provider receipt")
-            client = InfisicalClient(self.settings)
             if operation in {"create", "rotate"}:
-                value = body.get("secret_value")
-                if not isinstance(value, str) or not value:
-                    raise ConnectionsError("secret_value is required for this fixed mutation")
                 metadata = _safe_metadata(client.mutate(operation, secret_name, value))
                 if operation == "rotate":
                     _record_resend_rotation(self.settings, metadata)
@@ -1354,6 +1557,19 @@ class ConnectionsRuntime:
             result = {"schema": SCHEMA_VERSION, "operation": operation, "outcome": {"create": "created", "rotate": "updated", "delete": "deleted"}[operation], "receipt": {"id": str(uuid.uuid4()), "provider": "infisical-ce", "status": "completed", "secret_name": secret_name}, "secret": metadata}
             _LEDGER.finish(principal, operation, idempotency_key, body, result)
             return result
-        except Exception:
-            _LEDGER.abort(principal, operation, idempotency_key, body)
-            raise
+        except Exception as exc:
+            # Once the durable in-progress record exists, any exception may
+            # have occurred after the provider committed. Retrying would risk
+            # a second create/rotate/delete, so retain a terminal uncertain
+            # state for operator reconciliation.
+            try:
+                _LEDGER.mark_uncertain(principal, operation, idempotency_key, body)
+            except ConnectionsError:
+                # The original in-progress record remains fail-closed when an
+                # attempted uncertain-state update cannot be written.
+                pass
+            raise ConnectionsError(
+                "Vault mutation outcome is uncertain; manual reconciliation is required",
+                error_code="idempotency_uncertain",
+                error_category="unavailable",
+            ) from exc
