@@ -97,7 +97,13 @@ def parse_env_file(path: Path = KNOWLEDGE_SECRET_FILE) -> dict[str, str]:
 
 
 def _lock_file():
-    KNOWLEDGE_LOCK_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent = KNOWLEDGE_LOCK_FILE.parent
+    try:
+        info = parent.stat()
+        if parent.is_symlink() or not parent.is_dir() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise KnowledgeSetupError("Knowledge settings directory is not secure.")
+    except OSError as exc:
+        raise KnowledgeSetupError("Knowledge settings directory is unavailable.") from exc
     handle = KNOWLEDGE_LOCK_FILE.open("a+", encoding="utf-8")
     os.chmod(KNOWLEDGE_LOCK_FILE, 0o600)
     fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -107,7 +113,12 @@ def _lock_file():
 def _atomic_write(values: Mapping[str, str], path: Path = KNOWLEDGE_SECRET_FILE) -> None:
     if path.is_symlink():
         raise KnowledgeSetupError("Knowledge settings cannot be a symlink.")
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        parent_info = path.parent.stat()
+        if path.parent.is_symlink() or not path.parent.is_dir() or parent_info.st_uid != os.getuid() or parent_info.st_mode & 0o077:
+            raise KnowledgeSetupError("Knowledge settings directory is not secure.")
+    except OSError as exc:
+        raise KnowledgeSetupError("Knowledge settings directory is unavailable.") from exc
     fd, temp_name = tempfile.mkstemp(prefix=".knowledge-", dir=path.parent)
     temp_path = Path(temp_name)
     try:

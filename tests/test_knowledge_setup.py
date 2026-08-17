@@ -53,6 +53,20 @@ class KnowledgeSetupTests(unittest.TestCase):
         with self.assertRaises(knowledge_setup.KnowledgeSetupError):
             knowledge_setup.parse_env_file(self.path)
 
+    def test_secret_parent_must_be_private_and_real(self):
+        self.path.parent.chmod(0o755)
+        try:
+            with self.assertRaises(knowledge_setup.KnowledgeSetupError):
+                knowledge_setup.save_user_settings("one", self.path)
+        finally:
+            self.path.parent.chmod(0o700)
+        target = Path(self.tempdir.name) / "target"
+        target.mkdir(mode=0o700)
+        linked_parent = Path(self.tempdir.name) / "linked"
+        linked_parent.symlink_to(target, target_is_directory=True)
+        with self.assertRaises(knowledge_setup.KnowledgeSetupError):
+            knowledge_setup.save_user_settings("one", linked_parent / "knowledge.env")
+
     def test_csrf_is_single_use_and_session_bound(self):
         store = {}
         token = knowledge_setup.mint_csrf("session-a", store, 1.0)
