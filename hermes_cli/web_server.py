@@ -17528,9 +17528,8 @@ def _run_knowledge_helper(helper: Path, timeout: float = 900.0) -> bool:
             cwd="/",
             env=env,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             timeout=timeout,
             check=False,
         )

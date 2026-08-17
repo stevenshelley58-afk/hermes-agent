@@ -77,6 +77,8 @@ class KnowledgeWebSecurityTests(unittest.TestCase):
                     self.assertEqual(args, ["sudo", "-n", "/usr/bin/true"])
                     env = run.call_args.kwargs["env"]
                     self.assertEqual(set(env), {"PATH", "LANG", "HERMES_HOME"})
+                    self.assertIs(run.call_args.kwargs["stdout"], web_server.subprocess.DEVNULL)
+                    self.assertIs(run.call_args.kwargs["stderr"], web_server.subprocess.DEVNULL)
 
 
 if __name__ == "__main__":
