@@ -168,6 +168,39 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_run_agent_forwards_reasoning_callbacks_to_agent_creation(adapter, monkeypatch):
+    observed = {}
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        session_id = "callback-session"
+
+        def run_conversation(self, user_message, conversation_history, task_id):
+            return {"final_response": "ok"}
+
+    def fake_create_agent(**kwargs):
+        observed.update(kwargs)
+        return FakeAgent()
+
+    reasoning_callback = MagicMock()
+    thinking_callback = MagicMock()
+    monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
+
+    await adapter._run_agent(
+        user_message="hello",
+        conversation_history=[],
+        session_id="callback-session",
+        reasoning_callback=reasoning_callback,
+        thinking_callback=thinking_callback,
+    )
+
+    assert observed["reasoning_callback"] is reasoning_callback
+    assert observed["thinking_callback"] is thinking_callback
+
+
+@pytest.mark.asyncio
 async def test_run_agent_registers_active_run_id_for_steering(adapter, monkeypatch):
     observed = {}
 
@@ -296,6 +329,62 @@ async def test_session_chat_stream_disconnect_keeps_control_refs_until_executor_
         await handler_task
 
     assert run_id not in adapter._active_run_agents
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_forwards_live_reasoning_and_thinking(adapter, session_db):
+    import json as _json
+
+    session_id = session_db.create_session("reasoning-stream", "api_server")
+
+    async def fake_run(**kwargs):
+        kwargs["thinking_callback"]("Waiting for provider")
+        kwargs["reasoning_callback"]("inspect ")
+        kwargs["reasoning_callback"]("the repository")
+        kwargs["tool_progress_callback"](
+            "reasoning.available",
+            tool_name="_thinking",
+            preview="inspect the repository",
+        )
+        kwargs["stream_delta_callback"]("Done")
+        return {
+            "final_response": "Done",
+            "session_id": session_id,
+            "messages": [{"role": "assistant", "content": "Done"}],
+        }, {"total_tokens": 4}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "inspect"},
+            )
+            assert resp.status == 200
+            body = await resp.text()
+
+    events = []
+    for block in body.split("\n\n"):
+        event = next((line[7:] for line in block.splitlines() if line.startswith("event: ")), None)
+        data = next((line[6:] for line in block.splitlines() if line.startswith("data: ")), None)
+        if event and data:
+            events.append((event, _json.loads(data)))
+
+    names = [name for name, _payload in events]
+    assert names.index("thinking.delta") < names.index("reasoning.delta")
+    assert [payload["text"] for name, payload in events if name == "reasoning.delta"] == [
+        "inspect ",
+        "the repository",
+    ]
+    assert any(
+        name == "reasoning.available" and payload["text"] == "inspect the repository"
+        for name, payload in events
+    )
+    assert any(
+        name == "tool.progress" and payload["tool_name"] == "_thinking"
+        for name, payload in events
+    )
+    assert names.index("reasoning.available") < names.index("assistant.delta")
 
 
 @pytest.mark.asyncio
@@ -436,6 +525,31 @@ def _patch_api_server_runtime(monkeypatch):
             "api_mode": "chat_completions",
         },
     )
+
+
+def test_create_agent_wires_reasoning_callbacks_into_runtime(adapter, monkeypatch):
+    _patch_api_server_runtime(monkeypatch)
+    captured = {}
+
+    class FakeAgent:
+        provider = "openrouter"
+        model = "global/model"
+
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    reasoning_callback = MagicMock()
+    thinking_callback = MagicMock()
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+
+    adapter._create_agent(
+        session_id="callback-session",
+        reasoning_callback=reasoning_callback,
+        thinking_callback=thinking_callback,
+    )
+
+    assert captured["reasoning_callback"] is reasoning_callback
+    assert captured["thinking_callback"] is thinking_callback
 
 
 @pytest.mark.asyncio
