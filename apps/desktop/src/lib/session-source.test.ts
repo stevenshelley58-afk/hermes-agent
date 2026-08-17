@@ -1,6 +1,26 @@
 import { describe, expect, it } from 'vitest'
 
-import { isMessagingSource, MESSAGING_SESSION_SOURCE_IDS, sessionSourceSearchTerms } from './session-source'
+import {
+  isMessagingSource,
+  LOCAL_SESSION_SOURCE_IDS,
+  MESSAGING_SESSION_SOURCE_IDS,
+  sessionSourceSearchTerms
+} from './session-source'
+
+// API-server sessions are local gateway clients such as Frank. They belong in
+// generic Recents: classifying them as messaging excludes them from Recents,
+// while Desktop has no API platform section in which to render them.
+describe('API server session registration', () => {
+  it('keeps API sessions in local recents instead of a hidden messaging section', () => {
+    expect(LOCAL_SESSION_SOURCE_IDS).toContain('api_server')
+    expect(MESSAGING_SESSION_SOURCE_IDS).not.toContain('api_server')
+    expect(isMessagingSource('api_server')).toBe(false)
+  })
+
+  it('keeps API sessions findable by their source label', () => {
+    expect(sessionSourceSearchTerms('api_server')).toContain('API')
+  })
+})
 
 // Regression guard for #46761 / PR #47395: Photon (iMessage) must keep its own
 // sidebar section. refreshMessagingSessions() filters rows through
