@@ -308,6 +308,26 @@ export interface SessionQueryOptions {
   excludeSources?: string[];
 }
 
+export interface KnowledgeSetupStatus {
+  configured: boolean;
+  api_key_set: boolean;
+  namespace: string;
+  allowed_project: string;
+  neo4j_version: string;
+  neo4j_image_pinned: boolean;
+  provider_ready: boolean;
+  projection_ready: boolean;
+  status: string;
+  message: string;
+  action?: string;
+  ok?: boolean;
+}
+
+export interface KnowledgeSetupResponse {
+  csrf_token: string;
+  status: KnowledgeSetupStatus;
+}
+
 function normalizeSessionQueryOptions(
   profileOrOptions?: string | SessionQueryOptions,
   order: "created" | "recent" = "created",
@@ -591,6 +611,28 @@ export const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ key }),
+    }),
+  getKnowledgeSetup: () =>
+    fetchJSON<KnowledgeSetupResponse>("/api/knowledge/setup"),
+  saveKnowledgeSetup: (csrfToken: string, idempotencyKey: string, openaiApiKey?: string) =>
+    fetchJSON<KnowledgeSetupResponse>("/api/knowledge/setup", {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Hermes-CSRF": csrfToken,
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify(openaiApiKey ? { openai_api_key: openaiApiKey } : {}),
+    }),
+  startKnowledgeSetup: (csrfToken: string, idempotencyKey: string) =>
+    fetchJSON<KnowledgeSetupResponse>("/api/knowledge/setup/start", {
+      method: "POST",
+      headers: { "X-Hermes-CSRF": csrfToken, "Idempotency-Key": idempotencyKey },
+    }),
+  checkKnowledgeSetup: (csrfToken: string, idempotencyKey: string) =>
+    fetchJSON<KnowledgeSetupResponse>("/api/knowledge/setup/check", {
+      method: "POST",
+      headers: { "X-Hermes-CSRF": csrfToken, "Idempotency-Key": idempotencyKey },
     }),
 
   // Cron jobs
@@ -1882,42 +1924,8 @@ export interface StatusResponse {
   gateway_updated_at: string | null;
   hermes_home: string;
   latest_config_version: number;
-  /** NS-656: memory-pressure rollup from the gateway heartbeat +
-   * lifecycle ledger. Absent on older gateways. */
-  memory?: MemoryPressureStatus;
-  /** NS-656: disk-usage rollup for the HERMES_HOME volume. Absent on
-   * older gateways. */
-  disk?: DiskPressureStatus;
   release_date: string;
   version: string;
-}
-
-/** NS-656: coarse memory telemetry served by /api/status. */
-export interface MemoryPressureStatus {
-  pressure: "ok" | "elevated" | "critical" | "unknown";
-  gateway_rss_mb?: number | null;
-  system_total_mb?: number | null;
-  system_available_mb?: number | null;
-  swap_used_mb?: number | null;
-  sampled_at?: string | null;
-  /** Previous gateway life died without running any exit path. */
-  last_boot_unclean?: boolean;
-  /** ...and its final heartbeat showed near-exhausted memory. Heuristic —
-   * strong evidence of an OOM kill, not proof the kernel OOM killer acted. */
-  last_boot_suspected_oom?: boolean;
-  /** Identity of the current gateway life (sentinel started_at). Changes on
-   * every restart; keys per-incident banner dismissal. */
-  boot_id?: string | null;
-}
-
-/** NS-656: coarse disk telemetry served by /api/status. Live statvfs
- * sample of the HERMES_HOME volume — no staleness dimension, so no
- * sampled_at. */
-export interface DiskPressureStatus {
-  pressure: "ok" | "elevated" | "critical" | "unknown";
-  total_mb?: number | null;
-  free_mb?: number | null;
-  used_percent?: number | null;
 }
 
 export interface SessionInfo {

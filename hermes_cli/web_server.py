@@ -89,6 +89,7 @@ from plugins.memory.config_schema import (
     STORAGE_HONCHO_HOST_BLOCK,
     get_provider_config_schema,
 )
+from hermes_cli import knowledge_setup
 from gateway.status import (
     derive_gateway_busy,
     derive_gateway_drainable,
@@ -351,6 +352,9 @@ def _resolve_session_token() -> str:
 _SESSION_TOKEN = _resolve_session_token()
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 _SSH_OWNER_NONCE: Optional[str] = None
+_KNOWLEDGE_CSRF_TOKENS: dict[str, tuple[str, float]] = {}
+_KNOWLEDGE_IDEMPOTENCY: dict[str, tuple[str, float]] = {}
+_KNOWLEDGE_ACTION_LOCK = threading.Lock()
 
 
 def _apply_ssh_session_token(token: str) -> None:
@@ -3331,46 +3335,6 @@ async def get_status(profile: Optional[str] = None):
             if all(item.get("status") == "ok" for item in components.values())
             else "degraded"
         )
-
-        # Memory-pressure rollup (NS-656). Distilled from the gateway's
-        # 30s loop heartbeat + lifecycle sentinel — two small file reads,
-        # no gateway IPC. Coarse MB numbers/enums/booleans only: this
-        # endpoint is public (PUBLIC_API_PATHS), same disclosure class as
-        # nous_session_valid above. Deliberately NOT folded into
-        # components/overall — memory pressure is advisory (toast/notice
-        # material), not a liveness verdict, and flipping `overall` to
-        # "degraded" on it would page NAS's availability sweep for a
-        # condition the valve is already handling.
-        try:
-            from gateway.memory_status import collect_memory_status
-
-            status["memory"] = await asyncio.get_running_loop().run_in_executor(
-                None,
-                functools.partial(
-                    collect_memory_status,
-                    profile_dir if profile_dir else get_hermes_home(),
-                ),
-            )
-        except Exception:
-            status["memory"] = {"pressure": "unknown"}
-
-        # Disk-usage rollup (NS-656, same lineage as OOF-2/OOF-107 fleet
-        # disk-exhaustion incidents). One statvfs call on HERMES_HOME's
-        # filesystem — coarse MB numbers + enum, same public disclosure
-        # class as the memory block, and equally advisory: not folded
-        # into components/overall.
-        try:
-            from gateway.disk_status import collect_disk_status
-
-            status["disk"] = await asyncio.get_running_loop().run_in_executor(
-                None,
-                functools.partial(
-                    collect_disk_status,
-                    profile_dir if profile_dir else get_hermes_home(),
-                ),
-            )
-        except Exception:
-            status["disk"] = {"pressure": "unknown"}
 
         # Deferred FTS rebuild progress (schema v23): lets the desktop /
         # dashboard render a "search index rebuilding: N%" indicator instead
@@ -17461,6 +17425,160 @@ async def get_plugins_hub(request: Request):
     except Exception as exc:
         _log.warning("plugins/hub failed: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to build plugins hub.") from exc
+
+
+class _KnowledgeSetupBody(BaseModel):
+    # SecretStr prevents accidental representation/logging of the submitted key.
+    openai_api_key: Optional[SecretStr] = None
+
+
+def _knowledge_origin_is_same(request: Request) -> bool:
+    if request.headers.get("sec-fetch-site", "") != "same-origin":
+        return False
+    origin = request.headers.get("origin", "")
+    host = request.headers.get("host", "")
+    if not origin or not host:
+        return False
+    parsed = urllib.parse.urlsplit(origin)
+    return parsed.scheme in {"http", "https"} and parsed.netloc == host and not parsed.path and not parsed.query and not parsed.fragment
+
+
+def _knowledge_csrf_token(request: Request) -> str:
+    # Loopback mode is bound to this process's ephemeral session token; gated
+    # mode is bound to the verified provider session access token.
+    return knowledge_setup.csrf_binding(request, loopback_token=_SESSION_TOKEN)
+
+
+def _knowledge_issue_csrf(request: Request) -> str:
+    now = time.monotonic()
+    for token, (_, expires) in list(_KNOWLEDGE_CSRF_TOKENS.items()):
+        if expires < now:
+            _KNOWLEDGE_CSRF_TOKENS.pop(token, None)
+    return knowledge_setup.mint_csrf(_knowledge_csrf_token(request), _KNOWLEDGE_CSRF_TOKENS, now)
+
+
+def _knowledge_mutation_guard(request: Request) -> str:
+    _require_token(request)
+    if not _knowledge_origin_is_same(request):
+        raise HTTPException(status_code=403, detail="Knowledge settings require a same-origin request.")
+    csrf = request.headers.get("X-Hermes-CSRF", "")
+    if not knowledge_setup.consume_csrf(csrf, _knowledge_csrf_token(request), _KNOWLEDGE_CSRF_TOKENS, time.monotonic()):
+        raise HTTPException(status_code=403, detail="Knowledge settings require a fresh session-bound CSRF token.")
+    idempotency = request.headers.get("Idempotency-Key", "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{16,128}", idempotency):
+        raise HTTPException(status_code=400, detail="A valid idempotency key is required.")
+    with _KNOWLEDGE_ACTION_LOCK:
+        now = time.monotonic()
+        for key, (_, expires) in list(_KNOWLEDGE_IDEMPOTENCY.items()):
+            if expires < now:
+                _KNOWLEDGE_IDEMPOTENCY.pop(key, None)
+        if idempotency in _KNOWLEDGE_IDEMPOTENCY:
+            raise HTTPException(status_code=409, detail="That knowledge action was already submitted.")
+        _KNOWLEDGE_IDEMPOTENCY[idempotency] = ("submitted", now + 3600.0)
+    return idempotency
+
+
+def _knowledge_redacted_status(base: dict[str, object], *, action: str, ok: bool, message: str) -> dict[str, object]:
+    result = dict(base)
+    result.update({"action": action, "ok": ok, "message": message})
+    return result
+
+
+def _run_knowledge_helper(helper: Path, timeout: float = 900.0) -> bool:
+    try:
+        for receipt_path in (
+            knowledge_setup.APPROVED_FRANK_RECEIPT,
+            knowledge_setup.APPROVED_FRANK_HELPER_RECEIPT,
+        ):
+            if receipt_path.is_symlink():
+                return False
+            receipt_info = receipt_path.stat()
+            if receipt_info.st_uid != 0 or receipt_info.st_mode & 0o022:
+                return False
+        release_receipt = knowledge_setup.APPROVED_FRANK_RECEIPT.read_bytes()
+        helper_receipt = knowledge_setup.APPROVED_FRANK_HELPER_RECEIPT.read_bytes()
+        if release_receipt != f"{knowledge_setup.APPROVED_FRANK_SHA}\n".encode("ascii"):
+            return False
+        if helper_receipt != f"{knowledge_setup.APPROVED_FRANK_HELPER_SHA256}\n".encode("ascii"):
+            return False
+    except (OSError, UnicodeError):
+        return False
+    if helper != knowledge_setup.DEPLOY_HELPER or helper.is_symlink():
+        return False
+    try:
+        parent = helper.parent
+        parent_stat = parent.stat()
+        info = helper.stat()
+        if parent.is_symlink() or parent_stat.st_uid != 0 or parent_stat.st_mode & 0o022:
+            return False
+        if info.st_uid != 0 or info.st_mode & 0o022 or not (info.st_mode & 0o111):
+            return False
+        digest = hashlib.sha256()
+        with helper.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if not hmac.compare_digest(digest.hexdigest(), knowledge_setup.APPROVED_FRANK_HELPER_SHA256):
+            return False
+    except OSError:
+        return False
+    env = {"PATH": "/usr/bin:/bin", "LANG": "C", "HERMES_HOME": str(get_hermes_home())}
+    try:
+        completed = subprocess.run(
+            ["sudo", "-n", str(helper)],
+            cwd="/",
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    # Helper output is intentionally discarded; no deployment or projection
+    # payload is ever returned to the browser or written to the Hermes log.
+    return completed.returncode == 0
+
+
+@app.get("/api/knowledge/setup")
+async def get_knowledge_setup(request: Request):
+    _require_token(request)
+    return {"csrf_token": _knowledge_issue_csrf(request), "status": knowledge_setup.status()}
+
+
+@app.put("/api/knowledge/setup")
+async def save_knowledge_setup(request: Request, body: _KnowledgeSetupBody):
+    _knowledge_mutation_guard(request)
+    try:
+        api_key = body.openai_api_key.get_secret_value() if body.openai_api_key is not None else None
+        status = await asyncio.to_thread(knowledge_setup.save_user_settings, api_key)
+    except knowledge_setup.KnowledgeSetupError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"csrf_token": _knowledge_issue_csrf(request), "status": _knowledge_redacted_status(status, action="save", ok=True, message="Saved securely.")}
+
+
+@app.post("/api/knowledge/setup/start")
+async def start_knowledge_setup(request: Request):
+    _knowledge_mutation_guard(request)
+    current = knowledge_setup.status()
+    if not current.get("configured"):
+        raise HTTPException(status_code=400, detail="Enter the OpenAI API key before starting knowledge.")
+    ok = await asyncio.to_thread(_run_knowledge_helper, knowledge_setup.DEPLOY_HELPER)
+    current["provider_ready"] = ok
+    current["projection_ready"] = ok
+    status = _knowledge_redacted_status(current, action="start", ok=ok, message="Knowledge is running." if ok else "Knowledge could not be started; retry after checking the setup.")
+    return {"csrf_token": _knowledge_issue_csrf(request), "status": status}
+
+
+@app.post("/api/knowledge/setup/check")
+async def check_knowledge_setup(request: Request):
+    _knowledge_mutation_guard(request)
+    ok = await asyncio.to_thread(_run_knowledge_helper, knowledge_setup.DEPLOY_HELPER, 900.0)
+    current = knowledge_setup.status()
+    current["provider_ready"] = ok
+    current["projection_ready"] = ok
+    status = _knowledge_redacted_status(current, action="check", ok=ok, message="Knowledge is healthy." if ok else "Knowledge is not ready; retry after correcting the setup.")
+    return {"csrf_token": _knowledge_issue_csrf(request), "status": status}
 
 
 @app.post("/api/dashboard/agent-plugins/install")
