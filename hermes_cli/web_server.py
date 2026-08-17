@@ -89,6 +89,7 @@ from plugins.memory.config_schema import (
     STORAGE_HONCHO_HOST_BLOCK,
     get_provider_config_schema,
 )
+from hermes_cli import knowledge_setup
 from gateway.status import (
     derive_gateway_busy,
     derive_gateway_drainable,
@@ -136,94 +137,6 @@ except ImportError:
 
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
-
-
-def _process_start_marker(pid: int) -> str:
-    """Return a cross-runtime marker for the current incarnation of ``pid``.
-
-    ``ProcessLookupError`` means the process is absent. Other failures are left
-    distinct so callers can fail safe rather than killing a healthy backend.
-    """
-    if sys.platform == "linux":
-        try:
-            stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        except FileNotFoundError as exc:
-            raise ProcessLookupError(pid) from exc
-
-        # The command in field 2 may contain spaces or parentheses. Splitting
-        # after its final ')' leaves field 3 at index zero and field 22 at 19.
-        fields = stat_line.rsplit(")", 1)[1].strip().split()
-        if len(fields) < 20 or not fields[19].isdigit():
-            raise OSError(f"invalid /proc stat data for PID {pid}")
-        return f"linux:{fields[19]}"
-
-    if os.name == "nt":
-        import ctypes
-        from ctypes import wintypes
-
-        process_query_limited_information = 0x1000
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.GetProcessTimes.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(wintypes.FILETIME),
-            ctypes.POINTER(wintypes.FILETIME),
-            ctypes.POINTER(wintypes.FILETIME),
-            ctypes.POINTER(wintypes.FILETIME),
-        ]
-        kernel32.GetProcessTimes.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
-        if not handle:
-            error = ctypes.get_last_error()
-            if error in (87, 1168):  # invalid parameter / not found
-                raise ProcessLookupError(pid)
-            raise OSError(error, f"OpenProcess failed for PID {pid}")
-
-        creation = wintypes.FILETIME()
-        exit_time = wintypes.FILETIME()
-        kernel = wintypes.FILETIME()
-        user = wintypes.FILETIME()
-        try:
-            if not kernel32.GetProcessTimes(
-                handle,
-                ctypes.byref(creation),
-                ctypes.byref(exit_time),
-                ctypes.byref(kernel),
-                ctypes.byref(user),
-            ):
-                error = ctypes.get_last_error()
-                raise OSError(error, f"GetProcessTimes failed for PID {pid}")
-        finally:
-            kernel32.CloseHandle(handle)
-
-        filetime = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
-        return f"win:{filetime + 504911232000000000}"
-
-    result = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "lstart="],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    marker = result.stdout.strip()
-    if result.returncode == 0 and marker:
-        return f"ps:{marker}"
-    if result.returncode == 1 and not marker:
-        raise ProcessLookupError(pid)
-    raise OSError(f"ps could not inspect PID {pid}: {result.stderr.strip()}")
-
-
-def _valid_parent_start_marker(marker: str) -> bool:
-    prefix, separator, value = marker.partition(":")
-    if not separator or not value or value != value.strip():
-        return False
-    if prefix in ("linux", "win"):
-        return value.isdigit()
-    return prefix == "ps"
-
 
 # ---------------------------------------------------------------------------
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
@@ -304,27 +217,6 @@ def _resolve_restart_drain_timeout() -> float:
         return DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
 
 
-def _eager_reconcile_own_session_db() -> None:
-    """One writable open of this process's own state.db at startup.
-
-    ``SessionDB.__init__`` runs ``_init_schema`` → ``_reconcile_columns``,
-    bringing a store left behind by `hermes update` current before the
-    dashboard's first session-list poll, with the open-time lock patience
-    (jittered retries) absorbing transient contention. Never raises: a
-    store this cannot fix is still served through the read-probe heal in
-    :func:`_open_session_db_at_path`, which retries on every poll.
-    """
-    try:
-        from hermes_state import SessionDB, _default_db_path
-
-        SessionDB(db_path=Path(_default_db_path()), read_only=False).close()
-    except Exception as exc:
-        _log.warning(
-            "startup schema reconcile of state.db failed (%s); session "
-            "reads will retry the heal per poll", exc,
-        )
-
-
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
     app.state.event_channels = {}  # dict[str, set]
@@ -335,23 +227,6 @@ async def _lifespan(app: "FastAPI"):
     # On app.state (not a module global) so the Lock binds to the running
     # event loop during lifespan startup — see _get_event_state's docstring.
     app.state.chat_argv_lock = asyncio.Lock()
-
-    # Bring this profile's state.db schema current BEFORE the first
-    # session-list poll (#79531/#80037). Migrations used to run lazily on
-    # the first writable open — typically the user's first new session —
-    # so a store left behind by `hermes update` kept 500ing every
-    # /api/sessions poll (and the read-probe heal, while it retries per
-    # poll, can lose repeatedly to lock contention from orphaned sibling
-    # backends). One writable open here runs _init_schema →
-    # _reconcile_columns with the full open-time lock patience. Runs in a
-    # daemon thread so a locked store never delays the server socket (the
-    # Desktop ready-probe times out at 10s, GH-73083); reads that land
-    # before it finishes are still covered by the read-probe heal.
-    threading.Thread(
-        target=_eager_reconcile_own_session_db,
-        daemon=True,
-        name="statedb-eager-reconcile",
-    ).start()
 
     # Import hermes_cli.gateway eagerly *before* the lifespan yield so the
     # GIL-heavy .pyc compilation and Defender scan cost is absorbed during
@@ -403,12 +278,12 @@ async def _lifespan(app: "FastAPI"):
     try:
         yield
     finally:
-        if cron_stop is not None:
-            cron_stop.set()
         pty_reaper_task.cancel()
         selftest_task.cancel()
         auto_archive_task.cancel()
         await PTY_REGISTRY.close_all()
+        if cron_stop is not None:
+            cron_stop.set()
         if os.getenv("HERMES_DESKTOP") == "1":
             _terminate_desktop_managed_gateway()
 
@@ -455,7 +330,6 @@ def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
 
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
 
-
 # Memory-provider OAuth connect routes live in the memory layer, not here.
 from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
 
@@ -478,6 +352,9 @@ def _resolve_session_token() -> str:
 _SESSION_TOKEN = _resolve_session_token()
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 _SSH_OWNER_NONCE: Optional[str] = None
+_KNOWLEDGE_CSRF_TOKENS: dict[str, tuple[str, float]] = {}
+_KNOWLEDGE_IDEMPOTENCY: dict[str, tuple[str, float]] = {}
+_KNOWLEDGE_ACTION_LOCK = threading.Lock()
 
 
 def _apply_ssh_session_token(token: str) -> None:
@@ -1886,21 +1763,6 @@ _MEDIA_CONTENT_TYPES = {
 _MEDIA_MAX_BYTES = 25 * 1024 * 1024
 _MANAGED_FILES_ROOT_ENV = "HERMES_DASHBOARD_FILES_ROOT"
 _MANAGED_FILE_MAX_BYTES = 100 * 1024 * 1024
-_STREAMABLE_MEDIA_EXTENSIONS = frozenset(
-    {
-        ".avi",
-        ".flac",
-        ".m4a",
-        ".mkv",
-        ".mov",
-        ".mp3",
-        ".mp4",
-        ".ogg",
-        ".opus",
-        ".wav",
-        ".webm",
-    }
-)
 _HOSTED_MANAGED_FILES_ROOT = Path("/opt/data")
 
 
@@ -2591,14 +2453,17 @@ async def read_managed_file(request: Request, path: str):
     }
 
 
-def _managed_file_response(
-    request: Request,
-    path: str,
-    *,
-    content_disposition_type: str,
-    media_only: bool = False,
-) -> FileResponse:
-    """Build a range-aware response after applying managed-file policy."""
+@app.get("/api/files/download")
+async def download_managed_file(request: Request, path: str):
+    """Stream a managed file as an attachment download.
+
+    Remote clients (desktop app, browser dashboard) open agent-written files
+    that live on *this* gateway's disk, not theirs. Auth-gated like every other
+    managed-files route — ``auth_middleware`` additionally accepts the session
+    token as a ``?token=`` query param here so a shell/browser-opened download
+    (which can't set the session header) still authenticates. See ``/api/pty``
+    for the same query-token precedent.
+    """
     policy, target, _display_path = _resolve_managed_path(path, request)
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
@@ -2606,8 +2471,6 @@ def _managed_file_response(
         raise HTTPException(status_code=400, detail="Path is not a file")
     if _is_sensitive_path(target):
         raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
-    if media_only and target.suffix.lower() not in _STREAMABLE_MEDIA_EXTENSIONS:
-        raise HTTPException(status_code=415, detail="Unsupported media type")
 
     try:
         size = target.stat().st_size
@@ -2622,52 +2485,7 @@ def _managed_file_response(
         path=str(target),
         media_type=mime_type,
         filename=target.name,
-        content_disposition_type=content_disposition_type,
-        headers={"X-Content-Type-Options": "nosniff"} if media_only else None,
-    )
-
-
-@app.get("/api/files/download")
-async def download_managed_file(request: Request, path: str):
-    """Stream a managed file as an attachment download.
-
-    Remote clients (desktop app, browser dashboard) open agent-written files
-    that live on *this* gateway's disk, not theirs. Auth-gated like every other
-    managed-files route — ``auth_middleware`` additionally accepts the session
-    token as a ``?token=`` query param here so a shell/browser-opened download
-    (which can't set the session header) still authenticates. See ``/api/pty``
-    for the same query-token precedent. Chromium identifies ``<audio>`` and
-    ``<video>`` subresource requests through ``Sec-Fetch-Dest``; serve those
-    inline for compatibility with Desktop builds that still use this route as
-    their player source, while preserving attachment semantics for ordinary
-    link/document requests.
-    """
-    fetch_destination = request.headers.get("sec-fetch-dest", "").lower()
-    is_media_subresource = fetch_destination in {"audio", "video"}
-    return _managed_file_response(
-        request,
-        path,
-        content_disposition_type="inline" if is_media_subresource else "attachment",
-        media_only=is_media_subresource,
-    )
-
-
-@app.get("/api/files/stream")
-@app.head("/api/files/stream")
-async def stream_managed_file(request: Request, path: str):
-    """Stream managed audio/video inline with HTTP Range support.
-
-    Electron's Chromium media pipeline may reject an attachment response used
-    as an ``<audio>`` or ``<video>`` source. This route shares the download
-    endpoint's authentication, size cap, sensitive-file guard, MIME detection,
-    and Starlette ``FileResponse`` range handling, but explicitly marks the
-    response inline so metadata loading, playback, and seeking work remotely.
-    """
-    return _managed_file_response(
-        request,
-        path,
-        content_disposition_type="inline",
-        media_only=True,
+        content_disposition_type="attachment",
     )
 
 
@@ -2925,19 +2743,6 @@ async def fs_read_data_url(path: str):
     except OSError as exc:
         raise HTTPException(status_code=400, detail=str(exc) or "File read failed")
     return {"dataUrl": f"data:{_fs_mime_type(target)};base64,{encoded}"}
-
-
-@app.get("/api/fs/download")
-async def fs_download(path: str):
-    target, _st = _fs_regular_file(_fs_path(path))
-    if _is_sensitive_path(target):
-        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
-    return FileResponse(
-        path=str(target),
-        media_type=_fs_mime_type(target),
-        filename=target.name,
-        content_disposition_type="attachment",
-    )
 
 
 @app.get("/api/fs/git-root")
@@ -3424,13 +3229,10 @@ async def get_status(profile: Optional[str] = None):
         # to decide whether it can use the system-browser + loopback + PKCE
         # flow (no embedded webview, no session cookies) or must fall back to
         # the legacy embedded-webview cookie flow. "cookie" is always available
-        # in gated mode; "native_pkce" is present when at least one interactive
-        # session provider is registered — OAuth providers broker the upstream
-        # IDP round trip, password providers complete interactively at /login
-        # in the system browser (where OS password managers can autofill; an
-        # embedded webview cannot reach them). Token-only credentials (e.g.
-        # drain) don't count. Absent field / missing "native_pkce" ⇒ older
-        # gateway ⇒ desktop falls back automatically.
+        # in gated mode; "native_pkce" is present only when at least one
+        # registered session provider is a brokerable OAuth provider (not a
+        # password or token-only credential). Absent field / missing
+        # "native_pkce" ⇒ older gateway ⇒ desktop falls back automatically.
         auth_flows: list[str] = []
         try:
             from hermes_cli.dashboard_auth import (
@@ -3440,7 +3242,11 @@ async def get_status(profile: Optional[str] = None):
             auth_providers = [p.name for p in _list_providers()]
             if auth_required:
                 auth_flows.append("cookie")
-                if _list_session_providers():
+                brokerable = [
+                    p for p in _list_session_providers()
+                    if not getattr(p, "supports_password", False)
+                ]
+                if brokerable:
                     auth_flows.append("native_pkce")
         except Exception:
             # Module not importable yet (early startup) — leave as [].
@@ -3529,46 +3335,6 @@ async def get_status(profile: Optional[str] = None):
             if all(item.get("status") == "ok" for item in components.values())
             else "degraded"
         )
-
-        # Memory-pressure rollup (NS-656). Distilled from the gateway's
-        # 30s loop heartbeat + lifecycle sentinel — two small file reads,
-        # no gateway IPC. Coarse MB numbers/enums/booleans only: this
-        # endpoint is public (PUBLIC_API_PATHS), same disclosure class as
-        # nous_session_valid above. Deliberately NOT folded into
-        # components/overall — memory pressure is advisory (toast/notice
-        # material), not a liveness verdict, and flipping `overall` to
-        # "degraded" on it would page NAS's availability sweep for a
-        # condition the valve is already handling.
-        try:
-            from gateway.memory_status import collect_memory_status
-
-            status["memory"] = await asyncio.get_running_loop().run_in_executor(
-                None,
-                functools.partial(
-                    collect_memory_status,
-                    profile_dir if profile_dir else get_hermes_home(),
-                ),
-            )
-        except Exception:
-            status["memory"] = {"pressure": "unknown"}
-
-        # Disk-usage rollup (NS-656, same lineage as OOF-2/OOF-107 fleet
-        # disk-exhaustion incidents). One statvfs call on HERMES_HOME's
-        # filesystem — coarse MB numbers + enum, same public disclosure
-        # class as the memory block, and equally advisory: not folded
-        # into components/overall.
-        try:
-            from gateway.disk_status import collect_disk_status
-
-            status["disk"] = await asyncio.get_running_loop().run_in_executor(
-                None,
-                functools.partial(
-                    collect_disk_status,
-                    profile_dir if profile_dir else get_hermes_home(),
-                ),
-            )
-        except Exception:
-            status["disk"] = {"pressure": "unknown"}
 
         # Deferred FTS rebuild progress (schema v23): lets the desktop /
         # dashboard render a "search index rebuilding: N%" indicator instead
@@ -6896,12 +6662,12 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
         # event-loop thread could cross-restore the module globals).
         if model and not body.confirm_expensive_model:
             try:
-                from hermes_cli.model_selection_guards import combined_selection_warning
+                from hermes_cli.model_cost_guard import expensive_model_warning
 
                 # Pricing lookup can hit models.dev / a /models endpoint on a
                 # cache miss — keep it off the event loop.
                 warning = await asyncio.to_thread(
-                    combined_selection_warning,
+                    expensive_model_warning,
                     model,
                     provider=provider,
                     base_url=base_url,
@@ -6954,7 +6720,16 @@ def _apply_model_assignment_sync(
         model_cfg = _apply_main_model_assignment(
             cfg.get("model", {}), provider, model, base_url, api_key
         )
-        if isinstance(provider_entry, dict) and provider_entry.get("api_key"):
+        # Fall back to the provider entry's stored key only when the request
+        # didn't carry one — same precedence as the base_url fill above. An
+        # unconditional overwrite silently discards a key the caller is
+        # rotating in, and model.api_key outranks the environment at client
+        # construction (#62269), so the stale key keeps authenticating.
+        if (
+            not api_key
+            and isinstance(provider_entry, dict)
+            and provider_entry.get("api_key")
+        ):
             model_cfg["api_key"] = provider_entry["api_key"]
         cfg["model"] = model_cfg
 
@@ -12069,23 +11844,10 @@ def _validate_dashboard_cron_context_from(
 
 
 def _cron_profile_dicts() -> List[Dict[str, Any]]:
-    """Return the minimal profile records needed by cron aggregation.
-
-    The two callers only consume ``name``.  ``list_profiles()`` also parses
-    config/distribution metadata, probes gateway processes, and counts skills
-    for every profile; polling cron jobs through that path creates avoidable
-    GIL pressure on large profile pools.
-    """
+    """Return dashboard profile records, falling back to a directory scan."""
     from hermes_cli import profiles as profiles_mod
     try:
-        return [
-            {
-                "name": name,
-                "path": str(home),
-                "is_default": name == "default",
-            }
-            for name, home in profiles_mod.profiles_to_serve(multiplex=True)
-        ]
+        return [_profile_to_dict(p) for p in profiles_mod.list_profiles()]
     except Exception:
         _log.exception("Failed to list profiles for cron dashboard; falling back to directory scan")
         return _fallback_profile_dicts(profiles_mod)
@@ -12165,73 +11927,6 @@ def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args,
         return [_annotate_cron_job(j, profile_name, home) for j in result]
     if isinstance(result, dict):
         return _annotate_cron_job(result, profile_name, home)
-    return result
-
-
-def _notify_cron_provider_for_profile(target_profile: Optional[str]) -> None:
-    """Best-effort provider reconcile against one profile's job store.
-
-    Fail-closed for external providers on a multi-profile dashboard: an
-    external provider's ``reconcile`` converges its REMOTE registry toward
-    one profile's jobs.json, and its orphan cleanup cancels every remote
-    entry absent from that store. The NAS registry is not profile-scoped,
-    so reconciling profile B would silently disarm profile A's one-shots.
-    Until the provider contract carries a profile identity through
-    arm/cancel/list, a multi-profile dashboard must not drive unscoped
-    external reconciles at all — the affected profile simply re-arms on
-    its next fire/start (idempotent via dedup_key). The built-in provider
-    re-reads jobs.json each tick and stays a no-op here.
-    """
-    try:
-        _profile_name, home = _cron_profile_home(target_profile)
-        from cron import jobs as cron_jobs
-        from cron.scheduler_provider import (
-            InProcessCronScheduler,
-            resolve_cron_scheduler,
-        )
-        from hermes_constants import (
-            reset_hermes_home_override,
-            set_hermes_home_override,
-        )
-
-        token = set_hermes_home_override(str(home))
-        try:
-            with cron_jobs.use_cron_store(home):
-                provider = resolve_cron_scheduler()
-                if not isinstance(provider, InProcessCronScheduler):
-                    profile_names = [
-                        str(p.get("name") or "")
-                        for p in _cron_profile_dicts()
-                    ]
-                    if len([n for n in profile_names if n]) > 1:
-                        _log.warning(
-                            "Skipping cron provider reconcile for profile %s: "
-                            "external provider '%s' reconcile is not "
-                            "profile-scoped and would disarm other profiles' "
-                            "armed one-shots. The mutated profile re-arms "
-                            "idempotently on its next fire/start.",
-                            target_profile,
-                            provider.name,
-                        )
-                        return
-                provider.on_jobs_changed()
-        finally:
-            reset_hermes_home_override(token)
-    except Exception:
-        _log.debug(
-            "Cron provider reconciliation failed for profile %s",
-            target_profile,
-            exc_info=True,
-        )
-
-
-def _mutate_cron_for_profile(
-    target_profile: Optional[str], func_name: str, *args, **kwargs
-):
-    """Apply a cron store mutation and reconcile its scheduler provider."""
-    result = _call_cron_for_profile(target_profile, func_name, *args, **kwargs)
-    if result:
-        _notify_cron_provider_for_profile(target_profile)
     return result
 
 
@@ -12379,7 +12074,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
             "script": script,
             "no_agent": no_agent,
         })
-        return _mutate_cron_for_profile(
+        return _call_cron_for_profile(
             profile_name,
             "create_job",
             prompt=body.prompt or "",
@@ -12432,7 +12127,7 @@ def _update_cron_job_sync(job_id: str, body: CronJobUpdate, profile: Optional[st
             if "skills" in updates and "skill" not in updates:
                 effective["skill"] = None
             _validate_dashboard_cron_effective_job(effective)
-        job = _mutate_cron_for_profile(profile_name, "update_job", job_id, updates)
+        job = _call_cron_for_profile(profile_name, "update_job", job_id, updates)
     except HTTPException:
         raise
     except ValueError as exc:
@@ -12448,7 +12143,7 @@ def _pause_cron_job_sync(job_id: str, profile: Optional[str] = None):
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _mutate_cron_for_profile(selected, "pause_job", job_id)
+    job = _call_cron_for_profile(selected, "pause_job", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
@@ -12460,7 +12155,7 @@ def _resume_cron_job_sync(job_id: str, profile: Optional[str] = None):
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _mutate_cron_for_profile(selected, "resume_job", job_id)
+    job = _call_cron_for_profile(selected, "resume_job", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
@@ -12472,34 +12167,10 @@ def _trigger_cron_job_sync(job_id: str, profile: Optional[str] = None):
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(selected, "resolve_job_ref", job_id)
+    job = _call_cron_for_profile(selected, "trigger_job", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    # Do not expose the job as due before claiming it: the built-in ticker and
-    # external/manual fire paths share the same durable claim, so only one can
-    # execute this selected run even if they race across processes. Active jobs
-    # keep the legacy provider call shape; paused jobs need the explicit force
-    # flag to resume and claim atomically.
-    force = not job.get("enabled", True) or job.get("state") == "paused"
-    ran = _fire_cron_job_for_profile(selected, job["id"], force=force)
-    refreshed = _call_cron_for_profile(selected, "get_job", job["id"])
-    if refreshed and refreshed.get("last_run_at") != job.get("last_run_at"):
-        return refreshed
-    if not ran:
-        raise HTTPException(
-            status_code=409,
-            detail="Job is already running or was claimed by another scheduler",
-        )
-    if refreshed:
-        return refreshed
-    # A one-shot may remove itself after exhausting repeat=1. Keep the response
-    # shape compatible without inventing an outcome that is no longer present
-    # in the job store; authoritative list refresh removes the completed row.
-    return {
-        **job,
-        "enabled": False,
-        "state": "completed",
-    }
+    return job
 
 
 
@@ -12509,7 +12180,7 @@ def _delete_cron_job_sync(job_id: str, profile: Optional[str] = None):
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
     try:
-        removed = _mutate_cron_for_profile(selected, "remove_job", job_id)
+        removed = _call_cron_for_profile(selected, "remove_job", job_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not removed:
@@ -12519,17 +12190,8 @@ def _delete_cron_job_sync(job_id: str, profile: Optional[str] = None):
 
 
 
-def _fire_cron_job_for_profile(
-    profile: str,
-    job_id: str,
-    *,
-    force: bool = False,
-) -> bool:
-    """DEPRECATED for NAS webhook fires (superseded by gateway forwarding);
-    retained for the dashboard trigger path — do not add new uses.
-
-    Run ONE due cron job end-to-end for ``profile`` via the resolved
-    scheduler provider's ``fire_due`` (store CAS claim + ``run_one_job``).
+def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
+    """DEPRECATED — retained only until callers migrate; do not add new uses.
 
     Superseded by :func:`_forward_cron_fire_to_gateway`: cron fires must
     execute in the GATEWAY process (which owns the live platform adapters),
@@ -12541,10 +12203,7 @@ def _fire_cron_job_for_profile(
     """
     _profile_name, home = _cron_profile_home(profile)
     from cron import jobs as cron_jobs
-    from cron.scheduler_provider import (
-        provider_supports_force_fire,
-        resolve_cron_scheduler,
-    )
+    from cron.scheduler_provider import resolve_cron_scheduler
     from hermes_constants import (
         reset_hermes_home_override,
         set_hermes_home_override,
@@ -12554,18 +12213,6 @@ def _fire_cron_job_for_profile(
     try:
         with cron_jobs.use_cron_store(home):
             provider = resolve_cron_scheduler()
-            if force:
-                if not provider_supports_force_fire(provider):
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            f"Cron provider '{getattr(provider, 'name', 'custom')}' "
-                            "does not support atomic forced firing of paused jobs"
-                        ),
-                    )
-                return bool(
-                    provider.fire_due(job_id, adapters=None, loop=None, force=True)
-                )
             return bool(provider.fire_due(job_id, adapters=None, loop=None))
     finally:
         reset_hermes_home_override(token)
@@ -15208,10 +14855,6 @@ else:
 
 _RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
 _PTY_READ_CHUNK_TIMEOUT = 0.2
-# Back-off delay between idle PTY reads so a quiet terminal does not spin
-# the event loop.  A positive sleep lets other coroutines run and keeps
-# dashboard idle CPU low (#42627).
-_PTY_IDLE_BACKOFF = 0.05
 
 # Keep-alive PTY sessions: a terminal connecting with ``?attach=<token>`` is
 # bound to a process that survives disconnect/refresh and is reattachable.
@@ -15246,7 +14889,7 @@ async def _legacy_pump(ws: "WebSocket", bridge) -> None:
                 if chunk is None:  # EOF
                     return
                 if not chunk:  # no data this tick; yield control and retry
-                    await asyncio.sleep(_PTY_IDLE_BACKOFF)
+                    await asyncio.sleep(0)
                     continue
                 try:
                     await ws.send_bytes(chunk)
@@ -16569,10 +16212,7 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=1011)
         return
 
-    # A fresh xterm cannot reliably reconstruct the TUI from an arbitrary
-    # bounded tail of alternate-screen, differential ANSI output. Reused PTYs
-    # emit a complete frame after replay so reconnects never reopen blank.
-    await session.attach(ws, force_redraw=not _created)
+    await session.attach(ws)
 
     # --- writer loop: WebSocket → PTY master ----------------------------
     # No reader task here: the session's drain task (spawned once per PTY,
@@ -17787,6 +17427,161 @@ async def get_plugins_hub(request: Request):
         raise HTTPException(status_code=500, detail="Failed to build plugins hub.") from exc
 
 
+class _KnowledgeSetupBody(BaseModel):
+    # SecretStr prevents accidental representation/logging of the submitted key.
+    openai_api_key: Optional[SecretStr] = None
+
+
+def _knowledge_origin_is_same(request: Request) -> bool:
+    if request.headers.get("sec-fetch-site", "") != "same-origin":
+        return False
+    origin = request.headers.get("origin", "")
+    host = request.headers.get("host", "")
+    if not origin or not host:
+        return False
+    parsed = urllib.parse.urlsplit(origin)
+    return parsed.scheme in {"http", "https"} and parsed.netloc == host and not parsed.path and not parsed.query and not parsed.fragment
+
+
+def _knowledge_csrf_token(request: Request) -> str:
+    # Loopback mode is bound to this process's ephemeral session token; gated
+    # mode is bound to the verified provider session access token.
+    return knowledge_setup.csrf_binding(request, loopback_token=_SESSION_TOKEN)
+
+
+def _knowledge_issue_csrf(request: Request) -> str:
+    now = time.monotonic()
+    for token, (_, expires) in list(_KNOWLEDGE_CSRF_TOKENS.items()):
+        if expires < now:
+            _KNOWLEDGE_CSRF_TOKENS.pop(token, None)
+    return knowledge_setup.mint_csrf(_knowledge_csrf_token(request), _KNOWLEDGE_CSRF_TOKENS, now)
+
+
+def _knowledge_mutation_guard(request: Request) -> str:
+    _require_token(request)
+    if not _knowledge_origin_is_same(request):
+        raise HTTPException(status_code=403, detail="Knowledge settings require a same-origin request.")
+    csrf = request.headers.get("X-Hermes-CSRF", "")
+    if not knowledge_setup.consume_csrf(csrf, _knowledge_csrf_token(request), _KNOWLEDGE_CSRF_TOKENS, time.monotonic()):
+        raise HTTPException(status_code=403, detail="Knowledge settings require a fresh session-bound CSRF token.")
+    idempotency = request.headers.get("Idempotency-Key", "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{16,128}", idempotency):
+        raise HTTPException(status_code=400, detail="A valid idempotency key is required.")
+    with _KNOWLEDGE_ACTION_LOCK:
+        now = time.monotonic()
+        for key, (_, expires) in list(_KNOWLEDGE_IDEMPOTENCY.items()):
+            if expires < now:
+                _KNOWLEDGE_IDEMPOTENCY.pop(key, None)
+        if idempotency in _KNOWLEDGE_IDEMPOTENCY:
+            raise HTTPException(status_code=409, detail="That knowledge action was already submitted.")
+        _KNOWLEDGE_IDEMPOTENCY[idempotency] = ("submitted", now + 3600.0)
+    return idempotency
+
+
+def _knowledge_redacted_status(base: dict[str, object], *, action: str, ok: bool, message: str) -> dict[str, object]:
+    result = dict(base)
+    result.update({"action": action, "ok": ok, "message": message})
+    return result
+
+
+def _run_knowledge_helper(helper: Path, timeout: float = 900.0) -> bool:
+    try:
+        for receipt_path in (
+            knowledge_setup.APPROVED_FRANK_RECEIPT,
+            knowledge_setup.APPROVED_FRANK_HELPER_RECEIPT,
+        ):
+            if receipt_path.is_symlink():
+                return False
+            receipt_info = receipt_path.stat()
+            if receipt_info.st_uid != 0 or receipt_info.st_mode & 0o022:
+                return False
+        release_receipt = knowledge_setup.APPROVED_FRANK_RECEIPT.read_bytes()
+        helper_receipt = knowledge_setup.APPROVED_FRANK_HELPER_RECEIPT.read_bytes()
+        if release_receipt != f"{knowledge_setup.APPROVED_FRANK_SHA}\n".encode("ascii"):
+            return False
+        if helper_receipt != f"{knowledge_setup.APPROVED_FRANK_HELPER_SHA256}\n".encode("ascii"):
+            return False
+    except (OSError, UnicodeError):
+        return False
+    if helper != knowledge_setup.DEPLOY_HELPER or helper.is_symlink():
+        return False
+    try:
+        parent = helper.parent
+        parent_stat = parent.stat()
+        info = helper.stat()
+        if parent.is_symlink() or parent_stat.st_uid != 0 or parent_stat.st_mode & 0o022:
+            return False
+        if info.st_uid != 0 or info.st_mode & 0o022 or not (info.st_mode & 0o111):
+            return False
+        digest = hashlib.sha256()
+        with helper.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if not hmac.compare_digest(digest.hexdigest(), knowledge_setup.APPROVED_FRANK_HELPER_SHA256):
+            return False
+    except OSError:
+        return False
+    env = {"PATH": "/usr/bin:/bin", "LANG": "C", "HERMES_HOME": str(get_hermes_home())}
+    try:
+        completed = subprocess.run(
+            ["sudo", "-n", str(helper)],
+            cwd="/",
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    # Helper output is intentionally discarded; no deployment or projection
+    # payload is ever returned to the browser or written to the Hermes log.
+    return completed.returncode == 0
+
+
+@app.get("/api/knowledge/setup")
+async def get_knowledge_setup(request: Request):
+    _require_token(request)
+    return {"csrf_token": _knowledge_issue_csrf(request), "status": knowledge_setup.status()}
+
+
+@app.put("/api/knowledge/setup")
+async def save_knowledge_setup(request: Request, body: _KnowledgeSetupBody):
+    _knowledge_mutation_guard(request)
+    try:
+        api_key = body.openai_api_key.get_secret_value() if body.openai_api_key is not None else None
+        status = await asyncio.to_thread(knowledge_setup.save_user_settings, api_key)
+    except knowledge_setup.KnowledgeSetupError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"csrf_token": _knowledge_issue_csrf(request), "status": _knowledge_redacted_status(status, action="save", ok=True, message="Saved securely.")}
+
+
+@app.post("/api/knowledge/setup/start")
+async def start_knowledge_setup(request: Request):
+    _knowledge_mutation_guard(request)
+    current = knowledge_setup.status()
+    if not current.get("configured"):
+        raise HTTPException(status_code=400, detail="Enter the OpenAI API key before starting knowledge.")
+    ok = await asyncio.to_thread(_run_knowledge_helper, knowledge_setup.DEPLOY_HELPER)
+    current["provider_ready"] = ok
+    current["projection_ready"] = ok
+    status = _knowledge_redacted_status(current, action="start", ok=ok, message="Knowledge is running." if ok else "Knowledge could not be started; retry after checking the setup.")
+    return {"csrf_token": _knowledge_issue_csrf(request), "status": status}
+
+
+@app.post("/api/knowledge/setup/check")
+async def check_knowledge_setup(request: Request):
+    _knowledge_mutation_guard(request)
+    ok = await asyncio.to_thread(_run_knowledge_helper, knowledge_setup.DEPLOY_HELPER, 900.0)
+    current = knowledge_setup.status()
+    current["provider_ready"] = ok
+    current["projection_ready"] = ok
+    status = _knowledge_redacted_status(current, action="check", ok=ok, message="Knowledge is healthy." if ok else "Knowledge is not ready; retry after correcting the setup.")
+    return {"csrf_token": _knowledge_issue_csrf(request), "status": status}
+
+
 @app.post("/api/dashboard/agent-plugins/install")
 async def post_agent_plugin_install(request: Request, body: _AgentPluginInstallBody):
     _require_token(request)
@@ -18232,80 +18027,53 @@ def _maybe_open_browser(
     threading.Thread(target=_open, daemon=True).start()
 
 
-def _is_serve_orphaned(
-    desktop_pid: int,
-    expected_start_marker: Optional[str] = None,
-    *,
-    pid_exists=None,
-    process_start_marker=None,
-) -> bool:
-    """True when the exact Desktop process that owns this backend is gone.
+def _is_serve_orphaned(desktop_pid: int, pid_exists=None) -> bool:
+    """True when the Desktop process that owns this serve backend is gone.
 
     ``HERMES_PARENT_PID`` is the Electron Desktop PID, not necessarily this
     Python process's immediate PPID. On Windows the venv ``hermes.exe`` launcher
     introduces one or more shim processes, so comparing ``os.getppid()`` to the
     Electron PID incorrectly treats a healthy backend as orphaned and exits 0.
+    Probe the recorded Desktop PID directly instead.
 
-    New Desktop versions also provide the owner's process-start marker. This
-    prevents a recycled PID from keeping an orphan alive. Older versions remain
-    compatible through the PID-only probe. Any inconclusive probe failure is
-    fail-safe: keep serving rather than killing a backend whose owner could not
-    be conclusively shown to be dead.
+    Any liveness-probe failure is fail-safe: keep serving rather than killing a
+    backend whose owner could not be conclusively shown to be dead.
     """
     try:
-        if expected_start_marker is not None:
-            probe = process_start_marker or _process_start_marker
-            return probe(int(desktop_pid)) != expected_start_marker
-
         if pid_exists is None:
             from gateway.status import _pid_exists
 
             pid_exists = _pid_exists
         return not bool(pid_exists(int(desktop_pid)))
-    except ProcessLookupError:
-        return True
     except Exception:
         return False
 
 
 def _start_parent_death_watchdog() -> None:
-    """Exit when the exact desktop parent that spawned this backend dies.
+    """Exit when the desktop parent that spawned this backend dies.
 
-    The desktop passes its PID and, in newer versions, its process-start marker
-    plus a per-spawn nonce. The marker distinguishes a live owner from PID reuse;
-    the nonce makes partial/mixed-version identity plumbing fail safe. Legacy
-    Desktop versions that provide only ``HERMES_PARENT_PID`` retain PID-only
-    tracking.
+    The desktop passes its own PID via HERMES_PARENT_PID. When that process
+    vanishes (crash, SIGKILL, update handoff exiting before it reaps us) this
+    orphaned backend would otherwise keep serving forever and leak its MCP
+    child subtree. os._exit propagates to the MCP watchdogs parented here.
+
+    No-op for standalone `hermes serve` (env unset). Poll interval tunable via
+    HERMES_SERVE_WATCHDOG_POLL_S.
     """
-    raw_pid = os.environ.get("HERMES_PARENT_PID")
-    start_marker = os.environ.get("HERMES_PARENT_START_MARKER")
-    nonce = os.environ.get("HERMES_PARENT_NONCE")
-
+    raw = os.environ.get("HERMES_PARENT_PID")
+    if not raw:
+        return
     try:
-        desktop_pid = int(raw_pid or "")
+        desktop_pid = int(raw)
     except (TypeError, ValueError):
         return
-    if desktop_pid <= 0:
-        return
-
-    has_marker = start_marker is not None
-    has_nonce = nonce is not None
-    if has_marker != has_nonce:
-        return
-    if has_marker and (
-        not _valid_parent_start_marker(start_marker or "")
-        or not nonce
-        or nonce != nonce.strip()
-    ):
-        return
-
     try:
         poll = max(0.5, float(os.environ.get("HERMES_SERVE_WATCHDOG_POLL_S", "2.0")))
     except (TypeError, ValueError):
         poll = 2.0
 
     def _loop() -> None:
-        while not _is_serve_orphaned(desktop_pid, start_marker):
+        while not _is_serve_orphaned(desktop_pid):
             time.sleep(poll)
         os._exit(0)
 
@@ -18617,14 +18385,11 @@ def start_server(
             if server.started:
                 await server.shutdown()
 
-    # On POSIX, keep the long-standing ``asyncio.run(_serve())`` runner —
-    # Python's default loop there is already a SelectorEventLoop (or uvloop when
-    # uvicorn[standard] installs it), which is exactly what uvicorn serves on.
-    # Uvicorn's ``capture_signals()`` restores the original SIGINT handler and
-    # re-raises the captured signal after a graceful shutdown, which otherwise
-    # leaks a noisy KeyboardInterrupt traceback for the normal foreground
-    # dashboard Ctrl+C path. Treat that one signal as a clean user-requested
-    # shutdown; other serve-time errors still propagate.
+    # On POSIX, keep the long-standing ``asyncio.run(_serve())`` behavior
+    # unchanged — Python's default loop there is already a SelectorEventLoop
+    # (or uvloop when uvicorn[standard] installs it), which is exactly what
+    # uvicorn serves on. Touching that path would only widen the blast radius
+    # for no benefit.
     #
     # On Windows it is broken: ``asyncio.run`` defaults to a ProactorEventLoop,
     # but uvicorn's socket-serving stack assumes a SelectorEventLoop on win32
@@ -18636,17 +18401,14 @@ def start_server(
     # no TCP handshake completing (#50641). So *only on Windows* we mirror
     # uvicorn's own machinery and run on the loop factory it picks.
     if sys.platform != "win32":
-        try:
-            asyncio.run(_serve())
-        except KeyboardInterrupt:
-            return
+        asyncio.run(_serve())
         return
 
     # Windows-only path. Resolve the runner + loop factory FIRST (and fall back
     # to a hand-installed Windows selector policy only when uvicorn predates the
-    # loop-factory API, < 0.36). The actual serve call is then OUTSIDE this
-    # import try/except so genuine serve-time errors (port in use) propagate
-    # normally instead of being swallowed and double-run.
+    # loop-factory API, < 0.36). The actual serve call is then OUTSIDE the
+    # try/except so genuine serve-time errors (port in use, KeyboardInterrupt)
+    # propagate normally instead of being swallowed and double-run.
     try:
         from uvicorn._compat import asyncio_run as _runner
 
@@ -18661,16 +18423,7 @@ def start_server(
         except Exception:
             pass
 
-    # Same clean Ctrl+C contract as the POSIX branch above: ``capture_signals()``
-    # re-raises the captured signal after the graceful shutdown has already
-    # completed. For console Ctrl+C the re-raised SIGINT lands as
-    # ``KeyboardInterrupt`` — a clean user-requested exit here too. (Re-raised
-    # SIGTERM/SIGBREAK keep their default terminate disposition and never reach
-    # this except.)
-    try:
-        if _runner is not None:
-            _runner(_serve(), loop_factory=_loop_factory)
-        else:
-            asyncio.run(_serve())
-    except KeyboardInterrupt:
-        return
+    if _runner is not None:
+        _runner(_serve(), loop_factory=_loop_factory)
+    else:
+        asyncio.run(_serve())
