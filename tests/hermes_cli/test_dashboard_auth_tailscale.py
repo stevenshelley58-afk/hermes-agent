@@ -12,7 +12,7 @@ from plugins.dashboard_auth.tailscale import TailscaleAuthProvider
 
 
 def _request(*, peer: str, login: str | None = None) -> Request:
-    headers = [(b"host", b"srv1625369.tailnet.ts.net")]
+    headers = [(b"host", b"srv1625369.tail3084c0.ts.net")]
     if login is not None:
         headers.append((b"tailscale-user-login", login.encode()))
     return Request({
@@ -29,7 +29,7 @@ def test_should_require_auth_explicit_trusted_localhost_mode():
 
 def test_provider_requires_loopback_peer_even_with_identity_header():
     provider = TailscaleAuthProvider(
-        allowed_users={"operator@example.com"}, public_host="srv1625369.tailnet.ts.net", ttl_seconds=3600,
+        allowed_users={"operator@example.com"}, public_host="srv1625369.tail3084c0.ts.net", ttl_seconds=3600,
     )
     assert provider.complete_trusted_request(
         request=_request(peer="100.78.126.50", login="operator@example.com")
@@ -38,7 +38,7 @@ def test_provider_requires_loopback_peer_even_with_identity_header():
 
 def test_provider_rejects_missing_malformed_and_unlisted_identity():
     provider = TailscaleAuthProvider(
-        allowed_users={"operator@example.com"}, public_host="srv1625369.tailnet.ts.net", ttl_seconds=3600,
+        allowed_users={"operator@example.com"}, public_host="srv1625369.tail3084c0.ts.net", ttl_seconds=3600,
     )
     for login in (None, "other@example.com", "operator@example.com, forged", "operator@example.com\nX: forged"):
         assert provider.complete_trusted_request(
@@ -48,7 +48,7 @@ def test_provider_rejects_missing_malformed_and_unlisted_identity():
 
 def test_provider_mints_and_verifies_normal_session_for_allowlisted_identity():
     provider = TailscaleAuthProvider(
-        allowed_users={"operator@example.com"}, public_host="srv1625369.tailnet.ts.net", ttl_seconds=3600,
+        allowed_users={"operator@example.com"}, public_host="srv1625369.tail3084c0.ts.net", ttl_seconds=3600,
     )
     session = provider.complete_trusted_request(
         request=_request(peer="127.0.0.1", login="Operator@Example.com")
@@ -63,7 +63,7 @@ def test_provider_mints_and_verifies_normal_session_for_allowlisted_identity():
 
 def test_auth_login_mints_secure_session_and_safe_landing():
     provider = TailscaleAuthProvider(
-        allowed_users={"operator@example.com"}, public_host="srv1625369.tailnet.ts.net", ttl_seconds=3600,
+        allowed_users={"operator@example.com"}, public_host="srv1625369.tail3084c0.ts.net", ttl_seconds=3600,
     )
     clear_providers()
     register_provider(provider)
@@ -72,13 +72,13 @@ def test_auth_login_mints_secure_session_and_safe_landing():
         getattr(web_server.app.state, "bound_port", None),
         getattr(web_server.app.state, "auth_required", None),
     )
-    web_server.app.state.bound_host = "srv1625369.tailnet.ts.net"
+    web_server.app.state.bound_host = "srv1625369.tail3084c0.ts.net"
     web_server.app.state.bound_port = 443
     web_server.app.state.auth_required = True
     web_server.app.state.trusted_proxy_mode = True
-    web_server.app.state.trusted_public_host = "srv1625369.tailnet.ts.net"
+    web_server.app.state.trusted_public_host = "srv1625369.tail3084c0.ts.net"
     try:
-        client = TestClient(web_server.app, base_url="https://srv1625369.tailnet.ts.net", client=("127.0.0.1", 4321))
+        client = TestClient(web_server.app, base_url="https://srv1625369.tail3084c0.ts.net", client=("127.0.0.1", 4321))
         response = client.get(
             "/auth/login?provider=tailscale&next=/knowledge",
             headers={"Tailscale-User-Login": "operator@example.com"},
@@ -104,7 +104,7 @@ def test_auth_login_mints_secure_session_and_safe_landing():
 def test_fresh_browser_direct_knowledge_path_auto_authenticates():
     """Frank's direct /knowledge link must not expose a second login form."""
     provider = TailscaleAuthProvider(
-        allowed_users={"operator@example.com"}, public_host="srv1625369.tailnet.ts.net", ttl_seconds=3600,
+        allowed_users={"operator@example.com"}, public_host="srv1625369.tail3084c0.ts.net", ttl_seconds=3600,
     )
     clear_providers()
     register_provider(provider)
@@ -113,13 +113,13 @@ def test_fresh_browser_direct_knowledge_path_auto_authenticates():
         getattr(web_server.app.state, "bound_port", None),
         getattr(web_server.app.state, "auth_required", None),
     )
-    web_server.app.state.bound_host = "srv1625369.tailnet.ts.net"
+    web_server.app.state.bound_host = "srv1625369.tail3084c0.ts.net"
     web_server.app.state.bound_port = 443
     web_server.app.state.auth_required = True
     web_server.app.state.trusted_proxy_mode = True
-    web_server.app.state.trusted_public_host = "srv1625369.tailnet.ts.net"
+    web_server.app.state.trusted_public_host = "srv1625369.tail3084c0.ts.net"
     try:
-        client = TestClient(web_server.app, base_url="https://srv1625369.tailnet.ts.net", client=("127.0.0.1", 4321))
+        client = TestClient(web_server.app, base_url="https://srv1625369.tail3084c0.ts.net", client=("127.0.0.1", 4321))
         response = client.get(
             "/knowledge",
             headers={"Tailscale-User-Login": "operator@example.com"},
@@ -147,7 +147,7 @@ def test_fresh_browser_direct_knowledge_path_auto_authenticates():
 
 def test_auth_login_without_trusted_identity_falls_back_without_cookie():
     provider = TailscaleAuthProvider(
-        allowed_users={"operator@example.com"}, public_host="srv1625369.tailnet.ts.net", ttl_seconds=3600,
+        allowed_users={"operator@example.com"}, public_host="srv1625369.tail3084c0.ts.net", ttl_seconds=3600,
     )
     clear_providers()
     register_provider(provider)
@@ -156,13 +156,13 @@ def test_auth_login_without_trusted_identity_falls_back_without_cookie():
         getattr(web_server.app.state, "bound_port", None),
         getattr(web_server.app.state, "auth_required", None),
     )
-    web_server.app.state.bound_host = "srv1625369.tailnet.ts.net"
+    web_server.app.state.bound_host = "srv1625369.tail3084c0.ts.net"
     web_server.app.state.bound_port = 443
     web_server.app.state.auth_required = True
     web_server.app.state.trusted_proxy_mode = True
-    web_server.app.state.trusted_public_host = "srv1625369.tailnet.ts.net"
+    web_server.app.state.trusted_public_host = "srv1625369.tail3084c0.ts.net"
     try:
-        client = TestClient(web_server.app, base_url="https://srv1625369.tailnet.ts.net", client=("127.0.0.1", 4321))
+        client = TestClient(web_server.app, base_url="https://srv1625369.tail3084c0.ts.net", client=("127.0.0.1", 4321))
         response = client.get(
             "/auth/login?provider=tailscale&next=/knowledge",
             follow_redirects=False,
@@ -181,7 +181,7 @@ def test_auth_login_without_trusted_identity_falls_back_without_cookie():
 def test_runtime_localhost_mode_keeps_real_peer_and_secure_serve_cookies():
     """Model the real Serve hop: local transport, remote XFF, HTTPS XFP."""
     provider = TailscaleAuthProvider(
-        allowed_users={"operator@example.com"}, public_host="srv1625369.tailnet.ts.net", ttl_seconds=3600,
+        allowed_users={"operator@example.com"}, public_host="srv1625369.tail3084c0.ts.net", ttl_seconds=3600,
     )
     clear_providers()
     register_provider(provider)
@@ -195,13 +195,13 @@ def test_runtime_localhost_mode_keeps_real_peer_and_secure_serve_cookies():
     web_server.app.state.bound_host = "127.0.0.1"
     web_server.app.state.bound_port = 9119
     web_server.app.state.trusted_proxy_mode = True
-    web_server.app.state.trusted_public_host = "srv1625369.tailnet.ts.net"
+    web_server.app.state.trusted_public_host = "srv1625369.tail3084c0.ts.net"
     web_server.app.state.auth_required = should_require_auth(
         "127.0.0.1", trusted_local_proxy=True,
     )
     assert web_server.app.state.auth_required is True
     try:
-        client = TestClient(web_server.app, base_url="http://srv1625369.tailnet.ts.net", client=("127.0.0.1", 4321))
+        client = TestClient(web_server.app, base_url="http://srv1625369.tail3084c0.ts.net", client=("127.0.0.1", 4321))
         headers = {
             "Tailscale-User-Login": "operator@example.com",
             "X-Forwarded-For": "100.78.126.50",
@@ -225,7 +225,7 @@ def test_runtime_localhost_mode_keeps_real_peer_and_secure_serve_cookies():
 
 def test_runtime_localhost_mode_rejects_forged_local_host_and_header():
     provider = TailscaleAuthProvider(
-        allowed_users={"operator@example.com"}, public_host="srv1625369.tailnet.ts.net", ttl_seconds=3600,
+        allowed_users={"operator@example.com"}, public_host="srv1625369.tail3084c0.ts.net", ttl_seconds=3600,
     )
     clear_providers()
     register_provider(provider)
@@ -239,7 +239,7 @@ def test_runtime_localhost_mode_rejects_forged_local_host_and_header():
     web_server.app.state.bound_host = "127.0.0.1"
     web_server.app.state.bound_port = 9119
     web_server.app.state.trusted_proxy_mode = True
-    web_server.app.state.trusted_public_host = "srv1625369.tailnet.ts.net"
+    web_server.app.state.trusted_public_host = "srv1625369.tail3084c0.ts.net"
     web_server.app.state.auth_required = True
     try:
         client = TestClient(web_server.app, base_url="http://localhost", client=("127.0.0.1", 4321))
