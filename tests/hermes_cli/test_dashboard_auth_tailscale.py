@@ -1,6 +1,12 @@
 """Security tests for Tailscale Serve dashboard session entry."""
 from __future__ import annotations
 
+from http.cookies import SimpleCookie
+import threading
+import time
+
+import httpx
+import uvicorn
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
@@ -254,3 +260,121 @@ def test_runtime_localhost_mode_rejects_forged_local_host_and_header():
          web_server.app.state.auth_required,
          web_server.app.state.trusted_proxy_mode,
          web_server.app.state.trusted_public_host) = prev
+
+
+def test_real_uvicorn_socket_preserves_loopback_peer_and_mints_secure_session():
+    """Exercise the actual Serve-shaped hop over a real loopback socket."""
+
+    class RecordingProvider(TailscaleAuthProvider):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.peers: list[str] = []
+
+        def complete_trusted_request(self, *, request):
+            self.peers.append(request.client.host if request.client else "")
+            return super().complete_trusted_request(request=request)
+
+    provider = RecordingProvider(
+        allowed_users={"operator@example.com"},
+        public_host="srv1625369.tail3084c0.ts.net",
+        ttl_seconds=3600,
+    )
+    clear_providers()
+    register_provider(provider)
+    state_names = (
+        "bound_host", "bound_port", "auth_required", "trusted_proxy_mode",
+        "trusted_public_host",
+    )
+    previous = {name: getattr(web_server.app.state, name, None) for name in state_names}
+    web_server.app.state.bound_host = "127.0.0.1"
+    web_server.app.state.bound_port = 0
+    web_server.app.state.auth_required = True
+    web_server.app.state.trusted_proxy_mode = True
+    web_server.app.state.trusted_public_host = "srv1625369.tail3084c0.ts.net"
+
+    config = uvicorn.Config(
+        web_server.app,
+        host="127.0.0.1",
+        port=0,
+        lifespan="off",
+        proxy_headers=False,
+        log_level="error",
+    )
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    try:
+        thread.start()
+        deadline = time.monotonic() + 10
+        while not server.started and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server.started
+        assert server.servers and server.servers[0].sockets
+        port = server.servers[0].sockets[0].getsockname()[1]
+        serve_headers = {
+            "Host": "srv1625369.tail3084c0.ts.net",
+            "Tailscale-User-Login": "operator@example.com",
+            "X-Forwarded-For": "100.78.126.50",
+            "X-Forwarded-Proto": "https",
+        }
+        with httpx.Client(
+            base_url=f"http://127.0.0.1:{port}",
+            follow_redirects=False,
+            timeout=5,
+        ) as client:
+            first = client.get("/knowledge", headers=serve_headers)
+            assert first.status_code == 302
+            assert first.headers["location"].startswith(
+                "/auth/login?provider=tailscale"
+            )
+            login = client.get(first.headers["location"], headers=serve_headers)
+            assert login.status_code == 302
+            assert login.headers["location"] == "/knowledge"
+            set_cookie = SimpleCookie()
+            for value in login.headers.get_list("set-cookie"):
+                set_cookie.load(value)
+            access_cookie = next(
+                morsel for morsel in set_cookie.values()
+                if morsel.key.endswith(SESSION_AT_COOKIE)
+            )
+            refresh_cookie = next(
+                morsel for morsel in set_cookie.values()
+                if morsel.key.endswith(SESSION_RT_COOKIE)
+            )
+            assert access_cookie["secure"]
+            assert refresh_cookie["secure"]
+            cookie_header = "; ".join(
+                f"{morsel.key}={morsel.value}"
+                for morsel in set_cookie.values()
+            )
+            me = client.get(
+                "/api/auth/me",
+                headers={**serve_headers, "Cookie": cookie_header},
+            )
+            assert me.status_code == 200
+            assert me.json()["provider"] == "tailscale"
+
+            forged_local = client.get(
+                "/auth/login?provider=tailscale&next=/knowledge",
+                headers={
+                    **serve_headers,
+                    "Host": "localhost",
+                },
+            )
+            assert forged_local.status_code == 302
+            assert forged_local.headers["location"] == "/login?next=%2Fknowledge"
+            assert not any(
+                "hermes_session_at=" in value
+                for value in forged_local.headers.get_list("set-cookie")
+            )
+        assert provider.peers
+        assert set(provider.peers) == {"127.0.0.1"}
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        clear_providers()
+        for name, value in previous.items():
+            if value is None and hasattr(web_server.app.state, name):
+                delattr(web_server.app.state, name)
+            else:
+                setattr(web_server.app.state, name, value)
