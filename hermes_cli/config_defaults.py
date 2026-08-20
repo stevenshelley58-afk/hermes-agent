@@ -1443,6 +1443,13 @@ DEFAULT_CONFIG = {
             "secret": "",  # token-signing key; blank → random per-process
             "session_ttl_seconds": 0,  # 0 → plugin default (12h)
         },
+        # Tailscale Serve identity login. The provider is inactive when the
+        # allowlist is empty. Hermes must bind localhost and be exposed via
+        # Tailscale Serve before these headers are trusted.
+        "tailscale_auth": {
+            "allowed_users": [],  # exact Tailscale login names/emails
+            "session_ttl_seconds": 0,  # 0 → provider default (12h)
+        },
         # Drain-control service-credential configuration — read by the
         # bundled ``dashboard_auth/drain`` plugin (the first consumer of the
         # generic non-interactive token-auth capability). The SECRET itself

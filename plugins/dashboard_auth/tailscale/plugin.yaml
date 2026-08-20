@@ -1,0 +1,6 @@
+name: tailscale
+display_name: Tailscale Serve identity
+description: "Dashboard login through an allowlisted Tailscale Serve identity header; requires a localhost-only Hermes listener."
+version: 1.0.0
+author: NousResearch
+kind: backend

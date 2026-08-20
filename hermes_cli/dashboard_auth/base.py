@@ -177,6 +177,13 @@ class DashboardAuthProvider(ABC):
     # future machine-credential provider drops in without core changes.
     supports_token: bool = False
 
+    # When True, the provider can establish a browser session from a
+    # request-local, authenticated gateway identity (for example Tailscale
+    # Serve). The route invokes ``complete_trusted_request`` only after the
+    # provider opts in; providers MUST independently validate the request's
+    # trust boundary and return None when it is not present.
+    supports_trusted_request: bool = False
+
     # When True, this provider does the interactive cookie-session flow (login,
     # verify, refresh). The login page, /auth/login, and the gate's
     # verify/refresh loops consult only supports_session providers, so a

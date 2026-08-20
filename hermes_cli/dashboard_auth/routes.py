@@ -201,6 +201,56 @@ async def auth_login(request: Request, provider: str, next: str = ""):
             login_url = f"{login_url}?next={quote(safe_next, safe='')}"
         return RedirectResponse(url=login_url, status_code=302)
 
+    if getattr(p, "supports_trusted_request", False):
+        # Trusted-request providers (for example Tailscale Serve) mint the
+        # same normal Hermes cookie session, but only after validating their
+        # request-local trust boundary. ``None`` means this request did not
+        # arrive through that boundary; retain the password/OAuth fallback.
+        try:
+            session = p.complete_trusted_request(request=request)
+        except Exception as exc:  # noqa: BLE001 — provider boundary
+            audit_log(
+                AuditEvent.LOGIN_FAILURE,
+                provider=provider,
+                reason="trusted_request_error",
+                ip=_client_ip(request),
+            )
+            _log.warning(
+                "dashboard-auth: trusted login provider %r failed (%s)",
+                provider, type(exc).__name__,
+            )
+            session = None
+        if session is None:
+            from urllib.parse import quote
+
+            safe_next = _validate_post_login_target(next)
+            login_url = f"{_prefix(request)}/login"
+            if safe_next:
+                login_url = f"{login_url}?next={quote(safe_next, safe='')}"
+            return RedirectResponse(url=login_url, status_code=302)
+
+        audit_log(
+            AuditEvent.LOGIN_SUCCESS,
+            provider=provider,
+            user_id=session.user_id,
+            email=session.email,
+            org_id=session.org_id,
+            ip=_client_ip(request),
+        )
+        expires_in = max(60, session.expires_at - int(time.time()))
+        landing = _validate_post_login_target(next) or "/"
+        resp = RedirectResponse(url=landing, status_code=302)
+        set_session_cookies(
+            resp,
+            access_token=session.access_token,
+            refresh_token=session.refresh_token,
+            access_token_expires_in=expires_in,
+            use_https=detect_https(request),
+            prefix=_prefix(request),
+            provider=session.provider,
+        )
+        return resp
+
     try:
         ls = p.start_login(redirect_uri=_redirect_uri(request))
     except ProviderError as e:

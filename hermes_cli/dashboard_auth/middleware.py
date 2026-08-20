@@ -206,7 +206,16 @@ def _auto_sso_response(request: Request) -> Response | None:
     # list_session_providers() already filters on supports_session=True, so
     # token-only credentials (drain/service providers) are never candidates.
     providers = list_session_providers()
-    if len(providers) != 1:
+    # A trusted gateway provider is preferred over a password/OAuth fallback.
+    # It is still validated by the provider at /auth/login; selecting it here
+    # only removes the interstitial when the browser is on the trusted path.
+    trusted = [
+        p for p in providers
+        if getattr(p, "supports_trusted_request", False)
+    ]
+    if len(trusted) == 1:
+        providers = trusted
+    elif len(providers) != 1:
         # Zero → nothing to redirect to. Two+ → user must choose at /login.
         return None
 

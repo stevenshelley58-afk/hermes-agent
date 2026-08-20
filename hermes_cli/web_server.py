@@ -18170,6 +18170,15 @@ def start_server(
                     )
             except Exception:
                 pass
+            try:
+                from plugins.dashboard_auth import tailscale as _tailscale_plugin
+
+                if _tailscale_plugin.LAST_SKIP_REASON:
+                    skip_reasons.append(
+                        f"  • tailscale: {_tailscale_plugin.LAST_SKIP_REASON}"
+                    )
+            except Exception:
+                pass
 
             _fix_hint = (
                 "Configure an auth provider before exposing the dashboard:\n"
