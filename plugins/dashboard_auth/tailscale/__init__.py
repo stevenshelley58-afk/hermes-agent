@@ -13,6 +13,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import re
 import secrets
 import time
 from typing import Any, Optional
@@ -25,6 +26,7 @@ _DEFAULT_TTL_SECONDS = 12 * 60 * 60
 _REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60
 _SIG_LEN = hashlib.sha256().digest_size
 _MAX_LOGIN_LEN = 320
+_PUBLIC_HOST_RE = re.compile(r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 
 LAST_SKIP_REASON: str = ""
 
@@ -58,6 +60,19 @@ def _valid_login(value: str) -> bool:
     return "," not in value and ";" not in value
 
 
+def _valid_public_host(value: str) -> bool:
+    if not value or len(value) > 253 or value != value.strip():
+        return False
+    return bool(_PUBLIC_HOST_RE.fullmatch(value))
+
+
+def _host_only(value: str) -> str:
+    value = value.strip().casefold()
+    if value.startswith("[") and "]" in value:
+        return value[1:value.find("]")]
+    return value.rsplit(":", 1)[0] if ":" in value else value
+
+
 def _loopback_peer(request: Any) -> bool:
     peer = getattr(getattr(request, "client", None), "host", "") or ""
     try:
@@ -73,10 +88,13 @@ class TailscaleAuthProvider(DashboardAuthProvider):
     display_name = "Tailscale"
     supports_trusted_request = True
 
-    def __init__(self, *, allowed_users: set[str], ttl_seconds: int) -> None:
+    def __init__(self, *, allowed_users: set[str], public_host: str, ttl_seconds: int) -> None:
         if not allowed_users:
             raise ValueError("allowed_users must not be empty")
+        if not _valid_public_host(public_host):
+            raise ValueError("public_host must be a hostname without a scheme or port")
         self._allowed_users = frozenset(item.casefold() for item in allowed_users)
+        self.public_host = public_host.casefold()
         self._ttl = max(60, int(ttl_seconds))
         # This is intentionally process-local. It is not shared with Frank or
         # Tailscale; restart invalidates dashboard sessions and fails closed.
@@ -97,6 +115,8 @@ class TailscaleAuthProvider(DashboardAuthProvider):
         # A direct bind on the Tailscale IP is never trusted. Serve must proxy
         # to a localhost-only Hermes listener before these headers are accepted.
         if not _loopback_peer(request):
+            return None
+        if _host_only(request.headers.get("host", "")) != self.public_host:
             return None
         login = str(request.headers.get("Tailscale-User-Login", "")).strip()
         if not _valid_login(login) or login.casefold() not in self._allowed_users:
@@ -169,6 +189,7 @@ def register(ctx) -> None:
     LAST_SKIP_REASON = ""
     section = _load_section()
     raw_users = section.get("allowed_users", [])
+    public_host = str(section.get("public_host", "") or "").strip()
     if not isinstance(raw_users, (list, tuple, set)):
         LAST_SKIP_REASON = "dashboard.tailscale_auth.allowed_users must be a list"
         logger.warning("dashboard-auth-tailscale: %s", LAST_SKIP_REASON)
@@ -180,7 +201,7 @@ def register(ctx) -> None:
         return
     try:
         ttl = int(section.get("session_ttl_seconds") or _DEFAULT_TTL_SECONDS)
-        provider = TailscaleAuthProvider(allowed_users=users, ttl_seconds=ttl)
+        provider = TailscaleAuthProvider(allowed_users=users, public_host=public_host, ttl_seconds=ttl)
     except (TypeError, ValueError) as exc:
         LAST_SKIP_REASON = f"TailscaleAuthProvider construction failed: {exc}"
         logger.warning("dashboard-auth-tailscale: %s", LAST_SKIP_REASON)

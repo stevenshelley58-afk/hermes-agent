@@ -1448,6 +1448,7 @@ DEFAULT_CONFIG = {
         # Tailscale Serve before these headers are trusted.
         "tailscale_auth": {
             "allowed_users": [],  # exact Tailscale login names/emails
+            "public_host": "",  # exact HTTPS Serve hostname, no scheme/port
             "session_ttl_seconds": 0,  # 0 → provider default (12h)
         },
         # Drain-control service-credential configuration — read by the

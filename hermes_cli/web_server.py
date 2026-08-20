@@ -490,11 +490,17 @@ _LOOPBACK_HOST_VALUES: frozenset = frozenset({
 })
 
 
-def should_require_auth(host: str, allow_public: bool = False) -> bool:
+def should_require_auth(
+    host: str,
+    allow_public: bool = False,
+    *,
+    trusted_local_proxy: bool = False,
+) -> bool:
     """Return True iff the dashboard auth gate must be active.
 
     Truth table:
-      host == loopback        → False (no auth — local-only, trusted operator)
+      host == loopback        → False (ordinary local-only mode)
+      host == loopback + trusted_local_proxy → True (Serve identity mode)
       host != loopback        → True  (gate engages — OAuth or password required)
 
     "Loopback" is 127.0.0.1, localhost, ::1. RFC1918 / CGNAT / link-local are
@@ -509,7 +515,7 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     MCP-persistence campaign, where ``--insecure --host 0.0.0.0`` left the
     config/MCP/agent surface open to internet scanners.
     """
-    return host not in _LOOPBACK_HOST_VALUES
+    return host not in _LOOPBACK_HOST_VALUES or trusted_local_proxy
 
 
 def _is_accepted_host(host_header: str, bound_host: str) -> bool:
@@ -573,7 +579,11 @@ async def host_header_middleware(request: Request, call_next):
     bound_host = getattr(app.state, "bound_host", None)
     if bound_host:
         host_header = request.headers.get("host", "")
-        if not _is_accepted_host(host_header, bound_host):
+        trusted_public_host = getattr(request.app.state, "trusted_public_host", "")
+        host_allowed = _is_accepted_host(host_header, bound_host)
+        if trusted_public_host:
+            host_allowed = host_allowed or _is_accepted_host(host_header, trusted_public_host)
+        if not host_allowed:
             return JSONResponse(
                 status_code=400,
                 content={
@@ -18129,11 +18139,26 @@ def start_server(
     except Exception as exc:
         _log.debug("Nous auth keepalive did not start: %s", exc)
 
+    # Phase 0: a Tailscale trusted-request provider is only a safe proxy mode
+    # when Hermes itself is on loopback. Keep the real transport peer visible;
+    # uvicorn proxy_headers would rewrite it from X-Forwarded-For.
+    from hermes_cli.dashboard_auth import list_providers
+    trusted_providers = [
+        p for p in list_providers()
+        if getattr(p, "supports_trusted_request", False)
+    ]
+    trusted_local_proxy = host in _LOOPBACK_HOST_VALUES and len(trusted_providers) == 1
+    app.state.trusted_proxy_mode = trusted_local_proxy
+    app.state.trusted_public_host = (
+        getattr(trusted_providers[0], "public_host", "")
+        if trusted_local_proxy else ""
+    )
     # Phase 0: stash the auth-gate flag on app.state so middleware / SPA-token
-    # injection / WS-auth paths can branch on it consistently.  Phase 3.5
-    # uses this to decide whether to refuse the bind, log the gate-on
-    # banner, and enable uvicorn proxy_headers.
-    app.state.auth_required = should_require_auth(host)
+    # injection / WS-auth paths can branch consistently.  This also turns on
+    # the gate for the explicit localhost + Tailscale Serve mode.
+    app.state.auth_required = should_require_auth(
+        host, trusted_local_proxy=trusted_local_proxy,
+    )
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public
@@ -18285,7 +18310,7 @@ def start_server(
         # behind a TLS terminator (Fly.io) and need X-Forwarded-Proto to
         # decide cookie Secure flags, so we flip proxy_headers on for that
         # mode.
-        proxy_headers=bool(app.state.auth_required),
+        proxy_headers=bool(app.state.auth_required and not trusted_local_proxy),
         # Half-open detection for public binds only (see above). Loopback
         # disables the protocol ping (None) so an event-loop stall can never
         # trigger a false disconnect; a genuinely dead local client is still

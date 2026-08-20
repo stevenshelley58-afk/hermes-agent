@@ -335,4 +335,15 @@ def detect_https(request: Request) -> bool:
     ``X-Forwarded-Proto`` from Fly's TLS terminator. Loopback traffic is
     always HTTP so this returns False there.
     """
-    return request.url.scheme == "https"
+    if request.url.scheme == "https":
+        return True
+    # Tailscale Serve terminates HTTPS before proxying to localhost. In that
+    # mode uvicorn deliberately does NOT trust proxy headers (the real peer is
+    # part of the identity boundary), so accept X-Forwarded-Proto only from a
+    # loopback transport while the explicit trusted-proxy mode is active.
+    if request.headers.get("x-forwarded-proto", "").lower() != "https":
+        return False
+    if not getattr(request.app.state, "trusted_proxy_mode", False):
+        return False
+    peer = getattr(getattr(request, "client", None), "host", "") or ""
+    return peer in {"127.0.0.1", "::1"}
