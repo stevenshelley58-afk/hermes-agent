@@ -1,0 +1,5 @@
+# Install only after validating the reviewed Hermes tree and config.
+# /etc/systemd/system/hermes-serve.service.d/tailscale-localhost.conf
+[Service]
+ExecStart=
+ExecStart=/home/hermes/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main --profile default serve --host 127.0.0.1 --port 9119 --isolated

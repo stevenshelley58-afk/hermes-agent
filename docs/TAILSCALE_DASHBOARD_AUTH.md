@@ -51,7 +51,7 @@ Store this release evidence outside Git with the change ticket. Never store cook
 
 Verify the candidate Hermes tree is clean and exactly the reviewed commit/tree. Verify the config has the exact operator login and exact public_host; reject wildcards, schemes, paths, ports, or empty values. Compile and run the focused auth/knowledge suites before installing the candidate.
 
-Install a systemd drop-in that changes only Hermes Serve to --host 127.0.0.1. Keep the existing port and profile. The candidate must start with the auth gate active; ordinary localhost mode must not silently become unauthenticated.
+Install a systemd drop-in that changes only Hermes Serve to --host 127.0.0.1. Keep the existing port and profile. The candidate must start with the auth gate active; ordinary localhost mode must not silently become unauthenticated. The versioned template is ops/tailscale/hermes-serve-localhost.conf.example; install it as a drop-in only after capturing the prior unit and checksum.
 
 ### 3. Restart only Hermes Serve
 
