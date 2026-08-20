@@ -28,6 +28,30 @@ In the Hermes profile config.yaml:
 
 The provider is inactive when allowed_users or public_host is invalid. Values are matched case-insensitively after strict header validation; there is no wildcard mode. The process-local signing key is regenerated on restart, so dashboard cookies are invalidated on restart and users fall back to the normal login page.
 
+### Configure the allowlist atomically
+
+Use the committed helper after the reviewed Hermes tree is installed. It
+requires an explicit Hermes home, runs as the `hermes` user, accepts the
+operator login and public hostname as arguments, and updates only the
+`dashboard.tailscale_auth` mapping. It refuses missing or malformed config,
+symlinks, wrong ownership, and modes other than `0600`; repeated invocation
+with the same values is a no-op. Do not use `hermes config set` for
+`allowed_users`, because that command accepts a scalar value rather than a
+YAML list.
+
+    cd /home/hermes/.hermes
+    sudo -n -u hermes -H env -i \
+      HOME=/home/hermes \
+      HERMES_HOME=/home/hermes/.hermes \
+      PATH=/home/hermes/.hermes/hermes-agent/venv/bin:/usr/bin:/bin \
+      /home/hermes/.hermes/hermes-agent/venv/bin/python \
+      /home/hermes/.hermes/hermes-agent/ops/tailscale/configure_dashboard_auth.py \
+      '<TAILSCALE_OPERATOR_LOGIN>' srv1625369.tail3084c0.ts.net
+
+The helper prints only structural status (`allowed_users=1`, hostname
+configured, mode `0600`); never place credentials or identity values in Git or
+release logs.
+
 ## Staged rollout and evidence capture
 
 Do this as a staged release. Do not change hermes-gateway.service; this mode changes only hermes-serve.service.
