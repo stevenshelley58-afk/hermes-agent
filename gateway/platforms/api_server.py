@@ -95,6 +95,8 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
+from gateway.tool_run_api import ToolRunAPIMixin
+from gateway.tool_runs import ToolRunStore
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -1349,7 +1351,7 @@ class _ProviderAuthResolutionError(RuntimeError):
     """
 
 
-class APIServerAdapter(BasePlatformAdapter):
+class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
 
@@ -1419,6 +1421,13 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        # Durable Tool jobs are separate from chat sessions and the temporary
+        # /v1/runs transport. Their append-only ledger survives gateway and UI
+        # restarts and supports cursor-based replay for external mini apps.
+        self._tool_run_store = ToolRunStore()
+        self._tool_run_tasks: Dict[str, "asyncio.Task"] = {}
+        self._tool_run_agents: Dict[str, Any] = {}
+        self._tool_run_shutdown = False
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -1486,6 +1495,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 int(getattr(self, "_pending_agent_requests", 0))
                 + int(self._inflight_agent_runs)
                 + sum(not task.done() for task in self._active_run_tasks.values())
+                + sum(not task.done() for task in self._tool_run_tasks.values())
             )
         except Exception:
             return 0
@@ -2094,6 +2104,18 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
+            ("POST", "/v1/tool-runs", self._handle_create_tool_run),
+            ("GET", "/v1/tool-runs", self._handle_list_tool_runs),
+            ("GET", "/v1/tool-runs/models", self._handle_tool_run_models),
+            ("GET", "/v1/tool-runs/policies/{tool_id}", self._handle_list_tool_policies),
+            ("POST", "/v1/tool-runs/policies/{tool_id}", self._handle_create_tool_policy),
+            ("GET", "/v1/tool-runs/{run_id}", self._handle_get_tool_run),
+            ("GET", "/v1/tool-runs/{run_id}/download", self._handle_download_tool_run),
+            ("GET", "/v1/tool-runs/{run_id}/events", self._handle_tool_run_events),
+            ("POST", "/v1/tool-runs/{run_id}/approval", self._handle_tool_run_approval),
+            ("POST", "/v1/tool-runs/{run_id}/models", self._handle_tool_run_model_change),
+            ("POST", "/v1/tool-runs/{run_id}/retry", self._handle_retry_tool_run),
+            ("POST", "/v1/tool-runs/{run_id}/cancel", self._handle_cancel_tool_run),
         ]
         if _CRON_AVAILABLE:
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
@@ -3137,6 +3159,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
+                "durable_tool_runs": True,
+                "tool_run_event_replay": True,
+                "tool_model_policy_revisions": True,
                 "session_resources": True,
                 "model_options": True,
                 "session_chat": True,
@@ -3166,6 +3191,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "tool_runs": {"method": "POST", "path": "/v1/tool-runs"},
+                "tool_run_list": {"method": "GET", "path": "/v1/tool-runs"},
+                "tool_run_status": {"method": "GET", "path": "/v1/tool-runs/{run_id}"},
+                "tool_run_download": {"method": "GET", "path": "/v1/tool-runs/{run_id}/download"},
+                "tool_run_events": {"method": "GET", "path": "/v1/tool-runs/{run_id}/events"},
+                "tool_run_approval": {"method": "POST", "path": "/v1/tool-runs/{run_id}/approval"},
+                "tool_run_models": {"method": "POST", "path": "/v1/tool-runs/{run_id}/models"},
+                "tool_run_retry": {"method": "POST", "path": "/v1/tool-runs/{run_id}/retry"},
+                "tool_run_cancel": {"method": "POST", "path": "/v1/tool-runs/{run_id}/cancel"},
+                "tool_model_policies": {"method": "GET", "path": "/v1/tool-runs/policies/{tool_id}"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -7467,6 +7502,18 @@ class APIServerAdapter(BasePlatformAdapter):
             if hasattr(sweep_task, "add_done_callback"):
                 sweep_task.add_done_callback(self._background_tasks.discard)
 
+            # Resume durable Tool work independently of chat/session recovery.
+            # Interrupted rows retain their last stage checkpoint and are put
+            # back on the queue before the listener accepts new submissions.
+            self._tool_run_shutdown = False
+            self._tool_run_store.recover_incomplete()
+            for durable_run in self._tool_run_store.list_runs(limit=500):
+                if durable_run.get("status") == "queued":
+                    self._start_tool_task(
+                        durable_run["run_id"],
+                        finalize=durable_run.get("stage") == "release",
+                    )
+
             # Loud warning when a network-accessible API server runs against an
             # unsandboxed local terminal backend. The API server can drive the
             # agent's terminal/file tools as the host user; on a public bind
@@ -7571,6 +7618,26 @@ class APIServerAdapter(BasePlatformAdapter):
         (OSError: [Errno 24] Too many open files, #37011).
         """
         self._mark_disconnected()
+        self._tool_run_shutdown = True
+        for agent in list(self._tool_run_agents.values()):
+            try:
+                request_hard_interrupt(agent, source="api_server_tool_run_shutdown")
+            except Exception:
+                pass
+        tool_tasks = [task for task in self._tool_run_tasks.values() if not task.done()]
+        for task in tool_tasks:
+            task.cancel()
+        if tool_tasks:
+            await asyncio.gather(*tool_tasks, return_exceptions=True)
+        self._tool_run_tasks.clear()
+        self._tool_run_agents.clear()
+        if self._tool_run_store is not None:
+            try:
+                self._tool_run_store.close()
+            except Exception:
+                logger.debug(
+                    "Failed to close Tool run store for %s", self.name, exc_info=True,
+                )
         if self._response_store is not None:
             try:
                 self._response_store.close()
