@@ -52,9 +52,12 @@ def candidate_output(tmp_path, run_id, template_id):
     preview = tmp_path / "hermes" / "tool_assets" / "ad-template-generator" / "runs" / run_id / "previews" / "feed.png"
     preview.parent.mkdir(parents=True, exist_ok=True)
     preview.write_bytes(b"\x89PNG\r\n\x1a\npreview")
+    candidate = tmp_path / "hermes" / "tool_checkpoints" / "ad-template-generator" / run_id / "template.json"
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    candidate.write_text("{}", encoding="utf-8")
     return {
         "template_id": template_id,
-        "candidate_ref": str(tmp_path / "private" / "template.json"),
+        "candidate_ref": str(candidate),
         "preview_refs": [str(preview)],
         "evidence_refs": {"qa": "private"},
         "qa_summary": {

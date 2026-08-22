@@ -31,6 +31,14 @@ def _error(message: str, code: str) -> Dict[str, Any]:
     return {"error": {"message": message, "type": "invalid_request_error", "code": code}}
 
 
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
 class ToolRunAPIMixin:
     """Durable Tool-run endpoints mixed into ``APIServerAdapter``."""
 
@@ -163,12 +171,27 @@ class ToolRunAPIMixin:
             raise RuntimeError("Builder candidate did not pass every automated pre-release gate")
         try:
             from hermes_constants import get_hermes_home
+            hermes_home = get_hermes_home()
+            run_root = (
+                hermes_home / "tool_assets" / "ad-template-generator" / "runs" / run_id
+            ).resolve()
+            checkpoint_root = (
+                hermes_home / "tool_checkpoints" / "ad-template-generator" / run_id
+            ).resolve()
             preview_root = (
-                get_hermes_home() / "tool_assets" / "ad-template-generator" /
+                hermes_home / "tool_assets" / "ad-template-generator" /
                 "runs" / run_id / "previews"
             ).resolve()
         except Exception as exc:
             raise RuntimeError("Hermes private preview store is unavailable") from exc
+        try:
+            candidate = Path(str(output["candidate_ref"])).resolve(strict=True)
+            if not any(_path_is_relative_to(candidate, root) for root in (run_root, checkpoint_root)):
+                raise ValueError("outside private run roots")
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("Builder candidate is outside the private run store") from exc
+        if candidate.is_symlink() or not candidate.is_file() or candidate.suffix.lower() != ".json":
+            raise RuntimeError("Builder candidate is not an immutable JSON document")
         preview_refs = output.get("preview_refs")
         if not isinstance(preview_refs, list) or not preview_refs:
             raise RuntimeError("Builder candidate has no reviewable previews")
@@ -296,6 +319,9 @@ class ToolRunAPIMixin:
             "only inside declared masked regions. Run source, analyse, decompose, restyle, story-draft, check, "
             "subject-invariance, and prepare the Studio QA candidate. Use deterministic VPS commands and the "
             "canonical renderer wherever the pipeline declares a deterministic stage. Checkpoint every artifact. "
+            "Treat /opt/ad-template-builder and every Git checkout as read-only authority: never create, edit, or "
+            "delete repository files. Write candidate documents, previews, and evidence only beneath this run's "
+            "Hermes tool_assets or tool_checkpoints directories. A candidate path outside those private roots is rejected. "
             "Stop before release for human approval. Return one compact JSON object with template_id, candidate_ref, "
             "preview_refs, evidence_refs, qa_summary, cost, and attention items. Never return raw prompts, source "
             "bytes, credentials, or hidden reasoning.\n\n"
