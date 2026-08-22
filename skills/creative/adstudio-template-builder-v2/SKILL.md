@@ -8,7 +8,7 @@ or continue a chat.
 
 ## Runtime
 
-- The dedicated, committed builder checkout is `/projects/ad-template-builder`.
+- The dedicated, committed builder checkout is `/opt/ad-template-builder`.
 - Run every builder command from that directory with its locked Node runtime.
 - Inputs are private paths supplied by the Tool controller. Outputs remain
   beneath Hermes' private Tool asset, checkpoint, and release directories.
