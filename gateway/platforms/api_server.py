@@ -2632,6 +2632,7 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        persistence_disabled: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2939,7 +2940,9 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
-            "session_db": self._ensure_session_db(),
+            "session_db": None if persistence_disabled else self._ensure_session_db(),
+            "skip_memory": persistence_disabled,
+            "skip_background_review": persistence_disabled,
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
@@ -2948,6 +2951,14 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        if persistence_disabled:
+            # Durable Tool jobs have their own append-only operational ledger.
+            # They must never create a transcript row, JSON session log, memory
+            # review, or Hub-visible chat even though they reuse AIAgent's tool
+            # loop and provider adapters.
+            agent._persist_disabled = True
+            agent._session_db = None
+            agent._end_session_on_close = False
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,

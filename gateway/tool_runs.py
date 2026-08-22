@@ -33,6 +33,7 @@ _RUN_STATUSES = frozenset({
 })
 _EVENT_STATUSES = frozenset({"queued", "running", "ok", "blocked", "error", "cancelled"})
 _SECRET_KEY = re.compile(r"(?:api[_-]?key|token|secret|password|credential|private[_-]?key|authorization)", re.I)
+_SAFE_USAGE_KEYS = frozenset({"input_tokens", "output_tokens", "total_tokens"})
 _MAX_JSON_BYTES = 512 * 1024
 _MASKED_EDIT_MODELS = frozenset({
     "gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2",
@@ -74,7 +75,7 @@ def _safe_data(value: Any, field: str = "data", depth: int = 0) -> Any:
         for key, item in value.items():
             if not isinstance(key, str) or not key or len(key) > 128:
                 raise ToolRunError(f"{field} contains an invalid key")
-            if _SECRET_KEY.search(key):
+            if _SECRET_KEY.search(key) and key not in _SAFE_USAGE_KEYS:
                 raise ToolRunError(f"{field}.{key} is secret-bearing and cannot be persisted")
             result[key] = _safe_data(item, f"{field}.{key}", depth + 1)
         return result

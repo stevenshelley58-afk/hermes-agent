@@ -280,12 +280,14 @@ class ToolRunAPIMixin:
             loop = asyncio.get_running_loop()
             reported_cost = 0.0
             cost_limit = float(route_settings.get("max_cost_usd") or 0)
+            activity_sequence = 0
 
             def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
-                nonlocal current_stage, reported_cost
+                nonlocal current_stage, reported_cost, activity_sequence
                 next_stage = self._tool_stage_from_preview(preview, current_stage)
                 if next_stage != current_stage:
                     current_stage = next_stage
+                    activity_sequence += 1
                     order = self._tool_stage_order()
                     progress = min(0.90, max(0.03, order.index(next_stage) / len(order)))
                     self._tool_run_store.update_run(run_id, stage=next_stage, progress=progress)
@@ -295,6 +297,7 @@ class ToolRunAPIMixin:
                     )
                 if event_type not in {"tool.started", "tool.completed", "subagent.start", "subagent.complete"}:
                     return
+                activity_sequence += 1
                 data: Dict[str, Any] = {}
                 if tool_name:
                     data["tool"] = str(tool_name)[:160]
@@ -327,10 +330,8 @@ class ToolRunAPIMixin:
                     requested_model=candidate["model"],
                     requested_provider=candidate["provider"],
                     route=route,
+                    persistence_disabled=True,
                 )
-                # A Tool run has an operational ledger, not a chat transcript.
-                agent._persist_session = lambda *_args, **_kwargs: None
-                agent._save_session_log = lambda *_args, **_kwargs: None
                 self._tool_run_agents[run_id] = agent
                 result = agent.run_conversation(
                     user_message=self._tool_prompt(run, finalize=finalize),
@@ -353,9 +354,36 @@ class ToolRunAPIMixin:
                     data={"attempt": attempt, "provider": candidate["provider"], "model": candidate["model"], "timeout_seconds": timeout},
                 )
                 try:
-                    result, usage = await asyncio.wait_for(loop.run_in_executor(None, run_sync, candidate), timeout=timeout)
+                    future = loop.run_in_executor(None, run_sync, candidate)
+                    observed_activity = activity_sequence
+                    # The route timeout is an inactivity limit for the current
+                    # model/tool stage, not a deadline for the whole pipeline.
+                    # Every durable stage/tool event resets it; otherwise a
+                    # healthy multi-stage VPS build is killed at 120 seconds.
+                    deadline = loop.time() + timeout
+                    while True:
+                        remaining = deadline - loop.time()
+                        if remaining <= 0:
+                            raise asyncio.TimeoutError(
+                                f"{current_stage} made no recorded progress for {timeout:.0f} seconds"
+                            )
+                        try:
+                            result, usage = await asyncio.wait_for(
+                                asyncio.shield(future), timeout=min(1.0, remaining)
+                            )
+                            break
+                        except asyncio.TimeoutError:
+                            if future.done():
+                                result, usage = await future
+                                break
+                            if activity_sequence != observed_activity:
+                                observed_activity = activity_sequence
+                                deadline = loop.time() + timeout
                     break
                 except Exception as exc:
+                    running_agent = self._tool_run_agents.get(run_id)
+                    if isinstance(exc, asyncio.TimeoutError) and running_agent is not None:
+                        request_hard_interrupt(running_agent, source="api_server_tool_run_stage_timeout")
                     failure = redact_sensitive_text(str(exc), force=True)[:600]
                     failures.append(failure)
                     if attempt < len(candidates):

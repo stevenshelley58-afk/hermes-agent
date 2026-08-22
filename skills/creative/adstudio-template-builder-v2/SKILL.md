@@ -10,6 +10,9 @@ or continue a chat.
 
 - The dedicated, committed builder checkout is `/opt/ad-template-builder`.
 - Run every builder command from that directory with its locked Node runtime.
+- The canonical gallery is `src/lib/adstudio/template-gallery-v2` and the
+  canonical assets are `src/lib/adstudio/template-assets-v2`. Never look for
+  an unversioned `template-gallery` or `template-assets` directory.
 - Inputs are private paths supplied by the Tool controller. Outputs remain
   beneath Hermes' private Tool asset, checkpoint, and release directories.
 - The Tool run's pinned model-policy revision is authoritative. Do not inherit

@@ -226,6 +226,33 @@ class TestAdapterInit:
         assert captured["checkpoint_max_total_size_mb"] == 321
         assert captured["checkpoint_max_file_size_mb"] == 4
 
+    def test_create_agent_can_be_fully_persistence_isolated(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self._persist_disabled = False
+                self._session_db = kwargs.get("session_db")
+                self._end_session_on_close = True
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs", lambda: {"provider": "openai-codex"})
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.5")
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_reasoning_config", staticmethod(lambda model="": None))
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        agent = adapter._create_agent(session_id="tool-run", persistence_disabled=True)
+
+        assert captured["session_db"] is None
+        assert captured["skip_memory"] is True
+        assert captured["skip_background_review"] is True
+        assert agent._persist_disabled is True
+        assert agent._end_session_on_close is False
+
 
 # ---------------------------------------------------------------------------
 # Auth checking

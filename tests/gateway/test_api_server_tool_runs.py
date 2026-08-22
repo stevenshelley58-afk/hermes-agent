@@ -1,5 +1,6 @@
 import hashlib
 import json
+import time
 from unittest.mock import patch
 
 import pytest
@@ -104,6 +105,62 @@ async def test_create_list_and_get_are_durable_not_chat(tmp_path):
             assert [item["run_id"] for item in (await listed.json())["data"]] == [run["run_id"]]
             fetched = await client.get(f"/v1/tool-runs/{run['run_id']}")
             assert (await fetched.json())["model_policy_revision"] == 1
+    adapter._tool_run_store.close()
+
+
+@pytest.mark.asyncio
+async def test_executor_requests_persistence_isolation(tmp_path):
+    adapter = make_adapter(tmp_path)
+    run, _ = adapter._tool_run_store.create_run(command())
+
+    class FakeAgent:
+        session_prompt_tokens = 11
+        session_completion_tokens = 7
+        session_total_tokens = 18
+
+        def run_conversation(self, **_kwargs):
+            return {"final_response": json.dumps({"template_id": "candidate-1"})}
+
+    fake = FakeAgent()
+    with patch.object(adapter, "_create_agent", return_value=fake) as create:
+        await adapter._execute_tool_run(run["run_id"])
+
+    assert create.call_args.kwargs["persistence_disabled"] is True
+    assert adapter._tool_run_store.get_run(run["run_id"])["status"] == "waiting_for_approval"
+    adapter._tool_run_store.close()
+
+
+@pytest.mark.asyncio
+async def test_stage_activity_resets_provider_inactivity_timeout(tmp_path):
+    adapter = make_adapter(tmp_path)
+    policy = default_ad_template_policy()
+    policy["stages"]["analyse"]["timeout_seconds"] = 1
+    revision = adapter._tool_run_store.create_policy("ad-template-generator", policy)
+    value = command("watchdog")
+    value["model_policy_revision"] = revision["revision"]
+    run, _ = adapter._tool_run_store.create_run(value)
+
+    def create_agent(**kwargs):
+        progress = kwargs["tool_progress_callback"]
+
+        class ProgressAgent:
+            session_prompt_tokens = 1
+            session_completion_tokens = 1
+            session_total_tokens = 2
+
+            def run_conversation(self, **_kwargs):
+                time.sleep(0.6)
+                progress("tool.started", tool_name="builder", preview="decompose")
+                time.sleep(0.6)
+                progress("tool.completed", tool_name="builder", preview="check")
+                return {"final_response": json.dumps({"template_id": "candidate-2"})}
+
+        return ProgressAgent()
+
+    with patch.object(adapter, "_create_agent", side_effect=create_agent):
+        await adapter._execute_tool_run(run["run_id"])
+
+    assert adapter._tool_run_store.get_run(run["run_id"])["status"] == "waiting_for_approval"
     adapter._tool_run_store.close()
 
 

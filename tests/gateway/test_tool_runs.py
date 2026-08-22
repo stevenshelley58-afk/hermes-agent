@@ -127,6 +127,13 @@ def test_secret_bearing_payload_is_rejected(tmp_path):
         store.create_run(command(payload={"api_key": "do-not-store"}))
 
 
+def test_numeric_usage_counts_are_not_mistaken_for_credentials(tmp_path):
+    store = ToolRunStore(str(tmp_path / "usage.db"))
+    run, _ = store.create_run(command())
+    store.update_run(run["run_id"], output={"usage": {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18}})
+    assert store.get_run(run["run_id"])["output"]["usage"]["total_tokens"] == 18
+
+
 def test_invalid_model_candidate_is_rejected(tmp_path):
     store = ToolRunStore(str(tmp_path / "invalid.db"))
     invalid = {
