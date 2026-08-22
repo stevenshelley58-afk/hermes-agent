@@ -52,6 +52,25 @@ The helper prints only structural status (`allowed_users=1`, hostname
 configured, mode `0600`); never place credentials or identity values in Git or
 release logs.
 
+To remove only the Tailscale identity-provider configuration during rollback,
+run the same committed helper in disable mode. This mode accepts no operator
+login or hostname, refuses malformed or unsafe config files, and is idempotent.
+It preserves every unrelated dashboard, reasoning, display, plugin, and model
+preference through the existing comment-preserving atomic YAML writer.
+
+    cd /home/hermes/.hermes
+    sudo -n -u hermes -H env -i \
+      HOME=/home/hermes \
+      HERMES_HOME=/home/hermes/.hermes \
+      PATH=/home/hermes/.hermes/hermes-agent/venv/bin:/usr/bin:/bin \
+      /home/hermes/.hermes/hermes-agent/venv/bin/python \
+      /home/hermes/.hermes/hermes-agent/ops/tailscale/configure_dashboard_auth.py \
+      --disable
+
+The disable result is structural only (`tailscale_auth=absent`, mode `0600`).
+Passing an identity or hostname together with `--disable` is rejected without
+printing either value.
+
 ## Staged rollout and evidence capture
 
 Do this as a staged release. Do not change hermes-gateway.service; this mode changes only hermes-serve.service.
@@ -112,9 +131,13 @@ Rollback in reverse order:
 
 1. Disable or clear the Tailscale Serve mapping first; verify tailscale serve status no longer exposes Hermes.
 2. Stop/revert the candidate hermes-serve.service drop-in and restore the captured prior unit/drop-in bytes and checksums.
-3. Restore the captured prior Hermes revision/tree using the release lane; never patch the production checkout in place.
-4. Reload systemd and restart only hermes-serve.service.
-5. Verify the prior local/public endpoint behavior and password fallback.
-6. Confirm hermes-gateway.service was not restarted or modified.
+3. Run the committed config helper with `--disable` using the explicit
+   `HOME`/`HERMES_HOME` invocation above. Verify its redacted structural result,
+   confirm `dashboard.tailscale_auth` is absent, and confirm all unrelated
+   config bytes/values, ownership, and mode remain valid.
+4. Restore the captured prior Hermes revision/tree using the release lane; never patch the production checkout in place.
+5. Reload systemd and restart only hermes-serve.service.
+6. Verify the prior local/public endpoint behavior and password fallback.
+7. Confirm hermes-gateway.service was not restarted or modified.
 
 If any checksum, revision, tree, unit, or Serve-target check differs from the captured evidence, stop and leave the service fail-closed until the release lane reconciles it.
