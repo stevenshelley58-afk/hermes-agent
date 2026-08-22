@@ -1,4 +1,5 @@
 """Tests for the Hermes Tailscale dashboard config helper."""
+
 from __future__ import annotations
 
 import importlib.util
@@ -36,7 +37,9 @@ def _raw(config: Path):
     return yaml.safe_load(config.read_text(encoding="utf-8"))
 
 
-def test_updates_real_yaml_list_and_preserves_unrelated_config(tmp_path, monkeypatch, capsys):
+def test_updates_real_yaml_list_and_preserves_unrelated_config(
+    tmp_path, monkeypatch, capsys
+):
     config = _setup_home(
         tmp_path,
         monkeypatch,
@@ -188,7 +191,10 @@ def test_disable_refuses_positional_identity_or_host(args, capsys):
     [
         ("not-a-mapping\n", "config.yaml root is malformed"),
         ("dashboard: wrong\n", "dashboard is malformed"),
-        ("dashboard:\n  tailscale_auth: wrong\n", "dashboard.tailscale_auth is malformed"),
+        (
+            "dashboard:\n  tailscale_auth: wrong\n",
+            "dashboard.tailscale_auth is malformed",
+        ),
         (
             "dashboard:\n  tailscale_auth:\n    allowed_users: wrong\n",
             "allowed_users is malformed",
@@ -248,7 +254,9 @@ def test_disable_refuses_wrong_mode(tmp_path, monkeypatch, capsys):
     assert "mode 0600" in capsys.readouterr().out
 
 
-@pytest.mark.skipif(os.geteuid() != 0, reason="requires root to create wrong-owner fixture")
+@pytest.mark.skipif(
+    os.geteuid() != 0, reason="requires root to create wrong-owner fixture"
+)
 def test_refuses_wrong_owner(tmp_path, monkeypatch, capsys):
     config = _setup_home(tmp_path, monkeypatch, "dashboard: {}\n")
     os.chown(config, 1, config.stat().st_gid)
@@ -256,7 +264,9 @@ def test_refuses_wrong_owner(tmp_path, monkeypatch, capsys):
     assert "owner" in capsys.readouterr().out
 
 
-@pytest.mark.skipif(os.geteuid() != 0, reason="requires root to create wrong-owner fixture")
+@pytest.mark.skipif(
+    os.geteuid() != 0, reason="requires root to create wrong-owner fixture"
+)
 def test_disable_refuses_wrong_owner(tmp_path, monkeypatch, capsys):
     config = _setup_home(
         tmp_path,

@@ -6,6 +6,7 @@ as the owner of that Hermes profile. It changes only the
 ``dashboard.tailscale_auth`` mapping and uses Hermes' comment-preserving,
 atomic YAML writers.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -75,6 +76,7 @@ def _target_config() -> tuple[Path, os.stat_result]:
 
     override_token = set_hermes_home_override(home)
     from hermes_cli.config import get_config_path
+
     try:
         config_path = get_config_path()
     finally:
@@ -102,7 +104,9 @@ def _validated_dashboard(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validated_tailscale_section(dashboard: dict[str, Any]) -> dict[str, Any]:
-    if "tailscale_auth" in dashboard and not isinstance(dashboard["tailscale_auth"], dict):
+    if "tailscale_auth" in dashboard and not isinstance(
+        dashboard["tailscale_auth"], dict
+    ):
         raise HelperError("dashboard.tailscale_auth is malformed")
     section = dict(dashboard.get("tailscale_auth") or {})
     if "allowed_users" in section and not isinstance(section["allowed_users"], list):
@@ -112,7 +116,9 @@ def _validated_tailscale_section(dashboard: dict[str, Any]) -> dict[str, Any]:
     return section
 
 
-def _updated_section(raw: dict[str, Any], login: str, public_host: str) -> dict[str, Any]:
+def _updated_section(
+    raw: dict[str, Any], login: str, public_host: str
+) -> dict[str, Any]:
     dashboard = _validated_dashboard(raw)
     section = _validated_tailscale_section(dashboard)
     section["allowed_users"] = [login]
@@ -177,7 +183,10 @@ def configure(operator_login: str, public_host: str) -> bool:
     verified = (verify.get("dashboard") or {}).get("tailscale_auth")
     if not isinstance(verified, dict):
         raise HelperError("config.yaml verification failed")
-    if verified.get("allowed_users") != [operator_login] or verified.get("public_host") != public_host:
+    if (
+        verified.get("allowed_users") != [operator_login]
+        or verified.get("public_host") != public_host
+    ):
         raise HelperError("config.yaml verification failed")
     return True
 
@@ -224,10 +233,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("operator_login", nargs="?")
     parser.add_argument("public_host", nargs="?")
     args = parser.parse_args(argv)
-    if args.disable and (args.operator_login is not None or args.public_host is not None):
+    if args.disable and (
+        args.operator_login is not None or args.public_host is not None
+    ):
         parser.error("--disable does not accept operator_login or public_host")
     if not args.disable and (args.operator_login is None or args.public_host is None):
-        parser.error("operator_login and public_host are required unless --disable is used")
+        parser.error(
+            "operator_login and public_host are required unless --disable is used"
+        )
     try:
         if args.disable:
             changed = disable()
@@ -240,10 +253,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     state = "updated" if changed else "unchanged"
     if args.disable:
-        print(
-            "tailscale dashboard auth "
-            f"{state} (tailscale_auth=absent, mode=0600)"
-        )
+        print(f"tailscale dashboard auth {state} (tailscale_auth=absent, mode=0600)")
     else:
         print(
             "tailscale dashboard auth "
