@@ -3307,6 +3307,52 @@ class APIServerAdapter(BasePlatformAdapter):
         return payload
 
     @staticmethod
+    def _session_workspace_from_body(body: Dict[str, Any]) -> tuple[str, bool, Optional["web.Response"]]:
+        """Validate an optional session cwd/workspace binding.
+
+        ``cwd`` binds an existing directory. ``workspace`` is the explicit
+        provisioning form used by project clients: Hermes creates the
+        directory before the first agent is initialized, so tools, context
+        discovery, and memory all observe the same workspace on turn one.
+        """
+        raw_cwd = body.get("cwd")
+        raw_workspace = body.get("workspace")
+        if raw_cwd is None and raw_workspace is None:
+            return "", False, None
+        for field, value in (("cwd", raw_cwd), ("workspace", raw_workspace)):
+            if value is not None and not isinstance(value, str):
+                return "", False, web.json_response(
+                    _openai_error(f"{field} must be a string", code="invalid_workspace"),
+                    status=400,
+                )
+
+        def _normalize(value: str) -> Optional[str]:
+            value = value.strip()
+            if not value or len(value) > 2048 or re.search(r"[\r\n\x00]", value):
+                return None
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                return None
+            try:
+                return os.path.normpath(str(path))
+            except (OSError, ValueError):
+                return None
+
+        cwd = _normalize(raw_cwd) if raw_cwd is not None else ""
+        workspace = _normalize(raw_workspace) if raw_workspace is not None else ""
+        if (raw_cwd is not None and not cwd) or (raw_workspace is not None and not workspace):
+            return "", False, web.json_response(
+                _openai_error("cwd/workspace must be a valid absolute path", code="invalid_workspace"),
+                status=400,
+            )
+        if cwd and workspace and cwd != workspace:
+            return "", False, web.json_response(
+                _openai_error("cwd and workspace must resolve to the same path", code="invalid_workspace"),
+                status=400,
+            )
+        return workspace or cwd, bool(workspace), None
+
+    @staticmethod
     def _message_response(message: Dict[str, Any]) -> Dict[str, Any]:
         safe_keys = (
             "id", "session_id", "role", "content", "tool_call_id", "tool_calls",
@@ -3434,6 +3480,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 }
             }
         title = body.get("title")
+        session_cwd, provision_workspace, workspace_error = self._session_workspace_from_body(body)
+        if workspace_error is not None:
+            return workspace_error
+        if session_cwd:
+            workspace_path = Path(session_cwd)
+            try:
+                if provision_workspace:
+                    await asyncio.to_thread(workspace_path.mkdir, parents=True, exist_ok=True)
+                if not workspace_path.is_dir():
+                    raise NotADirectoryError(session_cwd)
+            except (OSError, RuntimeError) as exc:
+                logger.warning("Could not prepare API session workspace %s: %s", session_cwd, exc)
+                return web.json_response(
+                    _openai_error("Session workspace is unavailable", code="workspace_unavailable"),
+                    status=400,
+                )
 
         # Run the entire check-insert-title sequence inside a single
         # _execute_write call (BEGIN IMMEDIATE + commit) so the existence
@@ -3450,14 +3512,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 import time as _time
                 conn.execute(
                     """INSERT INTO sessions (
-                       id, source, model, model_config, system_prompt, started_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                       id, source, model, model_config, system_prompt, cwd, started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         source,
                         model_name,
                         json.dumps(model_config) if model_config else None,
                         system_prompt,
+                        session_cwd or None,
                         _time.time(),
                     ),
                 )
@@ -3738,6 +3801,7 @@ class APIServerAdapter(BasePlatformAdapter):
             conversation_history=history,
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
+            session_cwd=str(session.get("cwd") or ""),
             gateway_session_key=gateway_session_key,
             route=route,
             session_model=session_model,
@@ -3917,6 +3981,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history=history,
                     ephemeral_system_prompt=system_prompt,
                     session_id=session_id,
+                    session_cwd=str(session.get("cwd") or ""),
                     stream_delta_callback=_delta,
                     reasoning_callback=_reasoning_delta,
                     thinking_callback=_thinking_delta,
@@ -6186,6 +6251,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        cwd: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -6209,6 +6275,7 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            cwd=cwd,
             async_delivery=False,
             cron_session="",
         )
@@ -6219,6 +6286,7 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        session_cwd: Optional[str] = None,
         stream_delta_callback=None,
         reasoning_callback=None,
         thinking_callback=None,
@@ -6280,6 +6348,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    cwd=session_cwd or "",
                 )
                 agent = None
                 try:

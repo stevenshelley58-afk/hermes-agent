@@ -9,6 +9,7 @@ import agent.runtime_cwd as rt
 from agent.runtime_cwd import (
     clear_session_cwd,
     resolve_agent_cwd,
+    resolve_agent_workspace,
     resolve_context_cwd,
     set_session_cwd,
 )
@@ -76,6 +77,22 @@ class TestSessionCwdOverride:
         try:
             clear_session_cwd()
             assert resolve_agent_cwd() == tmp_path
+        finally:
+            rt._SESSION_CWD.reset(token)
+
+    def test_explicit_session_cwd_names_memory_workspace(self, tmp_path):
+        project = tmp_path / "Mini Frank!"
+        project.mkdir()
+        token = set_session_cwd(str(project))
+        try:
+            assert resolve_agent_workspace() == "mini-frank"
+        finally:
+            rt._SESSION_CWD.reset(token)
+
+    def test_unbound_session_uses_non_project_memory_workspace(self):
+        token = rt._SESSION_CWD.set(rt._UNSET)
+        try:
+            assert resolve_agent_workspace() == "unassigned"
         finally:
             rt._SESSION_CWD.reset(token)
 

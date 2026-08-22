@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -131,6 +132,7 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
             self.session_id = session_id
 
         def run_conversation(self, user_message, conversation_history, task_id):
+            from agent.runtime_cwd import resolve_agent_cwd, resolve_agent_workspace
             from gateway.session_context import get_session_env
             from tools.environments.local import _make_run_env
 
@@ -139,6 +141,8 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
             observed["context_platform"] = get_session_env("HERMES_SESSION_PLATFORM")
             observed["context_session_key"] = get_session_env("HERMES_SESSION_KEY")
             observed["child_session_id"] = _make_run_env({}).get("HERMES_SESSION_ID")
+            observed["cwd"] = str(resolve_agent_cwd())
+            observed["workspace"] = resolve_agent_workspace()
             return {"final_response": "ok"}
 
     def fake_create_agent(**kwargs):
@@ -146,12 +150,17 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
 
     monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
 
-    result, usage = await adapter._run_agent(
-        user_message="hello",
-        conversation_history=[],
-        session_id="request-session",
-        gateway_session_key="request-key",
-    )
+    from tempfile import TemporaryDirectory
+    with TemporaryDirectory(prefix="hermes-project-") as workspace:
+        result, usage = await adapter._run_agent(
+            user_message="hello",
+            conversation_history=[],
+            session_id="request-session",
+            session_cwd=workspace,
+            gateway_session_key="request-key",
+        )
+        expected_cwd = str(Path(workspace))
+        expected_workspace = Path(workspace).name
 
     assert result["session_id"] == "request-session"
     assert usage["input_tokens"] == 0
@@ -164,6 +173,8 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
         "context_platform": "api_server",
         "context_session_key": "request-key",
         "child_session_id": "request-session",
+        "cwd": expected_cwd,
+        "workspace": expected_workspace,
     }
 
 
@@ -473,7 +484,10 @@ async def test_session_chat_resolves_stored_model_route_alias(session_db, monkey
         )
     )
     adapter._session_db = session_db
-    session_id = session_db.create_session("route-pinned-session", "api_server", model="alias")
+    workspace = str(session_db.db_path.parent)
+    session_id = session_db.create_session(
+        "route-pinned-session", "api_server", model="alias", cwd=workspace
+    )
 
     mock_run = AsyncMock(return_value=({"final_response": "ok", "session_id": session_id}, {"total_tokens": 1}))
     app = _create_session_app(adapter)
@@ -488,6 +502,7 @@ async def test_session_chat_resolves_stored_model_route_alias(session_db, monkey
     _, kwargs = mock_run.call_args
     assert kwargs["route"] == {"model": "route/model", "provider": "openrouter"}
     assert kwargs["session_model"] is None
+    assert kwargs["session_cwd"] == workspace
 
 
 def _register_session_model_route(app, adapter):
@@ -586,6 +601,39 @@ async def test_create_session_respects_browser_source_and_model_lock(adapter, se
 
 
 @pytest.mark.asyncio
+async def test_create_session_provisions_and_persists_workspace(adapter, session_db, tmp_path):
+    workspace = tmp_path / "mini-frank"
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/api/sessions",
+            json={
+                "id": "project-session",
+                "cwd": str(workspace),
+                "workspace": str(workspace),
+            },
+        )
+        assert resp.status == 201, await resp.text()
+
+    assert workspace.is_dir()
+    assert session_db.get_session("project-session")["cwd"] == str(workspace.resolve())
+
+
+@pytest.mark.asyncio
+async def test_create_session_rejects_mismatched_workspace_binding(adapter, tmp_path):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/api/sessions",
+            json={"cwd": str(tmp_path / "one"), "workspace": str(tmp_path / "two")},
+        )
+        payload = await resp.json()
+
+    assert resp.status == 400
+    assert payload["error"]["code"] == "invalid_workspace"
+
+
+@pytest.mark.asyncio
 async def test_session_model_lock_endpoint_then_chat_reuses_persisted_lock_and_provider_credentials(
     adapter,
     session_db,
@@ -666,7 +714,10 @@ async def test_session_model_lock_endpoint_then_chat_stream_reuses_persisted_loc
     adapter,
     session_db,
 ):
-    session_id = session_db.create_session("endpoint-lock-stream", "api_server")
+    workspace = str(session_db.db_path.parent)
+    session_id = session_db.create_session(
+        "endpoint-lock-stream", "api_server", cwd=workspace
+    )
     captured = {}
 
     async def fake_run(**kwargs):
@@ -723,6 +774,7 @@ async def test_session_model_lock_endpoint_then_chat_stream_reuses_persisted_loc
     assert captured["requested_runtime"]["provider"] == "nous"
     assert captured["requested_runtime"]["model"] == "x-ai/grok-4.5"
     assert captured["route_source"] == "session_model_lock"
+    assert captured["session_cwd"] == workspace
     assert "x-ai/grok-4.5" in body
 
 
