@@ -161,6 +161,12 @@ async def test_stage_activity_resets_provider_inactivity_timeout(tmp_path):
         await adapter._execute_tool_run(run["run_id"])
 
     assert adapter._tool_run_store.get_run(run["run_id"])["status"] == "waiting_for_approval"
+    tool_events = [
+        event for event in adapter._tool_run_store.events(run["run_id"])
+        if event["kind"] in {"tool.started", "tool.completed"}
+    ]
+    assert [event["data"]["tool"] for event in tool_events] == ["builder", "builder"]
+    assert all("summary" not in event["data"] for event in tool_events)
     adapter._tool_run_store.close()
 
 

@@ -301,8 +301,10 @@ class ToolRunAPIMixin:
                 data: Dict[str, Any] = {}
                 if tool_name:
                     data["tool"] = str(tool_name)[:160]
-                if preview:
-                    data["summary"] = redact_sensitive_text(str(preview), force=True)[:1000]
+                # Tool previews can contain command text, private filesystem paths,
+                # prompt fragments, or provider payloads.  They are useful inside
+                # Hermes while deriving activity, but are never part of Frank's
+                # durable operator event contract.
                 if event_type == "tool.completed":
                     data["duration_seconds"] = round(float(kwargs.get("duration", 0) or 0), 3)
                     data["error"] = bool(kwargs.get("is_error"))
