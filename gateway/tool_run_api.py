@@ -238,7 +238,23 @@ class ToolRunAPIMixin:
             artifact = candidate.resolve(strict=True)
             artifact.relative_to(release_root)
         except (OSError, ValueError) as exc:
-            raise RuntimeError("TemplatePack is outside the private release store") from exc
+            # Finalizer models can redact an otherwise valid private path in
+            # their structured response (for example, ``private:``). Recover
+            # deterministically from the release identifier instead of making
+            # release correctness depend on model phrasing. The recovered
+            # artifact remains confined to the private store and is still
+            # bound below to the returned checksum and signature receipt.
+            release_id = str(output.get("release_id") or "")
+            if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,198}[A-Za-z0-9])?", release_id):
+                raise RuntimeError("TemplatePack is outside the private release store") from exc
+            candidate = release_root / release_id / "pack.bundle.json"
+            try:
+                if candidate.is_symlink():
+                    raise ValueError("symlink")
+                artifact = candidate.resolve(strict=True)
+                artifact.relative_to(release_root)
+            except (OSError, ValueError) as recovery_exc:
+                raise RuntimeError("TemplatePack is outside the private release store") from recovery_exc
         if not artifact.is_file() or artifact.suffix.lower() not in {".json", ".zip"}:
             raise RuntimeError("TemplatePack is not a supported immutable artifact")
         digest = hashlib.sha256()

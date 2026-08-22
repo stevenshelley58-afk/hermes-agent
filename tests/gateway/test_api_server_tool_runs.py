@@ -108,6 +108,33 @@ def test_release_artifact_is_bound_to_private_bytes_and_signature(tmp_path):
             APIServerAdapter._validate_release_artifact(output)
 
 
+def test_release_artifact_recovers_redacted_path_from_release_id(tmp_path):
+    release_id = "release-1"
+    release = (
+        tmp_path
+        / "hermes"
+        / "tool_releases"
+        / "ad-template-generator"
+        / release_id
+        / "pack.bundle.json"
+    )
+    release.parent.mkdir(parents=True)
+    signature = {"algorithm": "Ed25519", "key_id": release_id, "value": "signed"}
+    release.write_text(json.dumps({"integrity": {"signature": signature}}), encoding="utf-8")
+    output = {
+        "release_id": release_id,
+        "template_pack_path": "private:",
+        "sha256": hashlib.sha256(release.read_bytes()).hexdigest(),
+        "signature": signature,
+    }
+
+    with patch("hermes_constants.get_hermes_home", return_value=tmp_path / "hermes"):
+        APIServerAdapter._validate_release_artifact(output)
+        output["release_id"] = "../escape"
+        with pytest.raises(RuntimeError, match="outside"):
+            APIServerAdapter._validate_release_artifact(output)
+
+
 def test_tool_json_output_accepts_one_object_but_never_exposes_trailing_transport_text():
     value = {"final_response": '{"template_id":"candidate-1"}\nprivate verifier path: /srv/secret/file'}
     assert APIServerAdapter._tool_json_output(value) == {"template_id": "candidate-1"}
