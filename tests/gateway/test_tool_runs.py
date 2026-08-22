@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 import pytest
@@ -80,6 +81,34 @@ def test_model_policy_revisions_are_immutable_and_run_pinned(tmp_path):
     assert run["model_policy_revision"] == 2
     assert run["model_policy"]["stages"]["analyse"]["primary"]["model"] == "gemini-3.6-flash"
     assert store.get_policy("ad-template-generator", 1)["policy"]["name"] == "Recommended quality"
+
+
+def test_legacy_seed_is_superseded_without_rewriting_revision_one(tmp_path):
+    path = tmp_path / "seed-migration.db"
+    store = ToolRunStore(str(path))
+    legacy = default_ad_template_policy()
+    legacy.pop("seed_revision", None)
+    for stage_id in ("analyse", "visual-qa"):
+        legacy["stages"][stage_id]["primary"]["provider"] = "openai"
+        legacy["stages"][stage_id]["fallbacks"][0]["provider"] = "google"
+    for stage_id in ("masked-text-cleanup", "story-extend"):
+        legacy["stages"][stage_id]["primary"]["provider"] = "google"
+    legacy["stages"]["masked-text-cleanup"]["fallbacks"][0]["provider"] = "google"
+    legacy["stages"]["masked-text-cleanup"]["fallbacks"][1]["provider"] = "openai"
+    legacy["stages"]["story-extend"]["fallbacks"][0]["provider"] = "openai"
+    store._conn.execute(
+        "UPDATE tool_model_policies SET policy_json=? WHERE tool_id='ad-template-generator' AND revision=1",
+        (json.dumps(legacy, separators=(",", ":"), sort_keys=True),),
+    )
+    store._conn.commit()
+    store.close()
+
+    migrated = ToolRunStore(str(path))
+    assert migrated.get_policy("ad-template-generator", 1)["policy"]["stages"]["analyse"]["primary"]["provider"] == "openai"
+    current = migrated.get_policy("ad-template-generator")
+    assert current["revision"] == 2
+    assert current["policy"]["stages"]["analyse"]["primary"]["provider"] == "openai-codex"
+    assert current["policy"]["seed_revision"] == 2
 
 
 def test_one_run_override_creates_new_revision(tmp_path):

@@ -106,22 +106,23 @@ def default_ad_template_policy() -> Dict[str, Any]:
         "tool_id": "ad-template-generator",
         "name": "Recommended quality",
         "preset": "quality-first",
+        "seed_revision": 2,
         "pricing_checked_at": checked_at,
         "stages": {
             "analyse": {
                 "capability": "vision_structured",
-                "primary": {"provider": "openai", "model": "gpt-5.5"},
-                "fallbacks": [{"provider": "google", "model": "gemini-3.6-flash"}],
+                "primary": {"provider": "openai-codex", "model": "gpt-5.5"},
+                "fallbacks": [{"provider": "gemini", "model": "gemini-3.6-flash"}],
                 "max_attempts": 2,
                 "timeout_seconds": 120,
                 "max_cost_usd": 0.60,
             },
             "masked-text-cleanup": {
                 "capability": "masked_image_edit",
-                "primary": {"provider": "google", "model": "gemini-3.1-flash-image"},
+                "primary": {"provider": "gemini", "model": "gemini-3.1-flash-image"},
                 "fallbacks": [
-                    {"provider": "google", "model": "gemini-3-pro-image"},
-                    {"provider": "openai", "model": "gpt-image-2"},
+                    {"provider": "gemini", "model": "gemini-3-pro-image"},
+                    {"provider": "openai-api", "model": "gpt-image-2"},
                 ],
                 "max_attempts": 3,
                 "timeout_seconds": 180,
@@ -129,8 +130,8 @@ def default_ad_template_policy() -> Dict[str, Any]:
             },
             "story-extend": {
                 "capability": "masked_image_edit",
-                "primary": {"provider": "google", "model": "gemini-3.1-flash-image"},
-                "fallbacks": [{"provider": "openai", "model": "gpt-image-2"}],
+                "primary": {"provider": "gemini", "model": "gemini-3.1-flash-image"},
+                "fallbacks": [{"provider": "openai-api", "model": "gpt-image-2"}],
                 "max_attempts": 2,
                 "timeout_seconds": 180,
                 "max_cost_usd": 1.00,
@@ -138,8 +139,8 @@ def default_ad_template_policy() -> Dict[str, Any]:
             },
             "visual-qa": {
                 "capability": "vision_structured",
-                "primary": {"provider": "openai", "model": "gpt-5.5"},
-                "fallbacks": [{"provider": "google", "model": "gemini-3.6-flash"}],
+                "primary": {"provider": "openai-codex", "model": "gpt-5.5"},
+                "fallbacks": [{"provider": "gemini", "model": "gemini-3.6-flash"}],
                 "max_attempts": 2,
                 "timeout_seconds": 120,
                 "max_cost_usd": 0.60,
@@ -150,6 +151,27 @@ def default_ad_template_policy() -> Dict[str, Any]:
             "subject-invariance", "studio-qa", "ready", "release",
         ],
     }
+
+
+def _is_legacy_seed_policy(policy: Any) -> bool:
+    """Recognize only the exact first-party seed that needs superseding."""
+    if not isinstance(policy, dict):
+        return False
+    if policy.get("name") != "Recommended quality" or policy.get("preset") != "quality-first":
+        return False
+    stages = policy.get("stages") if isinstance(policy.get("stages"), dict) else {}
+    expected = {
+        "analyse": ("openai", "gpt-5.5"),
+        "masked-text-cleanup": ("google", "gemini-3.1-flash-image"),
+        "story-extend": ("google", "gemini-3.1-flash-image"),
+        "visual-qa": ("openai", "gpt-5.5"),
+    }
+    for stage_id, identity in expected.items():
+        stage = stages.get(stage_id) if isinstance(stages.get(stage_id), dict) else {}
+        primary = stage.get("primary") if isinstance(stage.get("primary"), dict) else {}
+        if (primary.get("provider"), primary.get("model")) != identity:
+            return False
+    return True
 
 
 def validate_model_policy(policy: Any, *, tool_id: Optional[str] = None) -> Dict[str, Any]:
@@ -339,12 +361,27 @@ class ToolRunStore:
         policy = validate_model_policy(policy, tool_id=tool_id)
         with self._lock:
             exists = self._conn.execute(
-                "SELECT 1 FROM tool_model_policies WHERE tool_id=? AND project_id='' LIMIT 1", (tool_id,)
+                "SELECT revision,policy_json FROM tool_model_policies "
+                "WHERE tool_id=? AND project_id='' AND is_default=1 ORDER BY revision DESC LIMIT 1", (tool_id,)
             ).fetchone()
             if exists is None:
                 self._conn.execute(
                     "INSERT INTO tool_model_policies(tool_id,revision,project_id,created_at,is_default,policy_json) VALUES(?,?,?,?,?,?)",
                     (tool_id, 1, "", _now(), 1, _json(policy, "model_policy")),
+                )
+                self._conn.commit()
+            elif tool_id == "ad-template-generator" and _is_legacy_seed_policy(_loads(exists["policy_json"], {})):
+                # Keep revision 1 immutable for reproducibility, and make the
+                # corrected executable provider slugs the future default.
+                revision = int(self._conn.execute(
+                    "SELECT COALESCE(MAX(revision),0)+1 FROM tool_model_policies WHERE tool_id=?", (tool_id,)
+                ).fetchone()[0])
+                self._conn.execute(
+                    "UPDATE tool_model_policies SET is_default=0 WHERE tool_id=? AND project_id=''", (tool_id,)
+                )
+                self._conn.execute(
+                    "INSERT INTO tool_model_policies(tool_id,revision,project_id,created_at,is_default,policy_json) VALUES(?,?,?,?,?,?)",
+                    (tool_id, revision, "", _now(), 1, _json(policy, "model_policy")),
                 )
                 self._conn.commit()
 

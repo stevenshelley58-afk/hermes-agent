@@ -577,12 +577,31 @@ class ToolRunAPIMixin:
             from hermes_cli.inventory import build_model_options_payload, load_picker_context
             payload = await asyncio.to_thread(lambda: build_model_options_payload(load_picker_context(), include_unconfigured=True, refresh=False))
             payload["policy_schema"] = TOOL_MODEL_POLICY_SCHEMA
+            providers = payload.get("providers") if isinstance(payload.get("providers"), list) else []
+            readiness = {
+                str(item.get("slug") or ""): bool(item.get("authenticated"))
+                for item in providers if isinstance(item, dict)
+            }
+            checked_at = "2026-08-14T03:24:31Z"
+
+            def capability(provider: str, model: str, name: str) -> Dict[str, Any]:
+                return {
+                    "provider": provider,
+                    "model": model,
+                    "capabilities": [name],
+                    "available": readiness.get(provider, False),
+                    "credential_ready": readiness.get(provider, False),
+                    "estimated_price": None,
+                    "price_checked_at": checked_at,
+                    "pricing_stale": True,
+                }
+
             payload["ad_studio_capabilities"] = [
-                {"provider": "openai", "model": "gpt-5.5", "capabilities": ["vision_structured"], "estimated_price": None, "price_checked_at": "2026-08-14T03:24:31Z", "pricing_stale": True},
-                {"provider": "google", "model": "gemini-3.6-flash", "capabilities": ["vision_structured"], "estimated_price": None, "price_checked_at": "2026-08-14T03:24:31Z", "pricing_stale": True},
-                {"provider": "google", "model": "gemini-3.1-flash-image", "capabilities": ["masked_image_edit"], "estimated_price": None, "price_checked_at": "2026-08-14T03:24:31Z", "pricing_stale": True},
-                {"provider": "google", "model": "gemini-3-pro-image", "capabilities": ["masked_image_edit"], "estimated_price": None, "price_checked_at": "2026-08-14T03:24:31Z", "pricing_stale": True},
-                {"provider": "openai", "model": "gpt-image-2", "capabilities": ["masked_image_edit"], "estimated_price": None, "price_checked_at": "2026-08-14T03:24:31Z", "pricing_stale": True},
+                capability("openai-codex", "gpt-5.5", "vision_structured"),
+                capability("gemini", "gemini-3.6-flash", "vision_structured"),
+                capability("gemini", "gemini-3.1-flash-image", "masked_image_edit"),
+                capability("gemini", "gemini-3-pro-image", "masked_image_edit"),
+                capability("openai-api", "gpt-image-2", "masked_image_edit"),
             ]
             return web.json_response(payload)
         except Exception:
