@@ -131,8 +131,71 @@ class ToolRunAPIMixin:
             if isinstance(parsed, dict):
                 return parsed
         except (TypeError, json.JSONDecodeError):
-            pass
-        return {"summary": text[:32_000]}
+            # Some agent transports append a local verifier note after the JSON
+            # response.  Decode one complete object, but never persist the
+            # trailing transport text as public Tool output.
+            start = text.find("{")
+            if start >= 0:
+                try:
+                    parsed, _ = json.JSONDecoder().raw_decode(text[start:])
+                    if isinstance(parsed, dict):
+                        return parsed
+                except (TypeError, json.JSONDecodeError):
+                    pass
+        raise RuntimeError("Builder did not return one structured JSON result")
+
+    @staticmethod
+    def _prepare_candidate_output(run_id: str, output: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate pre-release evidence and expose only opaque preview URLs."""
+        required = {"template_id", "candidate_ref", "preview_refs", "evidence_refs", "qa_summary"}
+        missing = sorted(key for key in required if not output.get(key))
+        if missing:
+            raise RuntimeError(f"Builder candidate is incomplete: {', '.join(missing)}")
+        qa = output.get("qa_summary")
+        if not isinstance(qa, dict):
+            raise RuntimeError("Builder candidate QA evidence is invalid")
+        if (
+            qa.get("source_verified") is not True
+            or qa.get("deterministic_check") != "passed"
+            or qa.get("subject_invariance_gate") is not True
+            or qa.get("release_status") != "blocked_pending_human_approval"
+        ):
+            raise RuntimeError("Builder candidate did not pass every automated pre-release gate")
+        try:
+            from hermes_constants import get_hermes_home
+            preview_root = (
+                get_hermes_home() / "tool_assets" / "ad-template-generator" /
+                "runs" / run_id / "previews"
+            ).resolve()
+        except Exception as exc:
+            raise RuntimeError("Hermes private preview store is unavailable") from exc
+        preview_refs = output.get("preview_refs")
+        if not isinstance(preview_refs, list) or not preview_refs:
+            raise RuntimeError("Builder candidate has no reviewable previews")
+        previews = []
+        for raw_path in preview_refs:
+            try:
+                target = Path(str(raw_path)).resolve(strict=True)
+                target.relative_to(preview_root)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError("Builder preview is outside the private run store") from exc
+            if target.is_symlink() or not target.is_file() or target.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+                raise RuntimeError("Builder preview is not a supported immutable image")
+            digest = hashlib.sha256(target.read_bytes()).hexdigest()
+            previews.append({
+                "name": target.name,
+                "sha256": digest,
+                "url": f"/api/ad-studio/runs/{run_id}/artifacts/{target.name}",
+            })
+        result = dict(output)
+        result["previews"] = previews
+        result["qa"] = {
+            "source_verified": True,
+            "deterministic_check": "passed",
+            "subject_invariance_passed": True,
+            "release_blocked_pending_approval": True,
+        }
+        return result
 
     @staticmethod
     def _validate_release_artifact(output: Dict[str, Any]) -> None:
@@ -432,6 +495,7 @@ class ToolRunAPIMixin:
                     data={key: output.get(key) for key in ("release_id", "template_pack_ref", "sha256", "compatibility") if output.get(key) is not None},
                 )
             else:
+                output = self._prepare_candidate_output(run_id, output)
                 self._tool_run_store.update_run(
                     run_id, status="waiting_for_approval", stage="studio-qa", progress=0.9,
                     output=output, attention=True,
@@ -533,6 +597,31 @@ class ToolRunAPIMixin:
             return web.json_response(_error(str(exc), "tool_run_not_found"), status=404)
         except (ToolRunError, OSError, ValueError) as exc:
             return web.json_response(_error(str(exc), "tool_pack_unavailable"), status=409)
+
+    async def _handle_tool_run_artifact(self, request: web.Request) -> web.StreamResponse:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = request.match_info["run_id"]
+        name = request.match_info["name"]
+        try:
+            self._tool_run_store.get_run(run_id)
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", name):
+                raise ToolRunError("invalid artifact name")
+            from hermes_constants import get_hermes_home
+            root = (
+                get_hermes_home() / "tool_assets" / "ad-template-generator" /
+                "runs" / run_id / "previews"
+            ).resolve()
+            target = (root / name).resolve(strict=True)
+            target.relative_to(root)
+            if target.is_symlink() or not target.is_file() or target.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+                raise ToolRunError("preview artifact is unavailable")
+            return web.FileResponse(target, headers={"Cache-Control": "private, no-store"})
+        except KeyError as exc:
+            return web.json_response(_error(str(exc), "tool_run_not_found"), status=404)
+        except (ToolRunError, OSError, ValueError) as exc:
+            return web.json_response(_error(str(exc), "tool_artifact_unavailable"), status=404)
 
     async def _handle_tool_run_events(self, request: web.Request) -> web.StreamResponse:
         auth_err = self._check_auth(request)

@@ -2111,6 +2111,7 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
             ("POST", "/v1/tool-runs/policies/{tool_id}", self._handle_create_tool_policy),
             ("GET", "/v1/tool-runs/{run_id}", self._handle_get_tool_run),
             ("GET", "/v1/tool-runs/{run_id}/download", self._handle_download_tool_run),
+            ("GET", "/v1/tool-runs/{run_id}/artifacts/{name}", self._handle_tool_run_artifact),
             ("GET", "/v1/tool-runs/{run_id}/events", self._handle_tool_run_events),
             ("POST", "/v1/tool-runs/{run_id}/approval", self._handle_tool_run_approval),
             ("POST", "/v1/tool-runs/{run_id}/models", self._handle_tool_run_model_change),

@@ -26,6 +26,7 @@ def make_app(adapter):
     app.router.add_get("/v1/tool-runs/policies/{tool_id}", adapter._handle_list_tool_policies)
     app.router.add_post("/v1/tool-runs/policies/{tool_id}", adapter._handle_create_tool_policy)
     app.router.add_get("/v1/tool-runs/{run_id}", adapter._handle_get_tool_run)
+    app.router.add_get("/v1/tool-runs/{run_id}/artifacts/{name}", adapter._handle_tool_run_artifact)
     app.router.add_get("/v1/tool-runs/{run_id}/events", adapter._handle_tool_run_events)
     app.router.add_post("/v1/tool-runs/{run_id}/models", adapter._handle_tool_run_model_change)
     app.router.add_post("/v1/tool-runs/{run_id}/approval", adapter._handle_tool_run_approval)
@@ -44,6 +45,24 @@ def command(key="job-1"):
         "payload": {"job_name": "August ads", "sources": [{"ref": "source:one"}]},
         "idempotency_key": key,
         "model_policy_revision": 1,
+    }
+
+
+def candidate_output(tmp_path, run_id, template_id):
+    preview = tmp_path / "hermes" / "tool_assets" / "ad-template-generator" / "runs" / run_id / "previews" / "feed.png"
+    preview.parent.mkdir(parents=True, exist_ok=True)
+    preview.write_bytes(b"\x89PNG\r\n\x1a\npreview")
+    return {
+        "template_id": template_id,
+        "candidate_ref": str(tmp_path / "private" / "template.json"),
+        "preview_refs": [str(preview)],
+        "evidence_refs": {"qa": "private"},
+        "qa_summary": {
+            "source_verified": True,
+            "deterministic_check": "passed",
+            "subject_invariance_gate": True,
+            "release_status": "blocked_pending_human_approval",
+        },
     }
 
 
@@ -84,6 +103,13 @@ def test_release_artifact_is_bound_to_private_bytes_and_signature(tmp_path):
         output["sha256"] = "0" * 64
         with pytest.raises(RuntimeError, match="checksum"):
             APIServerAdapter._validate_release_artifact(output)
+
+
+def test_tool_json_output_accepts_one_object_but_never_exposes_trailing_transport_text():
+    value = {"final_response": '{"template_id":"candidate-1"}\nprivate verifier path: /srv/secret/file'}
+    assert APIServerAdapter._tool_json_output(value) == {"template_id": "candidate-1"}
+    with pytest.raises(RuntimeError, match="structured JSON"):
+        APIServerAdapter._tool_json_output({"final_response": "private verifier path: /srv/secret/file"})
         outside = tmp_path / "outside.json"
         outside.write_text("{}", encoding="utf-8")
         output["template_pack_path"] = str(outside)
@@ -109,6 +135,22 @@ async def test_create_list_and_get_are_durable_not_chat(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_candidate_preview_is_served_only_from_private_run_store(tmp_path):
+    adapter = make_adapter(tmp_path)
+    app = make_app(adapter)
+    run, _ = adapter._tool_run_store.create_run(command("preview"))
+    candidate_output(tmp_path, run["run_id"], "candidate-preview")
+    with patch("hermes_constants.get_hermes_home", return_value=tmp_path / "hermes"):
+        async with TestClient(TestServer(app)) as client:
+            response = await client.get(f"/v1/tool-runs/{run['run_id']}/artifacts/feed.png")
+            assert response.status == 200
+            assert await response.read() == b"\x89PNG\r\n\x1a\npreview"
+            escaped = await client.get(f"/v1/tool-runs/{run['run_id']}/artifacts/..%2Fsecret.png")
+            assert escaped.status == 404
+    adapter._tool_run_store.close()
+
+
+@pytest.mark.asyncio
 async def test_executor_requests_persistence_isolation(tmp_path):
     adapter = make_adapter(tmp_path)
     run, _ = adapter._tool_run_store.create_run(command())
@@ -119,10 +161,10 @@ async def test_executor_requests_persistence_isolation(tmp_path):
         session_total_tokens = 18
 
         def run_conversation(self, **_kwargs):
-            return {"final_response": json.dumps({"template_id": "candidate-1"})}
+            return {"final_response": json.dumps(candidate_output(tmp_path, run["run_id"], "candidate-1"))}
 
     fake = FakeAgent()
-    with patch.object(adapter, "_create_agent", return_value=fake) as create:
+    with patch("hermes_constants.get_hermes_home", return_value=tmp_path / "hermes"), patch.object(adapter, "_create_agent", return_value=fake) as create:
         await adapter._execute_tool_run(run["run_id"])
 
     assert create.call_args.kwargs["persistence_disabled"] is True
@@ -153,11 +195,11 @@ async def test_stage_activity_resets_provider_inactivity_timeout(tmp_path):
                 progress("tool.started", tool_name="builder", preview="decompose")
                 time.sleep(0.6)
                 progress("tool.completed", tool_name="builder", preview="check")
-                return {"final_response": json.dumps({"template_id": "candidate-2"})}
+                return {"final_response": json.dumps(candidate_output(tmp_path, run["run_id"], "candidate-2"))}
 
         return ProgressAgent()
 
-    with patch.object(adapter, "_create_agent", side_effect=create_agent):
+    with patch("hermes_constants.get_hermes_home", return_value=tmp_path / "hermes"), patch.object(adapter, "_create_agent", side_effect=create_agent):
         await adapter._execute_tool_run(run["run_id"])
 
     assert adapter._tool_run_store.get_run(run["run_id"])["status"] == "waiting_for_approval"
