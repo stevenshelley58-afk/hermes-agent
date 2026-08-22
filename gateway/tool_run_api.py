@@ -134,6 +134,44 @@ class ToolRunAPIMixin:
             pass
         return {"summary": text[:32_000]}
 
+    @staticmethod
+    def _validate_release_artifact(output: Dict[str, Any]) -> None:
+        """Bind a release receipt to the exact private artifact bytes."""
+        try:
+            from hermes_constants import get_hermes_home
+            release_root = (get_hermes_home() / "tool_releases" / "ad-template-generator").resolve()
+        except Exception as exc:
+            raise RuntimeError("Hermes private release store is unavailable") from exc
+        raw_path = output.get("template_pack_path")
+        if not raw_path:
+            raise RuntimeError("Builder did not return the private TemplatePack path")
+        candidate = Path(str(raw_path))
+        if candidate.is_symlink():
+            raise RuntimeError("TemplatePack symlinks are not accepted")
+        try:
+            artifact = candidate.resolve(strict=True)
+            artifact.relative_to(release_root)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("TemplatePack is outside the private release store") from exc
+        if not artifact.is_file() or artifact.suffix.lower() not in {".json", ".zip"}:
+            raise RuntimeError("TemplatePack is not a supported immutable artifact")
+        digest = hashlib.sha256()
+        with artifact.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != str(output.get("sha256") or "").lower():
+            raise RuntimeError("TemplatePack checksum does not match the released bytes")
+        if artifact.suffix.lower() == ".json":
+            try:
+                pack = json.loads(artifact.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("TemplatePack JSON is unreadable") from exc
+            integrity = pack.get("integrity") if isinstance(pack, dict) else None
+            if not isinstance(integrity, dict) or not isinstance(integrity.get("signature"), dict):
+                raise RuntimeError("TemplatePack does not contain its signature receipt")
+            if integrity.get("signature") != output.get("signature"):
+                raise RuntimeError("TemplatePack signature receipt does not match the released artifact")
+
     def _tool_candidate(self, run: Dict[str, Any], stage: str) -> Dict[str, str]:
         stages = (run.get("model_policy") or {}).get("stages") or {}
         selected = stages.get(stage) or stages.get("analyse") or {}
@@ -345,12 +383,13 @@ class ToolRunAPIMixin:
             if finalize:
                 if output.get("failed"):
                     raise RuntimeError(str(output.get("error") or "Release checks failed"))
-                required_release = {"release_id", "template_pack_ref", "sha256", "signature", "compatibility", "qa", "trace_ref"}
+                required_release = {"release_id", "template_pack_ref", "template_pack_path", "sha256", "signature", "compatibility", "qa", "trace_ref"}
                 missing = sorted(key for key in required_release if not output.get(key))
                 if missing:
                     raise RuntimeError(f"Builder returned an incomplete TemplatePack release: {', '.join(missing)}")
                 if not re.fullmatch(r"[0-9a-f]{64}", str(output.get("sha256") or "")):
                     raise RuntimeError("Builder returned an invalid TemplatePack checksum")
+                self._validate_release_artifact(output)
                 qa = output.get("qa") if isinstance(output.get("qa"), dict) else {}
                 if qa.get("all_gates_passed") is not True or qa.get("subject_invariance_passed") is not True or qa.get("source_identity_leakage") != 0:
                     raise RuntimeError("Builder release evidence did not pass every mandatory QA gate")

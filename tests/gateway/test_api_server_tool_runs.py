@@ -1,3 +1,5 @@
+import hashlib
+import json
 from unittest.mock import patch
 
 import pytest
@@ -64,6 +66,28 @@ def test_source_ingestion_is_private_hashed_and_jail_bounded(tmp_path, monkeypat
         escaped["payload"]["sources"] = [{"path": str(outside)}]
         with pytest.raises(ValueError, match="outside"):
             APIServerAdapter._ingest_tool_sources(escaped)
+
+
+def test_release_artifact_is_bound_to_private_bytes_and_signature(tmp_path):
+    release = tmp_path / "hermes" / "tool_releases" / "ad-template-generator" / "pack.json"
+    release.parent.mkdir(parents=True)
+    signature = {"algorithm": "Ed25519", "key_id": "release-1", "value": "signed"}
+    release.write_text(json.dumps({"integrity": {"signature": signature}}), encoding="utf-8")
+    output = {
+        "template_pack_path": str(release),
+        "sha256": hashlib.sha256(release.read_bytes()).hexdigest(),
+        "signature": signature,
+    }
+    with patch("hermes_constants.get_hermes_home", return_value=tmp_path / "hermes"):
+        APIServerAdapter._validate_release_artifact(output)
+        output["sha256"] = "0" * 64
+        with pytest.raises(RuntimeError, match="checksum"):
+            APIServerAdapter._validate_release_artifact(output)
+        outside = tmp_path / "outside.json"
+        outside.write_text("{}", encoding="utf-8")
+        output["template_pack_path"] = str(outside)
+        with pytest.raises(RuntimeError, match="outside"):
+            APIServerAdapter._validate_release_artifact(output)
 
 
 @pytest.mark.asyncio
