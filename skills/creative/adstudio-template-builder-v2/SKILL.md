@@ -32,9 +32,10 @@ Run and checkpoint these stages in order:
 10. `release`: write the immutable pack beneath
     `$HERMES_HOME/tool_releases/ad-template-generator` and return its receipt.
 
-Use `node scripts/adstudio/v2/ingest.mjs analyse --source <path> --id <id>`
-for initial ingestion. If a deterministic command rejects the candidate, stop
-and report the evidence; never make the model simulate a passing result.
+The analyse stage uses the configured vision route to write the builder's
+evidence and layered draft contracts; it is not a deterministic CLI subcommand.
+If a deterministic command rejects the resulting candidate, stop and report
+the evidence; never make the model simulate a passing result.
 
 ## Image-model boundary
 
