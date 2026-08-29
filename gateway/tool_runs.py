@@ -113,7 +113,10 @@ def default_ad_template_policy() -> Dict[str, Any]:
         "schema": TOOL_MODEL_POLICY_SCHEMA, "tool_id": "ad-template-generator",
         "name": "Sole ad-template process", "preset": "cheap-quality",
         "stages": {
-            "analyse": {"capability": "vision_structured", "primary": {"provider": "gemini", "model": "gemini-3.6-flash"}, "fallbacks": [{"provider": "openai-codex", "model": "gpt-5.5"}], "max_attempts": 2, "timeout_seconds": 180, "max_cost_usd": 0.60},
+            "analyse": {"capability": "vision_structured", "primary": {"provider": "deepseek", "model": "deepseek-v4-flash"}, "fallbacks": [{"provider": "deepseek", "model": "deepseek-v4-pro"}], "max_attempts": 1, "timeout_seconds": 180, "max_cost_usd": 0.60},
+            "compare": {"capability": "vision_structured", "primary": {"provider": "deepseek", "model": "deepseek-v4-pro"}, "fallbacks": [{"provider": "deepseek", "model": "deepseek-v4-flash"}], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
+            "final-review-a": {"capability": "vision_structured", "primary": {"provider": "deepseek", "model": "deepseek-v4-flash"}, "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
+            "final-review-b": {"capability": "vision_structured", "primary": {"provider": "deepseek", "model": "deepseek-v4-pro"}, "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
         },
         "deterministic_stages": ["qa", "import"],
     }

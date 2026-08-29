@@ -21,7 +21,7 @@ from aiohttp import web
 
 from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
-from gateway.ad_template_process import validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
+from gateway.ad_template_process import SoleProcessOrchestrator, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
 from gateway.tool_runs import (
     TOOL_MODEL_POLICY_SCHEMA,
     ToolRunError,
@@ -125,20 +125,19 @@ class ToolRunAPIMixin:
 
     @staticmethod
     def _prepare_candidate_output(run_id: str, output: Dict[str, Any]) -> Dict[str, Any]:
-        """Accept only the sole process result and normalize deterministic docs."""
-        required = {"template", "iterations", "final_review", "previews", "template_path", "render_path", "import"}
+        required = {"template", "iterations", "final_review", "previews", "documents", "import"}
         missing = sorted(key for key in required if key not in output)
         if missing:
             raise RuntimeError(f"Generator result is incomplete: {', '.join(missing)}")
         iterations = validate_iterations(output.get("iterations"))
-        accepted = iterations[-1]["decision"] == "accepted"
-        final_review = validate_final_review(output.get("final_review"), accepted=accepted)
-        if accepted and final_review.get("decision") != "accepted":
+        final_review = validate_final_review(output.get("final_review"), accepted=iterations[-1]["decision"] == "accepted")
+        if final_review.get("decision") != "accepted":
             raise RuntimeError("final reviewers did not pass")
-        if not accepted:
-            raise RuntimeError("generator exhausted its loop without a passing comparator")
         docs = deterministic_documents(output.get("template"))
-        result = {key: output.get(key) for key in ("template", "previews", "template_path", "render_path", "import")}
+        imported = output.get("import")
+        if not isinstance(imported, dict) or not imported.get("template_id") or not imported.get("status"):
+            raise RuntimeError("Blockwise import receipt is missing")
+        result = {key: output.get(key) for key in ("template", "previews", "documents", "template_path", "render_path", "import", "process")}
         result["iterations"] = iterations
         result["final_review"] = final_review
         result["deterministic_documents"] = docs
@@ -153,16 +152,9 @@ class ToolRunAPIMixin:
         return validate_final_review(output.get("final_review"), accepted=iterations[-1]["decision"] == "accepted")
 
     def _project_generation_events(self, run_id: str, records: List[Dict[str, Any]]) -> None:
-        for record in records:
-            comparison = record.get("comparison") or {}
-            self._tool_run_store.append_event(run_id, "iteration.compared", status="ok",
-                node_id="compare", data={"iteration": record.get("iteration"),
-                "score": comparison.get("score"), "reason": comparison.get("reason"),
-                "decision": record.get("decision")})
-        if records and records[-1].get("decision") == "accepted":
-            self._tool_run_store.append_event(run_id, "final-review.started", status="running", node_id="final-review", data={})
-            self._tool_run_store.append_event(run_id, "final-review.completed", status="ok", node_id="final-review",
-                data={"decision": "accepted", "reviewer_count": 2})
+        # The executable orchestrator persists each real comparator and reviewer
+        # event as it happens. Never reconstruct or synthesize process truth.
+        return None
 
     def _tool_candidate(self, run: Dict[str, Any], stage: str) -> Dict[str, str]:
         stages = (run.get("model_policy") or {}).get("stages") or {}
@@ -289,31 +281,42 @@ class ToolRunAPIMixin:
                     node_id=current_stage, data=data,
                 )
 
-            def run_sync(candidate: Dict[str, str]):
-                route = self._resolve_route(candidate["model"])
-                agent = self._create_agent(
-                    ephemeral_system_prompt=(
-                        "You are executing a private durable Frank Tool job on the VPS. Operational progress is "
-                        "visible to the operator. Follow installed skills and project authority exactly."
-                    ),
-                    session_id=run_id,
-                    tool_progress_callback=progress_callback,
-                    requested_model=candidate["model"],
-                    requested_provider=candidate["provider"],
-                    route=route,
-                    persistence_disabled=True,
-                )
-                self._tool_run_agents[run_id] = agent
-                result = agent.run_conversation(
-                    user_message=self._tool_prompt(run, finalize=finalize),
-                    conversation_history=[],
-                    task_id=run_id,
-                )
-                usage = {
-                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                }
+            def run_sync(_candidate: Dict[str, str]):
+                from hermes_constants import get_hermes_home
+                workspace = (get_hermes_home() / "tool_runs" / "ad-template-generator" / run_id).resolve()
+                workspace.mkdir(parents=True, exist_ok=True)
+                usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+                def call_agent(instance_id: str, prompt: str, route_name: str):
+                    provider, model = route_name.split("/", 1)
+                    route = self._resolve_route(model)
+                    agent = self._create_agent(
+                        ephemeral_system_prompt="You are one isolated role in Hermes' sole ad-template process. Return only the requested JSON.",
+                        session_id=f"{run_id}:{instance_id}:{uuid.uuid4().hex}",
+                        tool_progress_callback=progress_callback,
+                        requested_model=model, requested_provider=provider, route=route,
+                        persistence_disabled=True,
+                    )
+                    result = agent.run_conversation(user_message=prompt, conversation_history=[], task_id=f"{run_id}:{instance_id}")
+                    usage["input_tokens"] += getattr(agent, "session_prompt_tokens", 0) or 0
+                    usage["output_tokens"] += getattr(agent, "session_completion_tokens", 0) or 0
+                    usage["total_tokens"] += getattr(agent, "session_total_tokens", 0) or 0
+                    return self._tool_json_output(result)
+                routes = []
+                for role in ("analyse", "compare", "final-review-a", "final-review-b"):
+                    stage_candidates, _ = self._tool_candidates(run, role)
+                    if not stage_candidates:
+                        raise RuntimeError(f"No route configured for {role}")
+                    routes.append(stage_candidates[0])
+                route_names = [f"{item['provider']}/{item['model']}" for item in routes]
+                def emit(kind: str, node: str, data: Dict[str, Any]):
+                    self._tool_run_store.append_event(run_id, kind, status="ok" if kind.endswith(("completed", "compared", "imported")) else "running", node_id=node, data=data)
+                payload = run.get("payload") or {}
+                source_items = payload.get("sources") or []
+                source = str((source_items[0] or {}).get("path") if source_items and isinstance(source_items[0], dict) else "")
+                result = SoleProcessOrchestrator(
+                    call_agent=call_agent, workspace=workspace, run_id=run_id,
+                    project_id=str((run.get("scope") or {}).get("project_id") or ""), emit=emit,
+                ).run(source=source, brief=str(payload.get("brief") or ""), placements=payload.get("placements") or [], routes=routes)
                 return result, usage
 
             result = usage = None
@@ -387,7 +390,7 @@ class ToolRunAPIMixin:
             )
             self._tool_run_store.append_event(
                 run_id, "template.imported", status="ok", node_id="import",
-                data={"status": "ready", "deterministic": True},
+                data=dict(output["import"]),
             )
         except asyncio.CancelledError:
             try:
@@ -509,7 +512,7 @@ class ToolRunAPIMixin:
             ).resolve()
             target = (root / name).resolve(strict=True)
             target.relative_to(root)
-            if target.is_symlink() or not target.is_file() or target.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+            if target.is_symlink() or not target.is_file() or target.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".svg"}:
                 raise ToolRunError("preview artifact is unavailable")
             return web.FileResponse(target, headers={"Cache-Control": "private, no-store"})
         except KeyError as exc:
