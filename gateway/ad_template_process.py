@@ -141,7 +141,9 @@ def run_generator_cli(candidate: Mapping[str, Any], workspace: Path) -> Dict[str
     workspace.mkdir(parents=True, exist_ok=True)
     artifact_path = workspace / "artifact.json"
     template = validate_template_artifact(candidate.get("template") if isinstance(candidate, Mapping) else None)
-    assets = candidate.get("assets") if isinstance(candidate, Mapping) and isinstance(candidate.get("assets"), list) else []
+    if not isinstance(candidate, Mapping) or not isinstance(candidate.get("assets"), list):
+        raise AdTemplateProcessError("builder must return template and assets")
+    assets = candidate["assets"]
     artifact_path.write_text(json.dumps({"template": template, "assets": assets}, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     out_dir = workspace / "rendered"
     argv = shlex.split(command) + ["--input", str(artifact_path), "--assets-dir", str(workspace), "--out-dir", str(out_dir)]
@@ -181,9 +183,7 @@ def import_template(output: Mapping[str, Any], *, run_id: str, project_id: str) 
     return {"template_id": str(payload["templateId"]), "status": "replayed" if replayed else "imported", "asset_count": int(payload.get("assetCount") or len(assets)), "replayed": replayed}
 
 def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: Any, source: str, feedback: str = "") -> str:
-    return f"""Run the sole ad-template process as the builder agent. Inspect the attached source pixels, remove advertiser identity (names, logos, phones, URLs, portraits), and return candidate JSON only. Hermes renders and reviews it; never self-score or invent review evidence.
-Exact candidate shape: {{"template": {{"feed": {{"width":1080,"height":1350,"layers":[...]}}, "story": {{"width":1080,"height":1920,"layers":[...]}}}}}}.
-Every layer must have a unique id, type, x,y,width,height,z. Allowed types: background, rect, shape, image/media/photo, text/headline/copy/label. Editable image layers use source-free assetKey/placeholder only; never source_path, original source bytes, or a full-source plate. Text uses text, font_family, font_size, color, align, max_lines, line_height. Keep all bounds inside the exact canvas and preserve safe margins; make Story a native composition, not a square crop. Include replaceable media/text slots and metadata. Hermes calls one separate comparator per iteration and two fresh final reviewers only after comparator >= {THRESHOLD}. Run {run_id}; project {project_id}; fixed placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback[:3000]}"""
+    return f"""Run the sole ad-template process as the builder agent. Inspect the attached source pixels, remove advertiser identity (names, logos, phones, URLs, portraits), and return JSON with exactly {{template, assets}}. The template must use schema blockwise.ad-template with templateId, createdAt, feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets (a record), fonts (objects with file), and metadata. Feed layout is placement feed with 1080x1350 geometry; Story layout is placement story with 1080x1920 geometry. Layers use only plate, image_slot, overlay_patch, text, logo, vector, icon and each has layerId and geometry. Text layers declare inputKey, font, fontSize, lineHeight, tracking, alignment, maxCharacters, maxLines, colourRole, overflowBehaviour. Image slots declare inputKey, geometry, mask, minSourceWidth, minSourceHeight, defaultCrop, allowedPlacementOverrides. Use source-free replacement asset slots and include each declared asset as {{assetKey,fileName,mimeType,bytesBase64}} in assets; never include the source composite, source_path, hashes, signatures, private fields, or a full-source plate. Keep geometry inside canvas and Story native. Hermes renders, compares one time per iteration, then runs two fresh final reviewers only after comparator >= {THRESHOLD}; never self-score or invent review evidence. Run {run_id}; project {project_id}; fixed placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback[:3000]}"""
 
 def vision_message(text: str, paths: List[str]) -> List[Dict[str, Any]]:
     parts: List[Dict[str, Any]] = [{"type": "text", "text": text}]
