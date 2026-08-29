@@ -132,4 +132,5 @@ def test_candidate_uses_private_authoritative_trace_over_lossy_summary(tmp_path)
     assert prepared["generations"][0]["scores"]["primaryAdSystemLikeness"] == 9.8
     assert prepared["generationTrace"]["status"] == "accepted"
     assert prepared["generation_contract"]["validated"] is True
+    assert prepared["qa"]["visual_review"] == prepared["generations"][-1]
 

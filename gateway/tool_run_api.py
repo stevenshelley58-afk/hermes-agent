@@ -290,12 +290,15 @@ class ToolRunAPIMixin:
                 "legacy_missing": True,
                 "approval_blocked_until_accepted": True,
             }
-        result["qa"] = {
+        qa_projection = {
             "source_verified": True,
             "deterministic_check": "passed",
             "subject_invariance_passed": True,
             "release_blocked_pending_approval": True,
         }
+        if result.get("generations"):
+            qa_projection["visual_review"] = result["generations"][-1]
+        result["qa"] = qa_projection
         return result
 
     @staticmethod
