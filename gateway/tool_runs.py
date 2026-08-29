@@ -39,10 +39,94 @@ _MASKED_EDIT_MODELS = frozenset({
     "gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2",
 })
 _KNOWN_IMAGE_ONLY = frozenset({"gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2"})
+_GENERATION_EVENT_KINDS = frozenset({
+    "generation.started", "generation.rendered", "generation.scored",
+    "generation.revision-requested", "generation.accepted", "generation.failed",
+})
+_GENERATION_HASH = re.compile(r"^[0-9a-f]{64}$")
+_GENERATION_REVIEWER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
+GENERATION_LIKENESS_THRESHOLD = 9.5
+GENERATION_MAX_RECORDS = 30
 
 
 class ToolRunError(ValueError):
     """Raised when a Tool-run contract or state transition is invalid."""
+
+
+def _generation_value(value: Any, *keys: str) -> Any:
+    if not isinstance(value, dict):
+        return None
+    for key in keys:
+        if key in value:
+            return value[key]
+    return None
+
+
+def validate_generation_records(value: Any, *, feed_sha256: Optional[str] = None,
+                                story_sha256: Optional[str] = None,
+                                render_set_sha256: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Validate Ad Studio generation records before they enter the ledger.
+
+    The builder may use camelCase (the canonical Ad Studio form) or the
+    snake_case form used by older adapters. Returned records retain the
+    builder's validated shape; all gate-critical fields are checked here.
+    """
+    if not isinstance(value, list) or not value or len(value) > GENERATION_MAX_RECORDS:
+        raise ToolRunError(f"generations must contain 1 to {GENERATION_MAX_RECORDS} records")
+    expected_hashes = {
+        "feed": str(feed_sha256 or "").lower(),
+        "story": str(story_sha256 or "").lower(),
+        "render_set": str(render_set_sha256 or "").lower(),
+    }
+    for label, digest in expected_hashes.items():
+        if digest and not _GENERATION_HASH.fullmatch(digest):
+            raise ToolRunError(f"{label}_sha256 must be a lowercase SHA-256")
+    validated: List[Dict[str, Any]] = []
+    accepted = False
+    for index, raw in enumerate(value, start=1):
+        if not isinstance(raw, dict):
+            raise ToolRunError("generation record must be an object")
+        iteration = _generation_value(raw, "iteration", "generation")
+        if iteration != index:
+            raise ToolRunError("generation iterations must be consecutive and one-based")
+        artifacts = raw.get("artifacts") if isinstance(raw.get("artifacts"), dict) else raw
+        feed = str(_generation_value(artifacts, "feedSha256", "feed_sha256") or "").lower()
+        story = str(_generation_value(artifacts, "storySha256", "story_sha256") or "").lower()
+        render_set = str(_generation_value(artifacts, "renderSetSha256", "render_set_sha256") or "").lower()
+        for label, digest in (("feed", feed), ("story", story), ("render_set", render_set)):
+            if not _GENERATION_HASH.fullmatch(digest):
+                raise ToolRunError(f"generation artifacts.{label}Sha256 must be a lowercase SHA-256")
+        for label, expected in expected_hashes.items():
+            actual = {"feed": feed, "story": story, "render_set": render_set}[label]
+            if expected and actual != expected:
+                raise ToolRunError(f"generation {label} artifact hash is stale")
+        reviewers = raw.get("reviewers") if isinstance(raw.get("reviewers"), dict) else raw
+        primary_reviewer = str(_generation_value(reviewers, "primary", "primaryReviewer", "primary_reviewer") or "")
+        strict_reviewer = str(_generation_value(reviewers, "strict", "strictReviewer", "strict_reviewer") or "")
+        if not _GENERATION_REVIEWER.fullmatch(primary_reviewer) or not _GENERATION_REVIEWER.fullmatch(strict_reviewer):
+            raise ToolRunError("generation reviewers must be bounded stable identifiers")
+        if primary_reviewer == strict_reviewer:
+            raise ToolRunError("generation reviewers must be independent identities")
+        scores = raw.get("scores") if isinstance(raw.get("scores"), dict) else raw
+        try:
+            primary_score = float(_generation_value(scores, "primaryAdSystemLikeness", "primary_ad_system_likeness", "primaryScore", "primary_score"))
+            strict_score = float(_generation_value(scores, "strictAdSystemLikeness", "strict_ad_system_likeness", "strictScore", "strict_score"))
+        except (TypeError, ValueError):
+            raise ToolRunError("generation scores must be numeric") from None
+        if not (0 <= primary_score <= 10 and 0 <= strict_score <= 10):
+            raise ToolRunError("generation scores must be between 0 and 10")
+        passed = primary_score >= GENERATION_LIKENESS_THRESHOLD and strict_score >= GENERATION_LIKENESS_THRESHOLD
+        decision = str(raw.get("decision") or ("accepted" if passed else "revise"))
+        if decision != ("accepted" if passed else "revise"):
+            raise ToolRunError("generation decision does not match its numeric gate")
+        reason = _generation_value(raw, "revisionReason", "revision_reason", "change_summary")
+        if not isinstance(reason, str) or len(reason.strip()) < 8:
+            raise ToolRunError("generation revision reason must explain the decision")
+        if accepted:
+            raise ToolRunError("no generation may follow an accepted generation")
+        accepted = passed
+        validated.append(copy.deepcopy(raw))
+    return validated
 
 
 def _now() -> float:
@@ -681,7 +765,7 @@ class ToolRunStore:
         if run["status"] in _TERMINAL_STATUSES:
             raise ToolRunError("completed Tool runs cannot change model policy")
         policy = validate_model_policy(policy, tool_id=run["tool_id"])
-        pipeline = ["source", "analyse", "decompose", "restyle", "story-draft", "check", "subject-invariance", "studio-qa", "ready", "release"]
+        pipeline = ["source", "analyse", "decompose", "restyle", "story-draft", "render", "visual-review", "check", "subject-invariance", "studio-qa", "ready", "release"]
         stage_starts = {"analyse": "analyse", "masked-text-cleanup": "restyle", "story-extend": "story-draft", "visual-qa": "check"}
         current_index = pipeline.index(run.get("stage")) if run.get("stage") in pipeline else 0
         merged = copy.deepcopy(policy)

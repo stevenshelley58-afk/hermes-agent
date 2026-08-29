@@ -298,7 +298,7 @@ async def test_sse_replays_from_last_event_id(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_approval_requires_native_zoom_confirmation(tmp_path):
+async def test_approval_requires_native_zoom_and_accepted_generation(tmp_path):
     adapter = make_adapter(tmp_path)
     app = make_app(adapter)
     run, _ = adapter._tool_run_store.create_run(command())
@@ -307,6 +307,35 @@ async def test_approval_requires_native_zoom_confirmation(tmp_path):
         async with TestClient(TestServer(app)) as client:
             denied = await client.post(f"/v1/tool-runs/{run['run_id']}/approval", json={"decision": "approve"})
             assert denied.status == 400
+            blocked_legacy = await client.post(
+                f"/v1/tool-runs/{run['run_id']}/approval",
+                json={"decision": "approve", "confirm_100_percent": True},
+            )
+            assert blocked_legacy.status == 400
+            assert "generation" in (await blocked_legacy.json())["error"]["message"].lower()
+            start.assert_not_called()
+    adapter._tool_run_store.close()
+
+
+@pytest.mark.asyncio
+async def test_approval_requires_dual_scored_generation_bound_to_current_previews(tmp_path):
+    adapter = make_adapter(tmp_path)
+    app = make_app(adapter)
+    run, _ = adapter._tool_run_store.create_run(command("generation-gate"))
+    output = {
+        "generations": [{
+            "iteration": 1,
+            "artifacts": {"feedSha256": "a" * 64, "storySha256": "b" * 64, "renderSetSha256": "c" * 64},
+            "reviewers": {"primary": "reviewer.primary", "strict": "reviewer.strict"},
+            "scores": {"primaryAdSystemLikeness": 9.8, "strictAdSystemLikeness": 9.6},
+            "decision": "accepted",
+            "revisionReason": "Accepted after independent visual review.",
+        }],
+        "current_artifacts": {"feedSha256": "a" * 64, "storySha256": "b" * 64},
+    }
+    adapter._tool_run_store.update_run(run["run_id"], status="waiting_for_approval", stage="studio-qa", output=output)
+    with patch.object(adapter, "_start_tool_task") as start:
+        async with TestClient(TestServer(app)) as client:
             approved = await client.post(
                 f"/v1/tool-runs/{run['run_id']}/approval",
                 json={"decision": "approve", "confirm_100_percent": True},
