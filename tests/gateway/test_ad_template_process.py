@@ -42,10 +42,21 @@ def test_nonexistent_artifact_and_import_fail(tmp_path, monkeypatch):
         import_template({"template": {}}, run_id="trun-test", project_id="blockwise")
 
 def test_layered_documents_are_stable():
-    template = {"story": {"layers": [{"id": "s1", "type": "image"}], "z": 1}, "feed": {"layers": [{"id": "f1", "type": "image"}], "b": 2}}
+    layout = lambda placement, height: {"placement": placement, "layers": [{"type": "plate", "layerId": placement, "colourRole": "background", "geometry": {"x": 0, "y": 0, "width": 1080, "height": height}, "protected": False}], "safeZones": [{"x": 0, "y": 0, "width": 1080, "height": height}]}
+    template = {"schema": "blockwise.ad-template", "templateId": "stable", "createdAt": "2026-08-30T00:00:00.000Z", "feedLayout": layout("feed", 1350), "storyLayout": layout("story", 1920), "imageInputs": [], "textInputs": [], "semanticColours": {"background": "#FFFFFF"}, "assets": {}, "fonts": [], "metadata": {}}
     first = deterministic_documents(template)
-    assert first == deterministic_documents({"feed": {"b": 2, "layers": [{"id": "f1", "type": "image"}]}, "story": {"layers": [{"id": "s1", "type": "image"}], "z": 1}})
+    assert first == deterministic_documents(template)
     assert list(first) == ["feed.json", "story.json", "template.json"]
+    with pytest.raises(AdTemplateProcessError): deterministic_documents({"feed": {}, "story": {}})
+
+def test_catalog_asset_resolution_rejects_unknown_and_traversal(tmp_path, monkeypatch):
+    (tmp_path / "property-photo.webp").write_bytes(b"catalog-photo")
+    template = {"schema": "blockwise.ad-template", "assets": {"property-photo": {"fileName": "property-photo.webp", "mimeType": "image/webp"}}}
+    monkeypatch.setenv("AD_TEMPLATE_ASSET_CATALOG_DIR", str(tmp_path))
+    resolved = process.resolve_catalog_assets(template, [{"assetKey": "property-photo", "fileName": "property-photo.webp", "mimeType": "image/webp"}])
+    assert resolved[0]["bytesBase64"] == "Y2F0YWxvZy1waG90bw=="
+    with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets(template, [{"assetKey": "missing", "fileName": "property-photo.webp", "mimeType": "image/webp"}])
+    with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets({"schema": "blockwise.ad-template", "assets": {"x": {"fileName": "../property-photo.webp", "mimeType": "image/webp"}}}, [{"assetKey": "x", "fileName": "../property-photo.webp", "mimeType": "image/webp"}])
 
 
 def test_orchestrator_calls_real_roles_and_persists_receipts(tmp_path, monkeypatch):

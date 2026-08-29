@@ -76,18 +76,15 @@ def validate_final_review(value: Any, *, accepted: bool) -> Dict[str, Any]:
     return {"reviewers": normalized, "decision": decision, "threshold": THRESHOLD}
 
 def deterministic_documents(template: Any) -> Dict[str, str]:
-    if not isinstance(template, dict): raise AdTemplateProcessError("template candidate must be an object")
-    feed = template.get("feedLayout") if template.get("schema") == "blockwise.ad-template" else template.get("feed")
-    story = template.get("storyLayout") if template.get("schema") == "blockwise.ad-template" else template.get("story")
-    feed = feed if isinstance(feed, dict) else {}
-    story = story if isinstance(story, dict) else {}
-    if not feed or not story: raise AdTemplateProcessError("template must contain Feed and Story documents")
-    for name, doc in (("feed", feed), ("story", story)):
+    if not isinstance(template, dict) or template.get("schema") != "blockwise.ad-template": raise AdTemplateProcessError("template must use the exact Blockwise schema")
+    feed, story = template.get("feedLayout"), template.get("storyLayout")
+    if not isinstance(feed, dict) or not isinstance(story, dict): raise AdTemplateProcessError("template must contain Feed and Story layouts")
+    for name, doc, placement in (("feed", feed, "feed"), ("story", story, "story")):
         layers = doc.get("layers")
-        if not isinstance(layers, list) or not layers or any(not isinstance(layer, dict) or not (layer.get("layerId") or layer.get("id")) or not layer.get("type") for layer in layers):
-            raise AdTemplateProcessError(f"{name} document has invalid layers")
+        if doc.get("placement") != placement or not isinstance(layers, list) or not layers or any(not isinstance(layer, dict) or not layer.get("layerId") or not layer.get("type") for layer in layers):
+            raise AdTemplateProcessError(f"{name} layout has invalid layers")
     encode = lambda value: json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return {"feed.json": encode(feed), "story.json": encode(story), "template.json": encode({"feed": feed, "story": story})}
+    return {"feed.json": encode(feed), "story.json": encode(story), "template.json": encode(template)}
 
 def _under(path: Path, root: Path) -> bool:
     try: path.relative_to(root); return True
@@ -135,6 +132,37 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
         if not isinstance(key, str) or not isinstance(asset, dict) or not asset.get("fileName") or not asset.get("mimeType"): raise AdTemplateProcessError("template asset declarations are invalid")
     return value
 
+def resolve_catalog_assets(template: Mapping[str, Any], assets: Any) -> List[Dict[str, Any]]:
+    if not isinstance(assets, list): raise AdTemplateProcessError("builder assets must be a list")
+    declarations = template.get("assets") if isinstance(template.get("assets"), dict) else {}
+    catalog = os.environ.get("AD_TEMPLATE_ASSET_CATALOG_DIR", "/vps/ad-template-assets").strip()
+    root = Path(catalog).expanduser().resolve() if catalog else None
+    resolved = []
+    seen = set()
+    for item in assets:
+        if not isinstance(item, dict): raise AdTemplateProcessError("asset declaration must be an object")
+        key = str(item.get("assetKey") or "").strip()
+        if not key or key in seen or key not in declarations: raise AdTemplateProcessError("asset key is undeclared or duplicated")
+        seen.add(key)
+        declared = declarations[key]
+        file_name = str(item.get("fileName") or declared.get("fileName") or "").strip() if isinstance(declared, dict) else ""
+        mime = str(item.get("mimeType") or declared.get("mimeType") or "").strip() if isinstance(declared, dict) else ""
+        if not file_name or Path(file_name).name != file_name or not mime or (not mime.startswith("image/") and not mime.startswith("font/")):
+            raise AdTemplateProcessError("asset fileName/mimeType is invalid")
+        encoded = item.get("bytesBase64")
+        if encoded:
+            if not isinstance(encoded, str) or len(encoded) > 20 * 1024 * 1024: raise AdTemplateProcessError("inline asset is too large")
+            try: base64.b64decode(encoded, validate=True)
+            except (ValueError, TypeError): raise AdTemplateProcessError("inline asset bytes are invalid") from None
+        else:
+            if root is None: raise AdTemplateProcessError("AD_TEMPLATE_ASSET_CATALOG_DIR is required for catalog assets")
+            path = (root / file_name).resolve()
+            if not _under(path, root) or not path.is_file(): raise AdTemplateProcessError("asset is missing from the source-free catalog")
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        resolved.append({"assetKey": key, "fileName": file_name, "mimeType": mime, "bytesBase64": encoded})
+    if set(declarations) != seen: raise AdTemplateProcessError("every declared template asset must be supplied")
+    return resolved
+
 def run_generator_cli(candidate: Mapping[str, Any], workspace: Path) -> Dict[str, Any]:
     command = os.environ.get("AD_TEMPLATE_GENERATOR_CMD", "").strip()
     if not command: raise AdTemplateProcessError("AD_TEMPLATE_GENERATOR_CMD must point to the shared Blockwise renderer CLI")
@@ -143,7 +171,7 @@ def run_generator_cli(candidate: Mapping[str, Any], workspace: Path) -> Dict[str
     template = validate_template_artifact(candidate.get("template") if isinstance(candidate, Mapping) else None)
     if not isinstance(candidate, Mapping) or not isinstance(candidate.get("assets"), list):
         raise AdTemplateProcessError("builder must return template and assets")
-    assets = candidate["assets"]
+    assets = resolve_catalog_assets(template, candidate["assets"])
     artifact_path.write_text(json.dumps({"template": template, "assets": assets}, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     out_dir = workspace / "rendered"
     argv = shlex.split(command) + ["--input", str(artifact_path), "--assets-dir", str(workspace), "--out-dir", str(out_dir)]
