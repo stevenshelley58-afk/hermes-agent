@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping
 
 THRESHOLD = 9.5
-STAGES = ("source", "analyse", "decompose", "restyle", "story-draft", "render", "compare", "qa", "final-review", "import")
+STAGES = ("source", "build", "render", "compare", "final-check", "live")
 
 class AdTemplateProcessError(ValueError):
     pass
@@ -433,10 +433,10 @@ class SoleProcessOrchestrator:
         candidate: Dict[str, Any] = {}
         for offset in range(31 - total_iterations - 1):
             index = total_iterations + offset + 1
-            self.emit("stage.started", "analyse", {"iteration": index, "role": "builder"})
+            self.emit("stage.started", "build", {"iteration": index, "role": "builder"})
             candidate = self.call_agent("builder-%d" % index, vision_message(generator_prompt(run_id=self.run_id, project_id=self.project_id, brief=brief, placements=placements, source=source, feedback=feedback), [source]), f"{routes[0].get('provider')}/{routes[0].get('model')}")
             if not isinstance(candidate, dict): raise AdTemplateProcessError("builder returned invalid candidate")
-            self.emit("iteration.started", "analyse", {"iteration": index, "role": "builder"})
+            self.emit("iteration.started", "build", {"iteration": index, "role": "builder"})
             # Render every candidate before comparison. This makes each
             # iteration preview a real generator artifact, not an agent claim.
             iteration_workspace = self.workspace / "iterations" / f"{index:02d}"
@@ -474,23 +474,23 @@ class SoleProcessOrchestrator:
             identity = f"final-reviewer-{self.run_id}-{n}-{uuid.uuid4().hex[:8]}"
             provider_route = f"{route.get('provider')}/{route.get('model')}"
             route_identity = f"final-review-{n}:{provider_route}"
-            self.emit("final-review.started", "final-review", {"reviewer": identity, "route": route_identity})
+            self.emit("final-review.started", "final-check", {"reviewer": identity, "route": route_identity})
             review = self.call_agent(identity, vision_message(review_prompt(final=True), [source, str((candidate.get("render") or {}).get("feed") or ""), str((candidate.get("render") or {}).get("story") or "")]), provider_route)
             if not isinstance(review, dict): raise AdTemplateProcessError("final reviewer returned invalid result")
             evidence = _assessment(review, "final reviewer")
             reviewers.append({"id": identity, "route": route_identity, **evidence})
         final_review = validate_final_review({"reviewers": reviewers}, accepted=True)
         if final_review["decision"] != "accepted":
-            self.emit("final-review.completed", "final-review", {"decision": "revise", "reviewers": final_review["reviewers"]})
+            self.emit("final-review.completed", "final-check", {"decision": "revise", "reviewers": final_review["reviewers"]})
             if review_round >= 5 or total_iterations + len(iterations) >= 30:
                 raise AdTemplateProcessError("final reviewers failed after the bounded automatic revision loop")
             iterations[-1]["final_review_failed"] = True
             reasons = "; ".join(f"{item['id']}: {item['reason']}" for item in final_review["reviewers"])
             return self.run(source=source, brief=brief, placements=placements, routes=routes, review_round=review_round + 1, total_iterations=total_iterations + len(iterations), feedback=reasons, history=history + iterations)
-        self.emit("final-review.completed", "final-review", {"decision": "accepted", "reviewers": final_review["reviewers"]})
+        self.emit("final-review.completed", "final-check", {"decision": "accepted", "reviewers": final_review["reviewers"]})
         generated = candidate
         documents = deterministic_documents(generated.get("template"))
         validate_artifacts(generated, self.workspace)
         imported = import_template({**generated, "documents": documents}, run_id=self.run_id, project_id=self.project_id)
-        self.emit("template.imported", "import", imported)
+        self.emit("template.imported", "live", imported)
         return {"template": generated.get("template") or candidate.get("template"), "iterations": history + iterations, "final_review": final_review, "previews": generated.get("previews"), "documents": documents, "template_path": generated.get("template_path"), "render_path": generated.get("render_path") or generated.get("render", {}).get("feed"), "import": imported, "process": "only-ad-template-process"}

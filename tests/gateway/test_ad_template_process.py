@@ -8,12 +8,25 @@ from gateway.ad_template_process import (
     AdTemplateProcessError, deterministic_documents, import_template,
     validate_artifacts, validate_final_review, validate_iterations, SoleProcessOrchestrator, vision_message,
 )
+from gateway.tool_run_api import ToolRunAPIMixin
 
 def evidence(score=9.4, reason="Improve spacing"):
     return {"rubric": {field: score for field in process.RUBRIC_FIELDS}, "reason": reason}
 
 def iteration(score=9.4, number=1):
     return {"iteration": number, "comparison": evidence(score), "decision": "accepted" if score >= 9.5 else "revise"}
+
+def test_only_real_stages_and_durable_source_preview(tmp_path):
+    assert process.STAGES == ("source", "build", "render", "compare", "final-check", "live")
+    assert ToolRunAPIMixin._tool_stage_order() == list(process.STAGES)
+    assert ToolRunAPIMixin._canonical_tool_stage("story-draft") == "build"
+    assert ToolRunAPIMixin._canonical_tool_stage("final-review") == "final-check"
+    assert ToolRunAPIMixin._canonical_tool_stage("import") == "live"
+    source = tmp_path / "upload.JPEG"
+    source.write_bytes(b"source-pixels")
+    target = ToolRunAPIMixin._copy_source_preview(tmp_path / "run", source)
+    assert target == tmp_path / "run" / "previews" / "source.jpeg"
+    assert target.read_bytes() == b"source-pixels"
 
 def metadata(title="Smoke"):
     return {
@@ -186,6 +199,23 @@ def test_blockwise_import_contract_uses_bearer_and_camel_case_receipt(monkeypatc
     assert {asset["assetKey"] for asset in seen["body"]["assets"]} == {"feed", "story"}
     assert all(asset["bytesBase64"] for asset in seen["body"]["assets"])
     assert receipt == {"template_id": "tpl-1", "status": "imported", "asset_count": 2, "replayed": False}
+
+
+def test_blockwise_replayed_import_is_a_valid_ready_receipt(monkeypatch):
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def read(self): return b'{"templateId":"tpl-replay","assetCount":1,"replayed":true}'
+    monkeypatch.setenv("BLOCKWISE_TEMPLATE_IMPORT_URL", "http://127.0.0.1:8080/import")
+    monkeypatch.setenv("BLOCKWISE_INTERNAL_AUTH_SECRET", "secret")
+    monkeypatch.setattr(process.urllib.request, "urlopen", lambda request, timeout: Response())
+    layout = lambda placement, height: {"placement": placement, "layers": [{"type": "plate", "layerId": placement, "colourRole": "background", "geometry": {"x": 0, "y": 0, "width": 1080, "height": height}, "protected": False}], "safeZones": [{"x": 0, "y": 0, "width": 1080, "height": height}]}
+    template = {"schema": "blockwise.ad-template", "templateId": "tpl-replay", "createdAt": "2026-08-30T00:00:00.000Z", "feedLayout": layout("feed", 1350), "storyLayout": layout("story", 1920), "imageInputs": [], "textInputs": [], "semanticColours": semantic_colours(), "assets": {"feed": {"fileName": "feed.png", "mimeType": "image/png"}}, "fonts": [], "metadata": metadata()}
+    receipt = process.import_template(
+        {"template": template, "assets": [{"assetKey": "feed", "fileName": "feed.png", "mimeType": "image/png", "bytesBase64": "ZmVlZA=="}], "previews": []},
+        run_id="run-replay", project_id="blockwise",
+    )
+    assert receipt == {"template_id": "tpl-replay", "status": "replayed", "asset_count": 1, "replayed": True}
 
 
 def test_blockwise_import_host_rejects_header_injection(monkeypatch):

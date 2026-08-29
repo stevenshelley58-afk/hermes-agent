@@ -49,8 +49,22 @@ class ToolRunAPIMixin:
 
     @staticmethod
     def _tool_stage_order() -> List[str]:
-        return list(("source", "analyse", "decompose", "restyle", "story-draft",
-                     "render", "compare", "qa", "final-review", "import"))
+        return list(("source", "build", "render", "compare", "final-check", "live"))
+
+    @staticmethod
+    def _canonical_tool_stage(stage: Any) -> str:
+        value = str(stage or "").strip().lower().replace("_", "-").replace(" ", "-")
+        aliases = {
+            "source": "source",
+            "analyse": "build", "analyze": "build", "build": "build",
+            "decompose": "build", "restyle": "build", "story-draft": "build",
+            "render": "render",
+            "compare": "compare", "qa": "compare", "visual-review": "compare",
+            "check": "compare", "subject-invariance": "compare", "studio-qa": "compare",
+            "final-review": "final-check", "final-check": "final-check", "ready": "final-check",
+            "import": "live", "release": "live", "live": "live",
+        }
+        return aliases.get(value, "source")
 
     @staticmethod
     def _preview_placement(name: str) -> str | None:
@@ -94,6 +108,15 @@ class ToolRunAPIMixin:
             staged.append({"name": str(item.get("name") or source.name), "path": str(target), "size": source.stat().st_size})
         result["payload"]["sources"] = staged
         return result
+
+    @staticmethod
+    def _copy_source_preview(workspace: Path, source_file: Path) -> Path:
+        """Persist the run input behind the same authenticated artifact route as renders."""
+        suffix = source_file.suffix.lower() if source_file.suffix else ".png"
+        target = workspace / "previews" / f"source{suffix}"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_file, target)
+        return target
 
     @staticmethod
     def _tool_json_output(value: Any) -> Dict[str, Any]:
@@ -177,11 +200,19 @@ class ToolRunAPIMixin:
 
     def _tool_stage_from_preview(self, preview: Any, current: str) -> str:
         haystack = str(preview or "").lower()
-        for stage in self._tool_stage_order():
-            for variant in (stage, stage.replace("-", "_"), stage.replace("-", " ")):
+        aliases = (
+            ("final-check", ("final-check", "final_review", "final review")),
+            ("compare", ("compare", "visual-review", "visual review", "qa", "check")),
+            ("render", ("render",)),
+            ("build", ("build", "analyse", "analyze", "decompose", "restyle", "story-draft", "story draft")),
+            ("live", ("live", "import", "release")),
+            ("source", ("source",)),
+        )
+        for stage, variants in aliases:
+            for variant in variants:
                 if re.search(rf"(?:^|[^a-z]){re.escape(variant)}(?:[^a-z]|$)", haystack):
                     return stage
-        return current
+        return self._canonical_tool_stage(current)
 
     def _tool_prompt(self, run: Dict[str, Any], *, finalize: bool = False) -> str:
         payload = run.get("payload") or {}
@@ -209,7 +240,7 @@ class ToolRunAPIMixin:
         current_stage = "source"
         try:
             run = self._tool_run_store.get_run(run_id)
-            current_stage = run.get("stage") or "source"
+            current_stage = self._canonical_tool_stage(run.get("stage"))
             self._tool_run_store.update_run(
                 run_id, status="running", stage=current_stage,
                 progress=max(0.02, float(run.get("progress") or 0)),
@@ -255,7 +286,7 @@ class ToolRunAPIMixin:
                     safe_data = {key: kwargs[key] for key in ("iteration", "score", "reason", "decision") if kwargs.get(key) is not None}
                     self._tool_run_store.append_event(
                         run_id, normalized_event, status="error" if kwargs.get("is_error") else "running",
-                        node_id="compare" if normalized_event.startswith("iteration.") else "final-review", data=safe_data,
+                        node_id="compare" if normalized_event.startswith("iteration.") else "final-check", data=safe_data,
                     )
                     return
                 activity_sequence += 1
@@ -327,9 +358,7 @@ class ToolRunAPIMixin:
                 if not source:
                     raise RuntimeError("source image is missing")
                 source_file = Path(source).resolve()
-                durable_source = workspace / ("source" + (source_file.suffix.lower() if source_file.suffix else ".png"))
-                shutil.copyfile(source_file, durable_source)
-                source = str(durable_source)
+                source = str(self._copy_source_preview(workspace, source_file))
                 result = SoleProcessOrchestrator(
                     call_agent=call_agent, workspace=workspace, run_id=run_id,
                     project_id=str((run.get("scope") or {}).get("project_id") or ""), emit=emit,
@@ -405,11 +434,11 @@ class ToolRunAPIMixin:
             output = self._prepare_candidate_output(run_id, output)
             self._project_generation_events(run_id, output["iterations"])
             self._tool_run_store.update_run(
-                run_id, status="completed", stage="import", progress=1,
+                run_id, status="completed", stage="live", progress=1,
                 output=output, attention=False,
             )
             self._tool_run_store.append_event(
-                run_id, "template.imported", status="ok", node_id="import",
+                run_id, "template.imported", status="ok", node_id="live",
                 data=dict(output["import"]),
             )
         except asyncio.CancelledError:
@@ -532,7 +561,7 @@ class ToolRunAPIMixin:
             ).resolve()
             target = (root / name).resolve(strict=True)
             target.relative_to(root)
-            if target.is_symlink() or not target.is_file() or target.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".svg"}:
+            if target.is_symlink() or not target.is_file() or target.suffix.lower() not in {".avif", ".bmp", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp", ".svg"}:
                 raise ToolRunError("preview artifact is unavailable")
             return web.FileResponse(target, headers={"Cache-Control": "private, no-store"})
         except KeyError as exc:
