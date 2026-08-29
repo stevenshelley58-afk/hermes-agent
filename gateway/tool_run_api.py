@@ -634,9 +634,6 @@ class ToolRunAPIMixin:
         except (ToolRunError, ValueError, TypeError) as exc:
             return web.json_response(_error(str(exc), "invalid_model_policy"), status=400)
 
-    async def _handle_tool_run_approval(self, request: web.Request) -> web.Response:
-        return web.json_response(_error("This process has no human approval step", "approval_removed"), status=410)
-
     async def _handle_retry_tool_run(self, request: web.Request) -> web.Response:
         auth_err = self._check_auth(request)
         if auth_err:
