@@ -285,8 +285,9 @@ class ToolRunAPIMixin:
                 from hermes_constants import get_hermes_home
                 workspace = (get_hermes_home() / "tool_runs" / "ad-template-generator" / run_id).resolve()
                 workspace.mkdir(parents=True, exist_ok=True)
-                usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-                def call_agent(instance_id: str, prompt: str, route_name: str):
+                usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "estimated_cost_usd": 0.0}
+                run_cost_limit = float(os.environ.get("AD_TEMPLATE_MAX_RUN_COST_USD", "10.0"))
+                def call_agent(instance_id: str, prompt: Any, route_name: str):
                     provider, model = route_name.split("/", 1)
                     route = self._resolve_route(model)
                     agent = self._create_agent(
@@ -296,11 +297,21 @@ class ToolRunAPIMixin:
                         requested_model=model, requested_provider=provider, route=route,
                         persistence_disabled=True,
                     )
-                    result = agent.run_conversation(user_message=prompt, conversation_history=[], task_id=f"{run_id}:{instance_id}")
-                    usage["input_tokens"] += getattr(agent, "session_prompt_tokens", 0) or 0
-                    usage["output_tokens"] += getattr(agent, "session_completion_tokens", 0) or 0
-                    usage["total_tokens"] += getattr(agent, "session_total_tokens", 0) or 0
-                    return self._tool_json_output(result)
+                    active = self._tool_run_agents.setdefault(run_id, {})
+                    active[instance_id] = agent
+                    try:
+                        result = agent.run_conversation(user_message=prompt, conversation_history=[], task_id=f"{run_id}:{instance_id}")
+                        usage["input_tokens"] += getattr(agent, "session_prompt_tokens", 0) or 0
+                        usage["output_tokens"] += getattr(agent, "session_completion_tokens", 0) or 0
+                        usage["total_tokens"] += getattr(agent, "session_total_tokens", 0) or 0
+                        usage["estimated_cost_usd"] += float(getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0)
+                        if run_cost_limit > 0 and usage["estimated_cost_usd"] > run_cost_limit:
+                            raise RuntimeError(f"sole ad-template process exceeded whole-run cost limit {run_cost_limit:.2f}")
+                        return self._tool_json_output(result)
+                    finally:
+                        active.pop(instance_id, None)
+                        if not active:
+                            self._tool_run_agents.pop(run_id, None)
                 routes = []
                 for role in ("analyse", "compare", "final-review-a", "final-review-b"):
                     stage_candidates, _ = self._tool_candidates(run, role)
@@ -313,6 +324,12 @@ class ToolRunAPIMixin:
                 payload = run.get("payload") or {}
                 source_items = payload.get("sources") or []
                 source = str((source_items[0] or {}).get("path") if source_items and isinstance(source_items[0], dict) else "")
+                if not source:
+                    raise RuntimeError("source image is missing")
+                source_file = Path(source).resolve()
+                durable_source = workspace / ("source" + (source_file.suffix.lower() if source_file.suffix else ".png"))
+                shutil.copyfile(source_file, durable_source)
+                source = str(durable_source)
                 result = SoleProcessOrchestrator(
                     call_agent=call_agent, workspace=workspace, run_id=run_id,
                     project_id=str((run.get("scope") or {}).get("project_id") or ""), emit=emit,
@@ -355,9 +372,11 @@ class ToolRunAPIMixin:
                                 deadline = loop.time() + timeout
                     break
                 except Exception as exc:
-                    running_agent = self._tool_run_agents.get(run_id)
-                    if isinstance(exc, asyncio.TimeoutError) and running_agent is not None:
-                        request_hard_interrupt(running_agent, source="api_server_tool_run_stage_timeout")
+                    running_agents = self._tool_run_agents.get(run_id)
+                    if isinstance(exc, asyncio.TimeoutError) and running_agents is not None:
+                        agents = running_agents.values() if isinstance(running_agents, dict) else [running_agents]
+                        for active_agent in list(agents):
+                            request_hard_interrupt(active_agent, source="api_server_tool_run_stage_timeout")
                     failure = redact_sensitive_text(str(exc), force=True)[:600]
                     failures.append(failure)
                     if attempt < len(candidates):
@@ -380,7 +399,8 @@ class ToolRunAPIMixin:
             output["usage"] = usage
             builder_cost = output.get("cost")
             output["cost"] = dict(builder_cost) if isinstance(builder_cost, dict) else ({"builder_reported": builder_cost} if builder_cost is not None else {})
-            output["cost"]["reported_usd"] = reported_cost
+            output["cost"]["reported_usd"] = usage.get("estimated_cost_usd") or reported_cost
+            output["cost"]["estimated_usd"] = usage.get("estimated_cost_usd", 0.0)
             output["model_policy_revision"] = refreshed["model_policy_revision"]
             output = self._prepare_candidate_output(run_id, output)
             self._project_generation_events(run_id, output["iterations"])
@@ -661,9 +681,11 @@ class ToolRunAPIMixin:
         run_id = request.match_info["run_id"]
         try:
             run = self._tool_run_store.request_cancel(run_id)
-            agent = self._tool_run_agents.get(run_id)
-            if agent is not None:
-                request_hard_interrupt(agent, source="api_server_tool_run_cancel")
+            agents = self._tool_run_agents.get(run_id)
+            if agents is not None:
+                values = agents.values() if isinstance(agents, dict) else [agents]
+                for active_agent in list(values):
+                    request_hard_interrupt(active_agent, source="api_server_tool_run_cancel")
             task = self._tool_run_tasks.get(run_id)
             if task is not None and not task.done():
                 task.cancel()

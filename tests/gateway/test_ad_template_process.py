@@ -1,3 +1,4 @@
+import json
 import shlex
 import sys
 from pathlib import Path
@@ -8,21 +9,30 @@ from gateway.ad_template_process import (
     validate_artifacts, validate_final_review, validate_iterations, SoleProcessOrchestrator, vision_message,
 )
 
+def evidence(score=9.4, reason="Improve spacing"):
+    return {"rubric": {field: score for field in process.RUBRIC_FIELDS}, "reason": reason}
+
 def iteration(score=9.4, number=1):
-    return {"iteration": number, "comparison": {"score": score, "reason": "Improve spacing"}, "decision": "accepted" if score >= 9.5 else "revise"}
+    return {"iteration": number, "comparison": evidence(score), "decision": "accepted" if score >= 9.5 else "revise"}
 
 def test_one_comparator_per_iteration_and_final_review_only_after_pass():
     assert validate_iterations([iteration()])[0]["comparison"]["score"] == 9.4
     with pytest.raises(AdTemplateProcessError):
         validate_iterations([{"iteration": 1, "comparison": {"score": 9.4, "reason": "x"}, "reviewers": []}])
-    review = validate_final_review({"reviewers": [{"id": "reviewer-a", "route": "a/m", "score": 9.6, "reason": "good"}, {"id": "reviewer-b", "route": "b/m", "score": 9.7, "reason": "good"}]}, accepted=True)
+    review = validate_final_review({"reviewers": [{"id": "reviewer-a", "route": "a/m", **evidence(9.6, "good")}, {"id": "reviewer-b", "route": "b/m", **evidence(9.7, "good")}]}, accepted=True)
     assert review["decision"] == "accepted"
+
+def test_bare_model_scores_are_rejected():
+    with pytest.raises(AdTemplateProcessError):
+        validate_iterations([iteration(9.8)]) if False else validate_iterations([{"iteration": 1, "comparison": {"score": 10, "reason": "looks good"}}])
+    with pytest.raises(AdTemplateProcessError):
+        validate_final_review({"reviewers": [{"id": "a", "route": "a/m", "score": 10, "reason": "ok"}, {"id": "b", "route": "b/m", "score": 10, "reason": "ok"}]}, accepted=True)
 
 def test_adversarial_reviewer_identity_route_and_self_score_fail():
     with pytest.raises(AdTemplateProcessError):
-        validate_final_review({"reviewers": [{"id": "same", "route": "a/m", "score": 10, "reason": "ok"}, {"id": "same", "route": "b/m", "score": 10, "reason": "ok"}]}, accepted=True)
+        validate_final_review({"reviewers": [{"id": "same", "route": "a/m", **evidence(10, "ok")}, {"id": "same", "route": "b/m", **evidence(10, "ok")}]}, accepted=True)
     with pytest.raises(AdTemplateProcessError):
-        validate_final_review({"reviewers": [{"id": "a", "route": "a/m", "score": 10, "reason": "ok"}, {"id": "b", "route": "a/m", "score": 10, "reason": "ok"}]}, accepted=True)
+        validate_final_review({"reviewers": [{"id": "a", "route": "a/m", **evidence(10, "ok")}, {"id": "b", "route": "a/m", **evidence(10, "ok")}]}, accepted=True)
 
 def test_nonexistent_artifact_and_import_fail(tmp_path, monkeypatch):
     with pytest.raises(AdTemplateProcessError):
@@ -47,8 +57,8 @@ def test_orchestrator_calls_real_roles_and_persists_receipts(tmp_path, monkeypat
     calls = []
     events = []
     template = {
-        "feed": {"layers": [{"id": "feed-bg", "type": "image"}], "headline": "Feed"},
-        "story": {"layers": [{"id": "story-bg", "type": "image"}], "headline": "Story"},
+        "feed": {"width": 1080, "height": 1350, "layers": [{"id": "feed-bg", "type": "image", "x": 0, "y": 0, "width": 1080, "height": 1350}], "headline": "Feed"},
+        "story": {"width": 1080, "height": 1920, "layers": [{"id": "story-bg", "type": "image", "x": 0, "y": 0, "width": 1080, "height": 1920}], "headline": "Story"},
     }
 
     def call_agent(instance, prompt, route):
@@ -56,8 +66,8 @@ def test_orchestrator_calls_real_roles_and_persists_receipts(tmp_path, monkeypat
         if instance.startswith("builder-"):
             return {"template": template}
         if instance.startswith("comparator-"):
-            return {"score": 9.6, "reason": "Composition is ready"}
-        return {"score": 9.7, "reason": "Final review is ready"}
+            return evidence(9.6, "Composition is ready")
+        return evidence(9.7, "Final review is ready")
 
     result = SoleProcessOrchestrator(
         call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_test",
@@ -87,3 +97,30 @@ def test_orchestrator_calls_real_roles_and_persists_receipts(tmp_path, monkeypat
 def test_vision_roles_reject_filename_only_inputs(tmp_path):
     with pytest.raises(AdTemplateProcessError):
         vision_message("inspect this", [str(tmp_path / "filename-only.png")])
+
+
+def test_blockwise_import_contract_uses_bearer_and_camel_case_receipt(monkeypatch, tmp_path):
+    seen = {}
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def read(self): return b'{"templateId":"tpl-1","assetCount":2,"replayed":false}'
+    def fake_urlopen(request, timeout):
+        seen["authorization"] = request.headers.get("Authorization")
+        seen["body"] = json.loads(request.data.decode())
+        return Response()
+    monkeypatch.setenv("BLOCKWISE_TEMPLATE_IMPORT_URL", "http://blockwise.test/import")
+    monkeypatch.setenv("BLOCKWISE_TEMPLATE_IMPORT_TOKEN", "secret")
+    monkeypatch.setattr(process.urllib.request, "urlopen", fake_urlopen)
+    feed = tmp_path / "feed.png"; story = tmp_path / "story.png"
+    feed.write_bytes(b"feed-png"); story.write_bytes(b"story-png")
+    output = {"template": {"feed": {"layers": [{"id": "f", "type": "image"}]}, "story": {"layers": [{"id": "s", "type": "image"}]}}, "previews": [{"path": str(feed), "placement": "feed"}, {"path": str(story), "placement": "story"}]}
+    receipt = process.import_template(output, run_id="trun-test", project_id="blockwise")
+    assert seen["authorization"] == "Bearer secret"
+    assert seen["body"]["template"]["schema"] == "blockwise.ad-template"
+    assert "feedLayout" in seen["body"]["template"] and "storyLayout" in seen["body"]["template"]
+    assert "version" not in seen["body"]["template"] and "inputs" not in seen["body"]["template"] and "Meta" not in seen["body"]["template"]
+    assert set(seen["body"]) == {"template", "assets"}
+    assert {asset["assetKey"] for asset in seen["body"]["assets"]} == {"preview-feed", "preview-story"}
+    assert all(asset["bytesBase64"] for asset in seen["body"]["assets"])
+    assert receipt == {"template_id": "tpl-1", "status": "imported", "asset_count": 2, "replayed": False}

@@ -7629,11 +7629,13 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
         """
         self._mark_disconnected()
         self._tool_run_shutdown = True
-        for agent in list(self._tool_run_agents.values()):
-            try:
-                request_hard_interrupt(agent, source="api_server_tool_run_shutdown")
-            except Exception:
-                pass
+        for agents in list(self._tool_run_agents.values()):
+            values = agents.values() if isinstance(agents, dict) else [agents]
+            for agent in list(values):
+                try:
+                    request_hard_interrupt(agent, source="api_server_tool_run_shutdown")
+                except Exception:
+                    pass
         tool_tasks = [task for task in self._tool_run_tasks.values() if not task.done()]
         for task in tool_tasks:
             task.cancel()
