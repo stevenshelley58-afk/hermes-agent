@@ -21,7 +21,12 @@ from aiohttp import web
 
 from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
-from gateway.tool_runs import TOOL_MODEL_POLICY_SCHEMA, ToolRunError
+from gateway.tool_runs import (
+    GENERATION_LIKENESS_THRESHOLD,
+    TOOL_MODEL_POLICY_SCHEMA,
+    ToolRunError,
+    validate_generation_records,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -46,7 +51,8 @@ class ToolRunAPIMixin:
     def _tool_stage_order() -> List[str]:
         return [
             "source", "analyse", "decompose", "restyle", "story-draft",
-            "check", "subject-invariance", "studio-qa", "ready", "release",
+            "render", "visual-review", "check", "subject-invariance",
+            "studio-qa", "ready", "release",
         ]
 
     @staticmethod
@@ -212,6 +218,46 @@ class ToolRunAPIMixin:
             })
         result = dict(output)
         result["previews"] = previews
+        generation_value = result.get("generations")
+        trace = result.get("generationTrace") or result.get("generation_trace")
+        if generation_value is None and isinstance(trace, dict):
+            generation_value = trace.get("generations")
+        if generation_value is not None:
+            feed_hashes = [item["sha256"] for item in previews if "feed" in item["name"].lower()]
+            story_hashes = [item["sha256"] for item in previews if "story" in item["name"].lower()]
+            current = result.get("current_artifacts") or result.get("artifact_hashes") or {}
+            feed_hash = current.get("feedSha256") or current.get("feed_sha256") if isinstance(current, dict) else None
+            story_hash = current.get("storySha256") or current.get("story_sha256") if isinstance(current, dict) else None
+            feed_hash = str(feed_hash or (feed_hashes[0] if len(feed_hashes) == 1 else "")).lower()
+            story_hash = str(story_hash or (story_hashes[0] if len(story_hashes) == 1 else "")).lower()
+            if not feed_hash or not story_hash:
+                raise RuntimeError("generation records must bind one current Feed and Story artifact hash")
+            records = validate_generation_records(
+                generation_value,
+                feed_sha256=feed_hash,
+                story_sha256=story_hash,
+            )
+            if isinstance(trace, dict):
+                if trace.get("templateId") not in (None, result.get("template_id")):
+                    raise RuntimeError("generation trace template id does not match candidate")
+                if trace.get("generations") is not None and trace.get("generations") != records:
+                    raise RuntimeError("generation trace and generation records disagree")
+            result["generations"] = records
+            result["generation_contract"] = {
+                "schema": "adstudio.generation-trace.v1",
+                "validated": True,
+                "approval_blocked_until_accepted": True,
+                "current_artifacts": {"feedSha256": feed_hash, "storySha256": story_hash},
+            }
+        else:
+            # Historical runs remain readable, but cannot cross the approval
+            # boundary because they have no authoritative scored generation.
+            result["generation_contract"] = {
+                "schema": "adstudio.generation-trace.v1",
+                "validated": False,
+                "legacy_missing": True,
+                "approval_blocked_until_accepted": True,
+            }
         result["qa"] = {
             "source_verified": True,
             "deterministic_check": "passed",
@@ -219,6 +265,78 @@ class ToolRunAPIMixin:
             "release_blocked_pending_approval": True,
         }
         return result
+
+    @staticmethod
+    def _validated_generation_gate(output: Any) -> Dict[str, Any]:
+        """Return the accepted generation only when it is current and dual-reviewed."""
+        if not isinstance(output, dict):
+            raise ToolRunError("approval requires a validated generation contract")
+        records = output.get("generations")
+        trace = output.get("generationTrace") or output.get("generation_trace")
+        if records is None and isinstance(trace, dict):
+            records = trace.get("generations")
+        current = output.get("current_artifacts") or output.get("artifact_hashes")
+        if not isinstance(current, dict):
+            current = (output.get("generation_contract") or {}).get("current_artifacts")
+        feed_hash = str((current or {}).get("feedSha256") or (current or {}).get("feed_sha256") or "").lower()
+        story_hash = str((current or {}).get("storySha256") or (current or {}).get("story_sha256") or "").lower()
+        if not feed_hash or not story_hash:
+            raise ToolRunError("approval requires current Feed and Story artifact hashes")
+        if isinstance(trace, dict) and trace.get("status") not in (None, "accepted"):
+            raise ToolRunError("approval requires an accepted generation trace")
+        validated = validate_generation_records(records, feed_sha256=feed_hash or None, story_sha256=story_hash or None)
+        last = validated[-1]
+        scores = last.get("scores") if isinstance(last.get("scores"), dict) else last
+        reviewers = last.get("reviewers") if isinstance(last.get("reviewers"), dict) else last
+        primary = float(scores.get("primaryAdSystemLikeness", scores.get("primary_ad_system_likeness", scores.get("primary_score"))))
+        strict = float(scores.get("strictAdSystemLikeness", scores.get("strict_ad_system_likeness", scores.get("strict_score"))))
+        if last.get("decision") != "accepted" or primary < GENERATION_LIKENESS_THRESHOLD or strict < GENERATION_LIKENESS_THRESHOLD:
+            raise ToolRunError("approval requires both independent likeness scores to be at least 9.5")
+        if reviewers.get("primary") == reviewers.get("strict"):
+            raise ToolRunError("approval requires independent reviewer identities")
+        artifacts = last.get("artifacts") if isinstance(last.get("artifacts"), dict) else last
+        if feed_hash and artifacts.get("feedSha256", artifacts.get("feed_sha256")) != feed_hash:
+            raise ToolRunError("approval generation Feed hash is stale")
+        if story_hash and artifacts.get("storySha256", artifacts.get("story_sha256")) != story_hash:
+            raise ToolRunError("approval generation Story hash is stale")
+        return {"generation": last, "feedSha256": artifacts.get("feedSha256", artifacts.get("feed_sha256")), "storySha256": artifacts.get("storySha256", artifacts.get("story_sha256"))}
+
+    def _project_generation_events(self, run_id: str, records: List[Dict[str, Any]]) -> None:
+        """Project validated generation records into Hermes' one event ledger."""
+        existing = {
+            (event["kind"], event.get("data", {}).get("iteration"))
+            for event in self._tool_run_store.events(run_id)
+            if event["kind"].startswith("generation.")
+        }
+        for record in records:
+            iteration = record["iteration"]
+            artifacts = record.get("artifacts") or {}
+            reviewers = record.get("reviewers") or {}
+            scores = record.get("scores") or {}
+            common = {
+                "iteration": iteration,
+                "feed_sha256": artifacts.get("feedSha256", artifacts.get("feed_sha256")),
+                "story_sha256": artifacts.get("storySha256", artifacts.get("story_sha256")),
+                "render_set_sha256": artifacts.get("renderSetSha256", artifacts.get("render_set_sha256")),
+            }
+            events = [
+                ("generation.started", {"iteration": iteration}),
+                ("generation.rendered", common),
+                ("generation.scored", {
+                    **common,
+                    "primary_reviewer": reviewers.get("primary", reviewers.get("primaryReviewer")),
+                    "strict_reviewer": reviewers.get("strict", reviewers.get("strictReviewer")),
+                    "primary_score": scores.get("primaryAdSystemLikeness", scores.get("primary_ad_system_likeness")),
+                    "strict_score": scores.get("strictAdSystemLikeness", scores.get("strict_ad_system_likeness")),
+                    "threshold": GENERATION_LIKENESS_THRESHOLD,
+                }),
+            ]
+            decision_kind = "generation.accepted" if record.get("decision") == "accepted" else "generation.revision-requested"
+            events.append((decision_kind, {"iteration": iteration, "revision_reason": str(record.get("revisionReason", record.get("revision_reason", "")))[:1000]}))
+            for kind, data in events:
+                if (kind, iteration) in existing:
+                    continue
+                self._tool_run_store.append_event(run_id, kind, status="ok", node_id="visual-review", data=data)
 
     @staticmethod
     def _validate_release_artifact(output: Dict[str, Any]) -> None:
@@ -317,13 +435,15 @@ class ToolRunAPIMixin:
             "Read and follow the installed adstudio-template-builder-v2 skill and project authority. One source "
             "produces at most one layered template. No image model may paint a whole ad; image models may operate "
             "only inside declared masked regions. Run source, analyse, decompose, restyle, story-draft, check, "
-            "subject-invariance, and prepare the Studio QA candidate. Use deterministic VPS commands and the "
+            "render, visual-review, check, subject-invariance, and prepare the Studio QA candidate. Use deterministic VPS commands and the "
             "canonical renderer wherever the pipeline declares a deterministic stage. Checkpoint every artifact. "
             "Treat /opt/ad-template-builder and every Git checkout as read-only authority: never create, edit, or "
             "delete repository files. Write candidate documents, previews, and evidence only beneath this run's "
             "Hermes tool_assets or tool_checkpoints directories. A candidate path outside those private roots is rejected. "
             "Stop before release for human approval. Return one compact JSON object with template_id, candidate_ref, "
-            "preview_refs, evidence_refs, qa_summary, cost, and attention items. Never return raw prompts, source "
+            "preview_refs, evidence_refs, generations, qa_summary, cost, and attention items. Every generation must "
+            "contain Feed/Story/render-set hashes, two different reviewer IDs, numeric likeness scores, a decision "
+            "and revision reason. Never return raw prompts, source "
             "bytes, credentials, or hidden reasoning.\n\n"
             f"Tool run: {run['run_id']}\nRequest: {run['request_id']}\n"
             f"Resume from checkpointed stage: {run.get('stage') or 'source'}. Do not rerun earlier valid checkpoints.\n"
@@ -384,7 +504,26 @@ class ToolRunAPIMixin:
                         run_id, "stage.started", status="running", node_id=next_stage,
                         data={"summary": f"Started {next_stage.replace('-', ' ')}"},
                     )
-                if event_type not in {"tool.started", "tool.completed", "subagent.start", "subagent.complete"}:
+                normalized_event = str(event_type).replace("-", ".")
+                generation_events = {
+                    "generation.started", "generation.rendered", "generation.scored",
+                    "generation.revision.requested", "generation.accepted", "generation.failed",
+                }
+                if event_type not in {"tool.started", "tool.completed", "subagent.start", "subagent.complete"} and normalized_event not in generation_events:
+                    return
+                if normalized_event.startswith("generation."):
+                    activity_sequence += 1
+                    safe_data = {
+                        key: kwargs[key] for key in (
+                            "iteration", "primary_score", "strict_score",
+                            "primary_reviewer", "strict_reviewer",
+                            "feed_sha256", "story_sha256", "render_set_sha256",
+                        ) if kwargs.get(key) is not None
+                    }
+                    self._tool_run_store.append_event(
+                        run_id, normalized_event, status="error" if kwargs.get("is_error") else "running",
+                        node_id="visual-review", data=safe_data,
+                    )
                     return
                 activity_sequence += 1
                 data: Dict[str, Any] = {}
@@ -500,6 +639,14 @@ class ToolRunAPIMixin:
             output["cost"]["reported_usd"] = reported_cost
             output["model_policy_revision"] = refreshed["model_policy_revision"]
             if finalize:
+                prior_output = refreshed.get("output") if isinstance(refreshed.get("output"), dict) else {}
+                self._validated_generation_gate(prior_output)
+                # Preserve the accepted candidate history in the release
+                # receipt even when the finalizer returns only pack metadata.
+                if prior_output.get("generations") is not None:
+                    output["generations"] = prior_output["generations"]
+                if prior_output.get("generationTrace") is not None:
+                    output["generationTrace"] = prior_output["generationTrace"]
                 if output.get("failed"):
                     raise RuntimeError(str(output.get("error") or "Release checks failed"))
                 required_release = {"release_id", "template_pack_ref", "template_pack_path", "sha256", "signature", "compatibility", "qa", "trace_ref"}
@@ -522,6 +669,8 @@ class ToolRunAPIMixin:
                 )
             else:
                 output = self._prepare_candidate_output(run_id, output)
+                if output.get("generations"):
+                    self._project_generation_events(run_id, output["generations"])
                 self._tool_run_store.update_run(
                     run_id, status="waiting_for_approval", stage="studio-qa", progress=0.9,
                     output=output, attention=True,
@@ -784,6 +933,7 @@ class ToolRunAPIMixin:
                 return web.json_response(self._tool_run_store.get_run(run_id))
             if decision != "approve" or body.get("confirm_100_percent") is not True:
                 raise ToolRunError("approval requires decision=approve and confirm_100_percent=true")
+            self._validated_generation_gate(run.get("output"))
             self._tool_run_store.append_event(run_id, "approval.approved", status="ok", node_id="studio-qa", data={"gate": "studio-qa-100-percent"})
             self._tool_run_store.requeue(run_id, stage="release")
             self._start_tool_task(run_id, finalize=True)
