@@ -226,10 +226,14 @@ class ToolRunAPIMixin:
             feed_hashes = [item["sha256"] for item in previews if "feed" in item["name"].lower()]
             story_hashes = [item["sha256"] for item in previews if "story" in item["name"].lower()]
             current = result.get("current_artifacts") or result.get("artifact_hashes") or {}
-            feed_hash = current.get("feedSha256") or current.get("feed_sha256") if isinstance(current, dict) else None
-            story_hash = current.get("storySha256") or current.get("story_sha256") if isinstance(current, dict) else None
-            feed_hash = str(feed_hash or (feed_hashes[0] if len(feed_hashes) == 1 else "")).lower()
-            story_hash = str(story_hash or (story_hashes[0] if len(story_hashes) == 1 else "")).lower()
+            declared_feed = current.get("feedSha256") or current.get("feed_sha256") if isinstance(current, dict) else None
+            declared_story = current.get("storySha256") or current.get("story_sha256") if isinstance(current, dict) else None
+            if len(feed_hashes) == 1 and declared_feed and str(declared_feed).lower() != feed_hashes[0]:
+                raise RuntimeError("declared current Feed hash does not match preview bytes")
+            if len(story_hashes) == 1 and declared_story and str(declared_story).lower() != story_hashes[0]:
+                raise RuntimeError("declared current Story hash does not match preview bytes")
+            feed_hash = str(feed_hashes[0] if len(feed_hashes) == 1 else (declared_feed or "")).lower()
+            story_hash = str(story_hashes[0] if len(story_hashes) == 1 else (declared_story or "")).lower()
             if not feed_hash or not story_hash:
                 raise RuntimeError("generation records must bind one current Feed and Story artifact hash")
             records = validate_generation_records(
