@@ -9,6 +9,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
+from gateway.tool_run_api import ToolRunAPIMixin
 from gateway.tool_runs import TOOL_RUN_COMMAND_SCHEMA, ToolRunStore, default_ad_template_policy
 
 
@@ -46,6 +47,13 @@ def command(key="job-1"):
         "idempotency_key": key,
         "model_policy_revision": 1,
     }
+
+
+def test_preview_placement_uses_final_filename_token():
+    assert ToolRunAPIMixin._preview_placement("meta-feed-006-feed.png") == "feed"
+    assert ToolRunAPIMixin._preview_placement("meta-feed-006-story.png") == "story"
+    assert ToolRunAPIMixin._preview_placement("meta-feed-006-feed-story.png") == "story"
+    assert ToolRunAPIMixin._preview_placement("meta-feed-006.png") is None
 
 
 def candidate_output(tmp_path, run_id, template_id):
