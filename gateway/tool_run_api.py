@@ -152,7 +152,23 @@ class ToolRunAPIMixin:
         return target
 
     @staticmethod
-    def _tool_json_output(value: Any) -> Dict[str, Any]:
+    def _tool_json_output(value: Any, *, process_result: bool = False) -> Dict[str, Any]:
+        if process_result:
+            required = {
+                "template", "iterations", "final_review", "previews",
+                "documents", "import", "process",
+            }
+            if (
+                not isinstance(value, dict)
+                or value.get("process") != "only-ad-template-process"
+                or not required.issubset(value)
+            ):
+                raise RuntimeError("Sole ad-template process returned an invalid result")
+            # The executable orchestrator already returns a structured object;
+            # its nested evidence is validated immediately afterward by
+            # _prepare_candidate_output. Keep the default agent-transport parser
+            # strict so arbitrary direct dictionaries are never accepted here.
+            return dict(value)
         text = ""
         if isinstance(value, dict):
             text = str(value.get("final_response") or value.get("output") or "")
@@ -444,7 +460,7 @@ class ToolRunAPIMixin:
                 return
             if isinstance(result, dict) and result.get("failed"):
                 raise RuntimeError(redact_sensitive_text(str(result.get("error") or "Tool execution failed"), force=True))
-            output = self._tool_json_output(result)
+            output = self._tool_json_output(result, process_result=True)
             output["usage"] = usage
             builder_cost = output.get("cost")
             output["cost"] = dict(builder_cost) if isinstance(builder_cost, dict) else ({"builder_reported": builder_cost} if builder_cost is not None else {})

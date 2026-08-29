@@ -1,8 +1,10 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import gateway.ad_template_process as process
 import gateway.tool_run_api as tool_run_api
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.tool_run_api import ToolRunAPIMixin
@@ -23,6 +25,63 @@ def _command(source: str, *, idempotency_key: str) -> dict:
         },
         "idempotency_key": idempotency_key,
         "model_policy_revision": 1,
+    }
+
+
+def _valid_template() -> dict:
+    def layout(placement: str, height: int) -> dict:
+        return {
+            "placement": placement,
+            "layers": [{
+                "type": "plate",
+                "layerId": f"{placement}-background",
+                "colourRole": "background",
+                "geometry": {"x": 0, "y": 0, "width": 1080, "height": height},
+                "protected": False,
+            }],
+            "safeZones": [{"x": 0, "y": 0, "width": 1080, "height": height}],
+        }
+
+    return {
+        "schema": "blockwise.ad-template",
+        "templateId": "completion-test",
+        "createdAt": "2026-08-30T00:00:00+00:00",
+        "feedLayout": layout("feed", 1350),
+        "storyLayout": layout("story", 1920),
+        "imageInputs": [],
+        "textInputs": [],
+        "semanticColours": {
+            "background": "#FFFFFF",
+            "primary": "#1A56DB",
+            "secondary": "#6B7280",
+            "accent": "#F59E0B",
+            "mainText": "#111827",
+            "inverseText": "#FFFFFF",
+        },
+        "assets": {},
+        "fonts": [],
+        "metadata": {
+            "title": "Completion test",
+            "description": "",
+            "gallerySamples": {},
+            "metaCopyDefaults": {
+                "primaryText": [], "headlines": [], "descriptions": [],
+                "cta": "LEARN_MORE",
+            },
+            "aiWritingGuidance": {"summary": "", "fields": {}},
+            "publishRequirements": {
+                "objective": "OUTCOME_TRAFFIC",
+                "specialAdCategory": None,
+                "instantForm": {"required": False, "dependency": None},
+                "destination": {
+                    "required": True, "kind": "website",
+                    "dependency": "landing_page_url",
+                },
+                "requiredCtaTypes": ["LEARN_MORE"],
+            },
+            "replacementAssets": [],
+            "realAssetRefs": [],
+        },
     }
 
 
@@ -77,6 +136,39 @@ class _ToolRunHarness(ToolRunAPIMixin):
         return None
 
 
+class _StructuredRoleAgent:
+    def __init__(self, instance_id: str, template: dict):
+        self._instance_id = instance_id
+        self._template = template
+        self.session_prompt_tokens = 0
+        self.session_completion_tokens = 0
+        self.session_total_tokens = 0
+        self.session_estimated_cost_usd = 0.0
+
+    def run_conversation(self, **_kwargs):
+        if self._instance_id.startswith("builder-"):
+            payload = {"template": self._template, "assets": []}
+        else:
+            payload = {
+                "reason": "All visible requirements pass",
+                "hard_failures": [],
+                "rubric": {field: 9.7 for field in process.RUBRIC_FIELDS},
+            }
+        return {"final_response": json.dumps(payload)}
+
+
+class _RealOrchestratorHarness(_ToolRunHarness):
+    def __init__(self, store, template):
+        super().__init__(store)
+        self._template = template
+        self.role_calls = []
+
+    def _create_agent(self, **kwargs):
+        instance_id = kwargs["session_id"].split(":", 2)[1]
+        self.role_calls.append(instance_id)
+        return _StructuredRoleAgent(instance_id, self._template)
+
+
 class _ExplicitEventOrchestrator:
     def __init__(self, *, call_agent, emit, **_kwargs):
         self.call_agent = call_agent
@@ -101,12 +193,13 @@ class _ExplicitEventOrchestrator:
         ):
             self.emit(kind, node, {})
         return {
-            "final_response": json.dumps(
-                {
-                    "iterations": [],
-                    "import": {"template_id": "tpl-test", "status": "imported"},
-                }
-            )
+            "template": {},
+            "iterations": [],
+            "final_review": {},
+            "previews": [],
+            "documents": {},
+            "import": {"template_id": "tpl-test", "status": "imported"},
+            "process": "only-ad-template-process",
         }
 
 
@@ -140,6 +233,80 @@ async def test_generic_terminal_preview_never_advances_or_emits_stage(tmp_path, 
         1.0,
     )
     assert api.system_prompts == [ToolRunAPIMixin._isolated_tool_role_prompt()]
+
+
+def test_direct_orchestrator_result_does_not_weaken_generic_agent_parser():
+    result = {
+        "template": {},
+        "iterations": [],
+        "final_review": {},
+        "previews": [],
+        "documents": {},
+        "import": {},
+        "process": "only-ad-template-process",
+    }
+    with pytest.raises(RuntimeError, match="structured JSON"):
+        ToolRunAPIMixin._tool_json_output(result)
+    assert ToolRunAPIMixin._tool_json_output(result, process_result=True) == result
+
+
+@pytest.mark.asyncio
+async def test_real_orchestrator_successful_import_reaches_completed(tmp_path, monkeypatch):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source-pixels")
+    template = _valid_template()
+    store = ToolRunStore(str(tmp_path / "completion.db"))
+    run, _ = store.create_run(_command(str(source), idempotency_key="completion"))
+    api = _RealOrchestratorHarness(store, template)
+
+    def render(candidate, workspace: Path):
+        rendered = workspace / "rendered"
+        rendered.mkdir(parents=True, exist_ok=True)
+        feed = rendered / "feed.png"
+        story = rendered / "story.png"
+        feed.write_bytes(b"feed-pixels")
+        story.write_bytes(b"story-pixels")
+        artifact = workspace / "artifact.json"
+        artifact.write_text(json.dumps(candidate), encoding="utf-8")
+        return {
+            **candidate,
+            "previews": [
+                {"name": feed.name, "path": str(feed), "placement": "feed"},
+                {"name": story.name, "path": str(story), "placement": "story"},
+            ],
+            "render": {"feed": str(feed), "story": str(story)},
+            "receipt": {"outputs": {"feed": {}, "story": {}}},
+            "template_path": str(artifact),
+        }
+
+    monkeypatch.setattr(process, "run_generator_cli", render)
+    monkeypatch.setattr(
+        process,
+        "import_template",
+        lambda _output, *, run_id, project_id: {
+            "template_id": f"tpl-{run_id[-8:]}",
+            "status": "imported",
+            "project_id": project_id,
+        },
+    )
+    assert tool_run_api.SoleProcessOrchestrator is process.SoleProcessOrchestrator
+
+    await api._execute_tool_run(run["run_id"])
+
+    completed = store.get_run(run["run_id"])
+    assert completed["status"] == "completed"
+    assert completed["stage"] == "live"
+    assert completed["error"] is None
+    assert completed["output"]["process"] == "only-ad-template-process"
+    assert completed["output"]["import"]["status"] == "imported"
+    assert len(api.role_calls) == 4
+    assert api.role_calls[0].startswith("builder-")
+    assert api.role_calls[1].startswith("comparator-")
+    assert all(name.startswith("final-reviewer-") for name in api.role_calls[2:])
+    assert not any(event["kind"] == "run.failed" for event in store.events(run["run_id"]))
 
 
 def test_isolated_role_prompt_forbids_discovery_and_orchestrator_work():
