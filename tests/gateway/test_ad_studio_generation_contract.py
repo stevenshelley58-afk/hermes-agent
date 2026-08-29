@@ -93,8 +93,8 @@ def test_candidate_uses_private_authoritative_trace_over_lossy_summary(tmp_path)
     run_root = hermes_home / "tool_assets" / "ad-template-generator" / "runs" / run_id
     preview_root = run_root / "previews"
     preview_root.mkdir(parents=True)
-    feed = preview_root / "candidate-feed.png"
-    story = preview_root / "candidate-story.png"
+    feed = preview_root / "meta-feed-006-feed.png"
+    story = preview_root / "meta-feed-006-story.png"
     feed.write_bytes(b"feed-preview")
     story.write_bytes(b"story-preview")
     feed_hash = hashlib.sha256(feed.read_bytes()).hexdigest()

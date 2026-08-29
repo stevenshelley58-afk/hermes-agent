@@ -248,7 +248,7 @@ class ToolRunAPIMixin:
         if generation_value is None and isinstance(trace, dict):
             generation_value = trace.get("generations")
         if generation_value is not None:
-            placements = [self._preview_placement(item["name"]) for item in previews]
+            placements = [ToolRunAPIMixin._preview_placement(item["name"]) for item in previews]
             if any(placement is None for placement in placements):
                 raise RuntimeError("every preview must have an unambiguous Feed or Story placement suffix")
             feed_hashes = [item["sha256"] for item, placement in zip(previews, placements) if placement == "feed"]
