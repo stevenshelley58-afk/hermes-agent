@@ -218,8 +218,26 @@ class ToolRunAPIMixin:
             })
         result = dict(output)
         result["previews"] = previews
-        generation_value = result.get("generations")
-        trace = result.get("generationTrace") or result.get("generation_trace")
+        # The deterministic builder writes the complete trace beneath the
+        # run's private root. Treat that file as authoritative: the agent's
+        # compact final response is a lossy transport summary and must not be
+        # able to replace valid numeric scores with prose, nulls, or stale data.
+        trace = None
+        trace_path = run_root / "generation-trace.json"
+        if trace_path.exists():
+            if trace_path.is_symlink() or not trace_path.is_file():
+                raise RuntimeError("generation trace is not an immutable private JSON document")
+            try:
+                trace = json.loads(trace_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError("generation trace is unreadable or invalid") from exc
+            if not isinstance(trace, dict):
+                raise RuntimeError("generation trace must be a JSON object")
+            result["generationTrace"] = trace
+            generation_value = trace.get("generations")
+        else:
+            generation_value = result.get("generations")
+            trace = result.get("generationTrace") or result.get("generation_trace")
         if generation_value is None and isinstance(trace, dict):
             generation_value = trace.get("generations")
         if generation_value is not None:
