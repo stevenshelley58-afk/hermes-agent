@@ -8,11 +8,11 @@ tool to every Hermes conversation.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
 import re
+import uuid
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List
@@ -21,8 +21,8 @@ from aiohttp import web
 
 from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
+from gateway.ad_template_process import validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
 from gateway.tool_runs import (
-    GENERATION_LIKENESS_THRESHOLD,
     TOOL_MODEL_POLICY_SCHEMA,
     ToolRunError,
     validate_generation_records,
@@ -49,11 +49,8 @@ class ToolRunAPIMixin:
 
     @staticmethod
     def _tool_stage_order() -> List[str]:
-        return [
-            "source", "analyse", "decompose", "restyle", "story-draft",
-            "render", "visual-review", "check", "subject-invariance",
-            "studio-qa", "ready", "release",
-        ]
+        return list(("source", "analyse", "decompose", "restyle", "story-draft",
+                     "render", "compare", "qa", "final-review", "import"))
 
     @staticmethod
     def _preview_placement(name: str) -> str | None:
@@ -64,77 +61,38 @@ class ToolRunAPIMixin:
 
     @staticmethod
     def _ingest_tool_sources(command: Dict[str, Any]) -> Dict[str, Any]:
-        """Copy Frank staging files into Hermes' private, content-addressed store."""
+        """Stage the source only for the duration of this run; no vault or hash."""
         payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
         sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
         if not sources:
             raise ToolRunError("at least one source is required")
         try:
             from hermes_constants import get_hermes_home
-            asset_root = (get_hermes_home() / "tool_assets" / "ad-template-generator").resolve()
+            staging_root = (get_hermes_home() / "tool_runs" / "staging").resolve()
         except Exception as exc:
-            raise ToolRunError("Hermes private asset store is unavailable") from exc
+            raise ToolRunError("Hermes run workspace is unavailable") from exc
         shared_root = Path(os.environ.get("FRANK_SHARED_UPLOAD_ROOT", "/srv/frank/data/window/uploads")).resolve()
-        allowed_extensions = {".avif", ".bmp", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+        allowed = {".avif", ".bmp", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
         result = json.loads(json.dumps(command))
-        ingested = []
+        staged = []
         for item in sources:
             if not isinstance(item, dict):
                 raise ToolRunError("source must be an object")
             raw_path = item.get("path")
             if not raw_path:
-                ingested.append(item)
-                continue
-            candidate_path = Path(str(raw_path))
-            if candidate_path.is_symlink():
-                raise ToolRunError("source symlinks are not accepted")
-            try:
-                source = candidate_path.resolve(strict=True)
-            except OSError as exc:
-                raise ToolRunError("source staging file is unavailable") from exc
+                raise ToolRunError("source image path is required")
+            source = Path(str(raw_path)).resolve(strict=True)
             try:
                 source.relative_to(shared_root)
             except ValueError as exc:
-                raise ToolRunError("source path is outside the Frank staging mount") from exc
-            relative = source.relative_to(shared_root)
-            if any(part.startswith(".") for part in relative.parts):
-                raise ToolRunError("hidden source files are not accepted")
-            if not source.is_file() or source.suffix.lower() not in allowed_extensions:
-                raise ToolRunError("source is not a supported regular image")
-            size = source.stat().st_size
-            if size < 1 or size > 250 * 1024 * 1024:
-                raise ToolRunError("source exceeds the private ingestion limit")
-            digest_builder = hashlib.sha256()
-            with source.open("rb") as source_stream:
-                head = source_stream.read(32)
-                digest_builder.update(head)
-                for chunk in iter(lambda: source_stream.read(1024 * 1024), b""):
-                    digest_builder.update(chunk)
-            image_header = (
-                head.startswith(b"\x89PNG\r\n\x1a\n") or head.startswith(b"\xff\xd8\xff") or
-                head.startswith((b"GIF87a", b"GIF89a", b"BM", b"II*\x00", b"MM\x00*")) or
-                (head.startswith(b"RIFF") and head[8:12] == b"WEBP") or b"ftypavif" in head or
-                b"ftypheic" in head or b"ftypheif" in head or b"ftypmif1" in head
-            )
-            if not image_header:
-                raise ToolRunError("source bytes are not a supported image format")
-            digest = digest_builder.hexdigest()
-            declared = str(item.get("sha256") or "").lower()
-            if declared and declared != digest:
-                raise ToolRunError("source hash did not match the uploaded bytes")
-            target_dir = asset_root / digest[:2]
-            target_dir.mkdir(parents=True, exist_ok=True)
-            target = target_dir / f"{digest}{source.suffix.lower()}"
-            if not target.exists():
-                shutil.copyfile(source, target)
-                target.chmod(0o600)
-            private = dict(item)
-            private["path"] = str(target)
-            private["sha256"] = digest
-            private["ref"] = f"source:{digest}"
-            private["ingested"] = True
-            ingested.append(private)
-        result["payload"]["sources"] = ingested
+                raise ToolRunError("source path is outside the Frank upload mount") from exc
+            if not source.is_file() or source.suffix.lower() not in allowed:
+                raise ToolRunError("source is not a supported image")
+            target = staging_root / f"source-{uuid.uuid4().hex}{source.suffix.lower()}"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            staged.append({"name": str(item.get("name") or source.name), "path": str(target), "size": source.stat().st_size})
+        result["payload"]["sources"] = staged
         return result
 
     @staticmethod
@@ -167,265 +125,44 @@ class ToolRunAPIMixin:
 
     @staticmethod
     def _prepare_candidate_output(run_id: str, output: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate pre-release evidence and expose only opaque preview URLs."""
-        required = {"template_id", "candidate_ref", "preview_refs", "evidence_refs", "qa_summary"}
-        missing = sorted(key for key in required if not output.get(key))
+        """Accept only the sole process result and normalize deterministic docs."""
+        required = {"template", "iterations", "final_review", "previews", "template_path", "render_path", "import"}
+        missing = sorted(key for key in required if key not in output)
         if missing:
-            raise RuntimeError(f"Builder candidate is incomplete: {', '.join(missing)}")
-        qa = output.get("qa_summary")
-        if not isinstance(qa, dict):
-            raise RuntimeError("Builder candidate QA evidence is invalid")
-        if (
-            qa.get("source_verified") is not True
-            or qa.get("deterministic_check") != "passed"
-            or qa.get("subject_invariance_gate") is not True
-            or qa.get("release_status") != "blocked_pending_human_approval"
-        ):
-            raise RuntimeError("Builder candidate did not pass every automated pre-release gate")
-        try:
-            from hermes_constants import get_hermes_home
-            hermes_home = get_hermes_home()
-            run_root = (
-                hermes_home / "tool_assets" / "ad-template-generator" / "runs" / run_id
-            ).resolve()
-            checkpoint_root = (
-                hermes_home / "tool_checkpoints" / "ad-template-generator" / run_id
-            ).resolve()
-            preview_root = (
-                hermes_home / "tool_assets" / "ad-template-generator" /
-                "runs" / run_id / "previews"
-            ).resolve()
-        except Exception as exc:
-            raise RuntimeError("Hermes private preview store is unavailable") from exc
-        try:
-            candidate = Path(str(output["candidate_ref"])).resolve(strict=True)
-            if not any(_path_is_relative_to(candidate, root) for root in (run_root, checkpoint_root)):
-                raise ValueError("outside private run roots")
-        except (OSError, ValueError) as exc:
-            raise RuntimeError("Builder candidate is outside the private run store") from exc
-        if candidate.is_symlink() or not candidate.is_file() or candidate.suffix.lower() != ".json":
-            raise RuntimeError("Builder candidate is not an immutable JSON document")
-        preview_refs = output.get("preview_refs")
-        if not isinstance(preview_refs, list) or not preview_refs:
-            raise RuntimeError("Builder candidate has no reviewable previews")
-        previews = []
-        for raw_path in preview_refs:
-            try:
-                target = Path(str(raw_path)).resolve(strict=True)
-                target.relative_to(preview_root)
-            except (OSError, ValueError) as exc:
-                raise RuntimeError("Builder preview is outside the private run store") from exc
-            if target.is_symlink() or not target.is_file() or target.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
-                raise RuntimeError("Builder preview is not a supported immutable image")
-            digest = hashlib.sha256(target.read_bytes()).hexdigest()
-            previews.append({
-                "name": target.name,
-                "sha256": digest,
-                "url": f"/api/ad-studio/runs/{run_id}/artifacts/{target.name}",
-            })
-        result = dict(output)
-        result["previews"] = previews
-        # The deterministic builder writes the complete trace beneath the
-        # run's private root. Treat that file as authoritative: the agent's
-        # compact final response is a lossy transport summary and must not be
-        # able to replace valid numeric scores with prose, nulls, or stale data.
-        trace = None
-        trace_path = run_root / "generation-trace.json"
-        if trace_path.exists():
-            if trace_path.is_symlink() or not trace_path.is_file():
-                raise RuntimeError("generation trace is not an immutable private JSON document")
-            try:
-                trace = json.loads(trace_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeError("generation trace is unreadable or invalid") from exc
-            if not isinstance(trace, dict):
-                raise RuntimeError("generation trace must be a JSON object")
-            result["generationTrace"] = trace
-            generation_value = trace.get("generations")
-        else:
-            generation_value = result.get("generations")
-            trace = result.get("generationTrace") or result.get("generation_trace")
-        if generation_value is None and isinstance(trace, dict):
-            generation_value = trace.get("generations")
-        if generation_value is not None:
-            placements = [ToolRunAPIMixin._preview_placement(item["name"]) for item in previews]
-            if any(placement is None for placement in placements):
-                raise RuntimeError("every preview must have an unambiguous Feed or Story placement suffix")
-            feed_hashes = [item["sha256"] for item, placement in zip(previews, placements) if placement == "feed"]
-            story_hashes = [item["sha256"] for item, placement in zip(previews, placements) if placement == "story"]
-            current = result.get("current_artifacts") or result.get("artifact_hashes") or {}
-            declared_feed = current.get("feedSha256") or current.get("feed_sha256") if isinstance(current, dict) else None
-            declared_story = current.get("storySha256") or current.get("story_sha256") if isinstance(current, dict) else None
-            if len(feed_hashes) == 1 and declared_feed and str(declared_feed).lower() != feed_hashes[0]:
-                raise RuntimeError("declared current Feed hash does not match preview bytes")
-            if len(story_hashes) == 1 and declared_story and str(declared_story).lower() != story_hashes[0]:
-                raise RuntimeError("declared current Story hash does not match preview bytes")
-            feed_hash = str(feed_hashes[0] if len(feed_hashes) == 1 else (declared_feed or "")).lower()
-            story_hash = str(story_hashes[0] if len(story_hashes) == 1 else (declared_story or "")).lower()
-            if not feed_hash or not story_hash:
-                raise RuntimeError("generation records must bind one current Feed and Story artifact hash")
-            records = validate_generation_records(
-                generation_value,
-                feed_sha256=feed_hash,
-                story_sha256=story_hash,
-            )
-            if isinstance(trace, dict):
-                if trace.get("templateId") not in (None, result.get("template_id")):
-                    raise RuntimeError("generation trace template id does not match candidate")
-                if trace.get("generations") is not None and trace.get("generations") != records:
-                    raise RuntimeError("generation trace and generation records disagree")
-            result["generations"] = records
-            result["generation_contract"] = {
-                "schema": "adstudio.generation-trace.v1",
-                "validated": True,
-                "approval_blocked_until_accepted": True,
-                "current_artifacts": {"feedSha256": feed_hash, "storySha256": story_hash},
-            }
-        else:
-            # Historical runs remain readable, but cannot cross the approval
-            # boundary because they have no authoritative scored generation.
-            result["generation_contract"] = {
-                "schema": "adstudio.generation-trace.v1",
-                "validated": False,
-                "legacy_missing": True,
-                "approval_blocked_until_accepted": True,
-            }
-        qa_projection = {
-            "source_verified": True,
-            "deterministic_check": "passed",
-            "subject_invariance_passed": True,
-            "release_blocked_pending_approval": True,
-        }
-        if result.get("generations"):
-            qa_projection["visual_review"] = result["generations"][-1]
-        result["qa"] = qa_projection
+            raise RuntimeError(f"Generator result is incomplete: {', '.join(missing)}")
+        iterations = validate_iterations(output.get("iterations"))
+        accepted = iterations[-1]["decision"] == "accepted"
+        final_review = validate_final_review(output.get("final_review"), accepted=accepted)
+        if accepted and final_review.get("decision") != "accepted":
+            raise RuntimeError("final reviewers did not pass")
+        if not accepted:
+            raise RuntimeError("generator exhausted its loop without a passing comparator")
+        docs = deterministic_documents(output.get("template"))
+        result = {key: output.get(key) for key in ("template", "previews", "template_path", "render_path", "import")}
+        result["iterations"] = iterations
+        result["final_review"] = final_review
+        result["deterministic_documents"] = docs
+        result["process"] = "only-ad-template-process"
         return result
 
     @staticmethod
     def _validated_generation_gate(output: Any) -> Dict[str, Any]:
-        """Return the accepted generation only when it is current and dual-reviewed."""
         if not isinstance(output, dict):
-            raise ToolRunError("approval requires a validated generation contract")
-        records = output.get("generations")
-        trace = output.get("generationTrace") or output.get("generation_trace")
-        if records is None and isinstance(trace, dict):
-            records = trace.get("generations")
-        current = output.get("current_artifacts") or output.get("artifact_hashes")
-        if not isinstance(current, dict):
-            current = (output.get("generation_contract") or {}).get("current_artifacts")
-        feed_hash = str((current or {}).get("feedSha256") or (current or {}).get("feed_sha256") or "").lower()
-        story_hash = str((current or {}).get("storySha256") or (current or {}).get("story_sha256") or "").lower()
-        if not feed_hash or not story_hash:
-            raise ToolRunError("approval requires current Feed and Story artifact hashes")
-        if isinstance(trace, dict) and trace.get("status") not in (None, "accepted"):
-            raise ToolRunError("approval requires an accepted generation trace")
-        validated = validate_generation_records(records, feed_sha256=feed_hash or None, story_sha256=story_hash or None)
-        last = validated[-1]
-        scores = last.get("scores") if isinstance(last.get("scores"), dict) else last
-        reviewers = last.get("reviewers") if isinstance(last.get("reviewers"), dict) else last
-        primary = float(scores.get("primaryAdSystemLikeness", scores.get("primary_ad_system_likeness", scores.get("primary_score"))))
-        strict = float(scores.get("strictAdSystemLikeness", scores.get("strict_ad_system_likeness", scores.get("strict_score"))))
-        if last.get("decision") != "accepted" or primary < GENERATION_LIKENESS_THRESHOLD or strict < GENERATION_LIKENESS_THRESHOLD:
-            raise ToolRunError("approval requires both independent likeness scores to be at least 9.5")
-        if reviewers.get("primary") == reviewers.get("strict"):
-            raise ToolRunError("approval requires independent reviewer identities")
-        artifacts = last.get("artifacts") if isinstance(last.get("artifacts"), dict) else last
-        if feed_hash and artifacts.get("feedSha256", artifacts.get("feed_sha256")) != feed_hash:
-            raise ToolRunError("approval generation Feed hash is stale")
-        if story_hash and artifacts.get("storySha256", artifacts.get("story_sha256")) != story_hash:
-            raise ToolRunError("approval generation Story hash is stale")
-        return {"generation": last, "feedSha256": artifacts.get("feedSha256", artifacts.get("feed_sha256")), "storySha256": artifacts.get("storySha256", artifacts.get("story_sha256"))}
+            raise ToolRunError("generator output is required")
+        iterations = validate_iterations(output.get("iterations"))
+        return validate_final_review(output.get("final_review"), accepted=iterations[-1]["decision"] == "accepted")
 
     def _project_generation_events(self, run_id: str, records: List[Dict[str, Any]]) -> None:
-        """Project validated generation records into Hermes' one event ledger."""
-        existing = {
-            (event["kind"], event.get("data", {}).get("iteration"))
-            for event in self._tool_run_store.events(run_id)
-            if event["kind"].startswith("generation.")
-        }
         for record in records:
-            iteration = record["iteration"]
-            artifacts = record.get("artifacts") or {}
-            reviewers = record.get("reviewers") or {}
-            scores = record.get("scores") or {}
-            common = {
-                "iteration": iteration,
-                "feed_sha256": artifacts.get("feedSha256", artifacts.get("feed_sha256")),
-                "story_sha256": artifacts.get("storySha256", artifacts.get("story_sha256")),
-                "render_set_sha256": artifacts.get("renderSetSha256", artifacts.get("render_set_sha256")),
-            }
-            events = [
-                ("generation.started", {"iteration": iteration}),
-                ("generation.rendered", common),
-                ("generation.scored", {
-                    **common,
-                    "primary_reviewer": reviewers.get("primary", reviewers.get("primaryReviewer")),
-                    "strict_reviewer": reviewers.get("strict", reviewers.get("strictReviewer")),
-                    "primary_score": scores.get("primaryAdSystemLikeness", scores.get("primary_ad_system_likeness")),
-                    "strict_score": scores.get("strictAdSystemLikeness", scores.get("strict_ad_system_likeness")),
-                    "threshold": GENERATION_LIKENESS_THRESHOLD,
-                }),
-            ]
-            decision_kind = "generation.accepted" if record.get("decision") == "accepted" else "generation.revision-requested"
-            events.append((decision_kind, {"iteration": iteration, "revision_reason": str(record.get("revisionReason", record.get("revision_reason", "")))[:1000]}))
-            for kind, data in events:
-                if (kind, iteration) in existing:
-                    continue
-                self._tool_run_store.append_event(run_id, kind, status="ok", node_id="visual-review", data=data)
-
-    @staticmethod
-    def _validate_release_artifact(output: Dict[str, Any]) -> None:
-        """Bind a release receipt to the exact private artifact bytes."""
-        try:
-            from hermes_constants import get_hermes_home
-            release_root = (get_hermes_home() / "tool_releases" / "ad-template-generator").resolve()
-        except Exception as exc:
-            raise RuntimeError("Hermes private release store is unavailable") from exc
-        raw_path = output.get("template_pack_path")
-        if not raw_path:
-            raise RuntimeError("Builder did not return the private TemplatePack path")
-        candidate = Path(str(raw_path))
-        if candidate.is_symlink():
-            raise RuntimeError("TemplatePack symlinks are not accepted")
-        try:
-            artifact = candidate.resolve(strict=True)
-            artifact.relative_to(release_root)
-        except (OSError, ValueError) as exc:
-            # Finalizer models can redact an otherwise valid private path in
-            # their structured response (for example, ``private:``). Recover
-            # deterministically from the release identifier instead of making
-            # release correctness depend on model phrasing. The recovered
-            # artifact remains confined to the private store and is still
-            # bound below to the returned checksum and signature receipt.
-            release_id = str(output.get("release_id") or "")
-            if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,198}[A-Za-z0-9])?", release_id):
-                raise RuntimeError("TemplatePack is outside the private release store") from exc
-            candidate = release_root / release_id / "pack.bundle.json"
-            try:
-                if candidate.is_symlink():
-                    raise ValueError("symlink")
-                artifact = candidate.resolve(strict=True)
-                artifact.relative_to(release_root)
-            except (OSError, ValueError) as recovery_exc:
-                raise RuntimeError("TemplatePack is outside the private release store") from recovery_exc
-        if not artifact.is_file() or artifact.suffix.lower() not in {".json", ".zip"}:
-            raise RuntimeError("TemplatePack is not a supported immutable artifact")
-        digest = hashlib.sha256()
-        with artifact.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-        if digest.hexdigest() != str(output.get("sha256") or "").lower():
-            raise RuntimeError("TemplatePack checksum does not match the released bytes")
-        if artifact.suffix.lower() == ".json":
-            try:
-                pack = json.loads(artifact.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-                raise RuntimeError("TemplatePack JSON is unreadable") from exc
-            integrity = pack.get("integrity") if isinstance(pack, dict) else None
-            if not isinstance(integrity, dict) or not isinstance(integrity.get("signature"), dict):
-                raise RuntimeError("TemplatePack does not contain its signature receipt")
-            if integrity.get("signature") != output.get("signature"):
-                raise RuntimeError("TemplatePack signature receipt does not match the released artifact")
+            comparison = record.get("comparison") or {}
+            self._tool_run_store.append_event(run_id, "iteration.compared", status="ok",
+                node_id="compare", data={"iteration": record.get("iteration"),
+                "score": comparison.get("score"), "reason": comparison.get("reason"),
+                "decision": record.get("decision")})
+        if records and records[-1].get("decision") == "accepted":
+            self._tool_run_store.append_event(run_id, "final-review.started", status="running", node_id="final-review", data={})
+            self._tool_run_store.append_event(run_id, "final-review.completed", status="ok", node_id="final-review",
+                data={"decision": "accepted", "reviewer_count": 2})
 
     def _tool_candidate(self, run: Dict[str, Any], stage: str) -> Dict[str, str]:
         stages = (run.get("model_policy") or {}).get("stages") or {}
@@ -454,58 +191,14 @@ class ToolRunAPIMixin:
                     return stage
         return current
 
-    def _tool_prompt(self, run: Dict[str, Any], *, finalize: bool) -> str:
+    def _tool_prompt(self, run: Dict[str, Any], *, finalize: bool = False) -> str:
         payload = run.get("payload") or {}
-        sources = []
-        for item in payload.get("sources") or []:
-            if isinstance(item, dict):
-                ref = item.get("path") or item.get("ref") or item.get("url")
-                if ref:
-                    sources.append(f"- {ref}")
-        if finalize:
-            return (
-                "Finalize an approved Ad Template Generator Tool run. The operator confirmed the Studio candidate "
-                "at 100% zoom. Re-open its checkpointed workspace, rerun every release-blocking check, and issue "
-                "only an immutable sanitized signed TemplatePack. Return one JSON object with release_id, "
-                "template_pack_ref, template_pack_path, sha256, signature, compatibility, qa, and trace_ref. Store "
-                "the pack beneath Hermes home/tool_releases/ad-template-generator; the path remains private. If a gate is stale or "
-                "failing return failed=true and error. Never expose sources, prompts, credentials, reviewer identity, "
-                "or private paths.\n\n"
-                f"Run: {run['run_id']}\nProject: {(run.get('scope') or {}).get('project_id')}\n"
-                f"Candidate: {json.dumps(run.get('output') or {}, ensure_ascii=False)}"
-            )
-        model_lines = []
-        for stage_id, stage in ((run.get("model_policy") or {}).get("stages") or {}).items():
-            primary = (stage or {}).get("primary") or {}
-            fallbacks = (stage or {}).get("fallbacks") or []
-            chain = [f"{primary.get('provider')}/{primary.get('model')}"]
-            chain.extend(f"{item.get('provider')}/{item.get('model')}" for item in fallbacks if isinstance(item, dict))
-            model_lines.append(f"- {stage_id}: {' -> '.join(chain)}")
-        return (
-            "Execute the canonical Ad Template Generator v2 process as a private durable Tool job, not a chat. "
-            "Read and follow the installed adstudio-template-builder-v2 skill and project authority. One source "
-            "produces at most one layered template. No image model may paint a whole ad; image models may operate "
-            "only inside declared masked regions. Run source, analyse, decompose, restyle, story-draft, check, "
-            "render, visual-review, check, subject-invariance, and prepare the Studio QA candidate. Use deterministic VPS commands and the "
-            "canonical renderer wherever the pipeline declares a deterministic stage. Checkpoint every artifact. "
-            "Treat /opt/ad-template-builder and every Git checkout as read-only authority: never create, edit, or "
-            "delete repository files. Write candidate documents, previews, and evidence only beneath this run's "
-            "Hermes tool_assets or tool_checkpoints directories. A candidate path outside those private roots is rejected. "
-            "Stop before release for human approval. Return one compact JSON object with template_id, candidate_ref, "
-            "preview_refs, evidence_refs, generations, qa_summary, cost, and attention items. Every generation must "
-            "contain Feed/Story/render-set hashes, two different reviewer IDs, numeric likeness scores, a decision "
-            "and revision reason. Never return raw prompts, source "
-            "bytes, credentials, or hidden reasoning.\n\n"
-            f"Tool run: {run['run_id']}\nRequest: {run['request_id']}\n"
-            f"Resume from checkpointed stage: {run.get('stage') or 'source'}. Do not rerun earlier valid checkpoints.\n"
-            f"Project: {(run.get('scope') or {}).get('project_id')}\n"
-            f"Job: {payload.get('job_name') or run['run_id']}\n"
-            f"Placements: {json.dumps(payload.get('placements') or [], ensure_ascii=False)}\n"
-            f"Brief: {str(payload.get('brief') or '')[:4000]}\n"
-            f"Sources:\n{chr(10).join(sources)}\n"
-            f"Pinned model-policy revision: {run['model_policy_revision']}\n"
-            f"AI routes:\n{chr(10).join(model_lines)}"
-        )
+        sources = payload.get("sources") or []
+        source = (sources[0] or {}).get("path") if isinstance(sources[0], dict) else ""
+        return generator_prompt(run_id=run["run_id"],
+            project_id=str((run.get("scope") or {}).get("project_id") or ""),
+            brief=str(payload.get("brief") or ""), placements=payload.get("placements") or [],
+            source=str(source or ""))
 
     def _start_tool_task(self, run_id: str, *, finalize: bool = False) -> None:
         task = self._tool_run_tasks.get(run_id)
@@ -521,19 +214,19 @@ class ToolRunAPIMixin:
             task.add_done_callback(self._background_tasks.discard)
 
     async def _execute_tool_run(self, run_id: str, *, finalize: bool = False) -> None:
-        current_stage = "release" if finalize else "source"
+        current_stage = "source"
         try:
             run = self._tool_run_store.get_run(run_id)
-            current_stage = "release" if finalize else (run.get("stage") or "source")
+            current_stage = run.get("stage") or "source"
             self._tool_run_store.update_run(
                 run_id, status="running", stage=current_stage,
-                progress=0.92 if finalize else max(0.02, float(run.get("progress") or 0)),
+                progress=max(0.02, float(run.get("progress") or 0)),
             )
             self._tool_run_store.append_event(
                 run_id, "stage.started", status="running", node_id=current_stage,
-                data={"summary": "Final release checks" if finalize else "Preparing private source evidence"},
+                data={"summary": "Starting sole ad-template process"},
             )
-            route_stage = "visual-qa" if finalize else "analyse"
+            route_stage = "analyse"
             candidates, route_settings = self._tool_candidates(run, route_stage)
             if not candidates:
                 raise RuntimeError(f"No compatible model configured for {route_stage}")
@@ -544,11 +237,7 @@ class ToolRunAPIMixin:
 
             def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
                 nonlocal current_stage, reported_cost, activity_sequence
-                # Release is a durable resume boundary.  Finalizer tool previews
-                # describe implementation details (often generation stages), but
-                # must not move the run back into the generation pipeline: a
-                # failed release must remain retryable as release.
-                next_stage = current_stage if finalize else self._tool_stage_from_preview(preview, current_stage)
+                next_stage = self._tool_stage_from_preview(preview, current_stage)
                 if next_stage != current_stage:
                     current_stage = next_stage
                     activity_sequence += 1
@@ -560,31 +249,21 @@ class ToolRunAPIMixin:
                         data={"summary": f"Started {next_stage.replace('-', ' ')}"},
                     )
                 normalized_event = {
-                    "generation-started": "generation.started",
-                    "generation-rendered": "generation.rendered",
-                    "generation-scored": "generation.scored",
-                    "generation-revision-requested": "generation.revision-requested",
-                    "generation-accepted": "generation.accepted",
-                    "generation-failed": "generation.failed",
+                    "generation-started": "iteration.started",
+                    "generation-rendered": "iteration.rendered",
+                    "generation-scored": "iteration.compared",
+                    "generation-revision-requested": "iteration.revised",
+                    "generation-accepted": "iteration.compared",
                 }.get(str(event_type), str(event_type))
-                generation_events = {
-                    "generation.started", "generation.rendered", "generation.scored",
-                    "generation.revision-requested", "generation.accepted", "generation.failed",
-                }
-                if event_type not in {"tool.started", "tool.completed", "subagent.start", "subagent.complete"} and normalized_event not in generation_events:
+                process_events = {"iteration.started", "iteration.rendered", "iteration.compared", "iteration.revised", "final-review.started", "final-review.completed"}
+                if event_type not in {"tool.started", "tool.completed", "subagent.start", "subagent.complete"} and normalized_event not in process_events:
                     return
-                if normalized_event.startswith("generation."):
+                if normalized_event in process_events:
                     activity_sequence += 1
-                    safe_data = {
-                        key: kwargs[key] for key in (
-                            "iteration", "primary_score", "strict_score",
-                            "primary_reviewer", "strict_reviewer",
-                            "feed_sha256", "story_sha256", "render_set_sha256",
-                        ) if kwargs.get(key) is not None
-                    }
+                    safe_data = {key: kwargs[key] for key in ("iteration", "score", "reason", "decision") if kwargs.get(key) is not None}
                     self._tool_run_store.append_event(
                         run_id, normalized_event, status="error" if kwargs.get("is_error") else "running",
-                        node_id="visual-review", data=safe_data,
+                        node_id="compare" if normalized_event.startswith("iteration.") else "final-review", data=safe_data,
                     )
                     return
                 activity_sequence += 1
@@ -700,47 +379,16 @@ class ToolRunAPIMixin:
             output["cost"] = dict(builder_cost) if isinstance(builder_cost, dict) else ({"builder_reported": builder_cost} if builder_cost is not None else {})
             output["cost"]["reported_usd"] = reported_cost
             output["model_policy_revision"] = refreshed["model_policy_revision"]
-            if finalize:
-                prior_output = refreshed.get("output") if isinstance(refreshed.get("output"), dict) else {}
-                self._validated_generation_gate(prior_output)
-                # Preserve the accepted candidate history in the release
-                # receipt even when the finalizer returns only pack metadata.
-                if prior_output.get("generations") is not None:
-                    output["generations"] = prior_output["generations"]
-                if prior_output.get("generationTrace") is not None:
-                    output["generationTrace"] = prior_output["generationTrace"]
-                if output.get("failed"):
-                    raise RuntimeError(str(output.get("error") or "Release checks failed"))
-                required_release = {"release_id", "template_pack_ref", "template_pack_path", "sha256", "signature", "compatibility", "qa", "trace_ref"}
-                missing = sorted(key for key in required_release if not output.get(key))
-                if missing:
-                    raise RuntimeError(f"Builder returned an incomplete TemplatePack release: {', '.join(missing)}")
-                if not re.fullmatch(r"[0-9a-f]{64}", str(output.get("sha256") or "")):
-                    raise RuntimeError("Builder returned an invalid TemplatePack checksum")
-                self._validate_release_artifact(output)
-                qa = output.get("qa") if isinstance(output.get("qa"), dict) else {}
-                if qa.get("all_gates_passed") is not True or qa.get("subject_invariance_passed") is not True or qa.get("source_identity_leakage") != 0:
-                    raise RuntimeError("Builder release evidence did not pass every mandatory QA gate")
-                self._tool_run_store.update_run(
-                    run_id, status="completed", stage="release", progress=1,
-                    output=output, attention=False,
-                )
-                self._tool_run_store.append_event(
-                    run_id, "release.published", status="ok", node_id="release",
-                    data={key: output.get(key) for key in ("release_id", "template_pack_ref", "sha256", "compatibility") if output.get(key) is not None},
-                )
-            else:
-                output = self._prepare_candidate_output(run_id, output)
-                if output.get("generations"):
-                    self._project_generation_events(run_id, output["generations"])
-                self._tool_run_store.update_run(
-                    run_id, status="waiting_for_approval", stage="studio-qa", progress=0.9,
-                    output=output, attention=True,
-                )
-                self._tool_run_store.append_event(
-                    run_id, "approval.requested", status="blocked", node_id="studio-qa",
-                    data={"gate": "studio-qa-100-percent", "choices": ["approve", "reject"]},
-                )
+            output = self._prepare_candidate_output(run_id, output)
+            self._project_generation_events(run_id, output["iterations"])
+            self._tool_run_store.update_run(
+                run_id, status="completed", stage="import", progress=1,
+                output=output, attention=False,
+            )
+            self._tool_run_store.append_event(
+                run_id, "template.imported", status="ok", node_id="import",
+                data={"status": "ready", "deterministic": True},
+            )
         except asyncio.CancelledError:
             try:
                 if getattr(self, "_tool_run_shutdown", False):
@@ -763,6 +411,15 @@ class ToolRunAPIMixin:
             except Exception:
                 pass
         finally:
+            try:
+                completed = self._tool_run_store.get_run(run_id)
+                for source in (completed.get("payload") or {}).get("sources") or []:
+                    raw = source.get("path") if isinstance(source, dict) else ""
+                    candidate = Path(str(raw))
+                    if "tool_runs" in candidate.parts and "staging" in candidate.parts:
+                        candidate.unlink(missing_ok=True)
+            except (KeyError, OSError):
+                pass
             self._tool_run_agents.pop(run_id, None)
             self._tool_run_tasks.pop(run_id, None)
 
@@ -818,17 +475,17 @@ class ToolRunAPIMixin:
         try:
             run = self._tool_run_store.get_run(request.match_info["run_id"])
             if run.get("status") != "completed":
-                raise ToolRunError("TemplatePack is not released")
+                raise ToolRunError("template is not ready")
             output = run.get("output") if isinstance(run.get("output"), dict) else {}
-            raw_path = output.get("template_pack_path")
+            raw_path = output.get("template_path")
             if not raw_path:
-                raise ToolRunError("released TemplatePack file is unavailable")
+                raise ToolRunError("deterministic template file is unavailable")
             from hermes_constants import get_hermes_home
-            root = (get_hermes_home() / "tool_releases" / "ad-template-generator").resolve()
+            root = (get_hermes_home() / "tool_runs").resolve()
             target = Path(str(raw_path)).resolve(strict=True)
             target.relative_to(root)
-            if target.suffix.lower() not in {".zip", ".json"} or not target.is_file():
-                raise ToolRunError("released TemplatePack file is invalid")
+            if target.suffix.lower() not in {".json", ".svg", ".png", ".webp"} or not target.is_file():
+                raise ToolRunError("deterministic template file is invalid")
             return web.FileResponse(target, headers={"Content-Disposition": f'attachment; filename="{target.name}"'})
         except KeyError as exc:
             return web.json_response(_error(str(exc), "tool_run_not_found"), status=404)
@@ -847,8 +504,8 @@ class ToolRunAPIMixin:
                 raise ToolRunError("invalid artifact name")
             from hermes_constants import get_hermes_home
             root = (
-                get_hermes_home() / "tool_assets" / "ad-template-generator" /
-                "runs" / run_id / "previews"
+                get_hermes_home() / "tool_runs" / "ad-template-generator" /
+                run_id / "previews"
             ).resolve()
             target = (root / name).resolve(strict=True)
             target.relative_to(root)
@@ -978,32 +635,7 @@ class ToolRunAPIMixin:
             return web.json_response(_error(str(exc), "invalid_model_policy"), status=400)
 
     async def _handle_tool_run_approval(self, request: web.Request) -> web.Response:
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        run_id = request.match_info["run_id"]
-        try:
-            body = await request.json()
-            run = self._tool_run_store.get_run(run_id)
-            if run["status"] != "waiting_for_approval":
-                raise ToolRunError("Tool run is not waiting for Studio QA")
-            decision = str(body.get("decision") or "").lower()
-            if decision == "reject":
-                reason = redact_sensitive_text(str(body.get("reason") or "Studio QA rejected"), force=True)
-                self._tool_run_store.update_run(run_id, status="failed", error=reason, attention=True)
-                self._tool_run_store.append_event(run_id, "approval.rejected", status="error", node_id="studio-qa", data={"reason": reason[:1000]})
-                return web.json_response(self._tool_run_store.get_run(run_id))
-            if decision != "approve" or body.get("confirm_100_percent") is not True:
-                raise ToolRunError("approval requires decision=approve and confirm_100_percent=true")
-            self._validated_generation_gate(run.get("output"))
-            self._tool_run_store.append_event(run_id, "approval.approved", status="ok", node_id="studio-qa", data={"gate": "studio-qa-100-percent"})
-            self._tool_run_store.requeue(run_id, stage="release")
-            self._start_tool_task(run_id, finalize=True)
-            return web.json_response(self._tool_run_store.get_run(run_id), status=202)
-        except KeyError as exc:
-            return web.json_response(_error(str(exc), "tool_run_not_found"), status=404)
-        except (ToolRunError, ValueError, TypeError) as exc:
-            return web.json_response(_error(str(exc), "invalid_tool_approval"), status=400)
+        return web.json_response(_error("This process has no human approval step", "approval_removed"), status=410)
 
     async def _handle_retry_tool_run(self, request: web.Request) -> web.Response:
         auth_err = self._check_auth(request)

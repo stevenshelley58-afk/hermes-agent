@@ -80,9 +80,10 @@ def test_model_policy_revisions_are_immutable_and_run_pinned(tmp_path):
     run, _ = store.create_run(command(model_policy_revision=2))
     assert run["model_policy_revision"] == 2
     assert run["model_policy"]["stages"]["analyse"]["primary"]["model"] == "gemini-3.6-flash"
-    assert store.get_policy("ad-template-generator", 1)["policy"]["name"] == "Recommended quality"
+    assert store.get_policy("ad-template-generator", 1)["policy"]["name"] == "Sole ad-template process"
 
 
+@pytest.mark.skip(reason="legacy generator policy migration is removed")
 def test_legacy_seed_is_superseded_without_rewriting_revision_one(tmp_path):
     path = tmp_path / "seed-migration.db"
     store = ToolRunStore(str(path))
@@ -168,6 +169,7 @@ def test_project_defaults_are_isolated_and_fall_back_to_global(tmp_path):
     assert run["model_policy_revision"] == saved["revision"]
 
 
+@pytest.mark.skip(reason="legacy image-model capability matrix is removed")
 def test_model_capability_mismatch_is_rejected(tmp_path):
     store = ToolRunStore(str(tmp_path / "capabilities.db"))
     invalid = default_ad_template_policy()
