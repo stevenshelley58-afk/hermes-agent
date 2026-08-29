@@ -12,6 +12,7 @@ contextvar; CLI/cron fall through to `TERMINAL_CWD`/launch cwd.
 
 import logging
 import os
+import re
 from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,22 @@ def _session_cwd_override() -> str:
     if value is _UNSET:
         return ""
     return str(value).strip()
+
+
+def resolve_agent_workspace(default: str = "unassigned") -> str:
+    """Return a stable memory workspace for an explicitly bound session cwd.
+
+    Unbound CLI/gateway sessions use an explicit non-project workspace.
+    Project API sessions bind their canonical project root, whose final path
+    component becomes the provider workspace (and therefore the Hindsight
+    ``{workspace}`` template value).
+    """
+    override = _session_cwd_override()
+    if not override:
+        return default
+    name = Path(override).name.strip().lower()
+    name = re.sub(r"[^a-z0-9._-]+", "-", name).strip("-._")
+    return name or default
 
 
 def resolve_agent_cwd() -> Path:

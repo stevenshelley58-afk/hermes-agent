@@ -1834,10 +1834,11 @@ def init_agent(
                         _init_kwargs["gateway_session_key"] = agent._gateway_session_key
                     # Profile identity for per-profile provider scoping
                     try:
+                        from agent.runtime_cwd import resolve_agent_workspace
                         from hermes_cli.profiles import get_active_profile_name
                         _profile = get_active_profile_name()
                         _init_kwargs["agent_identity"] = _profile
-                        _init_kwargs["agent_workspace"] = "hermes"
+                        _init_kwargs["agent_workspace"] = resolve_agent_workspace()
                     except Exception:
                         pass
                     # NOTE: status_callback (for the deterministic retain

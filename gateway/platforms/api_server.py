@@ -95,6 +95,8 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
+from gateway.tool_run_api import ToolRunAPIMixin
+from gateway.tool_runs import ToolRunStore
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -1349,7 +1351,7 @@ class _ProviderAuthResolutionError(RuntimeError):
     """
 
 
-class APIServerAdapter(BasePlatformAdapter):
+class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
 
@@ -1419,6 +1421,13 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        # Durable Tool jobs are separate from chat sessions and the temporary
+        # /v1/runs transport. Their append-only ledger survives gateway and UI
+        # restarts and supports cursor-based replay for external mini apps.
+        self._tool_run_store = ToolRunStore()
+        self._tool_run_tasks: Dict[str, "asyncio.Task"] = {}
+        self._tool_run_agents: Dict[str, Any] = {}
+        self._tool_run_shutdown = False
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -1489,6 +1498,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 int(getattr(self, "_pending_agent_requests", 0))
                 + int(self._inflight_agent_runs)
                 + sum(not task.done() for task in self._active_run_tasks.values())
+                + sum(not task.done() for task in self._tool_run_tasks.values())
             )
         except Exception:
             return 0
@@ -2097,6 +2107,18 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
+            ("POST", "/v1/tool-runs", self._handle_create_tool_run),
+            ("GET", "/v1/tool-runs", self._handle_list_tool_runs),
+            ("GET", "/v1/tool-runs/models", self._handle_tool_run_models),
+            ("GET", "/v1/tool-runs/policies/{tool_id}", self._handle_list_tool_policies),
+            ("POST", "/v1/tool-runs/policies/{tool_id}", self._handle_create_tool_policy),
+            ("GET", "/v1/tool-runs/{run_id}", self._handle_get_tool_run),
+            ("GET", "/v1/tool-runs/{run_id}/download", self._handle_download_tool_run),
+            ("GET", "/v1/tool-runs/{run_id}/artifacts/{name}", self._handle_tool_run_artifact),
+            ("GET", "/v1/tool-runs/{run_id}/events", self._handle_tool_run_events),
+            ("POST", "/v1/tool-runs/{run_id}/models", self._handle_tool_run_model_change),
+            ("POST", "/v1/tool-runs/{run_id}/retry", self._handle_retry_tool_run),
+            ("POST", "/v1/tool-runs/{run_id}/cancel", self._handle_cancel_tool_run),
         ]
         if _CRON_AVAILABLE:
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
@@ -2617,6 +2639,8 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        reasoning_callback=None,
+        thinking_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -2627,6 +2651,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        persistence_disabled: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2929,10 +2954,14 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_id": session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,
+            "reasoning_callback": reasoning_callback,
+            "thinking_callback": thinking_callback,
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
-            "session_db": self._ensure_session_db(),
+            "session_db": None if persistence_disabled else self._ensure_session_db(),
+            "skip_memory": persistence_disabled,
+            "skip_background_review": persistence_disabled,
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
@@ -2941,6 +2970,14 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        if persistence_disabled:
+            # Durable Tool jobs have their own append-only operational ledger.
+            # They must never create a transcript row, JSON session log, memory
+            # review, or Hub-visible chat even though they reuse AIAgent's tool
+            # loop and provider adapters.
+            agent._persist_disabled = True
+            agent._session_db = None
+            agent._end_session_on_close = False
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -3152,6 +3189,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
+                "durable_tool_runs": True,
+                "tool_run_event_replay": True,
+                "tool_model_policy_revisions": True,
                 "session_resources": True,
                 "model_options": True,
                 "session_chat": True,
@@ -3181,6 +3221,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "tool_runs": {"method": "POST", "path": "/v1/tool-runs"},
+                "tool_run_list": {"method": "GET", "path": "/v1/tool-runs"},
+                "tool_run_status": {"method": "GET", "path": "/v1/tool-runs/{run_id}"},
+                "tool_run_download": {"method": "GET", "path": "/v1/tool-runs/{run_id}/download"},
+                "tool_run_events": {"method": "GET", "path": "/v1/tool-runs/{run_id}/events"},
+                "tool_run_models": {"method": "POST", "path": "/v1/tool-runs/{run_id}/models"},
+                "tool_run_retry": {"method": "POST", "path": "/v1/tool-runs/{run_id}/retry"},
+                "tool_run_cancel": {"method": "POST", "path": "/v1/tool-runs/{run_id}/cancel"},
+                "tool_model_policies": {"method": "GET", "path": "/v1/tool-runs/policies/{tool_id}"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -3322,6 +3371,52 @@ class APIServerAdapter(BasePlatformAdapter):
         return payload
 
     @staticmethod
+    def _session_workspace_from_body(body: Dict[str, Any]) -> tuple[str, bool, Optional["web.Response"]]:
+        """Validate an optional session cwd/workspace binding.
+
+        ``cwd`` binds an existing directory. ``workspace`` is the explicit
+        provisioning form used by project clients: Hermes creates the
+        directory before the first agent is initialized, so tools, context
+        discovery, and memory all observe the same workspace on turn one.
+        """
+        raw_cwd = body.get("cwd")
+        raw_workspace = body.get("workspace")
+        if raw_cwd is None and raw_workspace is None:
+            return "", False, None
+        for field, value in (("cwd", raw_cwd), ("workspace", raw_workspace)):
+            if value is not None and not isinstance(value, str):
+                return "", False, web.json_response(
+                    _openai_error(f"{field} must be a string", code="invalid_workspace"),
+                    status=400,
+                )
+
+        def _normalize(value: str) -> Optional[str]:
+            value = value.strip()
+            if not value or len(value) > 2048 or re.search(r"[\r\n\x00]", value):
+                return None
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                return None
+            try:
+                return os.path.normpath(str(path))
+            except (OSError, ValueError):
+                return None
+
+        cwd = _normalize(raw_cwd) if raw_cwd is not None else ""
+        workspace = _normalize(raw_workspace) if raw_workspace is not None else ""
+        if (raw_cwd is not None and not cwd) or (raw_workspace is not None and not workspace):
+            return "", False, web.json_response(
+                _openai_error("cwd/workspace must be a valid absolute path", code="invalid_workspace"),
+                status=400,
+            )
+        if cwd and workspace and cwd != workspace:
+            return "", False, web.json_response(
+                _openai_error("cwd and workspace must resolve to the same path", code="invalid_workspace"),
+                status=400,
+            )
+        return workspace or cwd, bool(workspace), None
+
+    @staticmethod
     def _message_response(message: Dict[str, Any]) -> Dict[str, Any]:
         safe_keys = (
             "id", "session_id", "role", "content", "tool_call_id", "tool_calls",
@@ -3449,6 +3544,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 }
             }
         title = body.get("title")
+        session_cwd, provision_workspace, workspace_error = self._session_workspace_from_body(body)
+        if workspace_error is not None:
+            return workspace_error
+        if session_cwd:
+            workspace_path = Path(session_cwd)
+            try:
+                if provision_workspace:
+                    await asyncio.to_thread(workspace_path.mkdir, parents=True, exist_ok=True)
+                if not workspace_path.is_dir():
+                    raise NotADirectoryError(session_cwd)
+            except (OSError, RuntimeError) as exc:
+                logger.warning("Could not prepare API session workspace %s: %s", session_cwd, exc)
+                return web.json_response(
+                    _openai_error("Session workspace is unavailable", code="workspace_unavailable"),
+                    status=400,
+                )
 
         # Run the entire check-insert-title sequence inside a single
         # _execute_write call (BEGIN IMMEDIATE + commit) so the existence
@@ -3465,14 +3576,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 import time as _time
                 conn.execute(
                     """INSERT INTO sessions (
-                       id, source, model, model_config, system_prompt, started_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                       id, source, model, model_config, system_prompt, cwd, started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         source,
                         model_name,
                         json.dumps(model_config) if model_config else None,
                         system_prompt,
+                        session_cwd or None,
                         _time.time(),
                     ),
                 )
@@ -3760,6 +3872,7 @@ class APIServerAdapter(BasePlatformAdapter):
             conversation_history=history,
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
+            session_cwd=str(session.get("cwd") or ""),
             gateway_session_key=gateway_session_key,
             route=route,
             session_model=session_model,
@@ -3909,9 +4022,18 @@ class APIServerAdapter(BasePlatformAdapter):
             if delta:
                 _enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
 
+        def _reasoning_delta(delta: str) -> None:
+            if delta:
+                _enqueue("reasoning.delta", {"message_id": message_id, "text": delta})
+
+        def _thinking_delta(text: str) -> None:
+            if text:
+                _enqueue("thinking.delta", {"message_id": message_id, "text": text})
+
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
             if event_type == "reasoning.available":
                 _enqueue("tool.progress", {"message_id": message_id, "tool_name": tool_name or "_thinking", "delta": preview or ""})
+                _enqueue("reasoning.available", {"message_id": message_id, "text": preview or ""})
             elif event_type in {"tool.started", "tool.completed", "tool.failed"}:
                 event_name = event_type.replace("tool.", "tool.")
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
@@ -3930,7 +4052,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history=history,
                     ephemeral_system_prompt=system_prompt,
                     session_id=session_id,
+                    session_cwd=str(session.get("cwd") or ""),
                     stream_delta_callback=_delta,
+                    reasoning_callback=_reasoning_delta,
+                    thinking_callback=_thinking_delta,
                     tool_progress_callback=_tool_progress,
                     active_run_id=run_id,
                     gateway_session_key=gateway_session_key,
@@ -6245,6 +6370,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        cwd: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -6268,6 +6394,7 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            cwd=cwd,
             async_delivery=False,
             cron_session="",
         )
@@ -6278,7 +6405,10 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        session_cwd: Optional[str] = None,
         stream_delta_callback=None,
+        reasoning_callback=None,
+        thinking_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -6337,6 +6467,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    cwd=session_cwd or "",
                 )
                 agent = None
                 try:
@@ -6344,6 +6475,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
                         stream_delta_callback=stream_delta_callback,
+                        reasoning_callback=reasoning_callback,
+                        thinking_callback=thinking_callback,
                         tool_progress_callback=tool_progress_callback,
                         tool_start_callback=tool_start_callback,
                         tool_complete_callback=tool_complete_callback,
@@ -7456,6 +7589,18 @@ class APIServerAdapter(BasePlatformAdapter):
             if hasattr(sweep_task, "add_done_callback"):
                 sweep_task.add_done_callback(self._background_tasks.discard)
 
+            # Resume durable Tool work independently of chat/session recovery.
+            # Interrupted rows retain their last stage checkpoint and are put
+            # back on the queue before the listener accepts new submissions.
+            self._tool_run_shutdown = False
+            self._tool_run_store.recover_incomplete()
+            for durable_run in self._tool_run_store.list_runs(limit=500):
+                if durable_run.get("status") == "queued":
+                    self._start_tool_task(
+                        durable_run["run_id"],
+                        finalize=durable_run.get("stage") == "release",
+                    )
+
             # Loud warning when a network-accessible API server runs against an
             # unsandboxed local terminal backend. The API server can drive the
             # agent's terminal/file tools as the host user; on a public bind
@@ -7560,6 +7705,28 @@ class APIServerAdapter(BasePlatformAdapter):
         (OSError: [Errno 24] Too many open files, #37011).
         """
         self._mark_disconnected()
+        self._tool_run_shutdown = True
+        for agents in list(self._tool_run_agents.values()):
+            values = agents.values() if isinstance(agents, dict) else [agents]
+            for agent in list(values):
+                try:
+                    request_hard_interrupt(agent, source="api_server_tool_run_shutdown")
+                except Exception:
+                    pass
+        tool_tasks = [task for task in self._tool_run_tasks.values() if not task.done()]
+        for task in tool_tasks:
+            task.cancel()
+        if tool_tasks:
+            await asyncio.gather(*tool_tasks, return_exceptions=True)
+        self._tool_run_tasks.clear()
+        self._tool_run_agents.clear()
+        if self._tool_run_store is not None:
+            try:
+                self._tool_run_store.close()
+            except Exception:
+                logger.debug(
+                    "Failed to close Tool run store for %s", self.name, exc_info=True,
+                )
         if self._response_store is not None:
             try:
                 self._response_store.close()

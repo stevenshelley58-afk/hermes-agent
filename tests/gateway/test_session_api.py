@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -131,6 +132,7 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
             self.session_id = session_id
 
         def run_conversation(self, user_message, conversation_history, task_id):
+            from agent.runtime_cwd import resolve_agent_cwd, resolve_agent_workspace
             from gateway.session_context import get_session_env
             from tools.environments.local import _make_run_env
 
@@ -139,6 +141,8 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
             observed["context_platform"] = get_session_env("HERMES_SESSION_PLATFORM")
             observed["context_session_key"] = get_session_env("HERMES_SESSION_KEY")
             observed["child_session_id"] = _make_run_env({}).get("HERMES_SESSION_ID")
+            observed["cwd"] = str(resolve_agent_cwd())
+            observed["workspace"] = resolve_agent_workspace()
             return {"final_response": "ok"}
 
     def fake_create_agent(**kwargs):
@@ -146,12 +150,17 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
 
     monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
 
-    result, usage = await adapter._run_agent(
-        user_message="hello",
-        conversation_history=[],
-        session_id="request-session",
-        gateway_session_key="request-key",
-    )
+    from tempfile import TemporaryDirectory
+    with TemporaryDirectory(prefix="hermes-project-") as workspace:
+        result, usage = await adapter._run_agent(
+            user_message="hello",
+            conversation_history=[],
+            session_id="request-session",
+            session_cwd=workspace,
+            gateway_session_key="request-key",
+        )
+        expected_cwd = str(Path(workspace))
+        expected_workspace = Path(workspace).name
 
     assert result["session_id"] == "request-session"
     assert usage["input_tokens"] == 0
@@ -164,7 +173,42 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
         "context_platform": "api_server",
         "context_session_key": "request-key",
         "child_session_id": "request-session",
+        "cwd": expected_cwd,
+        "workspace": expected_workspace,
     }
+
+
+@pytest.mark.asyncio
+async def test_run_agent_forwards_reasoning_callbacks_to_agent_creation(adapter, monkeypatch):
+    observed = {}
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        session_id = "callback-session"
+
+        def run_conversation(self, user_message, conversation_history, task_id):
+            return {"final_response": "ok"}
+
+    def fake_create_agent(**kwargs):
+        observed.update(kwargs)
+        return FakeAgent()
+
+    reasoning_callback = MagicMock()
+    thinking_callback = MagicMock()
+    monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
+
+    await adapter._run_agent(
+        user_message="hello",
+        conversation_history=[],
+        session_id="callback-session",
+        reasoning_callback=reasoning_callback,
+        thinking_callback=thinking_callback,
+    )
+
+    assert observed["reasoning_callback"] is reasoning_callback
+    assert observed["thinking_callback"] is thinking_callback
 
 
 @pytest.mark.asyncio
@@ -299,6 +343,62 @@ async def test_session_chat_stream_disconnect_keeps_control_refs_until_executor_
 
 
 @pytest.mark.asyncio
+async def test_session_chat_stream_forwards_live_reasoning_and_thinking(adapter, session_db):
+    import json as _json
+
+    session_id = session_db.create_session("reasoning-stream", "api_server")
+
+    async def fake_run(**kwargs):
+        kwargs["thinking_callback"]("Waiting for provider")
+        kwargs["reasoning_callback"]("inspect ")
+        kwargs["reasoning_callback"]("the repository")
+        kwargs["tool_progress_callback"](
+            "reasoning.available",
+            tool_name="_thinking",
+            preview="inspect the repository",
+        )
+        kwargs["stream_delta_callback"]("Done")
+        return {
+            "final_response": "Done",
+            "session_id": session_id,
+            "messages": [{"role": "assistant", "content": "Done"}],
+        }, {"total_tokens": 4}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "inspect"},
+            )
+            assert resp.status == 200
+            body = await resp.text()
+
+    events = []
+    for block in body.split("\n\n"):
+        event = next((line[7:] for line in block.splitlines() if line.startswith("event: ")), None)
+        data = next((line[6:] for line in block.splitlines() if line.startswith("data: ")), None)
+        if event and data:
+            events.append((event, _json.loads(data)))
+
+    names = [name for name, _payload in events]
+    assert names.index("thinking.delta") < names.index("reasoning.delta")
+    assert [payload["text"] for name, payload in events if name == "reasoning.delta"] == [
+        "inspect ",
+        "the repository",
+    ]
+    assert any(
+        name == "reasoning.available" and payload["text"] == "inspect the repository"
+        for name, payload in events
+    )
+    assert any(
+        name == "tool.progress" and payload["tool_name"] == "_thinking"
+        for name, payload in events
+    )
+    assert names.index("reasoning.available") < names.index("assistant.delta")
+
+
+@pytest.mark.asyncio
 async def test_session_chat_stream_run_completed_carries_turn_transcript(adapter, session_db):
     """run.completed must include the full interleaved turn transcript so a
     client that lost intermediate (pre-tool-call) assistant text from the live
@@ -384,7 +484,10 @@ async def test_session_chat_resolves_stored_model_route_alias(session_db, monkey
         )
     )
     adapter._session_db = session_db
-    session_id = session_db.create_session("route-pinned-session", "api_server", model="alias")
+    workspace = str(session_db.db_path.parent)
+    session_id = session_db.create_session(
+        "route-pinned-session", "api_server", model="alias", cwd=workspace
+    )
 
     mock_run = AsyncMock(return_value=({"final_response": "ok", "session_id": session_id}, {"total_tokens": 1}))
     app = _create_session_app(adapter)
@@ -399,6 +502,7 @@ async def test_session_chat_resolves_stored_model_route_alias(session_db, monkey
     _, kwargs = mock_run.call_args
     assert kwargs["route"] == {"model": "route/model", "provider": "openrouter"}
     assert kwargs["session_model"] is None
+    assert kwargs["session_cwd"] == workspace
 
 
 def _register_session_model_route(app, adapter):
@@ -438,6 +542,31 @@ def _patch_api_server_runtime(monkeypatch):
     )
 
 
+def test_create_agent_wires_reasoning_callbacks_into_runtime(adapter, monkeypatch):
+    _patch_api_server_runtime(monkeypatch)
+    captured = {}
+
+    class FakeAgent:
+        provider = "openrouter"
+        model = "global/model"
+
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    reasoning_callback = MagicMock()
+    thinking_callback = MagicMock()
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+
+    adapter._create_agent(
+        session_id="callback-session",
+        reasoning_callback=reasoning_callback,
+        thinking_callback=thinking_callback,
+    )
+
+    assert captured["reasoning_callback"] is reasoning_callback
+    assert captured["thinking_callback"] is thinking_callback
+
+
 @pytest.mark.asyncio
 async def test_create_session_respects_browser_source_and_model_lock(adapter, session_db):
     app = _create_session_app(adapter)
@@ -469,6 +598,39 @@ async def test_create_session_respects_browser_source_and_model_lock(adapter, se
     assert model_config["browser_model_lock"]["provider"] == "nous"
     assert model_config["browser_model_lock"]["model"] == "x-ai/grok-4.5"
     assert model_config["browser_model_lock"]["confirmed"] is True
+
+
+@pytest.mark.asyncio
+async def test_create_session_provisions_and_persists_workspace(adapter, session_db, tmp_path):
+    workspace = tmp_path / "mini-frank"
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/api/sessions",
+            json={
+                "id": "project-session",
+                "cwd": str(workspace),
+                "workspace": str(workspace),
+            },
+        )
+        assert resp.status == 201, await resp.text()
+
+    assert workspace.is_dir()
+    assert session_db.get_session("project-session")["cwd"] == str(workspace.resolve())
+
+
+@pytest.mark.asyncio
+async def test_create_session_rejects_mismatched_workspace_binding(adapter, tmp_path):
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/api/sessions",
+            json={"cwd": str(tmp_path / "one"), "workspace": str(tmp_path / "two")},
+        )
+        payload = await resp.json()
+
+    assert resp.status == 400
+    assert payload["error"]["code"] == "invalid_workspace"
 
 
 @pytest.mark.asyncio
@@ -552,7 +714,10 @@ async def test_session_model_lock_endpoint_then_chat_stream_reuses_persisted_loc
     adapter,
     session_db,
 ):
-    session_id = session_db.create_session("endpoint-lock-stream", "api_server")
+    workspace = str(session_db.db_path.parent)
+    session_id = session_db.create_session(
+        "endpoint-lock-stream", "api_server", cwd=workspace
+    )
     captured = {}
 
     async def fake_run(**kwargs):
@@ -609,6 +774,7 @@ async def test_session_model_lock_endpoint_then_chat_stream_reuses_persisted_loc
     assert captured["requested_runtime"]["provider"] == "nous"
     assert captured["requested_runtime"]["model"] == "x-ai/grok-4.5"
     assert captured["route_source"] == "session_model_lock"
+    assert captured["session_cwd"] == workspace
     assert "x-ai/grok-4.5" in body
 
 
