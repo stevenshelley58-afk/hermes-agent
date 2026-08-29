@@ -56,6 +56,13 @@ class ToolRunAPIMixin:
         ]
 
     @staticmethod
+    def _preview_placement(name: str) -> str | None:
+        """Return the placement encoded by the final token of a preview stem."""
+        stem = Path(str(name)).stem.lower()
+        match = re.search(r"(?:^|[-_.])(feed|story)$", stem)
+        return match.group(1) if match else None
+
+    @staticmethod
     def _ingest_tool_sources(command: Dict[str, Any]) -> Dict[str, Any]:
         """Copy Frank staging files into Hermes' private, content-addressed store."""
         payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
@@ -241,8 +248,11 @@ class ToolRunAPIMixin:
         if generation_value is None and isinstance(trace, dict):
             generation_value = trace.get("generations")
         if generation_value is not None:
-            feed_hashes = [item["sha256"] for item in previews if "feed" in item["name"].lower()]
-            story_hashes = [item["sha256"] for item in previews if "story" in item["name"].lower()]
+            placements = [self._preview_placement(item["name"]) for item in previews]
+            if any(placement is None for placement in placements):
+                raise RuntimeError("every preview must have an unambiguous Feed or Story placement suffix")
+            feed_hashes = [item["sha256"] for item, placement in zip(previews, placements) if placement == "feed"]
+            story_hashes = [item["sha256"] for item, placement in zip(previews, placements) if placement == "story"]
             current = result.get("current_artifacts") or result.get("artifact_hashes") or {}
             declared_feed = current.get("feedSha256") or current.get("feed_sha256") if isinstance(current, dict) else None
             declared_story = current.get("storySha256") or current.get("story_sha256") if isinstance(current, dict) else None
