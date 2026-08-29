@@ -7710,7 +7710,7 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
             values = agents.values() if isinstance(agents, dict) else [agents]
             for agent in list(values):
                 try:
-                    request_hard_interrupt(agent, source="api_server_tool_run_shutdown")
+                    request_hard_interrupt(agent, "api_server_tool_run_shutdown")
                 except Exception:
                     pass
         tool_tasks = [task for task in self._tool_run_tasks.values() if not task.done()]

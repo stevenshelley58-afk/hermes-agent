@@ -52,6 +52,39 @@ class ToolRunAPIMixin:
         return list(("source", "build", "render", "compare", "final-check", "live"))
 
     @staticmethod
+    def _isolated_tool_role_prompt() -> str:
+        return (
+            "You are one isolated builder, comparator, or final-review role in "
+            "Hermes' sole ad-template process. The user message contains the "
+            "complete role contract and every required image input; reason only "
+            "from that prompt and those attached images. Do not inspect, list, "
+            "search, discover, or read repositories or the filesystem, and do not "
+            "use terminal, read_file, search_files, or broad shell searches. In "
+            "particular, never traverse /srv or the retired "
+            "/opt/ad-template-builder tree. The SoleProcessOrchestrator alone "
+            "executes the renderer and Blockwise import; do not run either. Return "
+            "exactly one requested JSON object with no prose or code fences."
+        )
+
+    @staticmethod
+    def _tool_stage_from_process_event(event_kind: Any, node: Any) -> str | None:
+        """Project only the orchestrator's explicit event contract into lifecycle state."""
+        kind = str(event_kind or "")
+        stage = str(node or "")
+        if kind == "stage.started":
+            return stage if stage in ToolRunAPIMixin._tool_stage_order() else None
+        expected = {
+            "iteration.started": "build",
+            "iteration.rendered": "render",
+            "iteration.compared": "compare",
+            "iteration.revised": "build",
+            "final-review.started": "final-check",
+            "final-review.completed": "final-check",
+            "template.imported": "live",
+        }.get(kind)
+        return stage if expected == stage else None
+
+    @staticmethod
     def _canonical_tool_stage(stage: Any) -> str:
         value = str(stage or "").strip().lower().replace("_", "-").replace(" ", "-")
         aliases = {
@@ -198,22 +231,6 @@ class ToolRunAPIMixin:
         ]
         return candidates[: int(settings.get("max_attempts") or len(candidates) or 1)], settings
 
-    def _tool_stage_from_preview(self, preview: Any, current: str) -> str:
-        haystack = str(preview or "").lower()
-        aliases = (
-            ("final-check", ("final-check", "final_review", "final review")),
-            ("compare", ("compare", "visual-review", "visual review", "qa", "check")),
-            ("render", ("render",)),
-            ("build", ("build", "analyse", "analyze", "decompose", "restyle", "story-draft", "story draft")),
-            ("live", ("live", "import", "release")),
-            ("source", ("source",)),
-        )
-        for stage, variants in aliases:
-            for variant in variants:
-                if re.search(rf"(?:^|[^a-z]){re.escape(variant)}(?:[^a-z]|$)", haystack):
-                    return stage
-        return self._canonical_tool_stage(current)
-
     def _tool_prompt(self, run: Dict[str, Any], *, finalize: bool = False) -> str:
         payload = run.get("payload") or {}
         sources = payload.get("sources") or []
@@ -259,18 +276,7 @@ class ToolRunAPIMixin:
             activity_sequence = 0
 
             def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
-                nonlocal current_stage, reported_cost, activity_sequence
-                next_stage = self._tool_stage_from_preview(preview, current_stage)
-                if next_stage != current_stage:
-                    current_stage = next_stage
-                    activity_sequence += 1
-                    order = self._tool_stage_order()
-                    progress = min(0.90, max(0.03, order.index(next_stage) / len(order)))
-                    self._tool_run_store.update_run(run_id, stage=next_stage, progress=progress)
-                    self._tool_run_store.append_event(
-                        run_id, "stage.started", status="running", node_id=next_stage,
-                        data={"summary": f"Started {next_stage.replace('-', ' ')}"},
-                    )
+                nonlocal reported_cost, activity_sequence
                 normalized_event = {
                     "generation-started": "iteration.started",
                     "generation-rendered": "iteration.rendered",
@@ -322,7 +328,7 @@ class ToolRunAPIMixin:
                     provider, model = route_name.split("/", 1)
                     route = self._resolve_route(model)
                     agent = self._create_agent(
-                        ephemeral_system_prompt="You are one isolated role in Hermes' sole ad-template process. Return only the requested JSON.",
+                        ephemeral_system_prompt=self._isolated_tool_role_prompt(),
                         session_id=f"{run_id}:{instance_id}:{uuid.uuid4().hex}",
                         tool_progress_callback=progress_callback,
                         requested_model=model, requested_provider=provider, route=route,
@@ -351,7 +357,21 @@ class ToolRunAPIMixin:
                     routes.append(stage_candidates[0])
                 route_names = [f"{item['provider']}/{item['model']}" for item in routes]
                 def emit(kind: str, node: str, data: Dict[str, Any]):
+                    nonlocal current_stage, activity_sequence
+                    event_stage = self._tool_stage_from_process_event(kind, node)
+                    if event_stage is not None and event_stage != current_stage:
+                        current_stage = event_stage
+                        order = self._tool_stage_order()
+                        progress = min(0.90, max(0.03, order.index(event_stage) / len(order)))
+                        self._tool_run_store.update_run(run_id, stage=event_stage, progress=progress)
+                        if kind != "stage.started":
+                            self._tool_run_store.append_event(
+                                run_id, "stage.started", status="running", node_id=event_stage,
+                                data={"summary": f"Started {event_stage.replace('-', ' ')}"},
+                            )
+                            activity_sequence += 1
                     self._tool_run_store.append_event(run_id, kind, status="ok" if kind.endswith(("completed", "compared", "imported")) else "running", node_id=node, data=data)
+                    activity_sequence += 1
                 payload = run.get("payload") or {}
                 source_items = payload.get("sources") or []
                 source = str((source_items[0] or {}).get("path") if source_items and isinstance(source_items[0], dict) else "")
@@ -405,7 +425,7 @@ class ToolRunAPIMixin:
                     if isinstance(exc, asyncio.TimeoutError) and running_agents is not None:
                         agents = running_agents.values() if isinstance(running_agents, dict) else [running_agents]
                         for active_agent in list(agents):
-                            request_hard_interrupt(active_agent, source="api_server_tool_run_stage_timeout")
+                            request_hard_interrupt(active_agent, "api_server_tool_run_stage_timeout")
                     failure = redact_sensitive_text(str(exc), force=True)[:600]
                     failures.append(failure)
                     if attempt < len(candidates):
@@ -714,7 +734,7 @@ class ToolRunAPIMixin:
             if agents is not None:
                 values = agents.values() if isinstance(agents, dict) else [agents]
                 for active_agent in list(values):
-                    request_hard_interrupt(active_agent, source="api_server_tool_run_cancel")
+                    request_hard_interrupt(active_agent, "api_server_tool_run_cancel")
             task = self._tool_run_tasks.get(run_id)
             if task is not None and not task.done():
                 task.cancel()
