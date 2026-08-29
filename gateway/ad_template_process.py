@@ -77,12 +77,14 @@ def validate_final_review(value: Any, *, accepted: bool) -> Dict[str, Any]:
 
 def deterministic_documents(template: Any) -> Dict[str, str]:
     if not isinstance(template, dict): raise AdTemplateProcessError("template candidate must be an object")
-    feed = template.get("feed") if isinstance(template.get("feed"), dict) else {}
-    story = template.get("story") if isinstance(template.get("story"), dict) else {}
+    feed = template.get("feedLayout") if template.get("schema") == "blockwise.ad-template" else template.get("feed")
+    story = template.get("storyLayout") if template.get("schema") == "blockwise.ad-template" else template.get("story")
+    feed = feed if isinstance(feed, dict) else {}
+    story = story if isinstance(story, dict) else {}
     if not feed or not story: raise AdTemplateProcessError("template must contain Feed and Story documents")
     for name, doc in (("feed", feed), ("story", story)):
         layers = doc.get("layers")
-        if not isinstance(layers, list) or not layers or any(not isinstance(layer, dict) or not layer.get("id") or not layer.get("type") for layer in layers):
+        if not isinstance(layers, list) or not layers or any(not isinstance(layer, dict) or not (layer.get("layerId") or layer.get("id")) or not layer.get("type") for layer in layers):
             raise AdTemplateProcessError(f"{name} document has invalid layers")
     encode = lambda value: json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return {"feed.json": encode(feed), "story.json": encode(story), "template.json": encode({"feed": feed, "story": story})}
@@ -93,7 +95,7 @@ def _under(path: Path, root: Path) -> bool:
 
 def validate_artifacts(output: Mapping[str, Any], workspace: Path) -> Dict[str, Any]:
     previews = output.get("previews")
-    if not isinstance(previews, list) or not previews: raise AdTemplateProcessError("generator produced no previews")
+    if not isinstance(previews, list) or not previews: raise AdTemplateProcessError("renderer produced no previews")
     safe = []
     for item in previews:
         if not isinstance(item, dict): raise AdTemplateProcessError("preview record must be an object")
@@ -103,88 +105,80 @@ def validate_artifacts(output: Mapping[str, Any], workspace: Path) -> Dict[str, 
         if placement not in {"feed", "story"}: raise AdTemplateProcessError("preview placement must be Feed or Story")
         safe.append({"name": raw.name, "placement": placement})
     render = output.get("render")
-    if render is not None:
-        if not isinstance(render, dict) or any(not isinstance(render.get(place), str) for place in ("feed", "story")):
-            raise AdTemplateProcessError("generator render receipt must contain Feed and Story paths")
-        for place in ("feed", "story"):
-            render_path = Path(render[place]).resolve()
-            if not _under(render_path, workspace) or not render_path.is_file():
-                raise AdTemplateProcessError("render artifact is missing or outside the run workspace")
+    if not isinstance(render, dict) or any(not isinstance(render.get(place), str) for place in ("feed", "story")):
+        raise AdTemplateProcessError("renderer receipt must contain Feed and Story paths")
+    for place in ("feed", "story"):
+        render_path = Path(render[place]).resolve()
+        if not _under(render_path, workspace) or not render_path.is_file(): raise AdTemplateProcessError("render artifact is missing or outside the run workspace")
     return {"previews": safe}
+
+def validate_template_artifact(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict) or value.get("schema") != "blockwise.ad-template":
+        raise AdTemplateProcessError("builder must return the unversioned Blockwise template schema")
+    for placement, width, height in (("feedLayout", 1080, 1350), ("storyLayout", 1080, 1920)):
+        layout = value.get(placement)
+        if not isinstance(layout, dict) or layout.get("placement") not in {"feed", "story"} or not isinstance(layout.get("layers"), list) or not layout["layers"]:
+            raise AdTemplateProcessError(f"{placement} is invalid")
+        ids = set()
+        for layer in layout["layers"]:
+            if not isinstance(layer, dict) or not layer.get("layerId") or layer["layerId"] in ids or not isinstance(layer.get("geometry"), dict):
+                raise AdTemplateProcessError(f"{placement} has invalid or duplicate layer ids")
+            ids.add(layer["layerId"])
+            geometry = layer["geometry"]
+            if any(not isinstance(geometry.get(key), (int, float)) for key in ("x", "y", "width", "height")):
+                raise AdTemplateProcessError(f"{placement} layer geometry is invalid")
+            if geometry["x"] < 0 or geometry["y"] < 0 or geometry["width"] <= 0 or geometry["height"] <= 0 or geometry["x"] + geometry["width"] > width or geometry["y"] + geometry["height"] > height:
+                raise AdTemplateProcessError(f"{placement} layer geometry exceeds canvas")
+    if not isinstance(value.get("assets"), dict) or not isinstance(value.get("imageInputs"), list) or not isinstance(value.get("textInputs"), list) or not isinstance(value.get("fonts"), list) or not isinstance(value.get("metadata"), dict):
+        raise AdTemplateProcessError("template is missing exact Blockwise fields")
+    for key, asset in value["assets"].items():
+        if not isinstance(key, str) or not isinstance(asset, dict) or not asset.get("fileName") or not asset.get("mimeType"): raise AdTemplateProcessError("template asset declarations are invalid")
+    return value
 
 def run_generator_cli(candidate: Mapping[str, Any], workspace: Path) -> Dict[str, Any]:
     command = os.environ.get("AD_TEMPLATE_GENERATOR_CMD", "").strip()
     if not command: raise AdTemplateProcessError("AD_TEMPLATE_GENERATOR_CMD must point to the shared Blockwise renderer CLI")
-    argv = shlex.split(command) + ["--input", "-", "--output-dir", str(workspace)]
-    proc = subprocess.run(argv, input=json.dumps(candidate), text=True, capture_output=True, timeout=600, check=False)
-    if proc.returncode: raise AdTemplateProcessError(f"generator failed ({proc.returncode})")
-    try: output = json.loads(proc.stdout)
-    except json.JSONDecodeError: raise AdTemplateProcessError("generator returned invalid JSON") from None
-    if not isinstance(output, dict): raise AdTemplateProcessError("generator output must be an object")
-    return output
+    workspace.mkdir(parents=True, exist_ok=True)
+    artifact_path = workspace / "artifact.json"
+    template = validate_template_artifact(candidate.get("template") if isinstance(candidate, Mapping) else None)
+    assets = candidate.get("assets") if isinstance(candidate, Mapping) and isinstance(candidate.get("assets"), list) else []
+    artifact_path.write_text(json.dumps({"template": template, "assets": assets}, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    out_dir = workspace / "rendered"
+    argv = shlex.split(command) + ["--input", str(artifact_path), "--assets-dir", str(workspace), "--out-dir", str(out_dir)]
+    proc = subprocess.run(argv, text=True, capture_output=True, timeout=600, check=False)
+    if proc.returncode: raise AdTemplateProcessError(f"shared Blockwise renderer failed ({proc.returncode})")
+    receipt_path = out_dir / "receipt.json"
+    try: receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError): raise AdTemplateProcessError("shared renderer returned no receipt") from None
+    outputs = receipt.get("outputs") if isinstance(receipt, dict) else {}
+    if not isinstance(outputs, dict) or not all(isinstance(outputs.get(place), dict) and isinstance(outputs[place].get("path"), str) for place in ("feed", "story")):
+        raise AdTemplateProcessError("shared renderer receipt is incomplete")
+    previews = [{"name": Path(outputs[place]["path"]).name, "path": outputs[place]["path"], "placement": place, "width": outputs[place].get("width"), "height": outputs[place].get("height")} for place in ("feed", "story")]
+    result = {"template": template, "assets": assets, "previews": previews, "render": {place: outputs[place]["path"] for place in ("feed", "story")}, "receipt": receipt, "template_path": str(artifact_path)}
+    validate_artifacts(result, workspace)
+    return result
 
 def blockwise_artifact_template(template: Any, *, run_id: str) -> Dict[str, Any]:
-    if not isinstance(template, dict):
-        raise AdTemplateProcessError("template is required")
-    feed, story = template.get("feed"), template.get("story")
-    if not isinstance(feed, dict) or not isinstance(story, dict):
-        raise AdTemplateProcessError("Feed and Story layouts are required")
-    image_inputs, text_inputs, semantic_colours, fonts, asset_refs = [], [], {}, set(), []
-    for placement, document in (("feed", feed), ("story", story)):
-        for layer in document.get("layers") or []:
-            if isinstance(layer, dict) and layer.get("id"):
-                kind = str(layer.get("type") or "unknown").lower()
-                descriptor = {"id": str(layer["id"]), "placement": placement, "type": kind, "replaceable": True}
-                if kind in {"image", "media", "photo", "bitmap"}:
-                    image_inputs.append(descriptor)
-                    asset_key = str(layer.get("assetKey") or layer.get("asset_key") or "").strip()
-                    if asset_key:
-                        asset_refs.append({"assetKey": asset_key, "layerId": descriptor["id"], "placement": placement})
-                elif kind in {"text", "headline", "copy", "label"}:
-                    text_inputs.append(descriptor)
-                colour = layer.get("color") or layer.get("colour")
-                if isinstance(colour, str) and colour.strip():
-                    semantic_colours[descriptor["id"]] = colour.strip()
-                font = layer.get("font_family") or layer.get("fontFamily")
-                if isinstance(font, str) and font.strip():
-                    fonts.add(font.strip())
-    return {
-        "schema": "blockwise.ad-template", "templateId": run_id,
-        "createdAt": "1970-01-01T00:00:00.000Z", "feedLayout": feed, "storyLayout": story,
-        "imageInputs": image_inputs, "textInputs": text_inputs,
-        "semanticColours": semantic_colours, "assets": asset_refs,
-        "fonts": sorted(fonts), "metadata": {"runId": run_id, "process": "only-ad-template-process"},
-    }
-
+    return validate_template_artifact(template)
 
 def import_template(output: Mapping[str, Any], *, run_id: str, project_id: str) -> Dict[str, Any]:
     url = os.environ.get("BLOCKWISE_TEMPLATE_IMPORT_URL", "").strip()
-    token = (os.environ.get("BLOCKWISE_INTERNAL_AUTH_SECRET") or os.environ.get("BLOCKWISE_TEMPLATE_IMPORT_TOKEN") or os.environ.get("BLOCKWISE_TEMPLATE_IMPORT_SECRET") or "").strip()
-    if not url or not token:
-        raise AdTemplateProcessError("Blockwise template import endpoint and bearer token are required")
+    token = (os.environ.get("BLOCKWISE_INTERNAL_AUTH_SECRET") or "").strip()
+    if not url or not token: raise AdTemplateProcessError("Blockwise template import endpoint and BLOCKWISE_INTERNAL_AUTH_SECRET are required")
     template = blockwise_artifact_template(output.get("template"), run_id=run_id)
-    assets = []
-    for item in output.get("previews") if isinstance(output.get("previews"), list) else []:
-        if isinstance(item, dict) and item.get("path"):
-            path = Path(str(item["path"])).resolve()
-            if not path.is_file():
-                raise AdTemplateProcessError("Blockwise import asset is missing")
-            mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-            assets.append({"assetKey": f"preview-{str(item.get('placement') or 'asset').lower()}", "fileName": path.name, "mimeType": mime, "bytesBase64": base64.b64encode(path.read_bytes()).decode("ascii")})
-    if not assets:
-        raise AdTemplateProcessError("Blockwise import requires Feed and Story render assets")
+    assets = output.get("assets") if isinstance(output.get("assets"), list) else []
+    if not assets: raise AdTemplateProcessError("Blockwise import requires declared assets")
+    for asset in assets:
+        if not isinstance(asset, dict) or not all(asset.get(key) for key in ("assetKey", "fileName", "mimeType", "bytesBase64")):
+            raise AdTemplateProcessError("Blockwise asset payload is invalid")
     body = json.dumps({"template": template, "assets": assets}).encode()
     request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"}, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise AdTemplateProcessError("Blockwise template import failed") from exc
-    if not isinstance(payload, dict) or not payload.get("templateId"):
-        raise AdTemplateProcessError("Blockwise import returned no templateId")
+        with urllib.request.urlopen(request, timeout=30) as response: payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc: raise AdTemplateProcessError("Blockwise template import failed") from exc
+    if not isinstance(payload, dict) or not payload.get("templateId"): raise AdTemplateProcessError("Blockwise import returned no templateId")
     replayed = bool(payload.get("replayed"))
     return {"template_id": str(payload["templateId"]), "status": "replayed" if replayed else "imported", "asset_count": int(payload.get("assetCount") or len(assets)), "replayed": replayed}
-
 
 def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: Any, source: str, feedback: str = "") -> str:
     return f"""Run the sole ad-template process as the builder agent. Inspect the attached source pixels, remove advertiser identity (names, logos, phones, URLs, portraits), and return candidate JSON only. Hermes renders and reviews it; never self-score or invent review evidence.

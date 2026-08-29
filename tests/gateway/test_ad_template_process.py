@@ -51,20 +51,19 @@ def test_layered_documents_are_stable():
 def test_orchestrator_calls_real_roles_and_persists_receipts(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
-    generator = Path(process.__file__).parents[1] / "tools" / "ad_template_generator.py"
-    monkeypatch.setenv("AD_TEMPLATE_GENERATOR_CMD", f"/usr/bin/python3 {shlex.quote(str(generator))}")
+    generator = Path("/projects/only-process-blockwise/packages/ad-template-renderer/dist/cli.js")
+    monkeypatch.setenv("AD_TEMPLATE_GENERATOR_CMD", f"/usr/bin/node {shlex.quote(str(generator))}")
     monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: {"template_id": "tpl_real", "status": "imported"})
     calls = []
     events = []
-    template = {
-        "feed": {"width": 1080, "height": 1350, "layers": [{"id": "feed-bg", "type": "image", "x": 0, "y": 0, "width": 1080, "height": 1350}], "headline": "Feed"},
-        "story": {"width": 1080, "height": 1920, "layers": [{"id": "story-bg", "type": "image", "x": 0, "y": 0, "width": 1080, "height": 1920}], "headline": "Story"},
-    }
+    def layout(placement, height):
+        return {"placement": placement, "layers": [{"type": "plate", "layerId": f"{placement}-bg", "colourRole": "background", "geometry": {"x": 0, "y": 0, "width": 1080, "height": height}, "protected": False}], "safeZones": [{"x": 0, "y": 0, "width": 1080, "height": height}]}
+    template = {"schema": "blockwise.ad-template", "templateId": "candidate", "createdAt": "2026-08-30T00:00:00.000Z", "feedLayout": layout("feed", 1350), "storyLayout": layout("story", 1920), "imageInputs": [], "textInputs": [], "semanticColours": {"background": "#FFFFFF", "primary": "#1A56DB", "secondary": "#6B7280", "accent": "#F59E0B", "mainText": "#111827", "inverseText": "#FFFFFF"}, "assets": {}, "fonts": [], "metadata": {"title": "Smoke", "description": "Smoke", "gallerySamples": {}, "metaCopyDefaults": {}, "aiWritingGuidance": {}, "publishRequirements": {}, "replacementAssets": [], "realAssetRefs": []}}
 
     def call_agent(instance, prompt, route):
         calls.append((instance, prompt, route))
         if instance.startswith("builder-"):
-            return {"template": template}
+            return {"template": template, "assets": []}
         if instance.startswith("comparator-"):
             return evidence(9.6, "Composition is ready")
         return evidence(9.7, "Final review is ready")
@@ -110,17 +109,19 @@ def test_blockwise_import_contract_uses_bearer_and_camel_case_receipt(monkeypatc
         seen["body"] = json.loads(request.data.decode())
         return Response()
     monkeypatch.setenv("BLOCKWISE_TEMPLATE_IMPORT_URL", "http://blockwise.test/import")
-    monkeypatch.setenv("BLOCKWISE_TEMPLATE_IMPORT_TOKEN", "secret")
+    monkeypatch.setenv("BLOCKWISE_INTERNAL_AUTH_SECRET", "secret")
     monkeypatch.setattr(process.urllib.request, "urlopen", fake_urlopen)
     feed = tmp_path / "feed.png"; story = tmp_path / "story.png"
     feed.write_bytes(b"feed-png"); story.write_bytes(b"story-png")
-    output = {"template": {"feed": {"layers": [{"id": "f", "type": "image"}]}, "story": {"layers": [{"id": "s", "type": "image"}]}}, "previews": [{"path": str(feed), "placement": "feed"}, {"path": str(story), "placement": "story"}]}
+    layout = lambda placement, height: {"placement": placement, "layers": [{"type": "plate", "layerId": placement, "colourRole": "background", "geometry": {"x": 0, "y": 0, "width": 1080, "height": height}, "protected": False}], "safeZones": [{"x": 0, "y": 0, "width": 1080, "height": height}]}
+    template = {"schema": "blockwise.ad-template", "templateId": "trun-test", "createdAt": "2026-08-30T00:00:00.000Z", "feedLayout": layout("feed", 1350), "storyLayout": layout("story", 1920), "imageInputs": [], "textInputs": [], "semanticColours": {"background": "#FFFFFF"}, "assets": {}, "fonts": [], "metadata": {}}
+    output = {"template": template, "assets": [{"assetKey": "feed", "fileName": "feed.png", "mimeType": "image/png", "bytesBase64": "ZmVlZC1wbmc="}, {"assetKey": "story", "fileName": "story.png", "mimeType": "image/png", "bytesBase64": "c3RvcnktcG5n"}], "previews": [{"path": str(feed), "placement": "feed"}, {"path": str(story), "placement": "story"}]}
     receipt = process.import_template(output, run_id="trun-test", project_id="blockwise")
     assert seen["authorization"] == "Bearer secret"
     assert seen["body"]["template"]["schema"] == "blockwise.ad-template"
     assert "feedLayout" in seen["body"]["template"] and "storyLayout" in seen["body"]["template"]
     assert "version" not in seen["body"]["template"] and "inputs" not in seen["body"]["template"] and "Meta" not in seen["body"]["template"]
     assert set(seen["body"]) == {"template", "assets"}
-    assert {asset["assetKey"] for asset in seen["body"]["assets"]} == {"preview-feed", "preview-story"}
+    assert {asset["assetKey"] for asset in seen["body"]["assets"]} == {"feed", "story"}
     assert all(asset["bytesBase64"] for asset in seen["body"]["assets"])
     assert receipt == {"template_id": "tpl-1", "status": "imported", "asset_count": 2, "replayed": False}
