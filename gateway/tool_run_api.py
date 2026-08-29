@@ -544,7 +544,11 @@ class ToolRunAPIMixin:
 
             def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
                 nonlocal current_stage, reported_cost, activity_sequence
-                next_stage = self._tool_stage_from_preview(preview, current_stage)
+                # Release is a durable resume boundary.  Finalizer tool previews
+                # describe implementation details (often generation stages), but
+                # must not move the run back into the generation pipeline: a
+                # failed release must remain retryable as release.
+                next_stage = current_stage if finalize else self._tool_stage_from_preview(preview, current_stage)
                 if next_stage != current_stage:
                     current_stage = next_stage
                     activity_sequence += 1

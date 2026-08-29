@@ -251,6 +251,47 @@ async def test_stage_activity_resets_provider_inactivity_timeout(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_failed_release_stays_at_release_and_retries_finalizer(tmp_path):
+    adapter = make_adapter(tmp_path)
+    run, _ = adapter._tool_run_store.create_run(command("release-retry"))
+
+    def create_agent(**kwargs):
+        progress = kwargs["tool_progress_callback"]
+
+        class FailedReleaseAgent:
+            session_prompt_tokens = 1
+            session_completion_tokens = 1
+            session_total_tokens = 2
+
+            def run_conversation(self, **_kwargs):
+                # This preview resembles a generation stage, but belongs to the
+                # release finalizer and must not change the durable resume stage.
+                progress("tool.started", tool_name="release-check", preview="render")
+                return {"failed": True, "error": "release verification failed"}
+
+        return FailedReleaseAgent()
+
+    with patch.object(adapter, "_create_agent", side_effect=create_agent):
+        await adapter._execute_tool_run(run["run_id"], finalize=True)
+
+    failed = adapter._tool_run_store.get_run(run["run_id"])
+    assert failed["status"] == "failed"
+    assert failed["stage"] == "release"
+    events = adapter._tool_run_store.events(run["run_id"])
+    assert events[-1]["kind"] == "run.failed"
+    assert events[-1]["node_id"] == "release"
+
+    app = make_app(adapter)
+    with patch.object(adapter, "_start_tool_task") as start:
+        async with TestClient(TestServer(app)) as client:
+            retried = await client.post(f"/v1/tool-runs/{run['run_id']}/retry")
+            assert retried.status == 202
+            assert (await retried.json())["stage"] == "release"
+            start.assert_called_once_with(run["run_id"], finalize=True)
+    adapter._tool_run_store.close()
+
+
+@pytest.mark.asyncio
 async def test_same_idempotency_key_does_not_start_twice(tmp_path):
     adapter = make_adapter(tmp_path)
     app = make_app(adapter)
