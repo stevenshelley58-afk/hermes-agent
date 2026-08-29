@@ -504,10 +504,17 @@ class ToolRunAPIMixin:
                         run_id, "stage.started", status="running", node_id=next_stage,
                         data={"summary": f"Started {next_stage.replace('-', ' ')}"},
                     )
-                normalized_event = str(event_type).replace("-", ".")
+                normalized_event = {
+                    "generation-started": "generation.started",
+                    "generation-rendered": "generation.rendered",
+                    "generation-scored": "generation.scored",
+                    "generation-revision-requested": "generation.revision-requested",
+                    "generation-accepted": "generation.accepted",
+                    "generation-failed": "generation.failed",
+                }.get(str(event_type), str(event_type))
                 generation_events = {
                     "generation.started", "generation.rendered", "generation.scored",
-                    "generation.revision.requested", "generation.accepted", "generation.failed",
+                    "generation.revision-requested", "generation.accepted", "generation.failed",
                 }
                 if event_type not in {"tool.started", "tool.completed", "subagent.start", "subagent.complete"} and normalized_event not in generation_events:
                     return
