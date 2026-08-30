@@ -135,6 +135,9 @@ def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
             assert field in prompt
         assert "hard failure" in prompt.lower()
         assert "source composite pixel" in prompt
+        assert "must not be penalized" in prompt
+        assert "source-free photography" in prompt
+        assert "neutral editable replacement is correct" in prompt
     builder = process.generator_prompt(run_id="run", project_id="blockwise", brief="", placements=["feed", "story"], source="source.png")
     for key in process.METADATA_FIELDS:
         assert key in builder

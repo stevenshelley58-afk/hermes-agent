@@ -542,6 +542,13 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
 
 def review_prompt(*, final: bool) -> str:
     role = "fresh independent final reviewer" if final else "iteration comparator"
+    role += (
+        ". Treat the source only as the structural visual reference. Mandatory removal of source advertiser identities, "
+        "logos, names, phones, URLs, portraits, contact details, source photography, and all source pixels must not be penalized. "
+        "Instead, score whether the same visual roles, media-slot count and shapes, composition, spacing, hierarchy, typography, "
+        "and colour relationships are recreated with source-free photography and neutral editable logo, image, contact, copy, icon, "
+        "patch, and CTA layers. A neutral editable replacement is correct; copied source identity or pixels, or a missing editable role, is not"
+    )
     return f"""Act as the {role}. Compare the attached source image with the attached rendered Feed and native Story previews. Return JSON only with exactly reason, hard_failures, and rubric. rubric must contain exactly these five numeric 0-10 fields: layout_geometry (source composition, proportions, spacing, alignment), hierarchy_typography (type hierarchy, wrapping, readability), colour_tone (palette, contrast, photographic tone), editable_decomposition (all copy, logo, CTA, patches, icons and media are real editable layers), native_story (a deliberate 1080x1920 composition, not a stretched, cropped, or letterboxed Feed). Explain concrete visible mismatches in reason. hard_failures must be a JSON list. Add a hard failure if any source advertiser name, logo, phone, URL, portrait, contact identity, or source composite pixel is reused; if Feed or Story is missing, clipped, unreadable, outside its canvas or safe zones; if critical text, logo, CTA, patch, icon or media is flattened/non-editable; if Story is a Feed crop, stretch, letterbox, or has essential content in platform UI zones; or if an asset is missing/unknown. Any hard failure makes the score zero. Do not reuse or infer another reviewer's score. Passing requires the mean of all five fields to be at least {THRESHOLD} with no hard failures."""
 
 def vision_message(text: str, paths: List[str]) -> List[Dict[str, Any]]:
