@@ -209,6 +209,8 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
         assert key in builder
     assert "never emit bytesBase64 anywhere" in builder
     assert "home/open-home-living.webp" in builder
+    assert "brand/neutral-real-estate.png" in builder
+    assert "Never leave a source-visible logo region blank" in builder
     assert 'Feed is 1080x1350 with safeZones=[{"x":72,"y":96,"width":936,"height":1158}]' in builder
     assert 'Story is 1080x1920 with safeZones=[{"x":72,"y":240,"width":936,"height":1380}]' in builder
     assert "Geometry is always {x,y,width,height} from the top-left" in builder
