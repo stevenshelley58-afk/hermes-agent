@@ -1236,7 +1236,7 @@ def test_builder_quality_escalates_on_regression_or_two_low_gains(tmp_path, monk
     assert len(result["iterations"]) == len(scores)
 
 
-def test_regressed_candidate_is_traced_but_next_revision_uses_best_candidate(tmp_path, monkeypatch):
+def test_regressed_candidate_is_traced_and_next_revision_uses_current_candidate(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
     scores = iter([8.6, 8.1, 9.6])
@@ -1259,10 +1259,8 @@ def test_regressed_candidate_is_traced_but_next_revision_uses_best_candidate(tmp
 
     builder_prompts = {instance: prompt for instance, _, prompt in calls if instance.startswith("builder-")}
     assert '"templateId":"candidate-builder-1"' in builder_prompts["builder-2"]
-    assert '"templateId":"candidate-builder-1"' in builder_prompts["builder-3"]
-    assert '"templateId":"candidate-builder-2"' not in builder_prompts["builder-3"]
-    assert "comparison comparator-1" in builder_prompts["builder-3"]
-    assert "comparison comparator-2" not in builder_prompts["builder-3"]
+    assert '"templateId":"candidate-builder-2"' in builder_prompts["builder-3"]
+    assert "comparison comparator-2" in builder_prompts["builder-3"]
     for field in ("rubric", "minimum_score", "hard_failures", "differences", "required_changes", "reason"):
         assert f'"{field}"' in builder_prompts["builder-2"]
     compared_events = [data for kind, data in events if kind == "iteration.compared"]
@@ -1285,7 +1283,7 @@ def test_regressed_candidate_is_traced_but_next_revision_uses_best_candidate(tmp
     ]
 
 
-def test_final_review_revision_keeps_best_candidate_when_next_score_regresses(tmp_path, monkeypatch):
+def test_final_review_revision_continues_from_the_reviewed_then_current_candidate(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
     scores = iter([9.54, 9.28, 9.6])
@@ -1310,8 +1308,7 @@ def test_final_review_revision_keeps_best_candidate_when_next_score_regresses(tm
 
     builder_prompts = {instance: prompt for instance, _, prompt in calls if instance.startswith("builder-")}
     assert '"templateId":"candidate-builder-1"' in builder_prompts["builder-2"]
-    assert '"templateId":"candidate-builder-1"' in builder_prompts["builder-3"]
-    assert '"templateId":"candidate-builder-2"' not in builder_prompts["builder-3"]
+    assert '"templateId":"candidate-builder-2"' in builder_prompts["builder-3"]
     assert [item["candidate"]["template"]["templateId"] for item in result["iterations"]] == [
         "candidate-builder-1", "candidate-builder-2", "candidate-builder-3",
     ]
