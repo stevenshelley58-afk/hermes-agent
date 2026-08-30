@@ -765,6 +765,83 @@ def test_builder_quality_escalates_on_regression_or_two_low_gains(tmp_path, monk
     assert len(result["iterations"]) == len(scores)
 
 
+def test_regressed_candidate_is_traced_but_next_revision_uses_best_candidate(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    scores = iter([8.6, 8.1, 9.6])
+    calls, renders = [], []
+
+    def call_agent(instance, prompt, route):
+        calls.append((instance, route, prompt[0]["text"]))
+        if instance.startswith("builder-"):
+            return valid_candidate(f"candidate-{instance}")
+        if instance.startswith("comparator-"):
+            return evidence(next(scores), f"comparison {instance}")
+        return evidence(9.7, "Independent final pass")
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: {"template_id": "tpl-best", "status": "imported"})
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_best",
+        project_id="blockwise", emit=lambda *_args: None,
+    ).run(source=str(source), brief="", placements=["feed", "story"], routes=_quality_routes(), require_quality_route=True)
+
+    builder_prompts = {instance: prompt for instance, _, prompt in calls if instance.startswith("builder-")}
+    assert '"templateId":"candidate-builder-1"' in builder_prompts["builder-2"]
+    assert '"templateId":"candidate-builder-1"' in builder_prompts["builder-3"]
+    assert '"templateId":"candidate-builder-2"' not in builder_prompts["builder-3"]
+    assert [route for instance, route, _ in calls if instance.startswith("builder-")] == [
+        "openai-codex/gpt-5.6-luna",
+        "openai-codex/gpt-5.6-luna",
+        "openai-codex/gpt-5.6-sol",
+    ]
+    assert [item["candidate"]["template"]["templateId"] for item in result["iterations"]] == [
+        "candidate-builder-1", "candidate-builder-2", "candidate-builder-3",
+    ]
+    assert [item["comparison"]["score"] for item in result["iterations"]] == [8.6, 8.1, 9.6]
+    assert [instance.split("-")[0] for instance, _, _ in calls] == [
+        "builder", "comparator", "builder", "comparator", "builder", "comparator", "final", "final",
+    ]
+
+
+def test_final_review_revision_keeps_best_candidate_when_next_score_regresses(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    scores = iter([9.54, 9.28, 9.6])
+    final_scores = iter([9.0, 9.7, 9.7, 9.7])
+    calls, renders = [], []
+
+    def call_agent(instance, prompt, route):
+        calls.append((instance, route, prompt[0]["text"]))
+        if instance.startswith("builder-"):
+            return valid_candidate(f"candidate-{instance}")
+        if instance.startswith("comparator-"):
+            return evidence(next(scores), f"comparison {instance}")
+        score = next(final_scores)
+        return evidence(score, "Revise spacing" if score < 9.5 else "Independent final pass")
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: {"template_id": "tpl-final-best", "status": "imported"})
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_final_best",
+        project_id="blockwise", emit=lambda *_args: None,
+    ).run(source=str(source), brief="", placements=["feed", "story"], routes=_quality_routes(), require_quality_route=True)
+
+    builder_prompts = {instance: prompt for instance, _, prompt in calls if instance.startswith("builder-")}
+    assert '"templateId":"candidate-builder-1"' in builder_prompts["builder-2"]
+    assert '"templateId":"candidate-builder-1"' in builder_prompts["builder-3"]
+    assert '"templateId":"candidate-builder-2"' not in builder_prompts["builder-3"]
+    assert [item["candidate"]["template"]["templateId"] for item in result["iterations"]] == [
+        "candidate-builder-1", "candidate-builder-2", "candidate-builder-3",
+    ]
+    assert result["iterations"][0]["final_review_failed"] is True
+    assert [route for instance, route, _ in calls if instance.startswith("builder-")] == [
+        "openai-codex/gpt-5.6-luna",
+        "openai-codex/gpt-5.6-luna",
+        "openai-codex/gpt-5.6-sol",
+    ]
+
+
 def test_builder_quality_escalation_is_sticky_through_repairs_and_final_review_revision(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")

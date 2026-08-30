@@ -783,12 +783,14 @@ class SoleProcessOrchestrator:
         history = list(history or [])
         iterations = []
         candidate: Dict[str, Any] = {}
+        best_candidate: Mapping[str, Any] | None = revision_candidate
+        best_score = previous_score if revision_candidate is not None else None
 
         def builder_route_identity(route: Mapping[str, str]) -> str:
             return f"{route.get('provider')}/{route.get('model')}"
         for offset in range(31 - total_iterations - 1):
             index = total_iterations + offset + 1
-            iteration_prior = revision_candidate if offset == 0 else candidate
+            iteration_prior = best_candidate
             iteration_workspace = self.workspace / "iterations" / f"{index:02d}"
             self._check_stop()
             self.emit("stage.started", "build", {"iteration": index, "role": "builder"})
@@ -870,6 +872,9 @@ class SoleProcessOrchestrator:
             }
             iterations.append(record)
             self.emit("iteration.compared", "compare", {"iteration": index, "score": score, "reason": reason, "decision": decision, "preview_names": [str(x.get("name")) for x in candidate.get("previews", []) if isinstance(x, dict)]})
+            if best_score is None or score >= best_score:
+                best_candidate = candidate
+                best_score = score
             if score >= THRESHOLD:
                 previous_score = score
                 break
@@ -920,9 +925,9 @@ class SoleProcessOrchestrator:
             return self.run(
                 source=source, brief=brief, placements=placements, routes=routes,
                 review_round=review_round + 1, total_iterations=total_iterations + len(iterations),
-                feedback=reasons, history=history + iterations, revision_candidate=candidate,
+                feedback=reasons, history=history + iterations, revision_candidate=best_candidate,
                 selected_builder_route=builder_route, builder_escalated=builder_escalated,
-                previous_score=previous_score, low_gain_streak=low_gain_streak,
+                previous_score=best_score, low_gain_streak=low_gain_streak,
                 require_quality_route=require_quality_route,
             )
         self.emit("final-review.completed", "final-check", {"decision": "accepted", "reviewers": final_review["reviewers"]})
