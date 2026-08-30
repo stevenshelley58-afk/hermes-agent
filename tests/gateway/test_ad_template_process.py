@@ -113,6 +113,26 @@ def test_source_match_and_concrete_change_list_are_hard_gates():
     ])[0]
     assert record["decision"] == "revise"
 
+
+def test_asset_envelope_is_mechanically_mirrored_without_changing_content():
+    candidate = valid_candidate("asset-normalization")
+    declaration = {
+        "assetKey": "hero",
+        "fileName": "home/mt-lawley-federation.webp",
+        "mimeType": "image/webp",
+    }
+    candidate["assets"] = [declaration]
+    candidate["template"].pop("assets")
+    normalized = process.normalize_asset_declarations(candidate)
+    assert normalized["template"]["assets"] == {
+        "hero": {"fileName": declaration["fileName"], "mimeType": declaration["mimeType"]}
+    }
+    assert normalized["assets"] == [declaration]
+
+    reverse = valid_candidate("asset-normalization-reverse")
+    reverse["template"]["assets"] = normalized["template"]["assets"]
+    assert process.normalize_asset_declarations(reverse)["assets"] == [declaration]
+
 def test_bare_model_scores_are_rejected():
     with pytest.raises(AdTemplateProcessError):
         validate_iterations([iteration(9.8)]) if False else validate_iterations([{"iteration": 1, "comparison": {"score": 10, "reason": "looks good"}}])

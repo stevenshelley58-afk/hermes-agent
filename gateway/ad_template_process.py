@@ -454,6 +454,35 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
             raise AdTemplateProcessError(f"{path}.required must be boolean")
     return value
 
+def normalize_asset_declarations(value: Any) -> Any:
+    """Repair the one mechanical asset-envelope omission models commonly make."""
+    if not isinstance(value, dict) or set(value) != {"template", "assets"}:
+        return value
+    template = value.get("template")
+    if not isinstance(template, dict):
+        return value
+    top_assets = value.get("assets")
+    declarations = template.get("assets")
+    if isinstance(top_assets, list) and top_assets and declarations is None:
+        normalized = {}
+        for item in top_assets:
+            if not isinstance(item, dict) or set(item) != {"assetKey", "fileName", "mimeType"}:
+                return value
+            key = item.get("assetKey")
+            if not _nonempty(key) or key in normalized:
+                return value
+            normalized[key] = {"fileName": item.get("fileName"), "mimeType": item.get("mimeType")}
+        value = {**value, "template": {**template, "assets": normalized}}
+    elif isinstance(declarations, dict) and declarations and top_assets == []:
+        mirrored = []
+        for key, item in declarations.items():
+            if not _nonempty(key) or not isinstance(item, dict) or set(item) != {"fileName", "mimeType"}:
+                return value
+            mirrored.append({"assetKey": key, "fileName": item.get("fileName"), "mimeType": item.get("mimeType")})
+        value = {**value, "assets": mirrored}
+    return value
+
+
 def validate_builder_candidate(value: Any) -> Dict[str, Any]:
     _reject_builder_bytes(value)
     if not isinstance(value, dict) or set(value) != {"template", "assets"}:
@@ -913,6 +942,7 @@ class SoleProcessOrchestrator:
                         ) from None
                 self._check_stop()
                 try:
+                    candidate = normalize_asset_declarations(candidate)
                     validate_builder_candidate(candidate)
                 except AdTemplateProcessError as exc:
                     validation_feedback = str(exc)
