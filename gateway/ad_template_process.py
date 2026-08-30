@@ -13,8 +13,15 @@ STAGES = ("source", "build", "render", "compare", "final-check", "live")
 MAX_CANDIDATE_CONTEXT_CHARS = 100_000
 MIN_MATERIAL_SCORE_GAIN = 0.5
 STORY_CONTENT_SAFE_ZONE = {"x": 72, "y": 240, "width": 936, "height": 1380}
+MAX_COMPARATOR_SELF_CONSISTENCY_RETRIES = 1
+MATERIAL_OVERLAP_RATIO = 0.08
 
 class AdTemplateProcessError(ValueError):
+    pass
+
+class ComparatorSelfConsistencyError(AdTemplateProcessError):
+    """Comparator feedback contradicts the current layered document."""
+
     pass
 
 class AdTemplateStructuredOutputError(RuntimeError):
@@ -39,22 +46,128 @@ RUBRIC_FIELDS = (
     "native_story_translation",
 )
 
-def _required_change_is_actionable(value: str) -> bool:
-    """Require placement, layer IDs, and current/target geometry in each change."""
+def _parse_required_change(value: str) -> Dict[str, Any] | None:
     placement = re.search(r"\bplacement\s*=\s*(feed|story)\b", value, re.IGNORECASE)
     layers = re.search(r"\blayers?\s*=\s*([^;]+)", value, re.IGNORECASE)
     current = re.search(r"\bcurrent(?:\s+geometry)?\s*=\s*(\{[^{}]+\})", value, re.IGNORECASE)
     target = re.search(r"\btarget(?:\s+geometry)?\s*=\s*(\{[^{}]+\})", value, re.IGNORECASE)
     change = re.search(r"\bchange\s*=\s*(\S.+)$", value, re.IGNORECASE)
     if not all((placement, layers, current, target, change)):
-        return False
-    if not layers.group(1).strip():
-        return False
+        return None
+    layer_ids = [item.strip() for item in layers.group(1).split(",") if item.strip()]
+    if not layer_ids:
+        return None
+    geometries = []
     for geometry in (current.group(1), target.group(1)):
+        parsed: Dict[str, float] = {}
         for key in ("x", "y", "width", "height"):
-            if not re.search(rf"[\"']?{key}[\"']?\s*[:=]", geometry, re.IGNORECASE):
-                return False
-    return True
+            match = re.search(
+                rf"[\"']?{key}[\"']?\s*[:=]\s*(-?(?:\d+(?:\.\d*)?|\.\d+))",
+                geometry,
+                re.IGNORECASE,
+            )
+            if not match:
+                return None
+            parsed[key] = float(match.group(1))
+        geometries.append(parsed)
+    return {
+        "placement": placement.group(1).lower(),
+        "layer_ids": layer_ids,
+        "current": geometries[0],
+        "target": geometries[1],
+        "change": change.group(1).strip(),
+    }
+
+def _required_change_is_actionable(value: str) -> bool:
+    """Require placement, layer IDs, and current/target geometry in each change."""
+    return _parse_required_change(value) is not None
+
+def _rect_matches(left: Mapping[str, Any], right: Mapping[str, Any], tolerance: float = 0.5) -> bool:
+    return all(abs(float(left[key]) - float(right[key])) <= tolerance for key in ("x", "y", "width", "height"))
+
+def _material_overlap(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    overlap_width = max(0.0, min(float(left["x"]) + float(left["width"]), float(right["x"]) + float(right["width"])) - max(float(left["x"]), float(right["x"])))
+    overlap_height = max(0.0, min(float(left["y"]) + float(left["height"]), float(right["y"]) + float(right["height"])) - max(float(left["y"]), float(right["y"])))
+    overlap_area = overlap_width * overlap_height
+    smaller_area = min(float(left["width"]) * float(left["height"]), float(right["width"]) * float(right["height"]))
+    return smaller_area > 0 and overlap_area / smaller_area >= MATERIAL_OVERLAP_RATIO
+
+def _opaque_collision_layer(layer: Mapping[str, Any]) -> bool:
+    if layer.get("type") == "image_slot":
+        return True
+    return (
+        layer.get("type") == "vector"
+        and layer.get("shape") in {"rect", "rounded", "pill", "notched"}
+        and isinstance(layer.get("opacity"), (int, float))
+        and float(layer["opacity"]) >= 0.8
+    )
+
+def _validate_required_change_targets(evidence: Mapping[str, Any], candidate: Mapping[str, Any]) -> None:
+    """Reject comparator targets that contradict or newly collide with the document."""
+    template = candidate.get("template") if isinstance(candidate.get("template"), dict) else {}
+    proposals_by_placement: Dict[str, Dict[str, Dict[str, float]]] = {}
+    changed_by_placement: Dict[str, set[str]] = {}
+    for raw in evidence.get("required_changes") or []:
+        parsed = _parse_required_change(str(raw))
+        if parsed is None:
+            raise ComparatorSelfConsistencyError("required change geometry is not machine-readable")
+        placement = parsed["placement"]
+        layout = template.get(f"{placement}Layout")
+        layers = layout.get("layers") if isinstance(layout, dict) else None
+        if not isinstance(layers, list):
+            raise ComparatorSelfConsistencyError(f"required change names missing {placement} document")
+        layer_map = {
+            str(layer.get("layerId")): layer
+            for layer in layers
+            if isinstance(layer, dict) and layer.get("layerId")
+        }
+        bounds = (1080, 1350 if placement == "feed" else 1920)
+        target = parsed["target"]
+        if (
+            target["x"] < 0
+            or target["y"] < 0
+            or target["width"] <= 0
+            or target["height"] <= 0
+            or target["x"] + target["width"] > bounds[0]
+            or target["y"] + target["height"] > bounds[1]
+        ):
+            raise ComparatorSelfConsistencyError(f"required change target exceeds the {placement} canvas")
+        proposals = proposals_by_placement.setdefault(placement, {})
+        changed = changed_by_placement.setdefault(placement, set())
+        for layer_id in parsed["layer_ids"]:
+            layer = layer_map.get(layer_id)
+            if layer is None:
+                raise ComparatorSelfConsistencyError(f"required change names unknown {placement} layer {layer_id}")
+            geometry = layer.get("geometry")
+            if not isinstance(geometry, dict) or not _rect_matches(geometry, parsed["current"]):
+                raise ComparatorSelfConsistencyError(f"required change current geometry does not match {placement} layer {layer_id}")
+            existing = proposals.get(layer_id)
+            if existing is not None and not _rect_matches(existing, target):
+                raise ComparatorSelfConsistencyError(f"required changes propose conflicting targets for {placement} layer {layer_id}")
+            proposals[layer_id] = dict(target)
+            if not _rect_matches(geometry, target):
+                changed.add(layer_id)
+
+    for placement, proposals in proposals_by_placement.items():
+        layout = template[f"{placement}Layout"]
+        layers = [layer for layer in layout["layers"] if isinstance(layer, dict) and layer.get("layerId")]
+        geometry_by_id = {str(layer["layerId"]): dict(layer["geometry"]) for layer in layers}
+        proposed_geometry = {**geometry_by_id, **proposals}
+        changed = changed_by_placement.get(placement, set())
+        for index, left_layer in enumerate(layers):
+            left_id = str(left_layer["layerId"])
+            for right_layer in layers[index + 1:]:
+                right_id = str(right_layer["layerId"])
+                if not ({left_id, right_id} & changed):
+                    continue
+                if not (_opaque_collision_layer(left_layer) and _opaque_collision_layer(right_layer)):
+                    continue
+                if "image_slot" not in {left_layer.get("type"), right_layer.get("type")}:
+                    continue
+                if _material_overlap(proposed_geometry[left_id], proposed_geometry[right_id]) and not _material_overlap(geometry_by_id[left_id], geometry_by_id[right_id]):
+                    raise ComparatorSelfConsistencyError(
+                        f"required change newly overlaps {placement} layers {left_id} and {right_id}"
+                    )
 
 def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> Dict[str, Any]:
     if not isinstance(value, dict):
@@ -854,7 +967,7 @@ Compare source versus Feed region by region: outer frame and margins; header/tit
 
 Use this scale strictly: 10.0 means the Feed is visually indistinguishable in structure at thumbnail size except permitted neutral content substitutions; 9.5 means only tiny finishing differences remain; 9.0 still has clearly visible spacing, scale, typography, or geometry differences; 8.0 is recognisably based on the source but materially different; 5.0 is merely the same category; 0 is missing or invalid. Do not award 9.5 to a design that a person can immediately distinguish from the source.
 
-Return JSON only with exactly reason, differences, required_changes, hard_failures, and rubric. differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. required_changes is the ordered list the builder must apply next; include only material work still needed to reach 9.5 and return [] only when the candidate genuinely clears the gate. Every required_changes string must use this exact actionable structure: placement=feed|story; layers=comma-separated layerIds; current={{x:...,y:...,width:...,height:...}}; target={{x:...,y:...,width:...,height:...}}; change=specific instruction. Name all affected layer IDs and use their current and intended target geometry. hard_failures is a list. rubric contains exactly these eight 0-10 numbers: feed_source_likeness, layout_geometry, spacing_proportions, typography_likeness, colour_likeness, image_slot_composition, editable_decomposition, native_story_translation. A passing candidate requires feed_source_likeness >= {THRESHOLD}, mean >= {THRESHOLD}, every field >= {MIN_RUBRIC_SCORE}, no hard failures, and no required changes.
+Return JSON only with exactly reason, differences, required_changes, hard_failures, and rubric. differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. required_changes is the ordered list the builder must apply next; include only material work still needed to reach 9.5 and return [] only when the candidate genuinely clears the gate. Every required_changes string must use this exact actionable structure: placement=feed|story; layers=comma-separated layerIds; current={{x:...,y:...,width:...,height:...}}; target={{x:...,y:...,width:...,height:...}}; change=specific instruction. Name all affected layer IDs and use their current and intended target geometry. Copy current geometry exactly from Candidate contract JSON, then check every proposed target rectangle against every existing layer before returning it. Never propose a target that newly overlaps an image slot or opaque vector panel with another image slot unless that overlap is visibly present in the source and the change text explicitly identifies and justifies the source-visible overlap. Use a separate required_changes item when affected layers do not share identical current and target geometry. hard_failures is a list. rubric contains exactly these eight 0-10 numbers: feed_source_likeness, layout_geometry, spacing_proportions, typography_likeness, colour_likeness, image_slot_composition, editable_decomposition, native_story_translation. A passing candidate requires feed_source_likeness >= {THRESHOLD}, mean >= {THRESHOLD}, every field >= {MIN_RUBRIC_SCORE}, no hard failures, and no required changes.
 
 Hard-fail source pixels flattened into the output, copied advertiser identity, missing/unreadable renders, clipping, canvas/safe-zone violations, non-editable critical roles, unknown assets, or a stretched/cropped/letterboxed Story. Do not infer another reviewer's score. Candidate contract JSON: {candidate_context}"""
 
@@ -1045,9 +1158,47 @@ class SoleProcessOrchestrator:
             self.emit("iteration.rendered", "render", {"iteration": index, "previews": [{"name": str(x.get("name") or ""), "placement": str(x.get("placement") or "")} for x in public_previews]})
             candidate = {**candidate, **rendered}
             self._check_stop()
-            comparison = self.call_agent("comparator-%d" % index, vision_message(review_prompt(final=False, candidate=candidate), [source, str((rendered.get("render") or {}).get("feed") or ""), str((rendered.get("render") or {}).get("story") or "")]), f"{routes[1].get('provider')}/{routes[1].get('model')}")
-            self._check_stop()
-            evidence = _assessment(comparison, "comparator", require_change_list=True)
+            comparison_prompt = review_prompt(final=False, candidate=candidate)
+            comparison_rejection = ""
+            for comparison_attempt in range(MAX_COMPARATOR_SELF_CONSISTENCY_RETRIES + 1):
+                retry_suffix = ""
+                if comparison_rejection:
+                    retry_suffix = (
+                        "\n\nYour previous response was rejected because its proposed geometry contradicted the "
+                        f"current layered document: {comparison_rejection}. Reinspect the candidate JSON and pixels, "
+                        "then return a self-consistent comparison without introducing a new opaque overlap."
+                    )
+                comparison = self.call_agent(
+                    "comparator-%d" % index if comparison_attempt == 0 else f"comparator-{index}-retry-{comparison_attempt}",
+                    vision_message(
+                        comparison_prompt + retry_suffix,
+                        [
+                            source,
+                            str((rendered.get("render") or {}).get("feed") or ""),
+                            str((rendered.get("render") or {}).get("story") or ""),
+                        ],
+                    ),
+                    f"{routes[1].get('provider')}/{routes[1].get('model')}",
+                )
+                self._check_stop()
+                evidence = _assessment(comparison, "comparator", require_change_list=True)
+                try:
+                    _validate_required_change_targets(evidence, candidate)
+                except ComparatorSelfConsistencyError as exc:
+                    comparison_rejection = str(exc)
+                    if comparison_attempt >= MAX_COMPARATOR_SELF_CONSISTENCY_RETRIES:
+                        raise
+                    self.emit(
+                        "comparator.retried",
+                        "compare",
+                        {
+                            "iteration": index,
+                            "attempt": comparison_attempt + 1,
+                            "reason": comparison_rejection,
+                        },
+                    )
+                    continue
+                break
             score, reason = evidence["score"], evidence["reason"]
             decision = "accepted" if _passes_quality_gate(evidence) else "revise"
             record = {

@@ -13,9 +13,9 @@ from gateway.tool_run_api import ToolRunAPIMixin
 
 def evidence(score=9.4, reason="Improve spacing"):
     actionable_change = (
-        "placement=feed; layers=feed-headline; "
-        "current={x:72,y:96,width:420,height:120}; "
-        "target={x:72,y:104,width:440,height:112}; "
+        "placement=feed; layers=feed-bg; "
+        "current={x:0,y:0,width:1080,height:1350}; "
+        "target={x:0,y:0,width:1080,height:1350}; "
         f"change={reason}"
     )
     return {
@@ -80,6 +80,35 @@ def fake_render(candidate, workspace, calls):
         "template_path": str(workspace / "artifact.json"),
     }
 
+def overlap_candidate(template_id="overlap-candidate"):
+    candidate = valid_candidate(template_id)
+    candidate["template"]["imageInputs"] = [
+        {"key": "hero", "label": "Hero", "acceptedTypes": ["image/jpeg"]},
+        {"key": "thumb", "label": "Thumbnail", "acceptedTypes": ["image/jpeg"]},
+    ]
+    candidate["template"]["feedLayout"]["layers"].extend([
+        {
+            "type": "image_slot", "layerId": "feed-hero", "inputKey": "hero",
+            "geometry": {"x": 72, "y": 184, "width": 600, "height": 400}, "mask": "none",
+            "minSourceWidth": 600, "minSourceHeight": 400,
+            "defaultCrop": {"x": 0, "y": 0, "width": 1, "height": 1},
+            "allowedPlacementOverrides": ["crop", "position"],
+        },
+        {
+            "type": "vector", "layerId": "feed-price-panel",
+            "geometry": {"x": 72, "y": 184, "width": 600, "height": 400},
+            "shape": "rect", "colourRole": "primary", "opacity": 0.9,
+        },
+        {
+            "type": "image_slot", "layerId": "feed-thumb-1", "inputKey": "thumb",
+            "geometry": {"x": 72, "y": 584, "width": 180, "height": 220}, "mask": "none",
+            "minSourceWidth": 180, "minSourceHeight": 220,
+            "defaultCrop": {"x": 0, "y": 0, "width": 1, "height": 1},
+            "allowedPlacementOverrides": ["crop", "position"],
+        },
+    ])
+    return candidate
+
 def test_one_comparator_per_iteration_and_final_review_only_after_pass():
     assert validate_iterations([iteration()])[0]["comparison"]["score"] == 9.4
     with pytest.raises(AdTemplateProcessError):
@@ -126,6 +155,80 @@ def test_source_match_and_concrete_change_list_are_hard_gates():
     vague["required_changes"] = ["Reduce footer height to match the source"]
     with pytest.raises(AdTemplateProcessError, match="placement, layers, current geometry, target geometry"):
         validate_iterations([{"iteration": 1, "comparison": vague, "decision": "revise"}])
+
+
+def test_comparator_target_overlap_rejects_exact_hero_thumbnail_collision():
+    candidate = overlap_candidate()
+    assessment = evidence(8.6, "Extend the hero and price panel")
+    assessment["required_changes"] = [
+        "placement=feed; layers=feed-hero,feed-price-panel; "
+        "current={x:72,y:184,width:600,height:400}; "
+        "target={x:72,y:184,width:600,height:620}; "
+        "change=Extend the hero and price panel to y=804"
+    ]
+    parsed = process._assessment(assessment, "comparator", require_change_list=True)
+    with pytest.raises(
+        process.ComparatorSelfConsistencyError,
+        match=r"newly overlaps feed layers (feed-hero and feed-thumb-1|feed-price-panel and feed-thumb-1)",
+    ):
+        process._validate_required_change_targets(parsed, candidate)
+
+    preexisting = overlap_candidate("preexisting-overlap")
+    for layer in preexisting["template"]["feedLayout"]["layers"]:
+        if layer.get("layerId") in {"feed-hero", "feed-price-panel"}:
+            layer["geometry"]["height"] = 620
+    assessment["required_changes"] = [
+        "placement=feed; layers=feed-hero,feed-price-panel; "
+        "current={x:72,y:184,width:600,height:620}; "
+        "target={x:72,y:184,width:600,height:600}; "
+        "change=Reduce an overlap that already exists"
+    ]
+    process._validate_required_change_targets(
+        process._assessment(assessment, "comparator", require_change_list=True),
+        preexisting,
+    )
+
+
+def test_comparator_retries_self_inconsistent_overlap_and_persists_event(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    events, calls, renders = [], [], []
+
+    bad = evidence(8.6, "Extend the hero and price panel")
+    bad["required_changes"] = [
+        "placement=feed; layers=feed-hero,feed-price-panel; "
+        "current={x:72,y:184,width:600,height:400}; "
+        "target={x:72,y:184,width:600,height:620}; "
+        "change=Extend the hero and price panel to y=804"
+    ]
+
+    def call_agent(instance, prompt, route):
+        calls.append((instance, prompt[0]["text"]))
+        if instance.startswith("builder-"):
+            return overlap_candidate(f"candidate-{instance}")
+        if instance == "comparator-1":
+            return bad
+        return evidence(9.7, "Self-consistent pass")
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: {"template_id": "tpl-overlap", "status": "imported"})
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_overlap",
+        project_id="blockwise", emit=lambda kind, node, data: events.append((kind, data)),
+    ).run(source=str(source), brief="", placements=["feed", "story"], routes=_quality_routes(), require_quality_route=True)
+
+    comparator_calls = [name for name, _ in calls if name.startswith("comparator-")]
+    assert comparator_calls == ["comparator-1", "comparator-1-retry-1"]
+    retry_events = [data for kind, data in events if kind == "comparator.retried"]
+    assert retry_events == [{
+        "iteration": 1,
+        "attempt": 1,
+        "reason": "required change newly overlaps feed layers feed-hero and feed-thumb-1",
+    }]
+    retry_prompt = next(prompt for name, prompt in calls if name == "comparator-1-retry-1")
+    assert "previous response was rejected" in retry_prompt
+    assert "feed-hero and feed-thumb-1" in retry_prompt
+    assert result["iterations"][0]["decision"] == "accepted"
 
 
 def test_asset_envelope_is_mechanically_mirrored_without_changing_content():
@@ -217,6 +320,8 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
         assert "Assess Story dead space only inside the content-safe band y=240..1620" in prompt
         assert "y=0..239 and y=1620..1919 is mandatory platform-UI protection" in prompt
         assert "placement=feed|story; layers=comma-separated layerIds" in prompt
+        assert "check every proposed target rectangle against every existing layer" in prompt
+        assert "Never propose a target that newly overlaps an image slot or opaque vector panel" in prompt
         assert '"templateId":"strict"' in prompt
         assert '"assetKey":"hero"' in prompt
         assert "privateNote" not in prompt
