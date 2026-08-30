@@ -12,11 +12,17 @@ from gateway.ad_template_process import (
 from gateway.tool_run_api import ToolRunAPIMixin
 
 def evidence(score=9.4, reason="Improve spacing"):
+    actionable_change = (
+        "placement=feed; layers=feed-headline; "
+        "current={x:72,y:96,width:420,height:120}; "
+        "target={x:72,y:104,width:440,height:112}; "
+        f"change={reason}"
+    )
     return {
         "rubric": {field: score for field in process.RUBRIC_FIELDS},
         "reason": reason,
         "differences": [reason] if score < 9.5 else [],
-        "required_changes": [reason] if score < 9.5 else [],
+        "required_changes": [actionable_change] if score < 9.5 else [],
         "hard_failures": [],
     }
 
@@ -107,11 +113,19 @@ def test_source_match_and_concrete_change_list_are_hard_gates():
     assert record["decision"] == "revise"
 
     unfinished = evidence(9.8, "Footer remains too tall")
-    unfinished["required_changes"] = ["Reduce footer height to match the source"]
+    unfinished["required_changes"] = [
+        "placement=feed; layers=feed-footer; current={x:72,y:1120,width:936,height:140}; "
+        "target={x:72,y:1140,width:936,height:120}; change=Reduce footer height to match the source"
+    ]
     record = validate_iterations([
         {"iteration": 1, "comparison": unfinished, "decision": "revise"}
     ])[0]
     assert record["decision"] == "revise"
+
+    vague = evidence(9.4, "Footer remains too tall")
+    vague["required_changes"] = ["Reduce footer height to match the source"]
+    with pytest.raises(AdTemplateProcessError, match="placement, layers, current geometry, target geometry"):
+        validate_iterations([{"iteration": 1, "comparison": vague, "decision": "revise"}])
 
 
 def test_asset_envelope_is_mechanically_mirrored_without_changing_content():
@@ -200,6 +214,9 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
         assert "The primary objective is not generic ad quality" in prompt
         assert "Neutral replacement photography" in prompt
         assert "required_changes" in prompt
+        assert "Assess Story dead space only inside the content-safe band y=240..1620" in prompt
+        assert "y=0..239 and y=1620..1919 is mandatory platform-UI protection" in prompt
+        assert "placement=feed|story; layers=comma-separated layerIds" in prompt
         assert '"templateId":"strict"' in prompt
         assert '"assetKey":"hero"' in prompt
         assert "privateNote" not in prompt
@@ -232,6 +249,24 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
     assert "Every text layer inputKey must be declared exactly once in textInputs" in builder
     assert 'Each realAssetRefs entry must contain exactly {"inputKey":"declaredKey"' in builder
     assert "Every layer assetKey, image defaultAssetKey, gallery sample assetKey" in builder
+    feedback = json.dumps({
+        "rubric": {field: 8.7 for field in process.RUBRIC_FIELDS},
+        "minimum_score": 8.7,
+        "hard_failures": ["failure detail"],
+        "differences": ["difference detail"],
+        "required_changes": [
+            "placement=story; layers=story-headline; current={x:72,y:260,width:700,height:140}; "
+            "target={x:72,y:280,width:720,height:120}; change=Move the headline"
+        ],
+        "reason": "r" * 6000 + "UNTRUNCATED-END",
+    })
+    feedback_builder = process.generator_prompt(
+        run_id="run", project_id="blockwise", brief="", placements=["feed", "story"],
+        source="source.png", feedback=feedback,
+    )
+    for key in ("rubric", "minimum_score", "hard_failures", "differences", "required_changes", "reason"):
+        assert f'"{key}"' in feedback_builder
+    assert "UNTRUNCATED-END" in feedback_builder
     repair_builder = process.generator_prompt(
         run_id="run", project_id="blockwise", brief="", placements=["feed", "story"], source="source.png",
         validation_feedback="template is invalid", repair_attempt=1,
@@ -257,9 +292,6 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
             run_id="run", project_id="blockwise", brief="", placements=["feed", "story"], source="source.png",
             prior_candidate=oversized_candidate,
         )
-
-
-
     invalid_fonts = json.loads(json.dumps(template))
     invalid_fonts["fonts"] = {"body": {"file": "manrope-400.woff2"}}
     with pytest.raises(AdTemplateProcessError, match=r"fonts must be a JSON list.*never an object or map"):
@@ -347,6 +379,62 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
         process.validate_template_artifact(duplicate_input)
 
 
+def test_story_essential_layers_stay_inside_content_safe_zone_but_visual_layers_may_bleed():
+    template = valid_candidate("story-safe-zone")["template"]
+    template["storyLayout"]["safeZones"] = [dict(process.STORY_CONTENT_SAFE_ZONE)]
+    template["imageInputs"] = [
+        {"key": "story-photo", "label": "Story photo", "acceptedTypes": ["image/jpeg"]},
+        {"key": "story-logo", "label": "Story logo", "acceptedTypes": ["image/png"]},
+    ]
+    template["textInputs"] = [
+        {"key": "story-headline", "label": "Story headline", "placeholder": "Just listed", "maxLength": 80},
+    ]
+    template["fonts"] = [{"file": "manrope-700.woff2"}]
+    decorative_layers = [
+        {
+            "type": "image_slot", "layerId": "story-photo", "inputKey": "story-photo",
+            "geometry": {"x": 0, "y": 0, "width": 1080, "height": 1920}, "mask": "none",
+            "minSourceWidth": 1080, "minSourceHeight": 1920,
+            "defaultCrop": {"x": 0, "y": 0, "width": 1, "height": 1},
+            "allowedPlacementOverrides": ["crop", "position"],
+        },
+        {
+            "type": "vector", "layerId": "story-decor", "geometry": {"x": 0, "y": 0, "width": 1080, "height": 1920},
+            "shape": "rect", "colourRole": "accent", "opacity": 0.2,
+        },
+    ]
+    essential_layers = [
+        {
+            "type": "text", "layerId": "story-headline", "inputKey": "story-headline",
+            "font": {"file": "manrope-700.woff2"}, "fontSize": 64, "lineHeight": 1.1,
+            "tracking": 0, "alignment": "left", "maxCharacters": 80, "maxLines": 2,
+            "colourRole": "mainText", "overflowBehaviour": "refuse",
+            "geometry": {"x": 72, "y": 240, "width": 720, "height": 160},
+        },
+        {
+            "type": "logo", "layerId": "story-logo", "inputKey": "story-logo",
+            "geometry": {"x": 820, "y": 260, "width": 160, "height": 100},
+        },
+        {
+            "type": "icon", "layerId": "story-pin", "icon": "pin", "colourRole": "accent",
+            "geometry": {"x": 72, "y": 1540, "width": 48, "height": 48},
+        },
+    ]
+    template["storyLayout"]["layers"].extend(decorative_layers + essential_layers)
+    assert process.validate_template_artifact(template) is template
+
+    for layer_id, geometry in (
+        ("story-headline", {"x": 72, "y": 220, "width": 720, "height": 160}),
+        ("story-logo", {"x": 820, "y": 1580, "width": 160, "height": 100}),
+        ("story-pin", {"x": 40, "y": 1540, "width": 48, "height": 48}),
+    ):
+        invalid = json.loads(json.dumps(template))
+        layer = next(item for item in invalid["storyLayout"]["layers"] if item["layerId"] == layer_id)
+        layer["geometry"] = geometry
+        with pytest.raises(AdTemplateProcessError, match="Story content-safe zone"):
+            process.validate_template_artifact(invalid)
+
+
 
 def test_orchestrator_calls_real_roles_and_persists_receipts(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
@@ -383,7 +471,11 @@ def test_orchestrator_calls_real_roles_and_persists_receipts(tmp_path, monkeypat
     assert all(isinstance(item[1], list) for item in calls)
     assert len(calls[0][1]) == 2 and len(calls[1][1]) == 4 and len(calls[2][1]) == 4 and len(calls[3][1]) == 4
     assert all(part["type"] == "image_url" for part in calls[1][1][1:])
-    assert len([item for item in events if item[0] == "iteration.compared"]) == 1
+    compared = [item for item in events if item[0] == "iteration.compared"]
+    assert len(compared) == 1
+    assert {
+        "rubric", "minimum_score", "hard_failures", "differences", "required_changes", "reason",
+    }.issubset(compared[0][1])
     completed = [item for item in events if item[0] == "final-review.completed"]
     assert len(completed) == 1 and len(completed[0][1]["reviewers"]) == 2
     assert [
@@ -982,7 +1074,7 @@ def test_regressed_candidate_is_traced_but_next_revision_uses_best_candidate(tmp
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
     scores = iter([8.6, 8.1, 9.6])
-    calls, renders = [], []
+    calls, renders, events = [], [], []
 
     def call_agent(instance, prompt, route):
         calls.append((instance, route, prompt[0]["text"]))
@@ -996,7 +1088,7 @@ def test_regressed_candidate_is_traced_but_next_revision_uses_best_candidate(tmp
     monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: {"template_id": "tpl-best", "status": "imported"})
     result = SoleProcessOrchestrator(
         call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_best",
-        project_id="blockwise", emit=lambda *_args: None,
+        project_id="blockwise", emit=lambda kind, node, data: events.append((kind, data)),
     ).run(source=str(source), brief="", placements=["feed", "story"], routes=_quality_routes(), require_quality_route=True)
 
     builder_prompts = {instance: prompt for instance, _, prompt in calls if instance.startswith("builder-")}
@@ -1005,6 +1097,14 @@ def test_regressed_candidate_is_traced_but_next_revision_uses_best_candidate(tmp
     assert '"templateId":"candidate-builder-2"' not in builder_prompts["builder-3"]
     assert "comparison comparator-1" in builder_prompts["builder-3"]
     assert "comparison comparator-2" not in builder_prompts["builder-3"]
+    for field in ("rubric", "minimum_score", "hard_failures", "differences", "required_changes", "reason"):
+        assert f'"{field}"' in builder_prompts["builder-2"]
+    compared_events = [data for kind, data in events if kind == "iteration.compared"]
+    assert len(compared_events) == 3
+    for event in compared_events:
+        assert {
+            "rubric", "minimum_score", "hard_failures", "differences", "required_changes", "reason",
+        }.issubset(event)
     assert [route for instance, route, _ in calls if instance.startswith("builder-")] == [
         "openai-codex/gpt-5.6-luna",
         "openai-codex/gpt-5.6-luna",

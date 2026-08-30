@@ -12,6 +12,7 @@ MAX_CHEAP_STRUCTURED_OUTPUT_RETRIES = 1
 STAGES = ("source", "build", "render", "compare", "final-check", "live")
 MAX_CANDIDATE_CONTEXT_CHARS = 100_000
 MIN_MATERIAL_SCORE_GAIN = 0.5
+STORY_CONTENT_SAFE_ZONE = {"x": 72, "y": 240, "width": 936, "height": 1380}
 
 class AdTemplateProcessError(ValueError):
     pass
@@ -38,6 +39,23 @@ RUBRIC_FIELDS = (
     "native_story_translation",
 )
 
+def _required_change_is_actionable(value: str) -> bool:
+    """Require placement, layer IDs, and current/target geometry in each change."""
+    placement = re.search(r"\bplacement\s*=\s*(feed|story)\b", value, re.IGNORECASE)
+    layers = re.search(r"\blayers?\s*=\s*([^;]+)", value, re.IGNORECASE)
+    current = re.search(r"\bcurrent(?:\s+geometry)?\s*=\s*(\{[^{}]+\})", value, re.IGNORECASE)
+    target = re.search(r"\btarget(?:\s+geometry)?\s*=\s*(\{[^{}]+\})", value, re.IGNORECASE)
+    change = re.search(r"\bchange\s*=\s*(\S.+)$", value, re.IGNORECASE)
+    if not all((placement, layers, current, target, change)):
+        return False
+    if not layers.group(1).strip():
+        return False
+    for geometry in (current.group(1), target.group(1)):
+        for key in ("x", "y", "width", "height"):
+            if not re.search(rf"[\"']?{key}[\"']?\s*[:=]", geometry, re.IGNORECASE):
+                return False
+    return True
+
 def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise AdTemplateProcessError(f"{role} returned invalid evidence")
@@ -59,8 +77,12 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
             raise AdTemplateProcessError(f"{role} must provide a concrete differences list")
         if not isinstance(required_changes, list) or not all(isinstance(item, str) and item.strip() for item in required_changes):
             raise AdTemplateProcessError(f"{role} must provide a concrete required_changes list")
-        differences = [item.strip()[:500] for item in differences]
-        required_changes = [item.strip()[:500] for item in required_changes]
+        differences = [item.strip() for item in differences]
+        required_changes = [item.strip() for item in required_changes]
+        if not all(_required_change_is_actionable(item) for item in required_changes):
+            raise AdTemplateProcessError(
+                f"{role} required_changes must name placement, layers, current geometry, target geometry, and change"
+            )
     score = round(sum(scores.values()) / len(scores), 2)
     if hard_failures: score = 0.0
     return {
@@ -68,7 +90,7 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
         "minimum_score": min(scores.values()),
         "reason": reason,
         "rubric": scores,
-        "hard_failures": [str(item)[:240] for item in hard_failures],
+        "hard_failures": [str(item) for item in hard_failures],
         **({"differences": differences, "required_changes": required_changes} if require_change_list else {}),
     }
 
@@ -280,6 +302,19 @@ def _validate_layout(layout: Any, *, placement: str, width: int, height: int) ->
         _validate_rect(layer.get("geometry"), path=f"{layer_path}.geometry", bounds=(width, height))
         ids.add(layer["layerId"])
         layer_type = layer["type"]
+        if placement == "story" and layer_type in {"text", "logo", "icon"}:
+            geometry = layer["geometry"]
+            safe = STORY_CONTENT_SAFE_ZONE
+            if (
+                geometry["x"] < safe["x"]
+                or geometry["y"] < safe["y"]
+                or geometry["x"] + geometry["width"] > safe["x"] + safe["width"]
+                or geometry["y"] + geometry["height"] > safe["y"] + safe["height"]
+            ):
+                raise AdTemplateProcessError(
+                    f"{layer_path} essential {layer_type} geometry must stay inside the Story content-safe zone "
+                    "x=72..1008 and y=240..1620"
+                )
         for key in ("inputKey", "colourRole", "icon", "assetKey"):
             if key in layer and not _nonempty(layer[key]):
                 raise AdTemplateProcessError(f"{layer_path}.{key} must be a non-empty string")
@@ -806,7 +841,7 @@ Return JSON only with exactly {{"template":{{...}},"assets":[]}}. template must 
 
 semanticColours contains exactly background, primary, secondary, accent, mainText, inverseText. Allowed font files are {', '.join(sorted(ALLOWED_FONT_FILES))}. metadata contains exactly title:string, description:string, gallerySamples:{{feed?:{{assetKey?,placement,purpose}},story?:{{assetKey?,placement,purpose}}}}, metaCopyDefaults:{{primaryText:string[],headlines:string[],descriptions:string[],cta:string}}, aiWritingGuidance:{{summary:string,fields:record<string,string>}}, publishRequirements:{{objective:string,specialAdCategory:string|null,instantForm:{{required:boolean,dependency:string|null,defaults?:record<string,string>}},destination:{{required:boolean,kind:'website'|'instant_form'|'none',dependency:string|null}},requiredCtaTypes?:string[]}}, replacementAssets:{{inputKey,assetKey,purpose?}}[], realAssetRefs:{{inputKey,kind,required}}[]. For property ads set specialAdCategory to HOUSING. Every layer, input, font, colour, asset, replacement, gallery, and realAsset reference must resolve inside the same template. template.assets is required and is a declaration record shaped exactly {{"asset-key":{{"fileName":"normalized/catalog/path.webp","mimeType":"image/webp"}}}}; it is never a list and may be {{}} only when no asset is used. Top-level assets is always a list of {{assetKey,fileName,mimeType}} and must exactly mirror template.assets; never emit bytesBase64 anywhere. Allowed catalog files are brand/neutral-real-estate.png, home/open-home-living.webp, home/home-dusk.webp, home/mt-lawley-federation.webp, home/home-pool.webp, home/interior-styled.webp, home/subiaco-townhouse.webp, and adstudio-samples/photos/int-bedroom.png. Use one coherent property across slots. When the source contains a logo, declare the neutral brand asset and bind it as the logo imageInput defaultAssetKey so the logo is visible in every rendered iteration.
 
-Hermes will render the candidate, attach the source and render to a vision comparator, and feed its concrete differences and required changes into the next revision. Do not self-score. Run {run_id}; project {project_id}; placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback[:5000]}.{repair_clause}"""
+Hermes will render the candidate, attach the source and render to a vision comparator, and feed its complete comparator evidence into the next revision. Prior reviewer feedback contains the rubric, minimum_score, hard_failures, differences, required_changes, and reason; apply every required change exactly and preserve already-correct regions. Do not self-score. Run {run_id}; project {project_id}; placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback}.{repair_clause}"""
 
     return f"""Run the sole ad-template process as the builder agent. Inspect the attached source pixels, remove advertiser identity (names, logos, phones, URLs, portraits), and return JSON with exactly {{template, assets}}. Treat the source as structural inspiration, not a quality ceiling: explicitly avoid inheriting brochure density, tiny copy, weak hierarchy, duplicated contact details, incoherent photography, or a Feed layout stretched into Story. Build a conversion-focused Meta ad around one dominant idea: a strong hook, one coherent hero treatment, only essential proof or facts, and one clear CTA. Dense descriptions and contact lists belong in Meta primary text or the destination, not inside the image. At native pixels use type large enough to remain legible inside a 500px, 390px and 320px-wide Meta shell; do not rely on scale-down or truncation to rescue excess copy. Feed must use a deliberate 72px horizontal and 96px vertical protected content margin. Story must be independently composed with its top 240px and bottom 300px protected from platform UI. Use true editable text, image, logo, CTA, patch and icon roles. Use one coherent property/photo subject across default slots; never mix unrelated properties. For a property listing, publishRequirements.specialAdCategory must be HOUSING. template must contain exactly schema='blockwise.ad-template', templateId, createdAt (ISO datetime), feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata. semanticColours must contain exactly background, primary, secondary, accent, mainText, inverseText; every layer colourRole is one of those six. Each layout contains exactly placement, layers, safeZones; Feed is placement feed within 1080x1350 and Story is placement story within 1080x1920, including safeZones. Geometry and every safe-zone rectangle contain exactly {{x,y,width,height}}: x,y are the top-left coordinates from canvas origin (0,0); width,height are positive sizes, not right/bottom coordinates; x + width must stay within canvas width and y + height within canvas height. Exact safe areas are Feed safeZones=[{{"x":72,"y":96,"width":936,"height":1158}}] within 1080x1350 and Story safeZones=[{{"x":72,"y":240,"width":936,"height":1380}}] within 1080x1920. Layer shapes are exact: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. imageInputs are {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs are {{key,label,placeholder,maxLength}}. fonts are {{file}} and every text-layer font must be declared; allowed bundled font files are {', '.join(sorted(ALLOWED_FONT_FILES))}. metadata is exact: title:string; description:string; gallerySamples={{feed?:{{assetKey?,placement,purpose}},story?:{{assetKey?,placement,purpose}}}}; metaCopyDefaults={{primaryText:string[],headlines:string[],descriptions:string[],cta:string}}; aiWritingGuidance={{summary:string,fields:record<string,string>}}; publishRequirements={{objective:string,specialAdCategory:string|null,instantForm:{{required:boolean,dependency:string|null,defaults?:record<string,string>}},destination:{{required:boolean,kind:'website'|'instant_form'|'none',dependency:string|null}},requiredCtaTypes?:string[]}}; replacementAssets={{inputKey,assetKey,purpose?}}[]; realAssetRefs={{inputKey,kind,required}}[]. Every layer/input/font/colour/asset metadata reference must resolve inside the same template. Declare source-free replacement assets in template.assets as assetKey -> {{fileName,mimeType}} and in top-level assets only as {{assetKey,fileName,mimeType}} with an exact match. Hermes resolves bytes from the fixed safe catalog; never emit bytesBase64 anywhere and never guess filenames. Allowed normalized relative catalog paths are home/open-home-living.webp, home/home-dusk.webp, home/mt-lawley-federation.webp, home/home-pool.webp, home/interior-styled.webp, home/subiaco-townhouse.webp, and adstudio-samples/photos/int-bedroom.png. Never include the source composite, source_path, hashes, signatures, private fields, or a full-source plate. Keep geometry inside canvas and Story native. Hermes renders, compares once per iteration, then runs two fresh final reviewers only after the comparator clears both the {THRESHOLD} mean and {MIN_RUBRIC_SCORE} subscore floor; never self-score or invent review evidence. Run {run_id}; project {project_id}; fixed placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback[:3000]}.{repair_clause}"""
 
@@ -815,11 +850,11 @@ def review_prompt(*, final: bool, candidate: Any = None) -> str:
     candidate_context = _safe_candidate_prompt_json(candidate)
     return f"""You are the {role} in a source-matching loop. The attached images are ordered: (1) the source reference, (2) the rendered Feed candidate, and (3) the rendered Story translation. Inspect the actual pixels together. The primary objective is not generic ad quality; it is faithful reconstruction of the source design as editable layers.
 
-Compare source versus Feed region by region: outer frame and margins; header/title block; image count, grid, aspect ratios and crop intent; logo/price panel; divider lines; body columns; feature list; footer/contact row; typography family/style/weight/scale/line wrapping; palette; alignment; whitespace; borders, corner radii, icons and decorative details. Neutral replacement photography and neutral advertiser identity must not reduce the score when their visual role, size, crop, and position match. Any simplification, omitted section, changed information density, different skeleton, moved panel, different image-slot structure, or generic redesign must reduce the score heavily. Story is scored only as a deliberate native 1080x1920 translation of the same visual system; it cannot compensate for a Feed mismatch.
+Compare source versus Feed region by region: outer frame and margins; header/title block; image count, grid, aspect ratios and crop intent; logo/price panel; divider lines; body columns; feature list; footer/contact row; typography family/style/weight/scale/line wrapping; palette; alignment; whitespace; borders, corner radii, icons and decorative details. Neutral replacement photography and neutral advertiser identity must not reduce the score when their visual role, size, crop, and position match. Any simplification, omitted section, changed information density, different skeleton, moved panel, different image-slot structure, or generic redesign must reduce the score heavily. Story is scored only as a deliberate native 1080x1920 translation of the same visual system; it cannot compensate for a Feed mismatch. Assess Story dead space only inside the content-safe band y=240..1620. Empty space in y=0..239 and y=1620..1919 is mandatory platform-UI protection and must never be reported or scored as dead space, a spacing defect, a difference, or a required change.
 
 Use this scale strictly: 10.0 means the Feed is visually indistinguishable in structure at thumbnail size except permitted neutral content substitutions; 9.5 means only tiny finishing differences remain; 9.0 still has clearly visible spacing, scale, typography, or geometry differences; 8.0 is recognisably based on the source but materially different; 5.0 is merely the same category; 0 is missing or invalid. Do not award 9.5 to a design that a person can immediately distinguish from the source.
 
-Return JSON only with exactly reason, differences, required_changes, hard_failures, and rubric. differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. required_changes is the ordered list the builder must apply next; include only material work still needed to reach 9.5 and return [] only when the candidate genuinely clears the gate. hard_failures is a list. rubric contains exactly these eight 0-10 numbers: feed_source_likeness, layout_geometry, spacing_proportions, typography_likeness, colour_likeness, image_slot_composition, editable_decomposition, native_story_translation. A passing candidate requires feed_source_likeness >= {THRESHOLD}, mean >= {THRESHOLD}, every field >= {MIN_RUBRIC_SCORE}, no hard failures, and no required changes.
+Return JSON only with exactly reason, differences, required_changes, hard_failures, and rubric. differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. required_changes is the ordered list the builder must apply next; include only material work still needed to reach 9.5 and return [] only when the candidate genuinely clears the gate. Every required_changes string must use this exact actionable structure: placement=feed|story; layers=comma-separated layerIds; current={{x:...,y:...,width:...,height:...}}; target={{x:...,y:...,width:...,height:...}}; change=specific instruction. Name all affected layer IDs and use their current and intended target geometry. hard_failures is a list. rubric contains exactly these eight 0-10 numbers: feed_source_likeness, layout_geometry, spacing_proportions, typography_likeness, colour_likeness, image_slot_composition, editable_decomposition, native_story_translation. A passing candidate requires feed_source_likeness >= {THRESHOLD}, mean >= {THRESHOLD}, every field >= {MIN_RUBRIC_SCORE}, no hard failures, and no required changes.
 
 Hard-fail source pixels flattened into the output, copied advertiser identity, missing/unreadable renders, clipping, canvas/safe-zone violations, non-editable critical roles, unknown assets, or a stretched/cropped/letterboxed Story. Do not infer another reviewer's score. Candidate contract JSON: {candidate_context}"""
 
@@ -1024,9 +1059,22 @@ class SoleProcessOrchestrator:
                 "builder_escalated": builder_escalated,
             }
             iterations.append(record)
-            self.emit("iteration.compared", "compare", {"iteration": index, "score": score, "reason": reason, "decision": decision, "preview_names": [str(x.get("name")) for x in candidate.get("previews", []) if isinstance(x, dict)]})
+            self.emit("iteration.compared", "compare", {
+                "iteration": index,
+                "score": score,
+                "minimum_score": evidence["minimum_score"],
+                "reason": reason,
+                "rubric": evidence["rubric"],
+                "hard_failures": evidence["hard_failures"],
+                "differences": evidence["differences"],
+                "required_changes": evidence["required_changes"],
+                "decision": decision,
+                "preview_names": [str(x.get("name")) for x in candidate.get("previews", []) if isinstance(x, dict)],
+            })
             current_feedback = json.dumps({
-                "source_match_score": evidence["rubric"]["feed_source_likeness"],
+                "rubric": evidence["rubric"],
+                "minimum_score": evidence["minimum_score"],
+                "hard_failures": evidence["hard_failures"],
                 "differences": evidence["differences"],
                 "required_changes": evidence["required_changes"],
                 "reason": reason,
