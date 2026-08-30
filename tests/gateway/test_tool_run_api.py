@@ -147,6 +147,53 @@ class _ToolRunHarness(ToolRunAPIMixin):
         return None
 
 
+def test_final_check_requeue_loads_accepted_iteration_and_existing_artifacts(tmp_path):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    store = ToolRunStore(str(tmp_path / "tool-runs.db"))
+    run, _ = store.create_run(_command(str(source), idempotency_key="final-check-resume"))
+    workspace = tmp_path / "run"
+    (workspace / "iterations" / "05").mkdir(parents=True)
+    (workspace / "previews").mkdir(parents=True)
+    (workspace / "iterations" / "05" / "artifact.json").write_text(json.dumps({
+        "template": _valid_template(), "assets": [],
+    }), encoding="utf-8")
+    for placement in ("feed", "story"):
+        (workspace / "previews" / f"iteration-05-{placement}.png").write_bytes(placement.encode())
+
+    for iteration in range(1, 6):
+        accepted = iteration == 5
+        score = 9.7 if accepted else 9.0
+        required_changes = [] if accepted else [
+            "placement=feed; layers=feed-background; "
+            "current={x:0,y:0,width:1080,height:1350}; "
+            "target={x:0,y:0,width:1080,height:1350}; change=Continue matching the source"
+        ]
+        store.append_event(run["run_id"], "iteration.compared", node_id="compare", data={
+            "iteration": iteration,
+            "rubric": {field: score for field in process.RUBRIC_FIELDS},
+            "reason": "Accepted comparison" if accepted else "Continue matching",
+            "hard_failures": [],
+            "differences": [] if accepted else ["Visible mismatch"],
+            "required_changes": required_changes,
+            "decision": "accepted" if accepted else "revise",
+            "preview_names": [f"iteration-{iteration:02d}-feed.png", f"iteration-{iteration:02d}-story.png"],
+        })
+
+    store.update_run(run["run_id"], status="failed", stage="final-check", attention=True)
+    requeued = store.requeue(run["run_id"])
+    assert (requeued["status"], requeued["stage"]) == ("queued", "final-check")
+    checkpoint = _ToolRunHarness(store)._final_check_checkpoint(run["run_id"], workspace)
+    assert len(checkpoint["history"]) == 5
+    assert checkpoint["history"][-1]["decision"] == "accepted"
+    assert checkpoint["previous_score"] == 9.7
+    assert checkpoint["candidate"]["template"]["templateId"] == "completion-test"
+    assert checkpoint["candidate"]["render"] == {
+        "feed": str((workspace / "previews" / "iteration-05-feed.png").resolve()),
+        "story": str((workspace / "previews" / "iteration-05-story.png").resolve()),
+    }
+
+
 class _StructuredRoleAgent:
     def __init__(self, instance_id: str, template: dict, messages: list):
         self._instance_id = instance_id

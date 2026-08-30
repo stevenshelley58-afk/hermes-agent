@@ -23,7 +23,7 @@ from aiohttp import web
 
 from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
-from gateway.ad_template_process import AdTemplateStructuredOutputError, SoleProcessOrchestrator, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
+from gateway.ad_template_process import AdTemplateStructuredOutputError, SoleProcessOrchestrator, validate_artifacts, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
 from gateway.tool_runs import (
     AD_TEMPLATE_ROUTE_ORDER,
     TOOL_MODEL_POLICY_SCHEMA,
@@ -84,6 +84,7 @@ class ToolRunAPIMixin:
             "iteration.revised": "build",
             "builder.escalated": "build",
             "final-review.started": "final-check",
+            "final-review.retried": "final-check",
             "final-review.completed": "final-check",
             "template.imported": "live",
         }.get(kind)
@@ -185,6 +186,65 @@ class ToolRunAPIMixin:
         if len(candidates) != 1:
             raise RuntimeError("durable run source preview is unavailable")
         return candidates[0]
+
+    def _final_check_checkpoint(self, run_id: str, workspace: Path) -> Dict[str, Any]:
+        """Load the last accepted render without rebuilding it on final-check retry."""
+        records: List[Dict[str, Any]] = []
+        for event in self._tool_run_store.events(run_id, limit=5000):
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            if event.get("kind") == "final-review.completed" and data.get("decision") == "revise" and records:
+                records[-1]["final_review_failed"] = True
+            if event.get("kind") != "iteration.compared":
+                continue
+            comparison = {
+                key: data.get(key)
+                for key in ("rubric", "reason", "hard_failures", "differences", "required_changes")
+            }
+            preview_names = data.get("preview_names") if isinstance(data.get("preview_names"), list) else []
+            records.append({
+                "iteration": data.get("iteration"),
+                "comparison": comparison,
+                "decision": data.get("decision"),
+                "candidate": {
+                    "previews": [
+                        {
+                            "name": str(name),
+                            "placement": "feed" if str(name).endswith("-feed.png") else "story",
+                        }
+                        for name in preview_names
+                    ],
+                },
+            })
+        history = validate_iterations(records)
+        if history[-1]["decision"] != "accepted":
+            raise RuntimeError("final-check retry has no accepted comparator checkpoint")
+        iteration = int(history[-1]["iteration"])
+        artifact_path = (workspace / "iterations" / f"{iteration:02d}" / "artifact.json").resolve()
+        workspace_root = workspace.resolve()
+        try:
+            artifact_path.relative_to(workspace_root)
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("accepted final-check artifact is unavailable") from exc
+        if not isinstance(artifact, dict) or set(artifact) != {"template", "assets"}:
+            raise RuntimeError("accepted final-check artifact is invalid")
+        previews = []
+        render = {}
+        for placement in ("feed", "story"):
+            preview = (workspace / "previews" / f"iteration-{iteration:02d}-{placement}.png").resolve()
+            try:
+                preview.relative_to(workspace_root)
+            except ValueError as exc:
+                raise RuntimeError("accepted final-check preview escapes the run workspace") from exc
+            render[placement] = str(preview)
+            previews.append({"name": preview.name, "path": str(preview), "placement": placement})
+        candidate = {**artifact, "previews": previews, "render": render, "template_path": str(artifact_path)}
+        validate_artifacts(candidate, workspace)
+        return {
+            "candidate": candidate,
+            "history": history,
+            "previous_score": history[-1]["comparison"]["score"],
+        }
 
     @staticmethod
     def _tool_json_output(value: Any, *, process_result: bool = False) -> Dict[str, Any]:
@@ -489,11 +549,21 @@ class ToolRunAPIMixin:
                 if not source:
                     raise RuntimeError("source image is missing")
                 source = str(self._durable_tool_source(workspace, source))
+                checkpoint = self._final_check_checkpoint(run_id, workspace) if current_stage == "final-check" else None
                 result = SoleProcessOrchestrator(
                     call_agent=call_agent, workspace=workspace, run_id=run_id,
                     project_id=str((run.get("scope") or {}).get("project_id") or ""), emit=emit,
                     should_stop=should_stop,
-                ).run(source=source, brief=str(payload.get("brief") or ""), placements=payload.get("placements") or [], routes=routes, require_quality_route=True)
+                ).run(
+                    source=source, brief=str(payload.get("brief") or ""),
+                    placements=payload.get("placements") or [], routes=routes,
+                    require_quality_route=True,
+                    resume_final_check=checkpoint is not None,
+                    revision_candidate=(checkpoint or {}).get("candidate"),
+                    history=(checkpoint or {}).get("history"),
+                    total_iterations=len((checkpoint or {}).get("history") or []),
+                    previous_score=(checkpoint or {}).get("previous_score"),
+                )
                 return result, usage
 
             result = usage = None

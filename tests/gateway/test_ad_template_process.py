@@ -34,6 +34,7 @@ def test_only_real_stages_and_durable_source_preview(tmp_path):
     assert ToolRunAPIMixin._tool_stage_order() == list(process.STAGES)
     assert ToolRunAPIMixin._canonical_tool_stage("story-draft") == "build"
     assert ToolRunAPIMixin._canonical_tool_stage("final-review") == "final-check"
+    assert ToolRunAPIMixin._tool_stage_from_process_event("final-review.retried", "final-check") == "final-check"
     assert ToolRunAPIMixin._canonical_tool_stage("import") == "live"
     source = tmp_path / "upload.JPEG"
     source.write_bytes(b"source-pixels")
@@ -1040,6 +1041,51 @@ def test_final_review_revision_prompt_carries_accepted_candidate(tmp_path, monke
     assert result["iterations"][1]["decision"] == "accepted"
     assert final_calls["count"] == 4
     assert result["import"]["template_id"] == "tpl-final-v2" and len(imports) == 1
+
+
+def test_invalid_final_review_output_retries_without_rebuilding_accepted_iteration(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    calls, events, renders, imports = [], [], [], []
+    invalid = evidence(9.2, "Final spacing needs revision")
+    invalid["required_changes"] = []
+
+    def call_agent(instance, prompt, route):
+        calls.append((instance, prompt[0]["text"], route))
+        if instance.startswith("builder-"):
+            return valid_candidate("final-output-retry")
+        if instance.startswith("comparator-"):
+            return evidence(9.7, "Comparator pass")
+        if instance.startswith("final-reviewer-") and "-retry-" not in instance and len([
+            item for item in calls if item[0].startswith("final-reviewer-")
+        ]) == 1:
+            return invalid
+        return evidence(9.7, "Independent final pass")
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: imports.append(output) or {"template_id": "tpl-final-retry", "status": "imported"})
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_final_retry",
+        project_id="blockwise", emit=lambda kind, node, data: events.append((kind, data)),
+    ).run(source=str(source), brief="", placements=["feed", "story"], routes=[
+        {"provider": "builder", "model": "vision"},
+        {"provider": "compare", "model": "vision"},
+        {"provider": "review-a", "model": "vision-a"},
+        {"provider": "review-b", "model": "vision-b"},
+    ])
+
+    assert [name.split("-")[0] for name, _, _ in calls].count("builder") == 1
+    assert len(renders) == 1 and len(imports) == 1
+    final_calls = [item for item in calls if item[0].startswith("final-reviewer-")]
+    assert len(final_calls) == 3
+    assert "-retry-1" in final_calls[1][0]
+    assert "previous final-review response was rejected" in final_calls[1][1]
+    retried = [data for kind, data in events if kind == "final-review.retried"]
+    assert len(retried) == 1
+    assert retried[0]["attempt"] == 1
+    assert retried[0]["reason"] == "final reviewer must provide a concrete required_changes list"
+    assert result["iterations"][0]["decision"] == "accepted"
+    assert result["final_review"]["decision"] == "accepted"
 
 
 def test_schema_repair_is_bounded_and_invalid_candidates_have_no_visual_side_effects(tmp_path, monkeypatch):

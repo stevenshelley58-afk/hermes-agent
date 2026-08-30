@@ -14,6 +14,7 @@ MAX_CANDIDATE_CONTEXT_CHARS = 100_000
 MIN_MATERIAL_SCORE_GAIN = 0.5
 STORY_CONTENT_SAFE_ZONE = {"x": 72, "y": 240, "width": 936, "height": 1380}
 MAX_COMPARATOR_SELF_CONSISTENCY_RETRIES = 1
+MAX_FINAL_REVIEW_OUTPUT_RETRIES = 1
 MATERIAL_OVERLAP_RATIO = 0.08
 
 class AdTemplateProcessError(ValueError):
@@ -192,6 +193,18 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
             raise AdTemplateProcessError(f"{role} must provide a concrete required_changes list")
         differences = [item.strip() for item in differences]
         required_changes = [item.strip() for item in required_changes]
+        preliminary_score = sum(scores.values()) / len(scores)
+        if (
+            role == "final reviewer"
+            and not required_changes
+            and (
+                hard_failures
+                or scores["feed_source_likeness"] < THRESHOLD
+                or preliminary_score < THRESHOLD
+                or min(scores.values()) < MIN_RUBRIC_SCORE
+            )
+        ):
+            raise AdTemplateProcessError(f"{role} must provide a concrete required_changes list")
         if not all(_required_change_is_actionable(item) for item in required_changes):
             raise AdTemplateProcessError(
                 f"{role} required_changes must name placement, layers, current geometry, target geometry, and change"
@@ -1005,7 +1018,7 @@ class SoleProcessOrchestrator:
         if self.should_stop():
             raise AdTemplateProcessError("sole ad-template process was cancelled")
 
-    def run(self, *, source: str, brief: str, placements: Any, routes: List[Dict[str, str]], review_round: int = 0, total_iterations: int = 0, feedback: str = "", history: List[Dict[str, Any]] | None = None, revision_candidate: Mapping[str, Any] | None = None, selected_builder_route: Mapping[str, str] | None = None, builder_escalated: bool = False, previous_score: float | None = None, low_gain_streak: int = 0, require_quality_route: bool = False) -> Dict[str, Any]:
+    def run(self, *, source: str, brief: str, placements: Any, routes: List[Dict[str, str]], review_round: int = 0, total_iterations: int = 0, feedback: str = "", history: List[Dict[str, Any]] | None = None, revision_candidate: Mapping[str, Any] | None = None, selected_builder_route: Mapping[str, str] | None = None, builder_escalated: bool = False, previous_score: float | None = None, low_gain_streak: int = 0, require_quality_route: bool = False, resume_final_check: bool = False) -> Dict[str, Any]:
         if len(routes) < 4: raise AdTemplateProcessError("builder, comparator, and two final reviewers require four configured roles")
         quality_route = routes[4] if len(routes) > 4 else None
         if require_quality_route and quality_route is None:
@@ -1019,9 +1032,14 @@ class SoleProcessOrchestrator:
         self._check_stop()
         history = list(history or [])
         iterations = []
-        candidate: Dict[str, Any] = {}
+        candidate: Dict[str, Any] = dict(revision_candidate or {}) if resume_final_check else {}
         best_candidate: Mapping[str, Any] | None = revision_candidate
         best_score = previous_score if revision_candidate is not None else None
+        if resume_final_check:
+            validated_history = validate_iterations(history)
+            if not candidate or validated_history[-1]["decision"] != "accepted":
+                raise AdTemplateProcessError("final-check resume requires one accepted candidate checkpoint")
+            history = validated_history
         # Feedback must describe the same candidate that will be revised. If a
         # visual iteration regresses, retain both the best candidate and its
         # own comparison instead of pairing the best JSON with feedback about
@@ -1030,7 +1048,8 @@ class SoleProcessOrchestrator:
 
         def builder_route_identity(route: Mapping[str, str]) -> str:
             return f"{route.get('provider')}/{route.get('model')}"
-        for offset in range(31 - total_iterations - 1):
+        iteration_offsets = () if resume_final_check else range(31 - total_iterations - 1)
+        for offset in iteration_offsets:
             index = total_iterations + offset + 1
             iteration_prior = best_candidate
             iteration_workspace = self.workspace / "iterations" / f"{index:02d}"
@@ -1261,25 +1280,56 @@ class SoleProcessOrchestrator:
                 })
             previous_score = score
             feedback = best_feedback
-        if not iterations or iterations[-1]["decision"] != "accepted": raise AdTemplateProcessError("comparator never reached threshold")
+        accepted_records = history if resume_final_check else iterations
+        if not accepted_records or accepted_records[-1]["decision"] != "accepted": raise AdTemplateProcessError("comparator never reached threshold")
         reviewers = []
         for n, route in enumerate(routes[2:4], 1):
             identity = f"final-reviewer-{self.run_id}-{n}-{uuid.uuid4().hex[:8]}"
             provider_route = f"{route.get('provider')}/{route.get('model')}"
             route_identity = provider_route
             self.emit("final-review.started", "final-check", {"reviewer": identity, "route": route_identity})
-            self._check_stop()
-            review = self.call_agent(identity, vision_message(review_prompt(final=True, candidate=candidate), [source, str((candidate.get("render") or {}).get("feed") or ""), str((candidate.get("render") or {}).get("story") or "")]), provider_route)
-            self._check_stop()
-            if not isinstance(review, dict): raise AdTemplateProcessError("final reviewer returned invalid result")
-            evidence = _assessment(review, "final reviewer", require_change_list=True)
-            reviewers.append({"id": identity, "route": route_identity, **evidence})
+            final_prompt = review_prompt(final=True, candidate=candidate)
+            rejection = ""
+            for output_attempt in range(MAX_FINAL_REVIEW_OUTPUT_RETRIES + 1):
+                retry_suffix = ""
+                if rejection:
+                    retry_suffix = (
+                        "\n\nYour previous final-review response was rejected by the strict evidence schema: "
+                        f"{rejection}. Return the complete corrected JSON object. If any rubric score is below the "
+                        "gate, required_changes must contain concrete placement/layer/current/target geometry items."
+                    )
+                attempt_identity = identity if output_attempt == 0 else f"{identity}-retry-{output_attempt}"
+                try:
+                    self._check_stop()
+                    review = self.call_agent(
+                        attempt_identity,
+                        vision_message(
+                            final_prompt + retry_suffix,
+                            [source, str((candidate.get("render") or {}).get("feed") or ""), str((candidate.get("render") or {}).get("story") or "")],
+                        ),
+                        provider_route,
+                    )
+                    self._check_stop()
+                    evidence = _assessment(review, "final reviewer", require_change_list=True)
+                except (AdTemplateProcessError, AdTemplateStructuredOutputError) as exc:
+                    rejection = str(exc)
+                    if output_attempt >= MAX_FINAL_REVIEW_OUTPUT_RETRIES:
+                        raise
+                    self.emit("final-review.retried", "final-check", {
+                        "reviewer": identity,
+                        "route": route_identity,
+                        "attempt": output_attempt + 1,
+                        "reason": rejection,
+                    })
+                    continue
+                reviewers.append({"id": attempt_identity, "route": route_identity, **evidence})
+                break
         final_review = validate_final_review({"reviewers": reviewers}, accepted=True)
         if final_review["decision"] != "accepted":
             self.emit("final-review.completed", "final-check", {"decision": "revise", "reviewers": final_review["reviewers"]})
             if review_round >= 5 or total_iterations + len(iterations) >= 30:
                 raise AdTemplateProcessError("final reviewers failed after the bounded automatic revision loop")
-            iterations[-1]["final_review_failed"] = True
+            accepted_records[-1]["final_review_failed"] = True
             reasons = json.dumps([
                 {
                     "reviewer": item["id"],
@@ -1292,7 +1342,7 @@ class SoleProcessOrchestrator:
             ], ensure_ascii=False)
             return self.run(
                 source=source, brief=brief, placements=placements, routes=routes,
-                review_round=review_round + 1, total_iterations=total_iterations + len(iterations),
+                review_round=review_round + 1, total_iterations=len(history + iterations),
                 feedback=reasons, history=history + iterations, revision_candidate=best_candidate,
                 selected_builder_route=builder_route, builder_escalated=builder_escalated,
                 previous_score=best_score, low_gain_streak=low_gain_streak,
