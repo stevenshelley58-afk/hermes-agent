@@ -156,6 +156,24 @@ def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
     assert "Every text layer inputKey must be declared exactly once in textInputs" in builder
     assert 'Each realAssetRefs entry must contain exactly {"inputKey":"declaredKey"' in builder
     assert "Every layer assetKey, image defaultAssetKey, gallery sample assetKey" in builder
+    repair_builder = process.generator_prompt(
+        run_id="run", project_id="blockwise", brief="", placements=["feed", "story"], source="source.png",
+        validation_feedback="template is invalid", repair_attempt=1,
+        rejected_candidate={"template": {"templateId": "broken", "bytesBase64": "forbidden", "privateNote": "secret"}, "assets": []},
+    )
+    assert "IMMEDIATELY PRIOR REJECTED CANDIDATE" in repair_builder
+    assert '"templateId":"broken"' in repair_builder
+    assert '"bytesBase64":' not in repair_builder
+    assert "privateNote" not in repair_builder
+    assert "forbidden" not in repair_builder and "secret" not in repair_builder
+    oversized_candidate = {"template": {"chunks": ["x" * 8000 for _ in range(20)]}, "assets": []}
+    with pytest.raises(AdTemplateProcessError, match=r"safe candidate context exceeds 100000 characters"):
+        process.generator_prompt(
+            run_id="run", project_id="blockwise", brief="", placements=["feed", "story"], source="source.png",
+            prior_candidate=oversized_candidate,
+        )
+
+
 
     invalid_fonts = json.loads(json.dumps(template))
     invalid_fonts["fonts"] = {"body": {"file": "manrope-400.woff2"}}
@@ -422,6 +440,11 @@ def test_schema_invalid_candidate_repairs_before_one_render_and_comparator(tmp_p
     repair_prompt = calls[1][1][0]["text"]
     exact_reason = "feedLayout.safeZones[0] must contain exactly x, y, width, and height (missing height, width; unexpected bottom, right)"
     assert exact_reason in repair_prompt
+    assert "IMMEDIATELY PRIOR REJECTED CANDIDATE" in repair_prompt
+    assert '"templateId":"bad"' in repair_prompt
+    assert '"right":1032' in repair_prompt
+    assert "must-not-persist" not in repair_prompt
+    assert '"private":' not in repair_prompt and '"hash":' not in repair_prompt
     assert len(renders) == 1 and renders[0]["template"]["templateId"] == "good"
     assert len([item for item in calls if item[0].startswith("comparator-")]) == 1
     assert len(imports) == 1 and result["import"]["template_id"] == "tpl-good"
@@ -434,6 +457,92 @@ def test_schema_invalid_candidate_repairs_before_one_render_and_comparator(tmp_p
     assert persisted["candidate"]["template"]["feedLayout"]["safeZones"][0]["right"] == 1032
     assert "private" not in persisted["candidate"]["template"]["metadata"]
     assert "hash" not in persisted["candidate"]["template"]["metadata"]
+
+
+def test_visual_revision_prompt_carries_prior_valid_candidate(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    first = valid_candidate("visual-v1")
+    second = valid_candidate("visual-v2")
+    calls, renders, imports = [], [], []
+
+    def call_agent(instance, prompt, route):
+        calls.append((instance, prompt[0]["text"]))
+        if instance == "builder-1":
+            return first
+        if instance == "comparator-1":
+            return evidence(9.0, "Layout needs revision")
+        if instance == "builder-2":
+            return second
+        if instance == "comparator-2":
+            return evidence(9.6, "Revision matches")
+        return evidence(9.7, "Independent final pass")
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: imports.append(output) or {"template_id": "tpl-visual-v2", "status": "imported"})
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_visual_revision",
+        project_id="blockwise", emit=lambda *_args: None,
+    ).run(source=str(source), brief="", placements=["feed", "story"], routes=[
+        {"provider": "builder", "model": "vision"},
+        {"provider": "compare", "model": "vision"},
+        {"provider": "review-a", "model": "vision"},
+        {"provider": "review-b", "model": "vision"},
+    ])
+
+    builder_one = next(text for instance, text in calls if instance == "builder-1")
+    builder_two = next(text for instance, text in calls if instance == "builder-2")
+    assert "PRIOR VALID CANDIDATE TO REVISE IN PLACE" not in builder_one
+    assert "PRIOR VALID CANDIDATE TO REVISE IN PLACE" in builder_two
+    assert '"templateId":"visual-v1"' in builder_two
+    assert "Layout needs revision" in builder_two
+    assert str(tmp_path) not in builder_two
+    assert len(result["iterations"]) == 2
+    assert result["import"]["template_id"] == "tpl-visual-v2" and len(imports) == 1
+
+
+def test_final_review_revision_prompt_carries_accepted_candidate(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    first = valid_candidate("final-v1")
+    second = valid_candidate("final-v2")
+    calls, renders, imports = [], [], []
+    final_calls = {"count": 0}
+
+    def call_agent(instance, prompt, route):
+        calls.append((instance, prompt[0]["text"]))
+        if instance == "builder-1":
+            return first
+        if instance == "builder-2":
+            return second
+        if instance.startswith("comparator-"):
+            return evidence(9.6, "Comparator pass")
+        final_calls["count"] += 1
+        if final_calls["count"] == 1:
+            return evidence(9.0, "Final spacing needs revision")
+        return evidence(9.7, "Independent final pass")
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: imports.append(output) or {"template_id": "tpl-final-v2", "status": "imported"})
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_final_revision",
+        project_id="blockwise", emit=lambda *_args: None,
+    ).run(source=str(source), brief="", placements=["feed", "story"], routes=[
+        {"provider": "builder", "model": "vision"},
+        {"provider": "compare", "model": "vision"},
+        {"provider": "review-a", "model": "vision-a"},
+        {"provider": "review-b", "model": "vision-b"},
+    ])
+
+    builder_two = next(text for instance, text in calls if instance == "builder-2")
+    assert "PRIOR VALID CANDIDATE TO REVISE IN PLACE" in builder_two
+    assert '"templateId":"final-v1"' in builder_two
+    assert "Final spacing needs revision" in builder_two
+    assert str(tmp_path) not in builder_two
+    assert result["iterations"][0]["final_review_failed"] is True
+    assert result["iterations"][1]["decision"] == "accepted"
+    assert final_calls["count"] == 4
+    assert result["import"]["template_id"] == "tpl-final-v2" and len(imports) == 1
 
 
 def test_schema_repair_is_bounded_and_invalid_candidates_have_no_visual_side_effects(tmp_path, monkeypatch):

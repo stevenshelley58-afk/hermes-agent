@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Mapping
 THRESHOLD = 9.5
 MAX_SCHEMA_REPAIRS_PER_ITERATION = 3
 STAGES = ("source", "build", "render", "compare", "final-check", "live")
+MAX_CANDIDATE_CONTEXT_CHARS = 100_000
 
 class AdTemplateProcessError(ValueError):
     pass
@@ -444,11 +445,25 @@ def _safe_rejected_candidate(value: Any, *, depth: int = 0) -> Any:
         for raw_key, child in list(value.items())[:512]:
             key = str(raw_key)[:160]
             normalized = re.sub(r"[^a-z0-9]", "", key.lower())
-            if normalized in _PRIVATE_EVIDENCE_KEYS:
+            if normalized in _PRIVATE_EVIDENCE_KEYS or any(normalized.startswith(prefix) for prefix in _PRIVATE_EVIDENCE_KEYS):
                 continue
             safe[key] = _safe_rejected_candidate(child, depth=depth + 1)
         return safe
     return str(value)[:1000]
+
+def _safe_candidate_prompt_json(value: Any) -> str:
+    """Return compact builder-contract JSON without paths, evidence, bytes, or private fields."""
+    if not isinstance(value, Mapping):
+        return ""
+    contract = {"template": value.get("template"), "assets": value.get("assets")}
+    safe = _safe_rejected_candidate(contract)
+    if not isinstance(safe, dict):
+        return ""
+    encoded = json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if len(encoded) > MAX_CANDIDATE_CONTEXT_CHARS:
+        raise AdTemplateProcessError(f"safe candidate context exceeds {MAX_CANDIDATE_CONTEXT_CHARS} characters")
+    return encoded
+
 
 def persist_rejected_candidate(candidate: Any, iteration_workspace: Path, *, iteration: int, attempt: int, reason: str) -> Path:
     safe_candidate = None
@@ -558,7 +573,7 @@ def import_template(output: Mapping[str, Any], *, run_id: str, project_id: str) 
     replayed = bool(payload.get("replayed"))
     return {"template_id": str(payload["templateId"]), "status": "replayed" if replayed else "imported", "asset_count": int(payload.get("assetCount") or len(assets)), "replayed": replayed}
 
-def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: Any, source: str, feedback: str = "", validation_feedback: str = "", repair_attempt: int = 0) -> str:
+def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: Any, source: str, feedback: str = "", validation_feedback: str = "", repair_attempt: int = 0, prior_candidate: Any = None, rejected_candidate: Any = None) -> str:
     repair_clause = (
         ' Return one JSON object with exactly two top-level keys: {"template": {...}, "assets": []}; '
         'never omit assets even when it is empty, and do not add prose or another wrapper. '
@@ -584,6 +599,21 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
             f"the previous candidate was rejected before rendering with this exact validation error: {validation_feedback}. "
             "Return a complete corrected template-and-assets JSON object, not a patch."
         )
+    rejected_json = _safe_candidate_prompt_json(rejected_candidate)
+    prior_json = _safe_candidate_prompt_json(prior_candidate)
+    if rejected_json:
+        repair_clause += (
+            " IMMEDIATELY PRIOR REJECTED CANDIDATE (safe builder-contract JSON): "
+            f"{rejected_json}. Make the minimum correction required by the exact validation error, preserve every "
+            "already-correct field, and return the complete corrected {template,assets} object."
+        )
+    elif prior_json:
+        repair_clause += (
+            " PRIOR VALID CANDIDATE TO REVISE IN PLACE (safe builder-contract JSON): "
+            f"{prior_json}. Revise this candidate in place using the reviewer feedback; preserve every correct layer, "
+            "input, asset, font, metadata field, and cross-reference, and return the complete revised {template,assets} object."
+        )
+
     return f"""Run the sole ad-template process as the builder agent. Inspect the attached source pixels, remove advertiser identity (names, logos, phones, URLs, portraits), and return JSON with exactly {{template, assets}}. template must contain exactly schema='blockwise.ad-template', templateId, createdAt (ISO datetime), feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata. semanticColours must contain exactly background, primary, secondary, accent, mainText, inverseText; every layer colourRole is one of those six. Each layout contains exactly placement, layers, safeZones; Feed is placement feed within 1080x1350 and Story is placement story within 1080x1920, including safeZones. Geometry and every safe-zone rectangle contain exactly {{x,y,width,height}}: x,y are the top-left coordinates from canvas origin (0,0); width,height are positive sizes, not right/bottom coordinates; x + width must stay within canvas width and y + height within canvas height. Exact valid examples are Feed safeZones=[{{"x":48,"y":48,"width":984,"height":1254}}] within 1080x1350 and Story safeZones=[{{"x":60,"y":250,"width":960,"height":1420}}] within 1080x1920. Layer shapes are exact: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. imageInputs are {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs are {{key,label,placeholder,maxLength}}. fonts are {{file}} and every text-layer font must be declared; allowed bundled font files are {', '.join(sorted(ALLOWED_FONT_FILES))}. metadata is exact: title:string; description:string; gallerySamples={{feed?:{{assetKey?,placement,purpose}},story?:{{assetKey?,placement,purpose}}}}; metaCopyDefaults={{primaryText:string[],headlines:string[],descriptions:string[],cta:string}}; aiWritingGuidance={{summary:string,fields:record<string,string>}}; publishRequirements={{objective:string,specialAdCategory:string|null,instantForm:{{required:boolean,dependency:string|null,defaults?:record<string,string>}},destination:{{required:boolean,kind:'website'|'instant_form'|'none',dependency:string|null}},requiredCtaTypes?:string[]}}; replacementAssets={{inputKey,assetKey,purpose?}}[]; realAssetRefs={{inputKey,kind,required}}[]. Every layer/input/font/colour/asset metadata reference must resolve inside the same template. Declare source-free replacement assets in template.assets as assetKey -> {{fileName,mimeType}} and in top-level assets only as {{assetKey,fileName,mimeType}} with an exact match. Hermes resolves bytes from the fixed safe catalog; never emit bytesBase64 anywhere and never guess filenames. Allowed normalized relative catalog paths are home/open-home-living.webp, home/home-dusk.webp, home/mt-lawley-federation.webp, home/home-pool.webp, home/interior-styled.webp, home/subiaco-townhouse.webp, and adstudio-samples/photos/int-bedroom.png. Never include the source composite, source_path, hashes, signatures, private fields, or a full-source plate. Keep geometry inside canvas and Story native. Hermes renders, compares once per iteration, then runs two fresh final reviewers only after comparator >= {THRESHOLD}; never self-score or invent review evidence. Run {run_id}; project {project_id}; fixed placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback[:3000]}.{repair_clause}"""
 
 def review_prompt(*, final: bool) -> str:
@@ -619,7 +649,7 @@ class SoleProcessOrchestrator:
         if self.should_stop():
             raise AdTemplateProcessError("sole ad-template process was cancelled")
 
-    def run(self, *, source: str, brief: str, placements: Any, routes: List[Dict[str, str]], review_round: int = 0, total_iterations: int = 0, feedback: str = "", history: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+    def run(self, *, source: str, brief: str, placements: Any, routes: List[Dict[str, str]], review_round: int = 0, total_iterations: int = 0, feedback: str = "", history: List[Dict[str, Any]] | None = None, revision_candidate: Mapping[str, Any] | None = None) -> Dict[str, Any]:
         if len(routes) < 4: raise AdTemplateProcessError("builder, comparator, and two final reviewers require four configured roles")
         self._check_stop()
         history = list(history or [])
@@ -627,10 +657,12 @@ class SoleProcessOrchestrator:
         candidate: Dict[str, Any] = {}
         for offset in range(31 - total_iterations - 1):
             index = total_iterations + offset + 1
+            iteration_prior = revision_candidate if offset == 0 else candidate
             iteration_workspace = self.workspace / "iterations" / f"{index:02d}"
             self._check_stop()
             self.emit("stage.started", "build", {"iteration": index, "role": "builder"})
             validation_feedback = ""
+            rejected_candidate: Any = None
             for repair_attempt in range(MAX_SCHEMA_REPAIRS_PER_ITERATION + 1):
                 self._check_stop()
                 instance = "builder-%d" % index if repair_attempt == 0 else "builder-%d-repair-%d" % (index, repair_attempt)
@@ -640,6 +672,8 @@ class SoleProcessOrchestrator:
                         run_id=self.run_id, project_id=self.project_id, brief=brief,
                         placements=placements, source=source, feedback=feedback,
                         validation_feedback=validation_feedback, repair_attempt=repair_attempt,
+                        prior_candidate=iteration_prior if repair_attempt == 0 else None,
+                        rejected_candidate=rejected_candidate if repair_attempt > 0 else None,
                     ), [source]),
                     f"{routes[0].get('provider')}/{routes[0].get('model')}",
                 )
@@ -649,6 +683,7 @@ class SoleProcessOrchestrator:
                 except AdTemplateProcessError as exc:
                     validation_feedback = str(exc)
                     self._check_stop()
+                    rejected_candidate = candidate
                     persist_rejected_candidate(
                         candidate, iteration_workspace, iteration=index,
                         attempt=repair_attempt + 1, reason=validation_feedback,
@@ -719,7 +754,7 @@ class SoleProcessOrchestrator:
                 raise AdTemplateProcessError("final reviewers failed after the bounded automatic revision loop")
             iterations[-1]["final_review_failed"] = True
             reasons = "; ".join(f"{item['id']}: {item['reason']}" for item in final_review["reviewers"])
-            return self.run(source=source, brief=brief, placements=placements, routes=routes, review_round=review_round + 1, total_iterations=total_iterations + len(iterations), feedback=reasons, history=history + iterations)
+            return self.run(source=source, brief=brief, placements=placements, routes=routes, review_round=review_round + 1, total_iterations=total_iterations + len(iterations), feedback=reasons, history=history + iterations, revision_candidate=candidate)
         self.emit("final-review.completed", "final-check", {"decision": "accepted", "reviewers": final_review["reviewers"]})
         generated = candidate
         documents = deterministic_documents(generated.get("template"))
