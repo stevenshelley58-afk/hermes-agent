@@ -74,6 +74,20 @@ def test_one_comparator_per_iteration_and_final_review_only_after_pass():
     review = validate_final_review({"reviewers": [{"id": "reviewer-a", "route": "a/m", **evidence(9.6, "good")}, {"id": "reviewer-b", "route": "b/m", **evidence(9.7, "good")}]}, accepted=True)
     assert review["decision"] == "accepted"
 
+def test_quality_gate_rejects_one_weak_dimension_even_when_mean_passes():
+    weak = evidence(9.6, "Delivered-size copy remains too small")
+    weak["rubric"]["real_shell_legibility"] = 9.1
+    record = validate_iterations([{"iteration": 1, "comparison": weak, "decision": "revise"}])[0]
+    assert record["comparison"]["score"] >= process.THRESHOLD
+    assert record["comparison"]["minimum_score"] == 9.1
+    assert record["decision"] == "revise"
+
+    reviewers = [
+        {"id": "reviewer-a", "route": "a/m", **weak},
+        {"id": "reviewer-b", "route": "b/m", **evidence(9.8, "Strong")},
+    ]
+    assert validate_final_review({"reviewers": reviewers}, accepted=True)["decision"] == "revise"
+
 def test_bare_model_scores_are_rejected():
     with pytest.raises(AdTemplateProcessError):
         validate_iterations([iteration(9.8)]) if False else validate_iterations([{"iteration": 1, "comparison": {"score": 10, "reason": "looks good"}}])
@@ -116,7 +130,7 @@ def test_catalog_asset_resolution_rejects_unknown_and_traversal(tmp_path, monkey
     with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets(template, [{"assetKey": "property-photo", "fileName": "home/property-photo.webp", "mimeType": "image/webp", "bytesBase64": ""}])
 
 
-def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
+def test_builder_contract_is_strict_and_prompts_require_quality_scores():
     layout = lambda placement, height: {"placement": placement, "layers": [{"type": "plate", "layerId": placement, "colourRole": "background", "geometry": {"x": 0, "y": 0, "width": 1080, "height": height}, "protected": False}], "safeZones": [{"x": 0, "y": 0, "width": 1080, "height": height}]}
     template = {"schema": "blockwise.ad-template", "templateId": "strict", "createdAt": "2026-08-30T00:00:00.000Z", "feedLayout": layout("feed", 1350), "storyLayout": layout("story", 1920), "imageInputs": [], "textInputs": [], "semanticColours": semantic_colours(), "assets": {}, "fonts": [], "metadata": metadata("Strict")}
     assert process.validate_template_artifact(template) is template
@@ -130,7 +144,10 @@ def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
     inline = json.loads(json.dumps(template)); inline["metadata"]["gallerySamples"]["bytesBase64"] = "forbidden"
     with pytest.raises(AdTemplateProcessError): process.validate_template_artifact(inline)
     for final in (False, True):
-        prompt = process.review_prompt(final=final)
+        prompt = process.review_prompt(final=final, candidate={
+            "template": {**template, "privateNote": "never expose"},
+            "assets": [{"assetKey": "hero", "fileName": "home/open-home-living.webp", "mimeType": "image/webp", "bytesBase64": "forbidden"}],
+        })
         for field in process.RUBRIC_FIELDS:
             assert field in prompt
         assert "hard failure" in prompt.lower()
@@ -138,13 +155,17 @@ def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
         assert "must not be penalized" in prompt
         assert "source-free photography" in prompt
         assert "neutral editable replacement is correct" in prompt
+        assert '"templateId":"strict"' in prompt
+        assert '"assetKey":"hero"' in prompt
+        assert "privateNote" not in prompt
+        assert "bytesBase64" not in prompt
     builder = process.generator_prompt(run_id="run", project_id="blockwise", brief="", placements=["feed", "story"], source="source.png")
     for key in process.METADATA_FIELDS:
         assert key in builder
     assert "never emit bytesBase64 anywhere" in builder
     assert "home/open-home-living.webp" in builder
-    assert 'Feed safeZones=[{"x":48,"y":48,"width":984,"height":1254}]' in builder
-    assert 'Story safeZones=[{"x":60,"y":250,"width":960,"height":1420}]' in builder
+    assert 'Feed safeZones=[{"x":72,"y":96,"width":936,"height":1158}]' in builder
+    assert 'Story safeZones=[{"x":72,"y":240,"width":936,"height":1380}]' in builder
     assert "width,height are positive sizes, not right/bottom coordinates" in builder
     assert '"template": {...}, "assets": []' in builder
     assert "mask must be exactly rounded_rect, circle, or none" in builder
@@ -155,7 +176,10 @@ def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
     assert "lineHeight is a unitless multiplier between 0.8 and 2.5" in builder
     assert "Every icon layer must use exactly arrow, check, phone, mail, globe, or pin" in builder
     assert "Every image_slot inputKey must be declared exactly once in imageInputs" in builder
-    assert "Do not emit a logo layer" in builder
+    assert "real logo layer" in builder
+    assert "one dominant idea" in builder
+    assert "brochure density" in builder
+    assert "specialAdCategory must be HOUSING" in builder
     assert "Every text layer inputKey must be declared exactly once in textInputs" in builder
     assert 'Each realAssetRefs entry must contain exactly {"inputKey":"declaredKey"' in builder
     assert "Every layer assetKey, image defaultAssetKey, gallery sample assetKey" in builder
@@ -256,8 +280,7 @@ def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
 
     blank_logo = json.loads(json.dumps(invalid_logo))
     blank_logo["imageInputs"] = [{"key": "brandLogo", "label": "Brand logo", "acceptedTypes": ["image/png"]}]
-    with pytest.raises(AdTemplateProcessError, match=r'feedLayout\.layers\[1\]\.inputKey="brandLogo" for logo must reference an imageInput\.defaultAssetKey'):
-        process.validate_template_artifact(blank_logo)
+    assert process.validate_template_artifact(blank_logo) is blank_logo
 
     real_text_ref = json.loads(json.dumps(template))
     real_text_ref["textInputs"] = [{"key": "address", "label": "Address", "placeholder": "1 Example St", "maxLength": 120}]

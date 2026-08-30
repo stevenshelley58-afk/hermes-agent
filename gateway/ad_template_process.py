@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping
 
 THRESHOLD = 9.5
+MIN_RUBRIC_SCORE = 9.2
 MAX_SCHEMA_REPAIRS_PER_ITERATION = 3
 STAGES = ("source", "build", "render", "compare", "final-check", "live")
 MAX_CANDIDATE_CONTEXT_CHARS = 100_000
@@ -20,7 +21,16 @@ def _number(value: Any) -> float:
     if not 0 <= result <= 10: raise AdTemplateProcessError("score must be between 0 and 10")
     return result
 
-RUBRIC_FIELDS = ("layout_geometry", "hierarchy_typography", "colour_tone", "editable_decomposition", "native_story")
+RUBRIC_FIELDS = (
+    "source_inspired_direction",
+    "ad_effectiveness",
+    "hierarchy_typography",
+    "real_shell_legibility",
+    "colour_art_direction",
+    "editable_decomposition",
+    "replacement_robustness",
+    "native_story",
+)
 
 def _assessment(value: Any, role: str) -> Dict[str, Any]:
     if not isinstance(value, dict):
@@ -29,7 +39,7 @@ def _assessment(value: Any, role: str) -> Dict[str, Any]:
     if not isinstance(rubric, dict):
         raise AdTemplateProcessError(f"{role} must provide all rubric subscores")
     if set(rubric) != set(RUBRIC_FIELDS):
-        raise AdTemplateProcessError(f"{role} rubric must contain exactly the five required fields")
+        raise AdTemplateProcessError(f"{role} rubric must contain exactly the eight required fields")
     scores = {field: _number(rubric.get(field)) for field in RUBRIC_FIELDS}
     hard_failures = value.get("hard_failures") or value.get("hard_fail") or []
     if isinstance(hard_failures, str): hard_failures = [hard_failures]
@@ -38,7 +48,20 @@ def _assessment(value: Any, role: str) -> Dict[str, Any]:
     if len(reason) < 3: raise AdTemplateProcessError(f"{role} must explain its decision")
     score = round(sum(scores.values()) / len(scores), 2)
     if hard_failures: score = 0.0
-    return {"score": score, "reason": reason, "rubric": scores, "hard_failures": [str(item)[:240] for item in hard_failures]}
+    return {
+        "score": score,
+        "minimum_score": min(scores.values()),
+        "reason": reason,
+        "rubric": scores,
+        "hard_failures": [str(item)[:240] for item in hard_failures],
+    }
+
+def _passes_quality_gate(evidence: Mapping[str, Any]) -> bool:
+    return (
+        not evidence.get("hard_failures")
+        and _number(evidence.get("score")) >= THRESHOLD
+        and _number(evidence.get("minimum_score")) >= MIN_RUBRIC_SCORE
+    )
 
 def validate_iterations(value: Any) -> List[Dict[str, Any]]:
     if not isinstance(value, list) or not value or len(value) > 30: raise AdTemplateProcessError("iterations must contain 1 to 30 records")
@@ -50,13 +73,14 @@ def validate_iterations(value: Any) -> List[Dict[str, Any]]:
         if any(key in raw or key in comparison for key in ("reviewers", "reviewer", "primary", "strict")): raise AdTemplateProcessError("final reviewers are only allowed after the comparator passes")
         evidence = _assessment(comparison, "comparator")
         score = evidence["score"]
-        decision = str(raw.get("decision") or ("accepted" if score >= THRESHOLD else "revise"))
-        expected = "accepted" if score >= THRESHOLD else "revise"
+        passes = _passes_quality_gate(evidence)
+        decision = str(raw.get("decision") or ("accepted" if passes else "revise"))
+        expected = "accepted" if passes else "revise"
         if decision != expected: raise AdTemplateProcessError("iteration decision does not match comparator score")
         reason = evidence["reason"]
         if accepted and not retry_after_review:
             raise AdTemplateProcessError("no iteration may follow an accepted candidate unless final reviewers requested revision")
-        accepted = score >= THRESHOLD
+        accepted = passes
         retry_after_review = bool(raw.get("final_review_failed"))
         item = dict(raw); item.update(iteration=index, comparison=evidence, decision=decision); result.append(item)
     return result
@@ -77,7 +101,7 @@ def validate_final_review(value: Any, *, accepted: bool) -> Dict[str, Any]:
         if not route: raise AdTemplateProcessError("reviewer route is required")
         normalized.append({"id": identity, "route": route, **evidence})
     if normalized[0]["id"] == normalized[1]["id"] or normalized[0]["route"] == normalized[1]["route"]: raise AdTemplateProcessError("final reviewers must use independent instances and routes")
-    passed = all(item["score"] >= THRESHOLD for item in normalized); decision = "accepted" if passed else "revise"
+    passed = all(_passes_quality_gate(item) for item in normalized); decision = "accepted" if passed else "revise"
     if str(value.get("decision") or decision) != decision: raise AdTemplateProcessError("final review decision does not match scores")
     return {"reviewers": normalized, "decision": decision, "threshold": THRESHOLD}
 
@@ -128,7 +152,6 @@ VECTOR_SHAPES = ("rect", "rounded", "circle", "line", "pill", "notched", "wave",
 LINE_HEIGHT_MIN = 0.8
 LINE_HEIGHT_MAX = 2.5
 SUPPORTED_ICONS = ("arrow", "check", "phone", "mail", "globe", "pin")
-VISIBLE_LOGO_ASSET_KEYS: frozenset[str] = frozenset()
 LAYER_FIELDS = {
     "plate": ({"type", "layerId", "colourRole", "geometry", "protected"}, {"assetKey"}),
     "image_slot": ({"type", "layerId", "inputKey", "geometry", "mask", "minSourceWidth", "minSourceHeight", "defaultCrop", "allowedPlacementOverrides"}, set()),
@@ -336,7 +359,6 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
             raise AdTemplateProcessError(f"fonts[{font_index}].file must name one of the allowed bundled font files")
     font_files = {item["file"] for item in value["fonts"]}
     asset_keys = set(value["assets"])
-    image_inputs_by_key = {item["key"]: item for item in value["imageInputs"]}
     for item in value["imageInputs"]:
         if item.get("defaultAssetKey") and item["defaultAssetKey"] not in asset_keys:
             raise AdTemplateProcessError("image input default asset is undeclared")
@@ -350,15 +372,6 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
                     f"{layer_path}.inputKey={offending} for {layer['type']} is undeclared; "
                     f"declare it exactly once in imageInputs (declared: {allowed})"
                 )
-            if layer["type"] == "logo":
-                input_record = image_inputs_by_key.get(layer["inputKey"]) or {}
-                default_key = input_record.get("defaultAssetKey")
-                if not default_key or default_key not in VISIBLE_LOGO_ASSET_KEYS:
-                    offending = json.dumps(layer["inputKey"], ensure_ascii=True)[:160]
-                    raise AdTemplateProcessError(
-                        f"{layer_path}.inputKey={offending} for logo must reference an imageInput.defaultAssetKey "
-                        "from the visible source-free logo catalog; none is available, so use editable brand text plus a vector mark instead"
-                    )
             if layer["type"] == "text" and layer["inputKey"] not in text_keys:
                 offending = json.dumps(layer["inputKey"], ensure_ascii=True)[:160]
                 allowed = ", ".join(sorted(text_keys)) or "(none declared)"
@@ -701,9 +714,10 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
         ' For every vector layer, shape must be exactly one of rect, rounded, circle, line, pill, notched, wave, or ring; '
         'never use aliases such as rectangle or rounded_rect_stroke. Every icon layer must use exactly arrow, check, phone, mail, globe, or pin; '
         'other icon names render as empty circles and are invalid. Every image_slot inputKey must be declared exactly once '
-        'in imageInputs. Do not emit a logo layer because the current source-free catalog has no visible logo default; recreate '
-        'every source logo/brand role as editable brand text plus a simple supported vector mark; declare that text input exactly once '
-        'in textInputs. Every text layer inputKey must be declared exactly once in textInputs. imageInputs and textInputs keys must be unique across both lists. Every text-layer font file must appear exactly once in fonts. '
+        'in imageInputs. A visible brand role must use a real logo layer bound to an optional imageInput; a logo input may omit '
+        'defaultAssetKey so the editor shows its neutral replaceable placeholder until a Brand Pack or customer logo is supplied. '
+        'Never fake a logo with a baked plate. Every text layer inputKey must be declared exactly once in textInputs. '
+        'imageInputs and textInputs keys must be unique across both lists. Every text-layer font file must appear exactly once in fonts. '
         'Every layer assetKey, image defaultAssetKey, gallery sample assetKey, and replacementAssets assetKey must resolve '
         'to template.assets. Every replacementAssets inputKey must resolve to imageInputs. Every realAssetRefs inputKey may '
         'resolve to imageInputs or textInputs, and must name a declared key. '
@@ -733,18 +747,20 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
             "input, asset, font, metadata field, and cross-reference, and return the complete revised {template,assets} object."
         )
 
-    return f"""Run the sole ad-template process as the builder agent. Inspect the attached source pixels, remove advertiser identity (names, logos, phones, URLs, portraits), and return JSON with exactly {{template, assets}}. template must contain exactly schema='blockwise.ad-template', templateId, createdAt (ISO datetime), feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata. semanticColours must contain exactly background, primary, secondary, accent, mainText, inverseText; every layer colourRole is one of those six. Each layout contains exactly placement, layers, safeZones; Feed is placement feed within 1080x1350 and Story is placement story within 1080x1920, including safeZones. Geometry and every safe-zone rectangle contain exactly {{x,y,width,height}}: x,y are the top-left coordinates from canvas origin (0,0); width,height are positive sizes, not right/bottom coordinates; x + width must stay within canvas width and y + height within canvas height. Exact valid examples are Feed safeZones=[{{"x":48,"y":48,"width":984,"height":1254}}] within 1080x1350 and Story safeZones=[{{"x":60,"y":250,"width":960,"height":1420}}] within 1080x1920. Layer shapes are exact: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. imageInputs are {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs are {{key,label,placeholder,maxLength}}. fonts are {{file}} and every text-layer font must be declared; allowed bundled font files are {', '.join(sorted(ALLOWED_FONT_FILES))}. metadata is exact: title:string; description:string; gallerySamples={{feed?:{{assetKey?,placement,purpose}},story?:{{assetKey?,placement,purpose}}}}; metaCopyDefaults={{primaryText:string[],headlines:string[],descriptions:string[],cta:string}}; aiWritingGuidance={{summary:string,fields:record<string,string>}}; publishRequirements={{objective:string,specialAdCategory:string|null,instantForm:{{required:boolean,dependency:string|null,defaults?:record<string,string>}},destination:{{required:boolean,kind:'website'|'instant_form'|'none',dependency:string|null}},requiredCtaTypes?:string[]}}; replacementAssets={{inputKey,assetKey,purpose?}}[]; realAssetRefs={{inputKey,kind,required}}[]. Every layer/input/font/colour/asset metadata reference must resolve inside the same template. Declare source-free replacement assets in template.assets as assetKey -> {{fileName,mimeType}} and in top-level assets only as {{assetKey,fileName,mimeType}} with an exact match. Hermes resolves bytes from the fixed safe catalog; never emit bytesBase64 anywhere and never guess filenames. Allowed normalized relative catalog paths are home/open-home-living.webp, home/home-dusk.webp, home/mt-lawley-federation.webp, home/home-pool.webp, home/interior-styled.webp, home/subiaco-townhouse.webp, and adstudio-samples/photos/int-bedroom.png. Never include the source composite, source_path, hashes, signatures, private fields, or a full-source plate. Keep geometry inside canvas and Story native. Hermes renders, compares once per iteration, then runs two fresh final reviewers only after comparator >= {THRESHOLD}; never self-score or invent review evidence. Run {run_id}; project {project_id}; fixed placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback[:3000]}.{repair_clause}"""
+    return f"""Run the sole ad-template process as the builder agent. Inspect the attached source pixels, remove advertiser identity (names, logos, phones, URLs, portraits), and return JSON with exactly {{template, assets}}. Treat the source as structural inspiration, not a quality ceiling: explicitly avoid inheriting brochure density, tiny copy, weak hierarchy, duplicated contact details, incoherent photography, or a Feed layout stretched into Story. Build a conversion-focused Meta ad around one dominant idea: a strong hook, one coherent hero treatment, only essential proof or facts, and one clear CTA. Dense descriptions and contact lists belong in Meta primary text or the destination, not inside the image. At native pixels use type large enough to remain legible inside a 500px, 390px and 320px-wide Meta shell; do not rely on scale-down or truncation to rescue excess copy. Feed must use a deliberate 72px horizontal and 96px vertical protected content margin. Story must be independently composed with its top 240px and bottom 300px protected from platform UI. Use true editable text, image, logo, CTA, patch and icon roles. Use one coherent property/photo subject across default slots; never mix unrelated properties. For a property listing, publishRequirements.specialAdCategory must be HOUSING. template must contain exactly schema='blockwise.ad-template', templateId, createdAt (ISO datetime), feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata. semanticColours must contain exactly background, primary, secondary, accent, mainText, inverseText; every layer colourRole is one of those six. Each layout contains exactly placement, layers, safeZones; Feed is placement feed within 1080x1350 and Story is placement story within 1080x1920, including safeZones. Geometry and every safe-zone rectangle contain exactly {{x,y,width,height}}: x,y are the top-left coordinates from canvas origin (0,0); width,height are positive sizes, not right/bottom coordinates; x + width must stay within canvas width and y + height within canvas height. Exact safe areas are Feed safeZones=[{{"x":72,"y":96,"width":936,"height":1158}}] within 1080x1350 and Story safeZones=[{{"x":72,"y":240,"width":936,"height":1380}}] within 1080x1920. Layer shapes are exact: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. imageInputs are {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs are {{key,label,placeholder,maxLength}}. fonts are {{file}} and every text-layer font must be declared; allowed bundled font files are {', '.join(sorted(ALLOWED_FONT_FILES))}. metadata is exact: title:string; description:string; gallerySamples={{feed?:{{assetKey?,placement,purpose}},story?:{{assetKey?,placement,purpose}}}}; metaCopyDefaults={{primaryText:string[],headlines:string[],descriptions:string[],cta:string}}; aiWritingGuidance={{summary:string,fields:record<string,string>}}; publishRequirements={{objective:string,specialAdCategory:string|null,instantForm:{{required:boolean,dependency:string|null,defaults?:record<string,string>}},destination:{{required:boolean,kind:'website'|'instant_form'|'none',dependency:string|null}},requiredCtaTypes?:string[]}}; replacementAssets={{inputKey,assetKey,purpose?}}[]; realAssetRefs={{inputKey,kind,required}}[]. Every layer/input/font/colour/asset metadata reference must resolve inside the same template. Declare source-free replacement assets in template.assets as assetKey -> {{fileName,mimeType}} and in top-level assets only as {{assetKey,fileName,mimeType}} with an exact match. Hermes resolves bytes from the fixed safe catalog; never emit bytesBase64 anywhere and never guess filenames. Allowed normalized relative catalog paths are home/open-home-living.webp, home/home-dusk.webp, home/mt-lawley-federation.webp, home/home-pool.webp, home/interior-styled.webp, home/subiaco-townhouse.webp, and adstudio-samples/photos/int-bedroom.png. Never include the source composite, source_path, hashes, signatures, private fields, or a full-source plate. Keep geometry inside canvas and Story native. Hermes renders, compares once per iteration, then runs two fresh final reviewers only after the comparator clears both the {THRESHOLD} mean and {MIN_RUBRIC_SCORE} subscore floor; never self-score or invent review evidence. Run {run_id}; project {project_id}; fixed placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback[:3000]}.{repair_clause}"""
 
-def review_prompt(*, final: bool) -> str:
+def review_prompt(*, final: bool, candidate: Any = None) -> str:
     role = "fresh independent final reviewer" if final else "iteration comparator"
     role += (
-        ". Treat the source only as the structural visual reference. Mandatory removal of source advertiser identities, "
+        ". Treat the source only as a structural reference whose defects must not be inherited. Mandatory removal of source advertiser identities, "
         "logos, names, phones, URLs, portraits, contact details, source photography, and all source pixels must not be penalized. "
-        "Instead, score whether the same visual roles, media-slot count and shapes, composition, spacing, hierarchy, typography, "
-        "and colour relationships are recreated with source-free photography and neutral editable logo, image, contact, copy, icon, "
-        "patch, and CTA layers. A neutral editable replacement is correct; copied source identity or pixels, or a missing editable role, is not"
+        "Instead, score whether its useful archetype has been elevated into a persuasive, legible Meta ad with source-free photography and "
+        "neutral editable logo, image, copy, icon, patch, and CTA layers. Do not reward literal reproduction of brochure density, tiny type, "
+        "duplicated contact details, weak hierarchy, or unrelated default photography. A neutral editable replacement is correct; copied "
+        "source identity or pixels, or a missing editable role, is not"
     )
-    return f"""Act as the {role}. Compare the attached source image with the attached rendered Feed and native Story previews. Return JSON only with exactly reason, hard_failures, and rubric. rubric must contain exactly these five numeric 0-10 fields: layout_geometry (source composition, proportions, spacing, alignment), hierarchy_typography (type hierarchy, wrapping, readability), colour_tone (palette, contrast, photographic tone), editable_decomposition (all copy, logo, CTA, patches, icons and media are real editable layers), native_story (a deliberate 1080x1920 composition, not a stretched, cropped, or letterboxed Feed). Explain concrete visible mismatches in reason. hard_failures must be a JSON list. Add a hard failure if any source advertiser name, logo, phone, URL, portrait, contact identity, or source composite pixel is reused; if Feed or Story is missing, clipped, unreadable, outside its canvas or safe zones; if critical text, logo, CTA, patch, icon or media is flattened/non-editable; if Story is a Feed crop, stretch, letterbox, or has essential content in platform UI zones; or if an asset is missing/unknown. Any hard failure makes the score zero. Do not reuse or infer another reviewer's score. Passing requires the mean of all five fields to be at least {THRESHOLD} with no hard failures."""
+    candidate_context = _safe_candidate_prompt_json(candidate)
+    return f"""Act as the {role}. Compare the attached source image with the attached rendered Feed and native Story previews. Evaluate the renders as they will appear inside real Meta shells at 500px, 390px and 320px wide, not only at full-resolution zoom. Return JSON only with exactly reason, hard_failures, and rubric. rubric must contain exactly these eight numeric 0-10 fields: source_inspired_direction (retains useful structural intent while improving source defects), ad_effectiveness (one clear hook, persuasive hierarchy, essential proof and CTA without brochure clutter), hierarchy_typography (strong type hierarchy, intentional wrapping and delivered-screen readability), real_shell_legibility (all essential content remains clear in Meta Feed and Story shells at the stated sizes), colour_art_direction (cohesive palette, contrast, photographic tone and finish), editable_decomposition (the supplied candidate JSON has genuine editable text, logo, CTA, patches, icons and media roles), replacement_robustness (slot geometry, masks, logo treatment and copy bounds plausibly survive realistic replacement content), native_story (a deliberate 1080x1920 composition, not a stretched, cropped, padded or letterboxed Feed). Explain concrete visible mismatches in reason. hard_failures must be a JSON list. Add a hard failure if any source advertiser name, logo, phone, URL, portrait, contact identity, or source composite pixel is reused; if Feed or Story is missing, clipped, distorted, unreadable at delivered size, outside its canvas or protected zones; if the design is a dense brochure rather than a Meta ad; if default photographs visibly represent unrelated subjects; if critical text, logo, CTA, patch, icon or media is flattened/non-editable; if Story is a Feed crop, stretch, letterbox, or has essential content in the top 240px or bottom 300px platform UI zones; or if an asset is missing/unknown. Any hard failure makes the score zero. Do not reuse or infer another reviewer's score. Passing requires a mean of at least {THRESHOLD}, every subscore at least {MIN_RUBRIC_SCORE}, and no hard failures. Candidate contract JSON: {candidate_context}"""
 
 def vision_message(text: str, paths: List[str]) -> List[Dict[str, Any]]:
     parts: List[Dict[str, Any]] = [{"type": "text", "text": text}]
@@ -857,11 +873,11 @@ class SoleProcessOrchestrator:
             self.emit("iteration.rendered", "render", {"iteration": index, "previews": [{"name": str(x.get("name") or ""), "placement": str(x.get("placement") or "")} for x in public_previews]})
             candidate = {**candidate, **rendered}
             self._check_stop()
-            comparison = self.call_agent("comparator-%d" % index, vision_message(review_prompt(final=False), [source, str((rendered.get("render") or {}).get("feed") or ""), str((rendered.get("render") or {}).get("story") or "")]), f"{routes[1].get('provider')}/{routes[1].get('model')}")
+            comparison = self.call_agent("comparator-%d" % index, vision_message(review_prompt(final=False, candidate=candidate), [source, str((rendered.get("render") or {}).get("feed") or ""), str((rendered.get("render") or {}).get("story") or "")]), f"{routes[1].get('provider')}/{routes[1].get('model')}")
             self._check_stop()
             evidence = _assessment(comparison, "comparator")
             score, reason = evidence["score"], evidence["reason"]
-            decision = "accepted" if score >= THRESHOLD else "revise"
+            decision = "accepted" if _passes_quality_gate(evidence) else "revise"
             record = {
                 "iteration": index,
                 "candidate": _candidate_trace_projection(candidate),
@@ -875,7 +891,7 @@ class SoleProcessOrchestrator:
             if best_score is None or score >= best_score:
                 best_candidate = candidate
                 best_score = score
-            if score >= THRESHOLD:
+            if _passes_quality_gate(evidence):
                 previous_score = score
                 break
 
@@ -910,7 +926,7 @@ class SoleProcessOrchestrator:
             route_identity = provider_route
             self.emit("final-review.started", "final-check", {"reviewer": identity, "route": route_identity})
             self._check_stop()
-            review = self.call_agent(identity, vision_message(review_prompt(final=True), [source, str((candidate.get("render") or {}).get("feed") or ""), str((candidate.get("render") or {}).get("story") or "")]), provider_route)
+            review = self.call_agent(identity, vision_message(review_prompt(final=True, candidate=candidate), [source, str((candidate.get("render") or {}).get("feed") or ""), str((candidate.get("render") or {}).get("story") or "")]), provider_route)
             self._check_stop()
             if not isinstance(review, dict): raise AdTemplateProcessError("final reviewer returned invalid result")
             evidence = _assessment(review, "final reviewer")
