@@ -150,6 +150,12 @@ def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
     assert "mask must be exactly rounded_rect, circle, or none" in builder
     assert 'defaultCrop must be exactly {"x":0,"y":0,"width":1,"height":1}' in builder
     assert "overflowBehaviour must be exactly refuse, truncate, or scale_down" in builder
+    assert 'fonts must always be a JSON list such as [{"file":"manrope-400.woff2"}' in builder
+
+    invalid_fonts = json.loads(json.dumps(template))
+    invalid_fonts["fonts"] = {"body": {"file": "manrope-400.woff2"}}
+    with pytest.raises(AdTemplateProcessError, match=r"fonts must be a JSON list.*never an object or map"):
+        process.validate_template_artifact(invalid_fonts)
 
     invalid_slot = json.loads(json.dumps(template))
     invalid_slot["feedLayout"]["layers"].append({

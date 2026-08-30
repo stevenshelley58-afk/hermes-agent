@@ -307,8 +307,13 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
     for key, asset in value["assets"].items():
         if not _nonempty(key) or not isinstance(asset, dict) or set(asset) != {"fileName", "mimeType"} or not _nonempty(asset["fileName"]) or not _nonempty(asset["mimeType"]):
             raise AdTemplateProcessError("template asset declarations are invalid")
-    if not isinstance(value["fonts"], list) or not all(_font(item) and item["file"] in ALLOWED_FONT_FILES for item in value["fonts"]):
-        raise AdTemplateProcessError("template fonts do not match the Blockwise contract")
+    if not isinstance(value["fonts"], list):
+        raise AdTemplateProcessError('fonts must be a JSON list of objects shaped exactly {"file":"allowed-font.woff2"}, never an object or map')
+    for font_index, item in enumerate(value["fonts"]):
+        if not _font(item):
+            raise AdTemplateProcessError(f'fonts[{font_index}] must be shaped exactly {{"file":"allowed-font.woff2"}}')
+        if item["file"] not in ALLOWED_FONT_FILES:
+            raise AdTemplateProcessError(f"fonts[{font_index}].file must name one of the allowed bundled font files")
     font_files = {item["file"] for item in value["fonts"]}
     asset_keys = set(value["assets"])
     for item in value["imageInputs"]:
@@ -531,6 +536,8 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
         '{"x":0,"y":0,"width":1,"height":1} for a full-source crop (not "cover"); allowedPlacementOverrides '
         'must be a JSON list containing only crop and/or position (not feed/story). For every text layer, alignment '
         'must be exactly left, center, or right and overflowBehaviour must be exactly refuse, truncate, or scale_down (never ellipsis).'
+        ' fonts must always be a JSON list such as [{"file":"manrope-400.woff2"},{"file":"manrope-700.woff2"}]; '
+        'never return fonts as an object, named map, or record.'
     )
     if validation_feedback:
         repair_clause += (
