@@ -1003,6 +1003,8 @@ def test_regressed_candidate_is_traced_but_next_revision_uses_best_candidate(tmp
     assert '"templateId":"candidate-builder-1"' in builder_prompts["builder-2"]
     assert '"templateId":"candidate-builder-1"' in builder_prompts["builder-3"]
     assert '"templateId":"candidate-builder-2"' not in builder_prompts["builder-3"]
+    assert "comparison comparator-1" in builder_prompts["builder-3"]
+    assert "comparison comparator-2" not in builder_prompts["builder-3"]
     assert [route for instance, route, _ in calls if instance.startswith("builder-")] == [
         "openai-codex/gpt-5.6-luna",
         "openai-codex/gpt-5.6-luna",

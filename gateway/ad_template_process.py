@@ -874,6 +874,11 @@ class SoleProcessOrchestrator:
         candidate: Dict[str, Any] = {}
         best_candidate: Mapping[str, Any] | None = revision_candidate
         best_score = previous_score if revision_candidate is not None else None
+        # Feedback must describe the same candidate that will be revised. If a
+        # visual iteration regresses, retain both the best candidate and its
+        # own comparison instead of pairing the best JSON with feedback about
+        # the rejected regression.
+        best_feedback = feedback
 
         def builder_route_identity(route: Mapping[str, str]) -> str:
             return f"{route.get('provider')}/{route.get('model')}"
@@ -1020,9 +1025,16 @@ class SoleProcessOrchestrator:
             }
             iterations.append(record)
             self.emit("iteration.compared", "compare", {"iteration": index, "score": score, "reason": reason, "decision": decision, "preview_names": [str(x.get("name")) for x in candidate.get("previews", []) if isinstance(x, dict)]})
+            current_feedback = json.dumps({
+                "source_match_score": evidence["rubric"]["feed_source_likeness"],
+                "differences": evidence["differences"],
+                "required_changes": evidence["required_changes"],
+                "reason": reason,
+            }, ensure_ascii=False)
             if best_score is None or score >= best_score:
                 best_candidate = candidate
                 best_score = score
+                best_feedback = current_feedback
             if _passes_quality_gate(evidence):
                 previous_score = score
                 break
@@ -1049,12 +1061,7 @@ class SoleProcessOrchestrator:
                     "reason": escalation_reason, "previous_score": previous_score, "score": score,
                 })
             previous_score = score
-            feedback = json.dumps({
-                "source_match_score": evidence["rubric"]["feed_source_likeness"],
-                "differences": evidence["differences"],
-                "required_changes": evidence["required_changes"],
-                "reason": reason,
-            }, ensure_ascii=False)
+            feedback = best_feedback
         if not iterations or iterations[-1]["decision"] != "accepted": raise AdTemplateProcessError("comparator never reached threshold")
         reviewers = []
         for n, route in enumerate(routes[2:4], 1):
