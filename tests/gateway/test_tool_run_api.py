@@ -195,7 +195,7 @@ class _ExplicitEventOrchestrator:
         self.call_agent(
             "builder-1",
             [{"type": "text", "text": "complete contract"}],
-            "openai-codex/gpt-5.6-luna",
+            "openai-codex/gpt-5.6-sol",
         )
         for kind, node in (
             ("stage.started", "build"),
@@ -442,7 +442,7 @@ def _one_second_candidates(_run, stage):
     routes = {
         "analyse": {
             "provider": "openai-codex",
-            "model": "gpt-5.6-luna",
+            "model": "gpt-5.6-sol",
         },
         "compare": {
             "provider": "openai-codex",
@@ -474,7 +474,7 @@ class _OneRoleOrchestrator:
         payload = self.call_agent(
             "builder-1",
             process.vision_message("inspect", [source]),
-            "openai-codex/gpt-5.6-luna",
+            "openai-codex/gpt-5.6-sol",
         )
         if self.should_stop():
             raise process.AdTemplateProcessError(

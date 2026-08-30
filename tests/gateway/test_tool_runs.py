@@ -87,7 +87,7 @@ def test_model_policy_revisions_are_immutable_and_run_pinned(tmp_path):
 def test_builtin_policy_uses_only_audited_native_vision_roles():
     policy = default_ad_template_policy()
     expected = {
-        "analyse": ("openai-codex", "gpt-5.6-luna"),
+        "analyse": ("openai-codex", "gpt-5.6-sol"),
         "compare": ("openai-codex", "gpt-5.6-luna"),
         "final-review-a": ("deepseek", "deepseek-v4-flash-vision-exp"),
         "final-review-b": ("openai-codex", "gpt-5.6-luna"),
@@ -150,36 +150,49 @@ def test_text_only_deepseek_routes_fail_closed_even_when_self_declared(model):
         validate_model_policy(policy)
 
 
-def test_stale_sole_revision_four_is_preserved_and_revision_five_selected(tmp_path):
-    path = tmp_path / "seed-v5.db"
+def test_stale_sole_revisions_one_to_five_are_preserved_and_revision_six_selected(tmp_path):
+    path = tmp_path / "seed-v6.db"
     store = ToolRunStore(str(path))
     stale = default_ad_template_policy()
-    stale["seed_revision"] = 4
-    stale["stages"]["analyse"]["primary"]["model"] = "deepseek-v4-flash"
+    stale["seed_revision"] = 5
+    stale["stages"]["analyse"]["primary"]["model"] = "gpt-5.6-luna"
     stale_json = json.dumps(stale, separators=(",", ":"), sort_keys=True)
     store._conn.execute(
-        "UPDATE tool_model_policies SET is_default=0 WHERE tool_id=?",
-        ("ad-template-generator",),
+        "UPDATE tool_model_policies SET is_default=0,policy_json=? WHERE tool_id=? AND revision=1",
+        (stale_json, "ad-template-generator"),
     )
-    for revision in (2, 3, 4):
+    for revision in (2, 3, 4, 5):
         store._conn.execute(
             "INSERT INTO tool_model_policies(tool_id,revision,project_id,created_at,is_default,policy_json) VALUES(?,?,?,?,?,?)",
-            ("ad-template-generator", revision, "", float(revision), int(revision == 4), stale_json),
+            ("ad-template-generator", revision, "", float(revision), int(revision == 5), stale_json),
         )
     store._conn.commit()
+    historical = store._conn.execute(
+        "SELECT revision,project_id,created_at,policy_json FROM tool_model_policies "
+        "WHERE tool_id=? AND revision<=5 ORDER BY revision",
+        ("ad-template-generator",),
+    ).fetchall()
+    historical = [tuple(row) for row in historical]
     store.close()
 
     migrated = ToolRunStore(str(path))
-    assert migrated.get_policy("ad-template-generator", 4)["policy"] == stale
+    preserved = migrated._conn.execute(
+        "SELECT revision,project_id,created_at,policy_json FROM tool_model_policies "
+        "WHERE tool_id=? AND revision<=5 ORDER BY revision",
+        ("ad-template-generator",),
+    ).fetchall()
+    assert [tuple(row) for row in preserved] == historical
+    assert migrated.get_policy("ad-template-generator", 5)["is_default"] is False
+    assert migrated.get_policy("ad-template-generator", 5)["policy"] == stale
     current = migrated.get_policy("ad-template-generator")
-    assert current["revision"] == 5
-    assert current["policy"]["seed_revision"] == 5
-    assert current["policy"]["stages"]["analyse"]["primary"]["model"] == "gpt-5.6-luna"
+    assert current["revision"] == 6
+    assert current["policy"]["seed_revision"] == 6
+    assert current["policy"]["stages"]["analyse"]["primary"]["model"] == "gpt-5.6-sol"
     with pytest.raises(ToolRunError, match="audited"):
         migrated.create_run(command(
             request_id="req-stale",
             idempotency_key="stale-policy-pin",
-            model_policy_revision=4,
+            model_policy_revision=5,
         ))
 
 

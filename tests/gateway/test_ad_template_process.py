@@ -425,7 +425,7 @@ def test_late_builder_return_cannot_render_or_import(tmp_path, monkeypatch):
             brief="",
             placements=["feed", "story"],
             routes=[
-                {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+                {"provider": "openai-codex", "model": "gpt-5.6-sol"},
                 {"provider": "openai-codex", "model": "gpt-5.6-luna"},
                 {"provider": "deepseek", "model": "deepseek-v4-flash-vision-exp"},
                 {"provider": "openai-codex", "model": "gpt-5.6-luna"},

@@ -40,13 +40,14 @@ _MASKED_EDIT_MODELS = frozenset({
     "gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2",
 })
 _KNOWN_IMAGE_ONLY = frozenset({"gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2"})
-_AD_TEMPLATE_POLICY_SEED_REVISION = 5
+_AD_TEMPLATE_POLICY_SEED_REVISION = 6
 _AUDITED_NATIVE_VISION_MODELS = frozenset({
     ("deepseek", "deepseek-v4-flash-vision-exp"),
     ("openai-codex", "gpt-5.6-luna"),
+    ("openai-codex", "gpt-5.6-sol"),
 })
 _AD_TEMPLATE_ROLE_MODELS = {
-    "analyse": ("openai-codex", "gpt-5.6-luna"),
+    "analyse": ("openai-codex", "gpt-5.6-sol"),
     "compare": ("openai-codex", "gpt-5.6-luna"),
     "final-review-a": ("deepseek", "deepseek-v4-flash-vision-exp"),
     "final-review-b": ("openai-codex", "gpt-5.6-luna"),
@@ -136,7 +137,7 @@ def default_ad_template_policy() -> Dict[str, Any]:
         "name": "Sole ad-template process", "preset": "cheap-quality",
         "seed_revision": _AD_TEMPLATE_POLICY_SEED_REVISION,
         "stages": {
-            "analyse": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-luna"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
+            "analyse": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-sol"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
             "compare": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-luna"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
             "final-review-a": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("deepseek", "deepseek-v4-flash-vision-exp"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
             "final-review-b": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-luna"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
