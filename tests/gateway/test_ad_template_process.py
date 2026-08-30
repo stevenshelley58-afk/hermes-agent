@@ -152,7 +152,10 @@ def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
     assert "overflowBehaviour must be exactly refuse, truncate, or scale_down" in builder
     assert 'fonts must always be a JSON list such as [{"file":"manrope-400.woff2"}' in builder
     assert "shape must be exactly one of rect, rounded, circle, line, pill, notched, wave, or ring" in builder
-    assert "Every image_slot and logo inputKey must be declared exactly once in imageInputs" in builder
+    assert "lineHeight is a unitless multiplier between 0.8 and 2.5" in builder
+    assert "Every icon layer must use exactly arrow, check, phone, mail, globe, or pin" in builder
+    assert "Every image_slot inputKey must be declared exactly once in imageInputs" in builder
+    assert "Do not emit a logo layer" in builder
     assert "Every text layer inputKey must be declared exactly once in textInputs" in builder
     assert 'Each realAssetRefs entry must contain exactly {"inputKey":"declaredKey"' in builder
     assert "Every layer assetKey, image defaultAssetKey, gallery sample assetKey" in builder
@@ -219,6 +222,12 @@ def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
     })
     with pytest.raises(AdTemplateProcessError, match=r"feedLayout\.layers\[1\]\.overflowBehaviour must be refuse, truncate, or scale_down"):
         process.validate_template_artifact(invalid_text)
+
+    invalid_line_height = json.loads(json.dumps(invalid_text))
+    invalid_line_height["feedLayout"]["layers"][1]["overflowBehaviour"] = "truncate"
+    invalid_line_height["feedLayout"]["layers"][1]["lineHeight"] = 29
+    with pytest.raises(AdTemplateProcessError, match=r"feedLayout\.layers\[1\]\.lineHeight=29 must be a unitless multiplier between 0\.8 and 2\.5"):
+        process.validate_template_artifact(invalid_line_height)
     invalid_vector = json.loads(json.dumps(template))
     invalid_vector["feedLayout"]["layers"].append({
         "type": "vector", "layerId": "feed-rule",
@@ -228,6 +237,15 @@ def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
     with pytest.raises(AdTemplateProcessError, match=r'feedLayout\.layers\[1\]\.shape="rectangle" must be one of rect, rounded'):
         process.validate_template_artifact(invalid_vector)
 
+    invalid_icon = json.loads(json.dumps(template))
+    invalid_icon["feedLayout"]["layers"].append({
+        "type": "icon", "layerId": "feed-phone",
+        "geometry": {"x": 10, "y": 10, "width": 40, "height": 40},
+        "icon": "fax", "colourRole": "mainText",
+    })
+    with pytest.raises(AdTemplateProcessError, match=r'feedLayout\.layers\[1\]\.icon="fax" must be one of arrow, check, phone, mail, globe, pin'):
+        process.validate_template_artifact(invalid_icon)
+
     invalid_logo = json.loads(json.dumps(template))
     invalid_logo["feedLayout"]["layers"].append({
         "type": "logo", "layerId": "feed-logo", "inputKey": "brandLogo",
@@ -235,6 +253,11 @@ def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
     })
     with pytest.raises(AdTemplateProcessError, match=r'feedLayout\.layers\[1\]\.inputKey="brandLogo" for logo is undeclared; declare it exactly once in imageInputs'):
         process.validate_template_artifact(invalid_logo)
+
+    blank_logo = json.loads(json.dumps(invalid_logo))
+    blank_logo["imageInputs"] = [{"key": "brandLogo", "label": "Brand logo", "acceptedTypes": ["image/png"]}]
+    with pytest.raises(AdTemplateProcessError, match=r'feedLayout\.layers\[1\]\.inputKey="brandLogo" for logo must reference an imageInput\.defaultAssetKey'):
+        process.validate_template_artifact(blank_logo)
 
     real_text_ref = json.loads(json.dumps(template))
     real_text_ref["textInputs"] = [{"key": "address", "label": "Address", "placeholder": "1 Example St", "maxLength": 120}]

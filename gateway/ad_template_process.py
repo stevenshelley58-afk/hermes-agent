@@ -124,6 +124,10 @@ METADATA_FIELDS = {
 }
 COLOUR_ROLES = {"background", "primary", "secondary", "accent", "mainText", "inverseText"}
 VECTOR_SHAPES = ("rect", "rounded", "circle", "line", "pill", "notched", "wave", "ring")
+LINE_HEIGHT_MIN = 0.8
+LINE_HEIGHT_MAX = 2.5
+SUPPORTED_ICONS = ("arrow", "check", "phone", "mail", "globe", "pin")
+VISIBLE_LOGO_ASSET_KEYS: frozenset[str] = frozenset()
 LAYER_FIELDS = {
     "plate": ({"type", "layerId", "colourRole", "geometry", "protected"}, {"assetKey"}),
     "image_slot": ({"type", "layerId", "inputKey", "geometry", "mask", "minSourceWidth", "minSourceHeight", "defaultCrop", "allowedPlacementOverrides"}, set()),
@@ -259,8 +263,12 @@ def _validate_layout(layout: Any, *, placement: str, width: int, height: int) ->
         if layer_type in {"overlay_patch", "vector"} and (not _number_value(layer["opacity"]) or not 0 <= layer["opacity"] <= 1):
             raise AdTemplateProcessError(f"{layer_type} opacity is invalid")
         if layer_type == "text":
-            if not _font(layer["font"]) or not _number_value(layer["fontSize"], positive=True) or not _number_value(layer["lineHeight"], positive=True) or not _number_value(layer["tracking"]) or not _positive_int(layer["maxCharacters"]) or not _positive_int(layer["maxLines"]):
+            if not _font(layer["font"]) or not _number_value(layer["fontSize"], positive=True) or not _number_value(layer["tracking"]) or not _positive_int(layer["maxCharacters"]) or not _positive_int(layer["maxLines"]):
                 raise AdTemplateProcessError("text layer sizing is invalid")
+            line_height = layer["lineHeight"]
+            if not _number_value(line_height) or not LINE_HEIGHT_MIN <= line_height <= LINE_HEIGHT_MAX:
+                offending = json.dumps(line_height, ensure_ascii=True)[:160]
+                raise AdTemplateProcessError(f"{layer_path}.lineHeight={offending} must be a unitless multiplier between 0.8 and 2.5 (normally 1.1 to 1.6), never pixels")
             if layer["alignment"] not in {"left", "center", "right"}:
                 raise AdTemplateProcessError(f"{layer_path}.alignment must be left, center, or right")
             if layer["overflowBehaviour"] not in {"refuse", "truncate", "scale_down"}:
@@ -269,6 +277,10 @@ def _validate_layout(layout: Any, *, placement: str, width: int, height: int) ->
             allowed = ", ".join(VECTOR_SHAPES)
             offending = json.dumps(layer["shape"], ensure_ascii=True)[:160]
             raise AdTemplateProcessError(f"{layer_path}.shape={offending} must be one of {allowed}")
+        if layer_type == "icon" and layer["icon"] not in SUPPORTED_ICONS:
+            allowed = ", ".join(SUPPORTED_ICONS)
+            offending = json.dumps(layer["icon"], ensure_ascii=True)[:160]
+            raise AdTemplateProcessError(f"{layer_path}.icon={offending} must be one of {allowed}")
 
 def validate_template_artifact(value: Any) -> Dict[str, Any]:
     if not isinstance(value, dict) or set(value) != TEMPLATE_FIELDS or value.get("schema") != "blockwise.ad-template":
@@ -323,6 +335,7 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
             raise AdTemplateProcessError(f"fonts[{font_index}].file must name one of the allowed bundled font files")
     font_files = {item["file"] for item in value["fonts"]}
     asset_keys = set(value["assets"])
+    image_inputs_by_key = {item["key"]: item for item in value["imageInputs"]}
     for item in value["imageInputs"]:
         if item.get("defaultAssetKey") and item["defaultAssetKey"] not in asset_keys:
             raise AdTemplateProcessError("image input default asset is undeclared")
@@ -336,6 +349,15 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
                     f"{layer_path}.inputKey={offending} for {layer['type']} is undeclared; "
                     f"declare it exactly once in imageInputs (declared: {allowed})"
                 )
+            if layer["type"] == "logo":
+                input_record = image_inputs_by_key.get(layer["inputKey"]) or {}
+                default_key = input_record.get("defaultAssetKey")
+                if not default_key or default_key not in VISIBLE_LOGO_ASSET_KEYS:
+                    offending = json.dumps(layer["inputKey"], ensure_ascii=True)[:160]
+                    raise AdTemplateProcessError(
+                        f"{layer_path}.inputKey={offending} for logo must reference an imageInput.defaultAssetKey "
+                        "from the visible source-free logo catalog; none is available, so use editable brand text plus a vector mark instead"
+                    )
             if layer["type"] == "text" and layer["inputKey"] not in text_keys:
                 offending = json.dumps(layer["inputKey"], ensure_ascii=True)[:160]
                 allowed = ", ".join(sorted(text_keys)) or "(none declared)"
@@ -673,11 +695,14 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
         'For every image_slot, mask must be exactly rounded_rect, circle, or none; defaultCrop must be exactly '
         '{"x":0,"y":0,"width":1,"height":1} for a full-source crop (not "cover"); allowedPlacementOverrides '
         'must be a JSON list containing only crop and/or position (not feed/story). For every text layer, alignment '
-        'must be exactly left, center, or right and overflowBehaviour must be exactly refuse, truncate, or scale_down (never ellipsis).'
+        'must be exactly left, center, or right and overflowBehaviour must be exactly refuse, truncate, or scale_down (never ellipsis). '
+        'lineHeight is a unitless multiplier between 0.8 and 2.5, normally 1.1 to 1.6; never supply lineHeight in pixels. '
         ' For every vector layer, shape must be exactly one of rect, rounded, circle, line, pill, notched, wave, or ring; '
-        'never use aliases such as rectangle or rounded_rect_stroke. Every image_slot and logo inputKey must be declared '
-        'exactly once in imageInputs. Every text layer inputKey must be declared exactly once in textInputs. imageInputs '
-        'and textInputs keys must be unique across both lists. Every text-layer font file must appear exactly once in fonts. '
+        'never use aliases such as rectangle or rounded_rect_stroke. Every icon layer must use exactly arrow, check, phone, mail, globe, or pin; '
+        'other icon names render as empty circles and are invalid. Every image_slot inputKey must be declared exactly once '
+        'in imageInputs. Do not emit a logo layer because the current source-free catalog has no visible logo default; recreate '
+        'every source logo/brand role as editable brand text plus a simple supported vector mark; declare that text input exactly once '
+        'in textInputs. Every text layer inputKey must be declared exactly once in textInputs. imageInputs and textInputs keys must be unique across both lists. Every text-layer font file must appear exactly once in fonts. '
         'Every layer assetKey, image defaultAssetKey, gallery sample assetKey, and replacementAssets assetKey must resolve '
         'to template.assets. Every replacementAssets inputKey must resolve to imageInputs. Every realAssetRefs inputKey may '
         'resolve to imageInputs or textInputs, and must name a declared key. '
