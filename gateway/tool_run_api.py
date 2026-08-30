@@ -458,7 +458,7 @@ class ToolRunAPIMixin:
                     call_agent=call_agent, workspace=workspace, run_id=run_id,
                     project_id=str((run.get("scope") or {}).get("project_id") or ""), emit=emit,
                     should_stop=should_stop,
-                ).run(source=source, brief=str(payload.get("brief") or ""), placements=payload.get("placements") or [], routes=routes)
+                ).run(source=source, brief=str(payload.get("brief") or ""), placements=payload.get("placements") or [], routes=routes, require_quality_route=True)
                 return result, usage
 
             result = usage = None

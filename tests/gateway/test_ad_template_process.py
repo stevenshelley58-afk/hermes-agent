@@ -683,3 +683,147 @@ def test_stop_during_schema_repair_prevents_render_import_and_rejection_write(tm
     assert renders == [] and imports == []
     assert [item[0] for item in events].count("candidate.rejected") == 1
     assert not (tmp_path / "run" / "iterations" / "01" / "rejected-candidate-02.json").exists()
+
+
+
+def _quality_routes():
+    return [
+        {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+        {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+        {"provider": "deepseek", "model": "deepseek-v4-flash-vision-exp"},
+        {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+        {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+    ]
+
+
+def test_builder_quality_escalation_ignores_steady_material_improvement(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    scores = iter([7.0, 7.5, 8.0, 9.6])
+    builder_calls, events, renders = [], [], []
+
+    def call_agent(instance, prompt, route):
+        if instance.startswith("builder-"):
+            builder_calls.append((instance, route, prompt[0]["text"]))
+            return valid_candidate(f"steady-{len(builder_calls)}")
+        if instance.startswith("comparator-"):
+            return evidence(next(scores), "Material improvement")
+        return evidence(9.7, "Independent final pass")
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: {"template_id": "tpl-steady", "status": "imported"})
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_steady",
+        project_id="blockwise", emit=lambda kind, node, data: events.append((kind, data)),
+    ).run(source=str(source), brief="", placements=["feed", "story"], routes=_quality_routes(), require_quality_route=True)
+
+    assert [route for _, route, _ in builder_calls] == ["openai-codex/gpt-5.6-luna"] * 4
+    assert not any(kind == "builder.escalated" for kind, _ in events)
+    assert result["builder_escalated"] is False
+    assert len(result["iterations"]) == 4
+    assert all(item["builder_route"]["model"] == "gpt-5.6-luna" for item in result["iterations"])
+
+
+@pytest.mark.parametrize(
+    ("scores", "event_iteration"),
+    [([8.0, 7.9, 9.6], 2), ([8.0, 8.2, 8.4, 9.6], 3)],
+)
+def test_builder_quality_escalates_on_regression_or_two_low_gains(tmp_path, monkeypatch, scores, event_iteration):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    score_iter = iter(scores)
+    builder_calls, events, renders = [], [], []
+
+    def call_agent(instance, prompt, route):
+        if instance.startswith("builder-"):
+            builder_calls.append((instance, route, prompt[0]["text"]))
+            return valid_candidate(f"candidate-{instance}")
+        if instance.startswith("comparator-"):
+            return evidence(next(score_iter), f"comparison {instance}")
+        return evidence(9.7, "Independent final pass")
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: {"template_id": "tpl-escalated", "status": "imported"})
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_escalate",
+        project_id="blockwise", emit=lambda kind, node, data: events.append((kind, data)),
+    ).run(source=str(source), brief="", placements=["feed", "story"], routes=_quality_routes(), require_quality_route=True)
+
+    escalations = [data for kind, data in events if kind == "builder.escalated"]
+    assert len(escalations) == 1
+    assert escalations[0] == {
+        "iteration": event_iteration,
+        "from_provider": "openai-codex", "from_model": "gpt-5.6-luna",
+        "to_provider": "openai-codex", "to_model": "gpt-5.6-sol",
+        "reason": "regression" if event_iteration == 2 else "insufficient_improvement",
+        "previous_score": scores[event_iteration - 2], "score": scores[event_iteration - 1],
+    }
+    assert [route for _, route, _ in builder_calls[:event_iteration]] == ["openai-codex/gpt-5.6-luna"] * event_iteration
+    assert [route for _, route, _ in builder_calls[event_iteration:]] == ["openai-codex/gpt-5.6-sol"] * (len(builder_calls) - event_iteration)
+    assert result["builder_escalated"] is True
+    assert result["builder_route"]["model"] == "gpt-5.6-sol"
+    assert len(result["iterations"]) == len(scores)
+
+
+def test_builder_quality_escalation_is_sticky_through_repairs_and_final_review_revision(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    scores = iter([8.0, 7.9, 9.6, 9.6])
+    builder_calls, events, renders = [], [], []
+    final_calls = {"count": 0}
+
+    invalid_quality = valid_candidate("quality-invalid")
+    invalid_quality["template"]["storyLayout"]["safeZones"] = [{"x": 0, "y": 0, "width": 1080, "height": 1921}]
+
+    def call_agent(instance, prompt, route):
+        if instance.startswith("builder-"):
+            builder_calls.append((instance, route, prompt[0]["text"]))
+            if instance == "builder-3":
+                return invalid_quality
+            return valid_candidate(f"candidate-{instance}")
+        if instance.startswith("comparator-"):
+            return evidence(next(scores), f"comparison {instance}")
+        final_calls["count"] += 1
+        if final_calls["count"] == 1:
+            return evidence(9.0, "Final spacing needs revision")
+        return evidence(9.7, "Independent final pass")
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: {"template_id": "tpl-sticky", "status": "imported"})
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_sticky",
+        project_id="blockwise", emit=lambda kind, node, data: events.append((kind, data)),
+    ).run(source=str(source), brief="", placements=["feed", "story"], routes=_quality_routes(), require_quality_route=True)
+
+    assert [instance for instance, _, _ in builder_calls] == [
+        "builder-1", "builder-2", "builder-3", "builder-3-repair-1", "builder-4",
+    ]
+    assert [route for _, route, _ in builder_calls] == [
+        "openai-codex/gpt-5.6-luna", "openai-codex/gpt-5.6-luna",
+        "openai-codex/gpt-5.6-sol", "openai-codex/gpt-5.6-sol", "openai-codex/gpt-5.6-sol",
+    ]
+    assert len([1 for kind, _ in events if kind == "builder.escalated"]) == 1
+    assert len(result["iterations"]) == 4
+    assert [item["iteration"] for item in result["iterations"]] == [1, 2, 3, 4]
+    assert result["iterations"][2]["final_review_failed"] is True
+    assert result["iterations"][3]["builder_escalated"] is True
+    builder_four_prompt = next(prompt for instance, _, prompt in builder_calls if instance == "builder-4")
+    assert '"templateId":"candidate-builder-3-repair-1"' in builder_four_prompt
+    assert "Final spacing needs revision" in builder_four_prompt
+    assert result["builder_route"]["model"] == "gpt-5.6-sol"
+
+
+def test_required_quality_route_fails_before_any_builder_call(tmp_path):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    calls = []
+    orchestrator = SoleProcessOrchestrator(
+        call_agent=lambda *args: calls.append(args), workspace=tmp_path / "run",
+        run_id="trun_missing_quality", project_id="blockwise", emit=lambda *_args: None,
+    )
+    with pytest.raises(AdTemplateProcessError, match="requires a configured quality route"):
+        orchestrator.run(
+            source=str(source), brief="", placements=["feed", "story"],
+            routes=_quality_routes()[:4], require_quality_route=True,
+        )
+    assert calls == []

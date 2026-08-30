@@ -9,6 +9,7 @@ THRESHOLD = 9.5
 MAX_SCHEMA_REPAIRS_PER_ITERATION = 3
 STAGES = ("source", "build", "render", "compare", "final-check", "live")
 MAX_CANDIDATE_CONTEXT_CHARS = 100_000
+MIN_MATERIAL_SCORE_GAIN = 0.5
 
 class AdTemplateProcessError(ValueError):
     pass
@@ -767,12 +768,24 @@ class SoleProcessOrchestrator:
         if self.should_stop():
             raise AdTemplateProcessError("sole ad-template process was cancelled")
 
-    def run(self, *, source: str, brief: str, placements: Any, routes: List[Dict[str, str]], review_round: int = 0, total_iterations: int = 0, feedback: str = "", history: List[Dict[str, Any]] | None = None, revision_candidate: Mapping[str, Any] | None = None) -> Dict[str, Any]:
+    def run(self, *, source: str, brief: str, placements: Any, routes: List[Dict[str, str]], review_round: int = 0, total_iterations: int = 0, feedback: str = "", history: List[Dict[str, Any]] | None = None, revision_candidate: Mapping[str, Any] | None = None, selected_builder_route: Mapping[str, str] | None = None, builder_escalated: bool = False, previous_score: float | None = None, low_gain_streak: int = 0, require_quality_route: bool = False) -> Dict[str, Any]:
         if len(routes) < 4: raise AdTemplateProcessError("builder, comparator, and two final reviewers require four configured roles")
+        quality_route = routes[4] if len(routes) > 4 else None
+        if require_quality_route and quality_route is None:
+            raise AdTemplateProcessError("automatic builder quality escalation requires a configured quality route")
+        builder_route = dict(selected_builder_route or (quality_route if builder_escalated and quality_route else routes[0]))
+        for label, route in (("builder", builder_route), ("quality", quality_route)):
+            if route is None:
+                continue
+            if not str(route.get("provider") or "").strip() or not str(route.get("model") or "").strip():
+                raise AdTemplateProcessError(f"{label} builder route is invalid")
         self._check_stop()
         history = list(history or [])
         iterations = []
         candidate: Dict[str, Any] = {}
+
+        def builder_route_identity(route: Mapping[str, str]) -> str:
+            return f"{route.get('provider')}/{route.get('model')}"
         for offset in range(31 - total_iterations - 1):
             index = total_iterations + offset + 1
             iteration_prior = revision_candidate if offset == 0 else candidate
@@ -793,7 +806,7 @@ class SoleProcessOrchestrator:
                         prior_candidate=iteration_prior if repair_attempt == 0 else None,
                         rejected_candidate=rejected_candidate if repair_attempt > 0 else None,
                     ), [source]),
-                    f"{routes[0].get('provider')}/{routes[0].get('model')}",
+                    builder_route_identity(builder_route),
                 )
                 self._check_stop()
                 try:
@@ -847,10 +860,42 @@ class SoleProcessOrchestrator:
             evidence = _assessment(comparison, "comparator")
             score, reason = evidence["score"], evidence["reason"]
             decision = "accepted" if score >= THRESHOLD else "revise"
-            record = {"iteration": index, "candidate": _candidate_trace_projection(candidate), "comparison": evidence, "decision": decision}
+            record = {
+                "iteration": index,
+                "candidate": _candidate_trace_projection(candidate),
+                "comparison": evidence,
+                "decision": decision,
+                "builder_route": {"provider": builder_route["provider"], "model": builder_route["model"]},
+                "builder_escalated": builder_escalated,
+            }
             iterations.append(record)
             self.emit("iteration.compared", "compare", {"iteration": index, "score": score, "reason": reason, "decision": decision, "preview_names": [str(x.get("name")) for x in candidate.get("previews", []) if isinstance(x, dict)]})
-            if score >= THRESHOLD: break
+            if score >= THRESHOLD:
+                previous_score = score
+                break
+
+            escalation_reason = ""
+            if not builder_escalated and quality_route is not None and previous_score is not None:
+                gain = score - previous_score
+                if score < previous_score:
+                    escalation_reason = "regression"
+                elif gain < MIN_MATERIAL_SCORE_GAIN:
+                    low_gain_streak += 1
+                    if low_gain_streak >= 2:
+                        escalation_reason = "insufficient_improvement"
+                else:
+                    low_gain_streak = 0
+            if escalation_reason:
+                prior_route = builder_route
+                builder_route = dict(quality_route or {})
+                builder_escalated = True
+                self.emit("builder.escalated", "build", {
+                    "iteration": index,
+                    "from_provider": prior_route["provider"], "from_model": prior_route["model"],
+                    "to_provider": builder_route["provider"], "to_model": builder_route["model"],
+                    "reason": escalation_reason, "previous_score": previous_score, "score": score,
+                })
+            previous_score = score
             feedback = reason
         if not iterations or iterations[-1]["decision"] != "accepted": raise AdTemplateProcessError("comparator never reached threshold")
         reviewers = []
@@ -872,7 +917,14 @@ class SoleProcessOrchestrator:
                 raise AdTemplateProcessError("final reviewers failed after the bounded automatic revision loop")
             iterations[-1]["final_review_failed"] = True
             reasons = "; ".join(f"{item['id']}: {item['reason']}" for item in final_review["reviewers"])
-            return self.run(source=source, brief=brief, placements=placements, routes=routes, review_round=review_round + 1, total_iterations=total_iterations + len(iterations), feedback=reasons, history=history + iterations, revision_candidate=candidate)
+            return self.run(
+                source=source, brief=brief, placements=placements, routes=routes,
+                review_round=review_round + 1, total_iterations=total_iterations + len(iterations),
+                feedback=reasons, history=history + iterations, revision_candidate=candidate,
+                selected_builder_route=builder_route, builder_escalated=builder_escalated,
+                previous_score=previous_score, low_gain_streak=low_gain_streak,
+                require_quality_route=require_quality_route,
+            )
         self.emit("final-review.completed", "final-check", {"decision": "accepted", "reviewers": final_review["reviewers"]})
         generated = candidate
         documents = deterministic_documents(generated.get("template"))
@@ -881,4 +933,4 @@ class SoleProcessOrchestrator:
         imported = import_template({**generated, "documents": documents}, run_id=self.run_id, project_id=self.project_id)
         self._check_stop()
         self.emit("template.imported", "live", imported)
-        return {"template": generated.get("template") or candidate.get("template"), "iterations": history + iterations, "final_review": final_review, "previews": generated.get("previews"), "documents": documents, "template_path": generated.get("template_path"), "render_path": generated.get("render_path") or generated.get("render", {}).get("feed"), "import": imported, "process": "only-ad-template-process"}
+        return {"template": generated.get("template") or candidate.get("template"), "iterations": history + iterations, "final_review": final_review, "previews": generated.get("previews"), "documents": documents, "template_path": generated.get("template_path"), "render_path": generated.get("render_path") or generated.get("render", {}).get("feed"), "import": imported, "process": "only-ad-template-process", "builder_escalated": builder_escalated, "builder_route": {"provider": builder_route["provider"], "model": builder_route["model"]}}
