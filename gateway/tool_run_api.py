@@ -25,6 +25,7 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
 from gateway.ad_template_process import SoleProcessOrchestrator, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
 from gateway.tool_runs import (
+    AD_TEMPLATE_ROUTE_ORDER,
     TOOL_MODEL_POLICY_SCHEMA,
     ToolRunError,
     validate_generation_records,
@@ -81,6 +82,7 @@ class ToolRunAPIMixin:
             "iteration.rendered": "render",
             "iteration.compared": "compare",
             "iteration.revised": "build",
+            "builder.escalated": "build",
             "final-review.started": "final-check",
             "final-review.completed": "final-check",
             "template.imported": "live",
@@ -423,7 +425,7 @@ class ToolRunAPIMixin:
                         if not active:
                             self._tool_run_agents.pop(run_id, None)
                 routes = []
-                for role in ("analyse", "compare", "final-review-a", "final-review-b"):
+                for role in AD_TEMPLATE_ROUTE_ORDER:
                     stage_candidates, _ = self._tool_candidates(run, role)
                     if not stage_candidates:
                         raise RuntimeError(f"No route configured for {role}")

@@ -189,24 +189,44 @@ class _ExplicitEventOrchestrator:
         self.call_agent = call_agent
         self.emit = emit
 
-    def run(self, **_kwargs):
+    def run(self, *, routes, **_kwargs):
+        assert [
+            (route["provider"], route["model"])
+            for route in routes
+        ] == [
+            ("openai-codex", "gpt-5.6-luna"),
+            ("openai-codex", "gpt-5.6-luna"),
+            ("deepseek", "deepseek-v4-flash-vision-exp"),
+            ("openai-codex", "gpt-5.6-luna"),
+            ("openai-codex", "gpt-5.6-sol"),
+        ]
         # A generic role activity preview happens before any orchestrator
         # lifecycle evidence. It must remain ordinary source-stage activity.
         self.call_agent(
             "builder-1",
             [{"type": "text", "text": "complete contract"}],
-            "openai-codex/gpt-5.6-sol",
+            "openai-codex/gpt-5.6-luna",
         )
-        for kind, node in (
-            ("stage.started", "build"),
-            ("iteration.started", "build"),
-            ("iteration.rendered", "render"),
-            ("iteration.compared", "compare"),
-            ("final-review.started", "final-check"),
-            ("final-review.completed", "final-check"),
-            ("template.imported", "live"),
+        for kind, node, data in (
+            ("stage.started", "build", {}),
+            ("iteration.started", "build", {}),
+            ("iteration.rendered", "render", {}),
+            ("iteration.compared", "compare", {}),
+            ("builder.escalated", "build", {
+                "iteration": 2,
+                "from_provider": "openai-codex",
+                "from_model": "gpt-5.6-luna",
+                "to_provider": "openai-codex",
+                "to_model": "gpt-5.6-sol",
+                "reason": "insufficient_improvement",
+                "previous_score": 8.2,
+                "score": 8.3,
+            }),
+            ("final-review.started", "final-check", {}),
+            ("final-review.completed", "final-check", {}),
+            ("template.imported", "live", {}),
         ):
-            self.emit(kind, node, {})
+            self.emit(kind, node, data)
         return {
             "template": {},
             "iterations": [],
@@ -238,7 +258,20 @@ async def test_generic_terminal_preview_never_advances_or_emits_stage(tmp_path, 
     events = store.events(run["run_id"])
     assert [
         event["node_id"] for event in events if event["kind"] == "stage.started"
-    ] == ["source", "build", "render", "compare", "final-check", "live"]
+    ] == ["source", "build", "render", "compare", "build", "final-check", "live"]
+    escalation = next(event for event in events if event["kind"] == "builder.escalated")
+    assert escalation["node_id"] == "build"
+    assert escalation["status"] == "running"
+    assert escalation["data"] == {
+        "iteration": 2,
+        "from_provider": "openai-codex",
+        "from_model": "gpt-5.6-luna",
+        "to_provider": "openai-codex",
+        "to_model": "gpt-5.6-sol",
+        "reason": "insufficient_improvement",
+        "previous_score": 8.2,
+        "score": 8.3,
+    }
     terminal_event = next(event for event in events if event["kind"] == "tool.started")
     assert terminal_event["node_id"] == "source"
     completed = store.get_run(run["run_id"])
@@ -442,7 +475,7 @@ def _one_second_candidates(_run, stage):
     routes = {
         "analyse": {
             "provider": "openai-codex",
-            "model": "gpt-5.6-sol",
+            "model": "gpt-5.6-luna",
         },
         "compare": {
             "provider": "openai-codex",
@@ -455,6 +488,10 @@ def _one_second_candidates(_run, stage):
         "final-review-b": {
             "provider": "openai-codex",
             "model": "gpt-5.6-luna",
+        },
+        "quality-escalation": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
         },
     }
     return [routes[stage]], {
@@ -474,7 +511,7 @@ class _OneRoleOrchestrator:
         payload = self.call_agent(
             "builder-1",
             process.vision_message("inspect", [source]),
-            "openai-codex/gpt-5.6-sol",
+            "openai-codex/gpt-5.6-luna",
         )
         if self.should_stop():
             raise process.AdTemplateProcessError(

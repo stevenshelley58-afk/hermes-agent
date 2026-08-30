@@ -40,17 +40,25 @@ _MASKED_EDIT_MODELS = frozenset({
     "gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2",
 })
 _KNOWN_IMAGE_ONLY = frozenset({"gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2"})
-_AD_TEMPLATE_POLICY_SEED_REVISION = 6
+_AD_TEMPLATE_POLICY_SEED_REVISION = 7
+AD_TEMPLATE_ROUTE_ORDER = (
+    "analyse",
+    "compare",
+    "final-review-a",
+    "final-review-b",
+    "quality-escalation",
+)
 _AUDITED_NATIVE_VISION_MODELS = frozenset({
     ("deepseek", "deepseek-v4-flash-vision-exp"),
     ("openai-codex", "gpt-5.6-luna"),
     ("openai-codex", "gpt-5.6-sol"),
 })
 _AD_TEMPLATE_ROLE_MODELS = {
-    "analyse": ("openai-codex", "gpt-5.6-sol"),
+    "analyse": ("openai-codex", "gpt-5.6-luna"),
     "compare": ("openai-codex", "gpt-5.6-luna"),
     "final-review-a": ("deepseek", "deepseek-v4-flash-vision-exp"),
     "final-review-b": ("openai-codex", "gpt-5.6-luna"),
+    "quality-escalation": ("openai-codex", "gpt-5.6-sol"),
 }
 _GENERATION_EVENT_KINDS = frozenset({
     "generation.started", "generation.rendered", "generation.scored",
@@ -137,10 +145,11 @@ def default_ad_template_policy() -> Dict[str, Any]:
         "name": "Sole ad-template process", "preset": "cheap-quality",
         "seed_revision": _AD_TEMPLATE_POLICY_SEED_REVISION,
         "stages": {
-            "analyse": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-sol"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
+            "analyse": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-luna"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
             "compare": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-luna"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
             "final-review-a": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("deepseek", "deepseek-v4-flash-vision-exp"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
             "final-review-b": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-luna"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
+            "quality-escalation": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-sol"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
         },
         "deterministic_stages": ["qa", "import"],
     }
@@ -206,9 +215,9 @@ def validate_model_policy(policy: Any, *, tool_id: Optional[str] = None) -> Dict
             if value is not None and (not isinstance(value, (int, float)) or value < 0):
                 raise ToolRunError(f"model policy stage {stage_id}.{numeric} is invalid")
     if policy_tool == "ad-template-generator":
-        if set(stages) != set(_AD_TEMPLATE_ROLE_MODELS):
+        if set(stages) != set(AD_TEMPLATE_ROUTE_ORDER):
             raise ToolRunError(
-                "ad-template policy requires exactly the four audited vision roles"
+                "ad-template policy requires exactly the five audited vision roles"
             )
         for stage_id, expected_route in _AD_TEMPLATE_ROLE_MODELS.items():
             stage = stages[stage_id]

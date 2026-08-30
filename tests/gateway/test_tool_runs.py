@@ -4,6 +4,7 @@ import sqlite3
 import pytest
 
 from gateway.tool_runs import (
+    AD_TEMPLATE_ROUTE_ORDER,
     TOOL_MODEL_POLICY_SCHEMA,
     TOOL_RUN_COMMAND_SCHEMA,
     ToolRunError,
@@ -87,11 +88,13 @@ def test_model_policy_revisions_are_immutable_and_run_pinned(tmp_path):
 def test_builtin_policy_uses_only_audited_native_vision_roles():
     policy = default_ad_template_policy()
     expected = {
-        "analyse": ("openai-codex", "gpt-5.6-sol"),
+        "analyse": ("openai-codex", "gpt-5.6-luna"),
         "compare": ("openai-codex", "gpt-5.6-luna"),
         "final-review-a": ("deepseek", "deepseek-v4-flash-vision-exp"),
         "final-review-b": ("openai-codex", "gpt-5.6-luna"),
+        "quality-escalation": ("openai-codex", "gpt-5.6-sol"),
     }
+    assert AD_TEMPLATE_ROUTE_ORDER == tuple(expected)
     for stage_id, route in expected.items():
         stage = policy["stages"][stage_id]
         candidate = stage["primary"]
@@ -108,7 +111,7 @@ def test_builtin_policy_uses_only_audited_native_vision_roles():
 def test_ad_template_policy_contract_rejects_missing_swapped_or_fallback_roles():
     missing = default_ad_template_policy()
     missing["stages"].pop("compare")
-    with pytest.raises(ToolRunError, match="exactly the four audited vision roles"):
+    with pytest.raises(ToolRunError, match="exactly the five audited vision roles"):
         validate_model_policy(missing)
 
     wrong_capability = default_ad_template_policy()
@@ -150,26 +153,27 @@ def test_text_only_deepseek_routes_fail_closed_even_when_self_declared(model):
         validate_model_policy(policy)
 
 
-def test_stale_sole_revisions_one_to_five_are_preserved_and_revision_six_selected(tmp_path):
-    path = tmp_path / "seed-v6.db"
+def test_stale_sole_revisions_one_to_six_are_preserved_and_revision_seven_selected(tmp_path):
+    path = tmp_path / "seed-v7.db"
     store = ToolRunStore(str(path))
     stale = default_ad_template_policy()
-    stale["seed_revision"] = 5
-    stale["stages"]["analyse"]["primary"]["model"] = "gpt-5.6-luna"
+    stale["seed_revision"] = 6
+    stale["stages"].pop("quality-escalation")
+    stale["stages"]["analyse"]["primary"]["model"] = "gpt-5.6-sol"
     stale_json = json.dumps(stale, separators=(",", ":"), sort_keys=True)
     store._conn.execute(
         "UPDATE tool_model_policies SET is_default=0,policy_json=? WHERE tool_id=? AND revision=1",
         (stale_json, "ad-template-generator"),
     )
-    for revision in (2, 3, 4, 5):
+    for revision in (2, 3, 4, 5, 6):
         store._conn.execute(
             "INSERT INTO tool_model_policies(tool_id,revision,project_id,created_at,is_default,policy_json) VALUES(?,?,?,?,?,?)",
-            ("ad-template-generator", revision, "", float(revision), int(revision == 5), stale_json),
+            ("ad-template-generator", revision, "", float(revision), int(revision == 6), stale_json),
         )
     store._conn.commit()
     historical = store._conn.execute(
         "SELECT revision,project_id,created_at,policy_json FROM tool_model_policies "
-        "WHERE tool_id=? AND revision<=5 ORDER BY revision",
+        "WHERE tool_id=? AND revision<=6 ORDER BY revision",
         ("ad-template-generator",),
     ).fetchall()
     historical = [tuple(row) for row in historical]
@@ -178,21 +182,22 @@ def test_stale_sole_revisions_one_to_five_are_preserved_and_revision_six_selecte
     migrated = ToolRunStore(str(path))
     preserved = migrated._conn.execute(
         "SELECT revision,project_id,created_at,policy_json FROM tool_model_policies "
-        "WHERE tool_id=? AND revision<=5 ORDER BY revision",
+        "WHERE tool_id=? AND revision<=6 ORDER BY revision",
         ("ad-template-generator",),
     ).fetchall()
     assert [tuple(row) for row in preserved] == historical
-    assert migrated.get_policy("ad-template-generator", 5)["is_default"] is False
-    assert migrated.get_policy("ad-template-generator", 5)["policy"] == stale
+    assert migrated.get_policy("ad-template-generator", 6)["is_default"] is False
+    assert migrated.get_policy("ad-template-generator", 6)["policy"] == stale
     current = migrated.get_policy("ad-template-generator")
-    assert current["revision"] == 6
-    assert current["policy"]["seed_revision"] == 6
-    assert current["policy"]["stages"]["analyse"]["primary"]["model"] == "gpt-5.6-sol"
+    assert current["revision"] == 7
+    assert current["policy"]["seed_revision"] == 7
+    assert current["policy"]["stages"]["analyse"]["primary"]["model"] == "gpt-5.6-luna"
+    assert current["policy"]["stages"]["quality-escalation"]["primary"]["model"] == "gpt-5.6-sol"
     with pytest.raises(ToolRunError, match="audited"):
         migrated.create_run(command(
             request_id="req-stale",
             idempotency_key="stale-policy-pin",
-            model_policy_revision=5,
+            model_policy_revision=6,
         ))
 
 
