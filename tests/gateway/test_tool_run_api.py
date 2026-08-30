@@ -195,7 +195,7 @@ class _ExplicitEventOrchestrator:
         self.call_agent(
             "builder-1",
             [{"type": "text", "text": "complete contract"}],
-            "deepseek/deepseek-v4-flash-vision-exp",
+            "openai-codex/gpt-5.6-luna",
         )
         for kind, node in (
             ("stage.started", "build"),
@@ -441,8 +441,8 @@ async def test_disconnect_stops_active_tool_role_with_current_interrupt_contract
 def _one_second_candidates(_run, stage):
     routes = {
         "analyse": {
-            "provider": "deepseek",
-            "model": "deepseek-v4-flash-vision-exp",
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
         },
         "compare": {
             "provider": "openai-codex",
@@ -474,7 +474,7 @@ class _OneRoleOrchestrator:
         payload = self.call_agent(
             "builder-1",
             process.vision_message("inspect", [source]),
-            "deepseek/deepseek-v4-flash-vision-exp",
+            "openai-codex/gpt-5.6-luna",
         )
         if self.should_stop():
             raise process.AdTemplateProcessError(
