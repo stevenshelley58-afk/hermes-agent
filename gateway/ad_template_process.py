@@ -423,24 +423,34 @@ def vision_message(text: str, paths: List[str]) -> List[Dict[str, Any]]:
 
 class SoleProcessOrchestrator:
     """Runs builder, comparator, final reviewers, renderer, and importer as separate roles."""
-    def __init__(self, *, call_agent: Callable[[str, Any, str], Dict[str, Any]], workspace: Path, run_id: str, project_id: str, emit: Callable[[str, str, Dict[str, Any]], None]):
+    def __init__(self, *, call_agent: Callable[[str, Any, str], Dict[str, Any]], workspace: Path, run_id: str, project_id: str, emit: Callable[[str, str, Dict[str, Any]], None], should_stop: Callable[[], bool] | None = None):
         self.call_agent, self.workspace, self.run_id, self.project_id, self.emit = call_agent, workspace, run_id, project_id, emit
+        self.should_stop = should_stop or (lambda: False)
+
+    def _check_stop(self) -> None:
+        if self.should_stop():
+            raise AdTemplateProcessError("sole ad-template process was cancelled")
 
     def run(self, *, source: str, brief: str, placements: Any, routes: List[Dict[str, str]], review_round: int = 0, total_iterations: int = 0, feedback: str = "", history: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
         if len(routes) < 4: raise AdTemplateProcessError("builder, comparator, and two final reviewers require four configured roles")
+        self._check_stop()
         history = list(history or [])
         iterations = []
         candidate: Dict[str, Any] = {}
         for offset in range(31 - total_iterations - 1):
             index = total_iterations + offset + 1
             self.emit("stage.started", "build", {"iteration": index, "role": "builder"})
+            self._check_stop()
             candidate = self.call_agent("builder-%d" % index, vision_message(generator_prompt(run_id=self.run_id, project_id=self.project_id, brief=brief, placements=placements, source=source, feedback=feedback), [source]), f"{routes[0].get('provider')}/{routes[0].get('model')}")
+            self._check_stop()
             if not isinstance(candidate, dict): raise AdTemplateProcessError("builder returned invalid candidate")
             self.emit("iteration.started", "build", {"iteration": index, "role": "builder"})
             # Render every candidate before comparison. This makes each
             # iteration preview a real generator artifact, not an agent claim.
             iteration_workspace = self.workspace / "iterations" / f"{index:02d}"
+            self._check_stop()
             rendered = run_generator_cli(candidate, iteration_workspace)
+            self._check_stop()
             preview_receipt = validate_artifacts(rendered, iteration_workspace)
             public_preview_root = self.workspace / "previews"
             public_preview_root.mkdir(parents=True, exist_ok=True)
@@ -459,7 +469,9 @@ class SoleProcessOrchestrator:
             validate_artifacts(rendered, self.workspace)
             self.emit("iteration.rendered", "render", {"iteration": index, "previews": [{"name": str(x.get("name") or ""), "placement": str(x.get("placement") or "")} for x in public_previews]})
             candidate = {**candidate, **rendered}
+            self._check_stop()
             comparison = self.call_agent("comparator-%d" % index, vision_message(review_prompt(final=False), [source, str((rendered.get("render") or {}).get("feed") or ""), str((rendered.get("render") or {}).get("story") or "")]), f"{routes[1].get('provider')}/{routes[1].get('model')}")
+            self._check_stop()
             evidence = _assessment(comparison, "comparator")
             score, reason = evidence["score"], evidence["reason"]
             decision = "accepted" if score >= THRESHOLD else "revise"
@@ -473,9 +485,11 @@ class SoleProcessOrchestrator:
         for n, route in enumerate(routes[2:4], 1):
             identity = f"final-reviewer-{self.run_id}-{n}-{uuid.uuid4().hex[:8]}"
             provider_route = f"{route.get('provider')}/{route.get('model')}"
-            route_identity = f"final-review-{n}:{provider_route}"
+            route_identity = provider_route
             self.emit("final-review.started", "final-check", {"reviewer": identity, "route": route_identity})
+            self._check_stop()
             review = self.call_agent(identity, vision_message(review_prompt(final=True), [source, str((candidate.get("render") or {}).get("feed") or ""), str((candidate.get("render") or {}).get("story") or "")]), provider_route)
+            self._check_stop()
             if not isinstance(review, dict): raise AdTemplateProcessError("final reviewer returned invalid result")
             evidence = _assessment(review, "final reviewer")
             reviewers.append({"id": identity, "route": route_identity, **evidence})
@@ -491,6 +505,8 @@ class SoleProcessOrchestrator:
         generated = candidate
         documents = deterministic_documents(generated.get("template"))
         validate_artifacts(generated, self.workspace)
+        self._check_stop()
         imported = import_template({**generated, "documents": documents}, run_id=self.run_id, project_id=self.project_id)
+        self._check_stop()
         self.emit("template.imported", "live", imported)
         return {"template": generated.get("template") or candidate.get("template"), "iterations": history + iterations, "final_review": final_review, "previews": generated.get("previews"), "documents": documents, "template_path": generated.get("template_path"), "render_path": generated.get("render_path") or generated.get("render", {}).get("feed"), "import": imported, "process": "only-ad-template-process"}

@@ -155,6 +155,9 @@ def test_orchestrator_calls_real_roles_and_persists_receipts(tmp_path, monkeypat
     assert len([item for item in events if item[0] == "iteration.compared"]) == 1
     completed = [item for item in events if item[0] == "final-review.completed"]
     assert len(completed) == 1 and len(completed[0][1]["reviewers"]) == 2
+    assert [
+        item["route"] for item in result["final_review"]["reviewers"]
+    ] == ["review-a/cheap-c", "review-b/cheap-d"]
     assert result["import"] == {"template_id": "tpl_real", "status": "imported"}
     assert all(Path(item["path"]).is_file() for item in result["previews"])
     dimensions = {}
@@ -224,3 +227,53 @@ def test_blockwise_import_host_rejects_header_injection(monkeypatch):
     monkeypatch.setenv("BLOCKWISE_INTERNAL_AUTH_SECRET", "secret")
     with pytest.raises(AdTemplateProcessError):
         process.import_template({"template": {}, "assets": []}, run_id="run", project_id="blockwise")
+
+
+def test_late_builder_return_cannot_render_or_import(tmp_path, monkeypatch):
+    """A cooperative stop observed after a role returns gates all side effects."""
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    stopped = {"value": False}
+    rendered = []
+    imported = []
+
+    def call_agent(instance, prompt, route):
+        assert instance == "builder-1"
+        assert prompt[1]["image_url"]["url"].startswith("data:image/png;base64,")
+        stopped["value"] = True
+        return {"template": {}, "assets": []}
+
+    monkeypatch.setattr(
+        process,
+        "run_generator_cli",
+        lambda candidate, workspace: rendered.append((candidate, workspace)),
+    )
+    monkeypatch.setattr(
+        process,
+        "import_template",
+        lambda output, run_id, project_id: imported.append(output),
+    )
+
+    orchestrator = SoleProcessOrchestrator(
+        call_agent=call_agent,
+        workspace=tmp_path / "run",
+        run_id="trun_cancelled",
+        project_id="blockwise",
+        emit=lambda *_args: None,
+        should_stop=lambda: stopped["value"],
+    )
+    with pytest.raises(AdTemplateProcessError, match="cancelled"):
+        orchestrator.run(
+            source=str(source),
+            brief="",
+            placements=["feed", "story"],
+            routes=[
+                {"provider": "deepseek", "model": "deepseek-v4-flash-vision-exp"},
+                {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+                {"provider": "deepseek", "model": "deepseek-v4-flash-vision-exp"},
+                {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+            ],
+        )
+
+    assert rendered == []
+    assert imported == []

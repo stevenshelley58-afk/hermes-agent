@@ -1,4 +1,6 @@
+import asyncio
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,7 +10,11 @@ import gateway.ad_template_process as process
 import gateway.tool_run_api as tool_run_api
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.tool_run_api import ToolRunAPIMixin
-from gateway.tool_runs import TOOL_RUN_COMMAND_SCHEMA, ToolRunStore
+from gateway.tool_runs import (
+    TOOL_RUN_COMMAND_SCHEMA,
+    ToolRunStore,
+    default_ad_template_policy,
+)
 
 
 def _command(source: str, *, idempotency_key: str) -> dict:
@@ -97,6 +103,7 @@ class _PreviewAgent:
         self.session_estimated_cost_usd = 0.0
 
     def run_conversation(self, **_kwargs):
+        self._observed["user_message"] = _kwargs.get("user_message")
         self._callback(
             "tool.started",
             "terminal",
@@ -117,15 +124,19 @@ class _ToolRunHarness(ToolRunAPIMixin):
         self._tool_run_store = store
         self._tool_run_tasks = {}
         self._tool_run_agents = {}
+        self._tool_run_stop_events = {}
+        self._tool_run_drain_tasks = set()
         self._tool_run_shutdown = False
         self._model_name = "test-model"
         self.observed = {}
         self.system_prompts = []
+        self.agent_kwargs = []
 
     def _resolve_route(self, _model):
         return {}
 
     def _create_agent(self, **kwargs):
+        self.agent_kwargs.append(kwargs)
         self.system_prompts.append(kwargs["ephemeral_system_prompt"])
         run_id = kwargs["session_id"].split(":", 1)[0]
         return _PreviewAgent(
@@ -137,15 +148,17 @@ class _ToolRunHarness(ToolRunAPIMixin):
 
 
 class _StructuredRoleAgent:
-    def __init__(self, instance_id: str, template: dict):
+    def __init__(self, instance_id: str, template: dict, messages: list):
         self._instance_id = instance_id
         self._template = template
+        self._messages = messages
         self.session_prompt_tokens = 0
         self.session_completion_tokens = 0
         self.session_total_tokens = 0
         self.session_estimated_cost_usd = 0.0
 
     def run_conversation(self, **_kwargs):
+        self._messages.append(_kwargs.get("user_message"))
         if self._instance_id.startswith("builder-"):
             payload = {"template": self._template, "assets": []}
         else:
@@ -162,11 +175,13 @@ class _RealOrchestratorHarness(_ToolRunHarness):
         super().__init__(store)
         self._template = template
         self.role_calls = []
+        self.role_messages = []
 
     def _create_agent(self, **kwargs):
+        self.agent_kwargs.append(kwargs)
         instance_id = kwargs["session_id"].split(":", 2)[1]
         self.role_calls.append(instance_id)
-        return _StructuredRoleAgent(instance_id, self._template)
+        return _StructuredRoleAgent(instance_id, self._template, self.role_messages)
 
 
 class _ExplicitEventOrchestrator:
@@ -180,7 +195,7 @@ class _ExplicitEventOrchestrator:
         self.call_agent(
             "builder-1",
             [{"type": "text", "text": "complete contract"}],
-            "deepseek/deepseek-v4-flash",
+            "deepseek/deepseek-v4-flash-vision-exp",
         )
         for kind, node in (
             ("stage.started", "build"),
@@ -233,6 +248,35 @@ async def test_generic_terminal_preview_never_advances_or_emits_stage(tmp_path, 
         1.0,
     )
     assert api.system_prompts == [ToolRunAPIMixin._isolated_tool_role_prompt()]
+    assert api.agent_kwargs[0]["enabled_toolsets_override"] == []
+    assert api.agent_kwargs[0]["persistence_disabled"] is True
+    assert callable(api.agent_kwargs[0]["stream_delta_callback"])
+    assert callable(api.agent_kwargs[0]["reasoning_callback"])
+    assert "thinking_callback" not in api.agent_kwargs[0]
+
+
+@pytest.mark.asyncio
+async def test_execution_rejects_stale_pinned_policy_before_agent(tmp_path):
+    store = ToolRunStore(str(tmp_path / "stale-execution.db"))
+    run, _ = store.create_run(
+        _command("source.png", idempotency_key="stale-execution")
+    )
+    stale = default_ad_template_policy()
+    stale["seed_revision"] = 3
+    stale["stages"]["analyse"]["primary"]["model"] = "deepseek-v4-flash"
+    store._conn.execute(
+        "UPDATE tool_runs SET policy_json=? WHERE run_id=?",
+        (json.dumps(stale, separators=(",", ":"), sort_keys=True), run["run_id"]),
+    )
+    store._conn.commit()
+    api = _ToolRunHarness(store)
+
+    await api._execute_tool_run(run["run_id"])
+
+    failed = store.get_run(run["run_id"])
+    assert failed["status"] == "failed"
+    assert "audited" in failed["error"]
+    assert api.agent_kwargs == []
 
 
 def test_direct_orchestrator_result_does_not_weaken_generic_agent_parser():
@@ -307,6 +351,16 @@ async def test_real_orchestrator_successful_import_reaches_completed(tmp_path, m
     assert api.role_calls[1].startswith("comparator-")
     assert all(name.startswith("final-reviewer-") for name in api.role_calls[2:])
     assert not any(event["kind"] == "run.failed" for event in store.events(run["run_id"]))
+    assert all(kwargs["enabled_toolsets_override"] == [] for kwargs in api.agent_kwargs)
+    builder_message = api.role_messages[0]
+    assert builder_message[0]["type"] == "text"
+    assert builder_message[1]["type"] == "image_url"
+    assert builder_message[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    comparator_message = api.role_messages[1]
+    assert comparator_message[0]["type"] == "text"
+    assert [part["type"] for part in comparator_message[1:]] == [
+        "image_url", "image_url", "image_url",
+    ]
 
 
 def test_isolated_role_prompt_forbids_discovery_and_orchestrator_work():
@@ -383,3 +437,175 @@ async def test_disconnect_stops_active_tool_role_with_current_interrupt_contract
     assert adapter._tool_run_shutdown is True
     assert adapter._tool_run_agents == {}
     assert adapter._app is None
+
+def _one_second_candidates(_run, stage):
+    routes = {
+        "analyse": {
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash-vision-exp",
+        },
+        "compare": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+        },
+        "final-review-a": {
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash-vision-exp",
+        },
+        "final-review-b": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+        },
+    }
+    return [routes[stage]], {
+        "timeout_seconds": 1,
+        "max_attempts": 1,
+        "max_cost_usd": 1,
+    }
+
+
+class _OneRoleOrchestrator:
+    def __init__(self, *, call_agent, emit, should_stop, **_kwargs):
+        self.call_agent = call_agent
+        self.emit = emit
+        self.should_stop = should_stop
+
+    def run(self, *, source, **_kwargs):
+        payload = self.call_agent(
+            "builder-1",
+            process.vision_message("inspect", [source]),
+            "deepseek/deepseek-v4-flash-vision-exp",
+        )
+        if self.should_stop():
+            raise process.AdTemplateProcessError(
+                "sole ad-template process was cancelled"
+            )
+        return {
+            "template": payload,
+            "iterations": [],
+            "final_review": {},
+            "previews": [],
+            "documents": {},
+            "import": {"template_id": "tpl-heartbeat", "status": "imported"},
+            "process": "only-ad-template-process",
+        }
+
+
+class _TimedRoleAgent:
+    def __init__(self, behavior, kwargs):
+        self._behavior = behavior
+        self.kwargs = kwargs
+        self.interrupts = []
+        self.session_prompt_tokens = 0
+        self.session_completion_tokens = 0
+        self.session_total_tokens = 0
+        self.session_estimated_cost_usd = 0.0
+
+    def run_conversation(self, **kwargs):
+        return self._behavior(self, kwargs)
+
+    def hard_interrupt(self, message=None):
+        self.interrupts.append(message)
+
+
+class _TimedRoleHarness(_ToolRunHarness):
+    def __init__(self, store, behavior):
+        super().__init__(store)
+        self._behavior = behavior
+        self.created_agents = []
+
+    def _create_agent(self, **kwargs):
+        self.agent_kwargs.append(kwargs)
+        agent = _TimedRoleAgent(self._behavior, kwargs)
+        self.created_agents.append(agent)
+        return agent
+
+
+@pytest.mark.asyncio
+async def test_stream_heartbeat_prevents_false_inactivity_timeout(tmp_path, monkeypatch):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source-pixels")
+    store = ToolRunStore(str(tmp_path / "heartbeat.db"))
+    run, _ = store.create_run(_command(str(source), idempotency_key="heartbeat"))
+
+    def streamed(agent, _kwargs):
+        for _ in range(6):
+            time.sleep(0.22)
+            agent.kwargs["stream_delta_callback"]("chunk")
+        return {"final_response": "{}"}
+
+    api = _TimedRoleHarness(store, streamed)
+    monkeypatch.setattr(api, "_tool_candidates", _one_second_candidates)
+    monkeypatch.setattr(tool_run_api, "SoleProcessOrchestrator", _OneRoleOrchestrator)
+    monkeypatch.setattr(api, "_prepare_candidate_output", lambda _run_id, output: output)
+
+    await api._execute_tool_run(run["run_id"])
+
+    completed = store.get_run(run["run_id"])
+    assert completed["status"] == "completed"
+    assert api.created_agents[0].interrupts == []
+
+
+@pytest.mark.asyncio
+async def test_silent_timeout_interrupts_drains_and_consumes_late_exception(tmp_path, monkeypatch):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source-pixels")
+    store = ToolRunStore(str(tmp_path / "silent-timeout.db"))
+    run, _ = store.create_run(_command(str(source), idempotency_key="silent-timeout"))
+    finished = {"value": False}
+
+    def late_failure(_agent, _kwargs):
+        time.sleep(1.2)
+        finished["value"] = True
+        raise RuntimeError("late role exception")
+
+    api = _TimedRoleHarness(store, late_failure)
+    monkeypatch.setattr(api, "_tool_candidates", _one_second_candidates)
+    monkeypatch.setattr(tool_run_api, "SoleProcessOrchestrator", _OneRoleOrchestrator)
+
+    await api._execute_tool_run(run["run_id"])
+    assert store.get_run(run["run_id"])["status"] == "failed"
+    assert api.created_agents[0].interrupts == [
+        "api_server_tool_run_stage_timeout"
+    ]
+    await asyncio.sleep(0.35)
+    assert finished["value"] is True
+    assert api._tool_run_drain_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_late_timed_out_builder_cannot_render_or_import(tmp_path, monkeypatch):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source-pixels")
+    store = ToolRunStore(str(tmp_path / "late-builder.db"))
+    run, _ = store.create_run(_command(str(source), idempotency_key="late-builder"))
+    rendered = []
+    imported = []
+
+    def late_builder(_agent, _kwargs):
+        time.sleep(1.2)
+        return {"final_response": json.dumps({"template": {}, "assets": []})}
+
+    api = _TimedRoleHarness(store, late_builder)
+    monkeypatch.setattr(api, "_tool_candidates", _one_second_candidates)
+    monkeypatch.setattr(process, "run_generator_cli", lambda *args: rendered.append(args))
+    monkeypatch.setattr(process, "import_template", lambda *args, **kwargs: imported.append((args, kwargs)))
+
+    await api._execute_tool_run(run["run_id"])
+    assert store.get_run(run["run_id"])["status"] == "failed"
+    await asyncio.sleep(0.35)
+    assert api.created_agents[0].interrupts == [
+        "api_server_tool_run_stage_timeout"
+    ]
+    assert api._tool_run_drain_tasks == set()
+    assert rendered == []
+    assert imported == []

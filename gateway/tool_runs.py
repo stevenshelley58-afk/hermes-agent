@@ -40,6 +40,17 @@ _MASKED_EDIT_MODELS = frozenset({
     "gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2",
 })
 _KNOWN_IMAGE_ONLY = frozenset({"gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2"})
+_AD_TEMPLATE_POLICY_SEED_REVISION = 4
+_AUDITED_NATIVE_VISION_MODELS = frozenset({
+    ("deepseek", "deepseek-v4-flash-vision-exp"),
+    ("openai-codex", "gpt-5.6-luna"),
+})
+_AD_TEMPLATE_ROLE_MODELS = {
+    "analyse": ("deepseek", "deepseek-v4-flash-vision-exp"),
+    "compare": ("openai-codex", "gpt-5.6-luna"),
+    "final-review-a": ("deepseek", "deepseek-v4-flash-vision-exp"),
+    "final-review-b": ("openai-codex", "gpt-5.6-luna"),
+}
 _GENERATION_EVENT_KINDS = frozenset({
     "generation.started", "generation.rendered", "generation.scored",
     "generation.revision-requested", "generation.accepted", "generation.failed",
@@ -107,24 +118,38 @@ def _loads(value: Optional[str], fallback: Any) -> Any:
         return copy.deepcopy(fallback)
 
 
+def _audited_native_vision_candidate(provider: str, model: str) -> Dict[str, Any]:
+    return {
+        "provider": provider,
+        "model": model,
+        "capability_verified": True,
+        "capabilities": ["vision_structured"],
+        "supports_vision": True,
+        "supports_tools": True,
+    }
+
+
 def default_ad_template_policy() -> Dict[str, Any]:
     """Cheap, bounded routes for the sole autonomous generator process."""
     return {
         "schema": TOOL_MODEL_POLICY_SCHEMA, "tool_id": "ad-template-generator",
         "name": "Sole ad-template process", "preset": "cheap-quality",
+        "seed_revision": _AD_TEMPLATE_POLICY_SEED_REVISION,
         "stages": {
-            "analyse": {"capability": "vision_structured", "primary": {"provider": "deepseek", "model": "deepseek-v4-flash"}, "fallbacks": [{"provider": "deepseek", "model": "deepseek-v4-pro"}], "max_attempts": 1, "timeout_seconds": 180, "max_cost_usd": 0.60},
-            "compare": {"capability": "vision_structured", "primary": {"provider": "deepseek", "model": "deepseek-v4-pro"}, "fallbacks": [{"provider": "deepseek", "model": "deepseek-v4-flash"}], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
-            "final-review-a": {"capability": "vision_structured", "primary": {"provider": "deepseek", "model": "deepseek-v4-flash"}, "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
-            "final-review-b": {"capability": "vision_structured", "primary": {"provider": "deepseek", "model": "deepseek-v4-pro"}, "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
+            "analyse": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("deepseek", "deepseek-v4-flash-vision-exp"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 180, "max_cost_usd": 0.60},
+            "compare": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-luna"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
+            "final-review-a": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("deepseek", "deepseek-v4-flash-vision-exp"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
+            "final-review-b": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-luna"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
         },
         "deterministic_stages": ["qa", "import"],
     }
 
 
 def _is_legacy_seed_policy(policy: Any) -> bool:
-    # Any prior policy belongs to the retired generator flow.
-    return isinstance(policy, dict) and policy.get("name") != "Sole ad-template process"
+    if not isinstance(policy, dict) or policy.get("name") != "Sole ad-template process":
+        return True
+    revision = policy.get("seed_revision")
+    return not isinstance(revision, int) or revision < _AD_TEMPLATE_POLICY_SEED_REVISION
 
 
 def validate_model_policy(policy: Any, *, tool_id: Optional[str] = None) -> Dict[str, Any]:
@@ -160,6 +185,18 @@ def validate_model_policy(policy: Any, *, tool_id: Optional[str] = None) -> Dict
                     raise ToolRunError(f"model {model} has not verified masked-image-edit support")
             if stage.get("capability") == "vision_structured" and model in _KNOWN_IMAGE_ONLY:
                 raise ToolRunError(f"image-generation model {model} cannot perform structured vision analysis")
+            if stage.get("capability") == "vision_structured":
+                provider = str(candidate.get("provider") or "").strip().lower()
+                declared = candidate.get("capabilities")
+                verified = candidate.get("capability_verified") is True
+                native_vision = candidate.get("supports_vision") is True
+                tools = candidate.get("supports_tools") is True
+                if (
+                    (provider, model) not in _AUDITED_NATIVE_VISION_MODELS
+                    or not verified or not isinstance(declared, list)
+                    or "vision_structured" not in declared or not native_vision or not tools
+                ):
+                    raise ToolRunError(f"model {provider}/{model} lacks audited native vision and tool support")
         attempts = stage.get("max_attempts", len(candidates))
         if not isinstance(attempts, int) or attempts < 1 or attempts > 10:
             raise ToolRunError(f"model policy stage {stage_id}.max_attempts is invalid")
@@ -167,6 +204,34 @@ def validate_model_policy(policy: Any, *, tool_id: Optional[str] = None) -> Dict
             value = stage.get(numeric)
             if value is not None and (not isinstance(value, (int, float)) or value < 0):
                 raise ToolRunError(f"model policy stage {stage_id}.{numeric} is invalid")
+    if policy_tool == "ad-template-generator":
+        if set(stages) != set(_AD_TEMPLATE_ROLE_MODELS):
+            raise ToolRunError(
+                "ad-template policy requires exactly the four audited vision roles"
+            )
+        for stage_id, expected_route in _AD_TEMPLATE_ROLE_MODELS.items():
+            stage = stages[stage_id]
+            if stage.get("capability") != "vision_structured":
+                raise ToolRunError(
+                    f"ad-template role {stage_id} requires audited structured vision"
+                )
+            if stage.get("fallbacks") != []:
+                raise ToolRunError(
+                    f"ad-template role {stage_id} cannot declare fallback models"
+                )
+            if stage.get("max_attempts") != 1:
+                raise ToolRunError(
+                    f"ad-template role {stage_id} requires exactly one model attempt"
+                )
+            primary = stage["primary"]
+            route = (
+                str(primary.get("provider") or "").strip().lower(),
+                str(primary.get("model") or "").strip().lower(),
+            )
+            if route != expected_route:
+                raise ToolRunError(
+                    f"ad-template role {stage_id} must use its audited model route"
+                )
     return result
 
 
@@ -324,8 +389,8 @@ class ToolRunStore:
                 )
                 self._conn.commit()
             elif tool_id == "ad-template-generator" and _is_legacy_seed_policy(_loads(exists["policy_json"], {})):
-                # Keep revision 1 immutable for reproducibility, and make the
-                # corrected executable provider slugs the future default.
+                # Keep every prior revision immutable for reproducibility and
+                # append the current audited native-vision seed as the default.
                 revision = int(self._conn.execute(
                     "SELECT COALESCE(MAX(revision),0)+1 FROM tool_model_policies WHERE tool_id=?", (tool_id,)
                 ).fetchone()[0])
@@ -423,6 +488,9 @@ class ToolRunStore:
                 policy_record = self.create_policy(tool_id, override, make_default=False, project_id=project_id)
             else:
                 policy_record = self.get_policy(tool_id, command.get("model_policy_revision"), project_id=project_id)
+            policy_record["policy"] = validate_model_policy(
+                policy_record["policy"], tool_id=tool_id,
+            )
             run_id = f"trun_{uuid.uuid4().hex}"
             trace_id = uuid.uuid4().hex
             now = _now()
