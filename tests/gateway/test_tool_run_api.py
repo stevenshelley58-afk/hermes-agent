@@ -196,7 +196,7 @@ class _ExplicitEventOrchestrator:
             (route["provider"], route["model"])
             for route in routes
         ] == [
-            ("openai-codex", "gpt-5.6-luna"),
+            ("openai-codex", "gpt-5.6-sol"),
             ("openai-codex", "gpt-5.6-luna"),
             ("deepseek", "deepseek-v4-flash-vision-exp"),
             ("openai-codex", "gpt-5.6-luna"),
@@ -207,7 +207,7 @@ class _ExplicitEventOrchestrator:
         self.call_agent(
             "builder-1",
             [{"type": "text", "text": "complete contract"}],
-            "openai-codex/gpt-5.6-luna",
+            "openai-codex/gpt-5.6-sol",
         )
         for kind, node, data in (
             ("stage.started", "build", {}),

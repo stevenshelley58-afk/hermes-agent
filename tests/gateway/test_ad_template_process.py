@@ -189,6 +189,21 @@ def test_comparator_target_overlap_rejects_exact_hero_thumbnail_collision():
     )
 
 
+def test_comparator_approximate_current_geometry_uses_actual_document_baseline():
+    candidate = overlap_candidate("approximate-current")
+    assessment = evidence(8.9, "Tighten the hero crop")
+    assessment["required_changes"] = [
+        "placement=feed; layers=feed-hero; "
+        "current={x:70,y:180,width:605,height:405}; "
+        "target={x:72,y:184,width:600,height:380}; "
+        "change=Tighten the hero without touching the thumbnail row"
+    ]
+    process._validate_required_change_targets(
+        process._assessment(assessment, "comparator", require_change_list=True),
+        candidate,
+    )
+
+
 def test_comparator_retries_self_inconsistent_overlap_and_persists_event(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")

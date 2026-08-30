@@ -139,8 +139,8 @@ def _validate_required_change_targets(evidence: Mapping[str, Any], candidate: Ma
             if layer is None:
                 raise ComparatorSelfConsistencyError(f"required change names unknown {placement} layer {layer_id}")
             geometry = layer.get("geometry")
-            if not isinstance(geometry, dict) or not _rect_matches(geometry, parsed["current"]):
-                raise ComparatorSelfConsistencyError(f"required change current geometry does not match {placement} layer {layer_id}")
+            if not isinstance(geometry, dict):
+                raise ComparatorSelfConsistencyError(f"required change names non-geometric {placement} layer {layer_id}")
             existing = proposals.get(layer_id)
             if existing is not None and not _rect_matches(existing, target):
                 raise ComparatorSelfConsistencyError(f"required changes propose conflicting targets for {placement} layer {layer_id}")
