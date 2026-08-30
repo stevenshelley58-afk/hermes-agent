@@ -164,6 +164,8 @@ class _StructuredRoleAgent:
         else:
             payload = {
                 "reason": "All visible requirements pass",
+                "differences": [],
+                "required_changes": [],
                 "hard_failures": [],
                 "rubric": {field: 9.7 for field in process.RUBRIC_FIELDS},
             }
@@ -509,6 +511,8 @@ async def test_initial_builder_format_recovery_persists_events_and_all_role_cost
             else:
                 payload = {
                     "reason": "All visible requirements pass",
+                    "differences": [],
+                    "required_changes": [],
                     "hard_failures": [],
                     "rubric": {
                         field: 9.7 for field in process.RUBRIC_FIELDS

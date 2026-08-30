@@ -28,17 +28,17 @@ def _number(value: Any) -> float:
     return result
 
 RUBRIC_FIELDS = (
-    "source_inspired_direction",
-    "ad_effectiveness",
-    "hierarchy_typography",
-    "real_shell_legibility",
-    "colour_art_direction",
+    "feed_source_likeness",
+    "layout_geometry",
+    "spacing_proportions",
+    "typography_likeness",
+    "colour_likeness",
+    "image_slot_composition",
     "editable_decomposition",
-    "replacement_robustness",
-    "native_story",
+    "native_story_translation",
 )
 
-def _assessment(value: Any, role: str) -> Dict[str, Any]:
+def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise AdTemplateProcessError(f"{role} returned invalid evidence")
     rubric = value.get("rubric")
@@ -52,6 +52,15 @@ def _assessment(value: Any, role: str) -> Dict[str, Any]:
     if not isinstance(hard_failures, list): raise AdTemplateProcessError(f"{role} hard_failures must be a list")
     reason = str(value.get("reason") or value.get("mismatches") or "").strip()
     if len(reason) < 3: raise AdTemplateProcessError(f"{role} must explain its decision")
+    differences = value.get("differences")
+    required_changes = value.get("required_changes")
+    if require_change_list:
+        if not isinstance(differences, list) or not all(isinstance(item, str) and item.strip() for item in differences):
+            raise AdTemplateProcessError(f"{role} must provide a concrete differences list")
+        if not isinstance(required_changes, list) or not all(isinstance(item, str) and item.strip() for item in required_changes):
+            raise AdTemplateProcessError(f"{role} must provide a concrete required_changes list")
+        differences = [item.strip()[:500] for item in differences]
+        required_changes = [item.strip()[:500] for item in required_changes]
     score = round(sum(scores.values()) / len(scores), 2)
     if hard_failures: score = 0.0
     return {
@@ -60,11 +69,14 @@ def _assessment(value: Any, role: str) -> Dict[str, Any]:
         "reason": reason,
         "rubric": scores,
         "hard_failures": [str(item)[:240] for item in hard_failures],
+        **({"differences": differences, "required_changes": required_changes} if require_change_list else {}),
     }
 
 def _passes_quality_gate(evidence: Mapping[str, Any]) -> bool:
     return (
         not evidence.get("hard_failures")
+        and not evidence.get("required_changes")
+        and _number((evidence.get("rubric") or {}).get("feed_source_likeness")) >= THRESHOLD
         and _number(evidence.get("score")) >= THRESHOLD
         and _number(evidence.get("minimum_score")) >= MIN_RUBRIC_SCORE
     )
@@ -77,7 +89,7 @@ def validate_iterations(value: Any) -> List[Dict[str, Any]]:
         comparison = raw.get("comparison")
         if not isinstance(comparison, dict): raise AdTemplateProcessError("each iteration requires one comparator")
         if any(key in raw or key in comparison for key in ("reviewers", "reviewer", "primary", "strict")): raise AdTemplateProcessError("final reviewers are only allowed after the comparator passes")
-        evidence = _assessment(comparison, "comparator")
+        evidence = _assessment(comparison, "comparator", require_change_list=True)
         score = evidence["score"]
         passes = _passes_quality_gate(evidence)
         decision = str(raw.get("decision") or ("accepted" if passes else "revise"))
@@ -101,7 +113,7 @@ def validate_final_review(value: Any, *, accepted: bool) -> Dict[str, Any]:
         if not isinstance(item, dict): raise AdTemplateProcessError("reviewer record must be an object")
         identity = str(item.get("id") or item.get("name") or "").strip()
         if not identity: raise AdTemplateProcessError("reviewer identity is required")
-        evidence = _assessment(item, "final reviewer")
+        evidence = _assessment(item, "final reviewer", require_change_list=True)
         score, reason = evidence["score"], evidence["reason"]
         route = str(item.get("route") or "").strip()
         if not route: raise AdTemplateProcessError("reviewer route is required")
@@ -753,9 +765,34 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
             "input, asset, font, metadata field, and cross-reference, and return the complete revised {template,assets} object."
         )
 
+    # Source fidelity is the sole visual objective. The source bitmap is never
+    # shipped, but its observable design must be reconstructed as editable
+    # layers instead of being simplified into a different archetype.
+    return f"""Build one layered Blockwise ad template by recreating the attached source image as closely as possible. The rendered Feed must be a near-match to the source at thumbnail and full size: preserve its layout regions, relative geometry, spacing, image-slot count and shapes, crop intent, border and divider treatment, typography scale and style, palette, information hierarchy, and visible content structure. Do not redesign, simplify, modernise, improve, or reinterpret the source. The only acceptable visual substitutions are neutral editable replacements for advertiser identity and source photography. Remove source names, logos, phone numbers, URLs, portraits, contact identity, and source pixels, but keep equivalent editable logo, text, icon, patch, and image-slot roles in the same visual positions. Never flatten the source image into a plate.
+
+The attached source is the authority. For a revision, apply every item in prior reviewer feedback to the prior valid candidate and leave already-matching regions unchanged. Story must be a native 1080x1920 translation of the same design system and hierarchy, with essential content outside the top 240px and bottom 300px platform zones; it is not evidence that Feed may diverge from the source.
+
+Return JSON only with exactly {{"template":{{...}},"assets":[]}}. template must use schema "blockwise.ad-template" and contain exactly templateId, createdAt, feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata plus schema. Feed is 1080x1350 with safeZones=[{{"x":72,"y":96,"width":936,"height":1158}}]. Story is 1080x1920 with safeZones=[{{"x":72,"y":240,"width":936,"height":1380}}]. Geometry is always {{x,y,width,height}} from the top-left and must remain inside the canvas. Layouts contain placement, ordered editable layers, and safeZones. Allowed layer types and shapes are plate, image_slot, overlay_patch, text, logo, vector, and icon using the existing Blockwise contract. Text uses a declared bundled font, native-canvas fontSize, unitless lineHeight 0.8-2.5, tracking 0-4 canvas pixels, alignment left|center|right, maxCharacters, maxLines, colourRole, overflowBehaviour refuse|truncate|scale_down, and geometry. image_slot uses inputKey, geometry, mask rounded_rect|circle|none, minimum dimensions, normalized defaultCrop, and allowedPlacementOverrides. Every reference must resolve.
+
+semanticColours contains exactly background, primary, secondary, accent, mainText, inverseText. Allowed font files are {', '.join(sorted(ALLOWED_FONT_FILES))}. metadata contains exactly title, description, gallerySamples, metaCopyDefaults, aiWritingGuidance, publishRequirements, replacementAssets, realAssetRefs. For property ads set specialAdCategory to HOUSING. Declare source-free replacement assets in template.assets and top-level assets with exact matching assetKey, fileName, and mimeType; never emit bytesBase64 anywhere. Allowed catalog files are home/open-home-living.webp, home/home-dusk.webp, home/mt-lawley-federation.webp, home/home-pool.webp, home/interior-styled.webp, home/subiaco-townhouse.webp, and adstudio-samples/photos/int-bedroom.png. Use one coherent property across slots.
+
+Hermes will render the candidate, attach the source and render to a vision comparator, and feed its concrete differences and required changes into the next revision. Do not self-score. Run {run_id}; project {project_id}; placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback[:5000]}.{repair_clause}"""
+
     return f"""Run the sole ad-template process as the builder agent. Inspect the attached source pixels, remove advertiser identity (names, logos, phones, URLs, portraits), and return JSON with exactly {{template, assets}}. Treat the source as structural inspiration, not a quality ceiling: explicitly avoid inheriting brochure density, tiny copy, weak hierarchy, duplicated contact details, incoherent photography, or a Feed layout stretched into Story. Build a conversion-focused Meta ad around one dominant idea: a strong hook, one coherent hero treatment, only essential proof or facts, and one clear CTA. Dense descriptions and contact lists belong in Meta primary text or the destination, not inside the image. At native pixels use type large enough to remain legible inside a 500px, 390px and 320px-wide Meta shell; do not rely on scale-down or truncation to rescue excess copy. Feed must use a deliberate 72px horizontal and 96px vertical protected content margin. Story must be independently composed with its top 240px and bottom 300px protected from platform UI. Use true editable text, image, logo, CTA, patch and icon roles. Use one coherent property/photo subject across default slots; never mix unrelated properties. For a property listing, publishRequirements.specialAdCategory must be HOUSING. template must contain exactly schema='blockwise.ad-template', templateId, createdAt (ISO datetime), feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata. semanticColours must contain exactly background, primary, secondary, accent, mainText, inverseText; every layer colourRole is one of those six. Each layout contains exactly placement, layers, safeZones; Feed is placement feed within 1080x1350 and Story is placement story within 1080x1920, including safeZones. Geometry and every safe-zone rectangle contain exactly {{x,y,width,height}}: x,y are the top-left coordinates from canvas origin (0,0); width,height are positive sizes, not right/bottom coordinates; x + width must stay within canvas width and y + height within canvas height. Exact safe areas are Feed safeZones=[{{"x":72,"y":96,"width":936,"height":1158}}] within 1080x1350 and Story safeZones=[{{"x":72,"y":240,"width":936,"height":1380}}] within 1080x1920. Layer shapes are exact: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. imageInputs are {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs are {{key,label,placeholder,maxLength}}. fonts are {{file}} and every text-layer font must be declared; allowed bundled font files are {', '.join(sorted(ALLOWED_FONT_FILES))}. metadata is exact: title:string; description:string; gallerySamples={{feed?:{{assetKey?,placement,purpose}},story?:{{assetKey?,placement,purpose}}}}; metaCopyDefaults={{primaryText:string[],headlines:string[],descriptions:string[],cta:string}}; aiWritingGuidance={{summary:string,fields:record<string,string>}}; publishRequirements={{objective:string,specialAdCategory:string|null,instantForm:{{required:boolean,dependency:string|null,defaults?:record<string,string>}},destination:{{required:boolean,kind:'website'|'instant_form'|'none',dependency:string|null}},requiredCtaTypes?:string[]}}; replacementAssets={{inputKey,assetKey,purpose?}}[]; realAssetRefs={{inputKey,kind,required}}[]. Every layer/input/font/colour/asset metadata reference must resolve inside the same template. Declare source-free replacement assets in template.assets as assetKey -> {{fileName,mimeType}} and in top-level assets only as {{assetKey,fileName,mimeType}} with an exact match. Hermes resolves bytes from the fixed safe catalog; never emit bytesBase64 anywhere and never guess filenames. Allowed normalized relative catalog paths are home/open-home-living.webp, home/home-dusk.webp, home/mt-lawley-federation.webp, home/home-pool.webp, home/interior-styled.webp, home/subiaco-townhouse.webp, and adstudio-samples/photos/int-bedroom.png. Never include the source composite, source_path, hashes, signatures, private fields, or a full-source plate. Keep geometry inside canvas and Story native. Hermes renders, compares once per iteration, then runs two fresh final reviewers only after the comparator clears both the {THRESHOLD} mean and {MIN_RUBRIC_SCORE} subscore floor; never self-score or invent review evidence. Run {run_id}; project {project_id}; fixed placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback[:3000]}.{repair_clause}"""
 
 def review_prompt(*, final: bool, candidate: Any = None) -> str:
+    role = "fresh independent final reviewer" if final else "iteration comparator"
+    candidate_context = _safe_candidate_prompt_json(candidate)
+    return f"""You are the {role} in a source-matching loop. The attached images are ordered: (1) the source reference, (2) the rendered Feed candidate, and (3) the rendered Story translation. Inspect the actual pixels together. The primary objective is not generic ad quality; it is faithful reconstruction of the source design as editable layers.
+
+Compare source versus Feed region by region: outer frame and margins; header/title block; image count, grid, aspect ratios and crop intent; logo/price panel; divider lines; body columns; feature list; footer/contact row; typography family/style/weight/scale/line wrapping; palette; alignment; whitespace; borders, corner radii, icons and decorative details. Neutral replacement photography and neutral advertiser identity must not reduce the score when their visual role, size, crop, and position match. Any simplification, omitted section, changed information density, different skeleton, moved panel, different image-slot structure, or generic redesign must reduce the score heavily. Story is scored only as a deliberate native 1080x1920 translation of the same visual system; it cannot compensate for a Feed mismatch.
+
+Use this scale strictly: 10.0 means the Feed is visually indistinguishable in structure at thumbnail size except permitted neutral content substitutions; 9.5 means only tiny finishing differences remain; 9.0 still has clearly visible spacing, scale, typography, or geometry differences; 8.0 is recognisably based on the source but materially different; 5.0 is merely the same category; 0 is missing or invalid. Do not award 9.5 to a design that a person can immediately distinguish from the source.
+
+Return JSON only with exactly reason, differences, required_changes, hard_failures, and rubric. differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. required_changes is the ordered list the builder must apply next; include only material work still needed to reach 9.5 and return [] only when the candidate genuinely clears the gate. hard_failures is a list. rubric contains exactly these eight 0-10 numbers: feed_source_likeness, layout_geometry, spacing_proportions, typography_likeness, colour_likeness, image_slot_composition, editable_decomposition, native_story_translation. A passing candidate requires feed_source_likeness >= {THRESHOLD}, mean >= {THRESHOLD}, every field >= {MIN_RUBRIC_SCORE}, no hard failures, and no required changes.
+
+Hard-fail source pixels flattened into the output, copied advertiser identity, missing/unreadable renders, clipping, canvas/safe-zone violations, non-editable critical roles, unknown assets, or a stretched/cropped/letterboxed Story. Do not infer another reviewer's score. Candidate contract JSON: {candidate_context}"""
+
     role = "fresh independent final reviewer" if final else "iteration comparator"
     role += (
         ". Treat the source only as a structural reference whose defects must not be inherited. Mandatory removal of source advertiser identities, "
@@ -939,7 +976,7 @@ class SoleProcessOrchestrator:
             self._check_stop()
             comparison = self.call_agent("comparator-%d" % index, vision_message(review_prompt(final=False, candidate=candidate), [source, str((rendered.get("render") or {}).get("feed") or ""), str((rendered.get("render") or {}).get("story") or "")]), f"{routes[1].get('provider')}/{routes[1].get('model')}")
             self._check_stop()
-            evidence = _assessment(comparison, "comparator")
+            evidence = _assessment(comparison, "comparator", require_change_list=True)
             score, reason = evidence["score"], evidence["reason"]
             decision = "accepted" if _passes_quality_gate(evidence) else "revise"
             record = {
@@ -981,7 +1018,12 @@ class SoleProcessOrchestrator:
                     "reason": escalation_reason, "previous_score": previous_score, "score": score,
                 })
             previous_score = score
-            feedback = reason
+            feedback = json.dumps({
+                "source_match_score": evidence["rubric"]["feed_source_likeness"],
+                "differences": evidence["differences"],
+                "required_changes": evidence["required_changes"],
+                "reason": reason,
+            }, ensure_ascii=False)
         if not iterations or iterations[-1]["decision"] != "accepted": raise AdTemplateProcessError("comparator never reached threshold")
         reviewers = []
         for n, route in enumerate(routes[2:4], 1):
@@ -993,7 +1035,7 @@ class SoleProcessOrchestrator:
             review = self.call_agent(identity, vision_message(review_prompt(final=True, candidate=candidate), [source, str((candidate.get("render") or {}).get("feed") or ""), str((candidate.get("render") or {}).get("story") or "")]), provider_route)
             self._check_stop()
             if not isinstance(review, dict): raise AdTemplateProcessError("final reviewer returned invalid result")
-            evidence = _assessment(review, "final reviewer")
+            evidence = _assessment(review, "final reviewer", require_change_list=True)
             reviewers.append({"id": identity, "route": route_identity, **evidence})
         final_review = validate_final_review({"reviewers": reviewers}, accepted=True)
         if final_review["decision"] != "accepted":
@@ -1001,7 +1043,16 @@ class SoleProcessOrchestrator:
             if review_round >= 5 or total_iterations + len(iterations) >= 30:
                 raise AdTemplateProcessError("final reviewers failed after the bounded automatic revision loop")
             iterations[-1]["final_review_failed"] = True
-            reasons = "; ".join(f"{item['id']}: {item['reason']}" for item in final_review["reviewers"])
+            reasons = json.dumps([
+                {
+                    "reviewer": item["id"],
+                    "source_match_score": item["rubric"]["feed_source_likeness"],
+                    "differences": item["differences"],
+                    "required_changes": item["required_changes"],
+                    "reason": item["reason"],
+                }
+                for item in final_review["reviewers"]
+            ], ensure_ascii=False)
             return self.run(
                 source=source, brief=brief, placements=placements, routes=routes,
                 review_round=review_round + 1, total_iterations=total_iterations + len(iterations),

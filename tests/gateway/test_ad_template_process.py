@@ -12,7 +12,13 @@ from gateway.ad_template_process import (
 from gateway.tool_run_api import ToolRunAPIMixin
 
 def evidence(score=9.4, reason="Improve spacing"):
-    return {"rubric": {field: score for field in process.RUBRIC_FIELDS}, "reason": reason}
+    return {
+        "rubric": {field: score for field in process.RUBRIC_FIELDS},
+        "reason": reason,
+        "differences": [reason] if score < 9.5 else [],
+        "required_changes": [reason] if score < 9.5 else [],
+        "hard_failures": [],
+    }
 
 def iteration(score=9.4, number=1):
     return {"iteration": number, "comparison": evidence(score), "decision": "accepted" if score >= 9.5 else "revise"}
@@ -77,7 +83,7 @@ def test_one_comparator_per_iteration_and_final_review_only_after_pass():
 
 def test_quality_gate_rejects_one_weak_dimension_even_when_mean_passes():
     weak = evidence(9.6, "Delivered-size copy remains too small")
-    weak["rubric"]["real_shell_legibility"] = 9.1
+    weak["rubric"]["layout_geometry"] = 9.1
     record = validate_iterations([{"iteration": 1, "comparison": weak, "decision": "revise"}])[0]
     assert record["comparison"]["score"] >= process.THRESHOLD
     assert record["comparison"]["minimum_score"] == 9.1
@@ -88,6 +94,24 @@ def test_quality_gate_rejects_one_weak_dimension_even_when_mean_passes():
         {"id": "reviewer-b", "route": "b/m", **evidence(9.8, "Strong")},
     ]
     assert validate_final_review({"reviewers": reviewers}, accepted=True)["decision"] == "revise"
+
+
+def test_source_match_and_concrete_change_list_are_hard_gates():
+    weak_match = evidence(9.8, "Header and image grid still differ")
+    weak_match["rubric"]["feed_source_likeness"] = 9.4
+    weak_match["required_changes"] = []
+    record = validate_iterations([
+        {"iteration": 1, "comparison": weak_match, "decision": "revise"}
+    ])[0]
+    assert record["comparison"]["score"] >= process.THRESHOLD
+    assert record["decision"] == "revise"
+
+    unfinished = evidence(9.8, "Footer remains too tall")
+    unfinished["required_changes"] = ["Reduce footer height to match the source"]
+    record = validate_iterations([
+        {"iteration": 1, "comparison": unfinished, "decision": "revise"}
+    ])[0]
+    assert record["decision"] == "revise"
 
 def test_bare_model_scores_are_rejected():
     with pytest.raises(AdTemplateProcessError):
@@ -152,10 +176,10 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
         for field in process.RUBRIC_FIELDS:
             assert field in prompt
         assert "hard failure" in prompt.lower()
-        assert "source composite pixel" in prompt
-        assert "must not be penalized" in prompt
-        assert "source-free photography" in prompt
-        assert "neutral editable replacement is correct" in prompt
+        assert "source pixels flattened into the output" in prompt
+        assert "The primary objective is not generic ad quality" in prompt
+        assert "Neutral replacement photography" in prompt
+        assert "required_changes" in prompt
         assert '"templateId":"strict"' in prompt
         assert '"assetKey":"hero"' in prompt
         assert "privateNote" not in prompt
@@ -165,9 +189,11 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
         assert key in builder
     assert "never emit bytesBase64 anywhere" in builder
     assert "home/open-home-living.webp" in builder
-    assert 'Feed safeZones=[{"x":72,"y":96,"width":936,"height":1158}]' in builder
-    assert 'Story safeZones=[{"x":72,"y":240,"width":936,"height":1380}]' in builder
-    assert "width,height are positive sizes, not right/bottom coordinates" in builder
+    assert 'Feed is 1080x1350 with safeZones=[{"x":72,"y":96,"width":936,"height":1158}]' in builder
+    assert 'Story is 1080x1920 with safeZones=[{"x":72,"y":240,"width":936,"height":1380}]' in builder
+    assert "Geometry is always {x,y,width,height} from the top-left" in builder
+    assert "Do not redesign, simplify, modernise, improve, or reinterpret the source" in builder
+    assert "structural inspiration, not a quality ceiling" not in builder
     assert '"template": {...}, "assets": []' in builder
     assert "mask must be exactly rounded_rect, circle, or none" in builder
     assert 'defaultCrop must be exactly {"x":0,"y":0,"width":1,"height":1}' in builder
@@ -178,9 +204,9 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
     assert "Every icon layer must use exactly arrow, check, phone, mail, globe, or pin" in builder
     assert "Every image_slot inputKey must be declared exactly once in imageInputs" in builder
     assert "real logo layer" in builder
-    assert "one dominant idea" in builder
-    assert "brochure density" in builder
-    assert "specialAdCategory must be HOUSING" in builder
+    assert "preserve its layout regions" in builder
+    assert "image-slot count and shapes" in builder
+    assert "set specialAdCategory to HOUSING" in builder
     assert "Every text layer inputKey must be declared exactly once in textInputs" in builder
     assert 'Each realAssetRefs entry must contain exactly {"inputKey":"declaredKey"' in builder
     assert "Every layer assetKey, image defaultAssetKey, gallery sample assetKey" in builder
