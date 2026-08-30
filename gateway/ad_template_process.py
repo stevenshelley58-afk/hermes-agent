@@ -431,49 +431,142 @@ _PRIVATE_EVIDENCE_KEYS = frozenset({
     "private", "privatefields", "secret", "signature", "sourcepath", "token",
 })
 
-def _safe_rejected_candidate(value: Any, *, depth: int = 0) -> Any:
+def _prompt_value(value: Any, *, depth: int = 0) -> Any:
     if depth > 12:
         return "[truncated]"
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, str):
+        if re.search(r"data:[^,]{0,200};base64,", value, re.IGNORECASE):
+            return "[omitted inline data]"
         return value[:8000]
     if isinstance(value, list):
-        return [_safe_rejected_candidate(item, depth=depth + 1) for item in value[:512]]
-    if isinstance(value, dict):
+        return [_prompt_value(item, depth=depth + 1) for item in value[:512]]
+    if isinstance(value, Mapping):
         safe: Dict[str, Any] = {}
         for raw_key, child in list(value.items())[:512]:
             key = str(raw_key)[:160]
             normalized = re.sub(r"[^a-z0-9]", "", key.lower())
             if normalized in _PRIVATE_EVIDENCE_KEYS or any(normalized.startswith(prefix) for prefix in _PRIVATE_EVIDENCE_KEYS):
                 continue
-            safe[key] = _safe_rejected_candidate(child, depth=depth + 1)
+            safe[key] = _prompt_value(child, depth=depth + 1)
         return safe
     return str(value)[:1000]
 
+def _prompt_object(value: Any, keys: tuple[str, ...]) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {key: _prompt_value(value[key]) for key in keys if key in value}
+
+def _prompt_rect(value: Any) -> Dict[str, Any]:
+    return _prompt_object(value, ("x", "y", "width", "height"))
+
+def _prompt_layer(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    layer_type = value.get("type")
+    required, optional = LAYER_FIELDS.get(layer_type, ({"type", "layerId", "geometry"}, set()))
+    projected = _prompt_object(value, tuple(sorted(required | optional)))
+    if "geometry" in value:
+        projected["geometry"] = _prompt_rect(value["geometry"])
+    if "defaultCrop" in value:
+        projected["defaultCrop"] = _prompt_rect(value["defaultCrop"])
+    if "font" in value:
+        projected["font"] = _prompt_object(value["font"], ("file",))
+    return projected
+
+def _prompt_layout(value: Any) -> Dict[str, Any]:
+    projected = _prompt_object(value, ("placement",))
+    if isinstance(value, Mapping) and isinstance(value.get("layers"), list):
+        projected["layers"] = [_prompt_layer(item) for item in value["layers"][:256]]
+    if isinstance(value, Mapping) and isinstance(value.get("safeZones"), list):
+        projected["safeZones"] = [_prompt_rect(item) for item in value["safeZones"][:32]]
+    return projected
+
+def _prompt_metadata(value: Any) -> Dict[str, Any]:
+    projected = _prompt_object(value, ("title", "description"))
+    if not isinstance(value, Mapping):
+        return projected
+    samples = value.get("gallerySamples")
+    if isinstance(samples, Mapping):
+        projected["gallerySamples"] = {
+            placement: _prompt_object(samples[placement], ("assetKey", "placement", "purpose"))
+            for placement in ("feed", "story") if placement in samples
+        }
+    if "metaCopyDefaults" in value:
+        projected["metaCopyDefaults"] = _prompt_object(value["metaCopyDefaults"], ("primaryText", "headlines", "descriptions", "cta"))
+    if "aiWritingGuidance" in value:
+        projected["aiWritingGuidance"] = _prompt_object(value["aiWritingGuidance"], ("summary", "fields"))
+    publish = value.get("publishRequirements")
+    if isinstance(publish, Mapping):
+        publish_out = _prompt_object(publish, ("objective", "specialAdCategory", "requiredCtaTypes"))
+        if "instantForm" in publish:
+            publish_out["instantForm"] = _prompt_object(publish["instantForm"], ("required", "dependency", "defaults"))
+        if "destination" in publish:
+            publish_out["destination"] = _prompt_object(publish["destination"], ("required", "kind", "dependency"))
+        projected["publishRequirements"] = publish_out
+    if isinstance(value.get("replacementAssets"), list):
+        projected["replacementAssets"] = [_prompt_object(item, ("inputKey", "assetKey", "purpose")) for item in value["replacementAssets"][:512]]
+    if isinstance(value.get("realAssetRefs"), list):
+        projected["realAssetRefs"] = [_prompt_object(item, ("inputKey", "kind", "required")) for item in value["realAssetRefs"][:512]]
+    return projected
+
+def _prompt_template(value: Any) -> Dict[str, Any]:
+    projected = _prompt_object(value, ("schema", "templateId", "createdAt"))
+    if not isinstance(value, Mapping):
+        return projected
+    if "feedLayout" in value:
+        projected["feedLayout"] = _prompt_layout(value["feedLayout"])
+    if "storyLayout" in value:
+        projected["storyLayout"] = _prompt_layout(value["storyLayout"])
+    if isinstance(value.get("imageInputs"), list):
+        projected["imageInputs"] = [_prompt_object(item, ("key", "label", "required", "acceptedTypes", "defaultAssetKey")) for item in value["imageInputs"][:512]]
+    if isinstance(value.get("textInputs"), list):
+        projected["textInputs"] = [_prompt_object(item, ("key", "label", "placeholder", "maxLength")) for item in value["textInputs"][:512]]
+    if "semanticColours" in value:
+        projected["semanticColours"] = _prompt_object(value["semanticColours"], tuple(sorted(COLOUR_ROLES)))
+    declarations = value.get("assets")
+    if isinstance(declarations, Mapping):
+        projected["assets"] = {str(key)[:160]: _prompt_object(item, ("fileName", "mimeType")) for key, item in list(declarations.items())[:512]}
+    if isinstance(value.get("fonts"), list):
+        projected["fonts"] = [_prompt_object(item, ("file",)) for item in value["fonts"][:128]]
+    if "metadata" in value:
+        projected["metadata"] = _prompt_metadata(value["metadata"])
+    return projected
+
+def _candidate_contract_projection(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {"template": {}, "assets": []}
+    raw_assets = value.get("assets")
+    assets = [_prompt_object(item, ("assetKey", "fileName", "mimeType")) for item in raw_assets[:512]] if isinstance(raw_assets, list) else []
+    return {"template": _prompt_template(value.get("template")), "assets": assets}
+
 def _safe_candidate_prompt_json(value: Any) -> str:
-    """Return compact builder-contract JSON without paths, evidence, bytes, or private fields."""
+    """Return compact, exact allowlisted builder-contract JSON for the next model call."""
     if not isinstance(value, Mapping):
         return ""
-    contract = {"template": value.get("template"), "assets": value.get("assets")}
-    safe = _safe_rejected_candidate(contract)
-    if not isinstance(safe, dict):
-        return ""
-    encoded = json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    encoded = json.dumps(_candidate_contract_projection(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if len(encoded) > MAX_CANDIDATE_CONTEXT_CHARS:
         raise AdTemplateProcessError(f"safe candidate context exceeds {MAX_CANDIDATE_CONTEXT_CHARS} characters")
     return encoded
 
+def _candidate_trace_projection(value: Any) -> Dict[str, Any]:
+    projected = _candidate_contract_projection(value)
+    previews = []
+    if isinstance(value, Mapping) and isinstance(value.get("previews"), list):
+        for item in value["previews"][:16]:
+            if not isinstance(item, Mapping):
+                continue
+            name = Path(str(item.get("name") or "")).name
+            placement = str(item.get("placement") or "").lower()
+            if name and placement in {"feed", "story"}:
+                previews.append({"name": name, "placement": placement})
+    projected["previews"] = previews
+    return projected
+
 
 def persist_rejected_candidate(candidate: Any, iteration_workspace: Path, *, iteration: int, attempt: int, reason: str) -> Path:
-    safe_candidate = None
-    try:
-        _reject_builder_bytes(candidate)
-    except AdTemplateProcessError:
-        # The reason is retained, but model-supplied bytes are never written.
-        pass
-    else:
-        safe_candidate = _safe_rejected_candidate(candidate)
+    safe_candidate = _candidate_contract_projection(candidate)
     iteration_workspace.mkdir(parents=True, exist_ok=True)
     path = iteration_workspace / f"rejected-candidate-{attempt:02d}.json"
     evidence = {"iteration": iteration, "attempt": attempt, "reason": reason, "candidate": safe_candidate}
@@ -729,7 +822,7 @@ class SoleProcessOrchestrator:
             evidence = _assessment(comparison, "comparator")
             score, reason = evidence["score"], evidence["reason"]
             decision = "accepted" if score >= THRESHOLD else "revise"
-            record = {"iteration": index, "candidate": candidate, "comparison": evidence, "decision": decision}
+            record = {"iteration": index, "candidate": _candidate_trace_projection(candidate), "comparison": evidence, "decision": decision}
             iterations.append(record)
             self.emit("iteration.compared", "compare", {"iteration": index, "score": score, "reason": reason, "decision": decision, "preview_names": [str(x.get("name")) for x in candidate.get("previews", []) if isinstance(x, dict)]})
             if score >= THRESHOLD: break

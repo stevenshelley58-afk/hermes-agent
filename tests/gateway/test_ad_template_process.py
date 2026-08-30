@@ -166,7 +166,16 @@ def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
     assert '"bytesBase64":' not in repair_builder
     assert "privateNote" not in repair_builder
     assert "forbidden" not in repair_builder and "secret" not in repair_builder
-    oversized_candidate = {"template": {"chunks": ["x" * 8000 for _ in range(20)]}, "assets": []}
+    oversized_candidate = {
+        "template": {
+            "metadata": {
+                "metaCopyDefaults": {
+                    "primaryText": ["x" * 8000 for _ in range(20)],
+                },
+            },
+        },
+        "assets": [],
+    }
     with pytest.raises(AdTemplateProcessError, match=r"safe candidate context exceeds 100000 characters"):
         process.generator_prompt(
             run_id="run", project_id="blockwise", brief="", placements=["feed", "story"], source="source.png",
@@ -411,6 +420,12 @@ def test_schema_invalid_candidate_repairs_before_one_render_and_comparator(tmp_p
     bad["template"]["feedLayout"]["safeZones"][0] = {"x": 48, "y": 48, "right": 1032, "bottom": 1302}
     bad["template"]["metadata"]["private"] = "must-not-persist"
     bad["template"]["metadata"]["hash"] = "must-not-persist"
+    bad["template"]["metadata"]["path"] = "/tmp/private-source.png"
+    bad["template"]["metadata"]["renderPath"] = "/tmp/private-render.png"
+    bad["template"]["metadata"]["dataUri"] = "data:image/png;base64,c2VjcmV0"
+    bad["template"]["metadata"]["base64"] = "c2VjcmV0"
+    bad["template"]["metadata"]["accessToken"] = "secret-access"
+    bad["template"]["metadata"]["apiToken"] = "secret-api"
     good = valid_candidate("good")
     calls, renders, imports, events = [], [], [], []
 
@@ -442,9 +457,13 @@ def test_schema_invalid_candidate_repairs_before_one_render_and_comparator(tmp_p
     assert exact_reason in repair_prompt
     assert "IMMEDIATELY PRIOR REJECTED CANDIDATE" in repair_prompt
     assert '"templateId":"bad"' in repair_prompt
-    assert '"right":1032' in repair_prompt
+    assert '"safeZones":[{"x":48,"y":48}]' in repair_prompt
+    assert '"right":' not in repair_prompt and '"bottom":' not in repair_prompt
     assert "must-not-persist" not in repair_prompt
     assert '"private":' not in repair_prompt and '"hash":' not in repair_prompt
+    for forbidden in ("path", "renderPath", "dataUri", "base64", "accessToken", "apiToken"):
+        assert f'"{forbidden}":' not in repair_prompt
+    assert "data:image/png;base64" not in repair_prompt
     assert len(renders) == 1 and renders[0]["template"]["templateId"] == "good"
     assert len([item for item in calls if item[0].startswith("comparator-")]) == 1
     assert len(imports) == 1 and result["import"]["template_id"] == "tpl-good"
@@ -454,9 +473,13 @@ def test_schema_invalid_candidate_repairs_before_one_render_and_comparator(tmp_p
     assert rejected == {"iteration": 1, "attempt": 1, "reason": exact_reason, "decision": "repair"}
     evidence_path = tmp_path / "run" / "iterations" / "01" / "rejected-candidate-01.json"
     persisted = json.loads(evidence_path.read_text(encoding="utf-8"))
-    assert persisted["candidate"]["template"]["feedLayout"]["safeZones"][0]["right"] == 1032
+    assert persisted["candidate"]["template"]["feedLayout"]["safeZones"][0] == {"x": 48, "y": 48}
     assert "private" not in persisted["candidate"]["template"]["metadata"]
     assert "hash" not in persisted["candidate"]["template"]["metadata"]
+    persisted_blob = json.dumps(persisted, sort_keys=True)
+    for forbidden in ("path", "renderPath", "dataUri", "base64", "accessToken", "apiToken"):
+        assert f'"{forbidden}":' not in persisted_blob
+    assert "data:image/png;base64" not in persisted_blob
 
 
 def test_visual_revision_prompt_carries_prior_valid_candidate(tmp_path, monkeypatch):
@@ -478,7 +501,19 @@ def test_visual_revision_prompt_carries_prior_valid_candidate(tmp_path, monkeypa
             return evidence(9.6, "Revision matches")
         return evidence(9.7, "Independent final pass")
 
-    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    def render_with_private_runtime_fields(candidate, workspace):
+        output = fake_render(candidate, workspace, renders)
+        output["assets"] = [{
+            "assetKey": "hero", "fileName": "home/open-home-living.webp", "mimeType": "image/webp",
+            "bytesBase64": "c2VjcmV0", "dataUri": "data:image/webp;base64,c2VjcmV0",
+            "base64": "c2VjcmV0", "accessToken": "secret-access", "apiToken": "secret-api",
+            "path": str(workspace / "asset.webp"), "renderPath": str(workspace / "render.webp"),
+        }]
+        output["receipt"] = {"path": str(workspace / "receipt.json"), "accessToken": "secret-access"}
+        output["dataUri"] = "data:image/png;base64,c2VjcmV0"
+        return output
+
+    monkeypatch.setattr(process, "run_generator_cli", render_with_private_runtime_fields)
     monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: imports.append(output) or {"template_id": "tpl-visual-v2", "status": "imported"})
     result = SoleProcessOrchestrator(
         call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_visual_revision",
@@ -497,8 +532,22 @@ def test_visual_revision_prompt_carries_prior_valid_candidate(tmp_path, monkeypa
     assert '"templateId":"visual-v1"' in builder_two
     assert "Layout needs revision" in builder_two
     assert str(tmp_path) not in builder_two
+    for forbidden in ("bytesBase64", "dataUri", "base64", "accessToken", "apiToken", "path", "renderPath"):
+        assert f'"{forbidden}":' not in builder_two
     assert len(result["iterations"]) == 2
+    trace_blob = json.dumps(result["iterations"], sort_keys=True)
+    for forbidden in ("bytesBase64", "dataUri", "base64", "accessToken", "apiToken", "path", "renderPath"):
+        assert f'"{forbidden}":' not in trace_blob
+    assert str(tmp_path) not in trace_blob
+    for index, item in enumerate(result["iterations"], start=1):
+        assert item["candidate"]["previews"] == [
+            {"name": f"iteration-{index:02d}-feed.png", "placement": "feed"},
+            {"name": f"iteration-{index:02d}-story.png", "placement": "story"},
+        ]
     assert result["import"]["template_id"] == "tpl-visual-v2" and len(imports) == 1
+    assert imports[0]["assets"][0]["bytesBase64"] == "c2VjcmV0"
+    assert imports[0]["assets"][0]["path"].startswith(str(tmp_path))
+    assert imports[0]["receipt"]["accessToken"] == "secret-access"
 
 
 def test_final_review_revision_prompt_carries_accepted_candidate(tmp_path, monkeypatch):
