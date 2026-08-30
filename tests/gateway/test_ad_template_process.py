@@ -1,4 +1,5 @@
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -302,8 +303,10 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
 def test_orchestrator_calls_real_roles_and_persists_receipts(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
-    generator = Path("/projects/only-process-blockwise/packages/ad-template-renderer/dist/cli.js")
-    monkeypatch.setenv("AD_TEMPLATE_GENERATOR_CMD", f"/usr/bin/node {shlex.quote(str(generator))}")
+    renderer_command = os.environ.get("AD_TEMPLATE_GENERATOR_CMD") or (
+        f"/usr/bin/node {shlex.quote(str(Path('/projects/only-process-blockwise/packages/ad-template-renderer/dist/cli.js')))}"
+    )
+    monkeypatch.setenv("AD_TEMPLATE_GENERATOR_CMD", renderer_command)
     monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: {"template_id": "tpl_real", "status": "imported"})
     calls = []
     events = []
