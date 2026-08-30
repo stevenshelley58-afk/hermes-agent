@@ -122,6 +122,7 @@ METADATA_FIELDS = {
     "publishRequirements", "replacementAssets", "realAssetRefs",
 }
 COLOUR_ROLES = {"background", "primary", "secondary", "accent", "mainText", "inverseText"}
+VECTOR_SHAPES = ("rect", "rounded", "circle", "line", "pill", "notched", "wave", "ring")
 LAYER_FIELDS = {
     "plate": ({"type", "layerId", "colourRole", "geometry", "protected"}, {"assetKey"}),
     "image_slot": ({"type", "layerId", "inputKey", "geometry", "mask", "minSourceWidth", "minSourceHeight", "defaultCrop", "allowedPlacementOverrides"}, set()),
@@ -263,8 +264,10 @@ def _validate_layout(layout: Any, *, placement: str, width: int, height: int) ->
                 raise AdTemplateProcessError(f"{layer_path}.alignment must be left, center, or right")
             if layer["overflowBehaviour"] not in {"refuse", "truncate", "scale_down"}:
                 raise AdTemplateProcessError(f"{layer_path}.overflowBehaviour must be refuse, truncate, or scale_down")
-        if layer_type == "vector" and layer["shape"] not in {"rect", "rounded", "circle", "line", "pill", "notched", "wave", "ring"}:
-            raise AdTemplateProcessError("vector shape is invalid")
+        if layer_type == "vector" and layer["shape"] not in VECTOR_SHAPES:
+            allowed = ", ".join(VECTOR_SHAPES)
+            offending = json.dumps(layer["shape"], ensure_ascii=True)[:160]
+            raise AdTemplateProcessError(f"{layer_path}.shape={offending} must be one of {allowed}")
 
 def validate_template_artifact(value: Any) -> Dict[str, Any]:
     if not isinstance(value, dict) or set(value) != TEMPLATE_FIELDS or value.get("schema") != "blockwise.ad-template":
@@ -300,6 +303,9 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
         if item["key"] in text_keys:
             raise AdTemplateProcessError("text input keys must be unique")
         text_keys.add(item["key"])
+    duplicate_input_keys = sorted(image_keys & text_keys)
+    if duplicate_input_keys:
+        raise AdTemplateProcessError(f"input key {json.dumps(duplicate_input_keys[0])} must be unique across imageInputs and textInputs")
     if not isinstance(value["semanticColours"], dict) or set(value["semanticColours"]) != COLOUR_ROLES or not all(_nonempty(colour) for colour in value["semanticColours"].values()):
         raise AdTemplateProcessError("semanticColours must contain exactly the six Blockwise colour roles")
     if not isinstance(value["assets"], dict):
@@ -319,14 +325,28 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
     for item in value["imageInputs"]:
         if item.get("defaultAssetKey") and item["defaultAssetKey"] not in asset_keys:
             raise AdTemplateProcessError("image input default asset is undeclared")
-    for layout in (value["feedLayout"], value["storyLayout"]):
-        for layer in layout["layers"]:
+    for layout_name, layout in (("feedLayout", value["feedLayout"]), ("storyLayout", value["storyLayout"])):
+        for layer_index, layer in enumerate(layout["layers"]):
+            layer_path = f"{layout_name}.layers[{layer_index}]"
             if layer["type"] in {"image_slot", "logo"} and layer["inputKey"] not in image_keys:
-                raise AdTemplateProcessError("image layer inputKey is undeclared")
-            if layer["type"] == "text" and (layer["inputKey"] not in text_keys or layer["font"]["file"] not in font_files):
-                raise AdTemplateProcessError("text layer inputKey or font is undeclared")
+                offending = json.dumps(layer["inputKey"], ensure_ascii=True)[:160]
+                allowed = ", ".join(sorted(image_keys)) or "(none declared)"
+                raise AdTemplateProcessError(
+                    f"{layer_path}.inputKey={offending} for {layer['type']} is undeclared; "
+                    f"declare it exactly once in imageInputs (declared: {allowed})"
+                )
+            if layer["type"] == "text" and layer["inputKey"] not in text_keys:
+                offending = json.dumps(layer["inputKey"], ensure_ascii=True)[:160]
+                allowed = ", ".join(sorted(text_keys)) or "(none declared)"
+                raise AdTemplateProcessError(f"{layer_path}.inputKey={offending} for text is undeclared (declared: {allowed})")
+            if layer["type"] == "text" and layer["font"]["file"] not in font_files:
+                offending = json.dumps(layer["font"]["file"], ensure_ascii=True)[:160]
+                allowed = ", ".join(sorted(font_files)) or "(none declared)"
+                raise AdTemplateProcessError(f"{layer_path}.font.file={offending} is undeclared (declared: {allowed})")
             if layer.get("assetKey") and layer["assetKey"] not in asset_keys:
-                raise AdTemplateProcessError("layer assetKey is undeclared")
+                offending = json.dumps(layer["assetKey"], ensure_ascii=True)[:160]
+                allowed = ", ".join(sorted(asset_keys)) or "(none declared)"
+                raise AdTemplateProcessError(f"{layer_path}.assetKey={offending} is undeclared (declared: {allowed})")
             if layer.get("colourRole") and layer["colourRole"] not in value["semanticColours"]:
                 raise AdTemplateProcessError("layer colourRole is undeclared")
     metadata = value["metadata"]
@@ -364,9 +384,19 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
     real_assets = metadata["realAssetRefs"]
     if not isinstance(real_assets, list):
         raise AdTemplateProcessError("metadata realAssetRefs must be a list")
-    for item in real_assets:
-        if not isinstance(item, dict) or set(item) != {"inputKey", "kind", "required"} or item["inputKey"] not in image_keys or not _nonempty(item["kind"]) or not isinstance(item["required"], bool):
-            raise AdTemplateProcessError("metadata real asset reference is invalid")
+    declared_input_keys = image_keys | text_keys
+    for ref_index, item in enumerate(real_assets):
+        path = f"metadata.realAssetRefs[{ref_index}]"
+        if not isinstance(item, dict) or set(item) != {"inputKey", "kind", "required"}:
+            raise AdTemplateProcessError(f"{path} must contain exactly inputKey, kind, and required")
+        if item["inputKey"] not in declared_input_keys:
+            offending = json.dumps(item["inputKey"], ensure_ascii=True)[:160]
+            allowed = ", ".join(sorted(declared_input_keys)) or "(none declared)"
+            raise AdTemplateProcessError(f"{path}.inputKey={offending} is undeclared (declared inputs: {allowed})")
+        if not _nonempty(item["kind"]):
+            raise AdTemplateProcessError(f"{path}.kind must be a non-empty descriptive string")
+        if not isinstance(item["required"], bool):
+            raise AdTemplateProcessError(f"{path}.required must be boolean")
     return value
 
 def validate_builder_candidate(value: Any) -> Dict[str, Any]:
@@ -536,6 +566,15 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
         '{"x":0,"y":0,"width":1,"height":1} for a full-source crop (not "cover"); allowedPlacementOverrides '
         'must be a JSON list containing only crop and/or position (not feed/story). For every text layer, alignment '
         'must be exactly left, center, or right and overflowBehaviour must be exactly refuse, truncate, or scale_down (never ellipsis).'
+        ' For every vector layer, shape must be exactly one of rect, rounded, circle, line, pill, notched, wave, or ring; '
+        'never use aliases such as rectangle or rounded_rect_stroke. Every image_slot and logo inputKey must be declared '
+        'exactly once in imageInputs. Every text layer inputKey must be declared exactly once in textInputs. imageInputs '
+        'and textInputs keys must be unique across both lists. Every text-layer font file must appear exactly once in fonts. '
+        'Every layer assetKey, image defaultAssetKey, gallery sample assetKey, and replacementAssets assetKey must resolve '
+        'to template.assets. Every replacementAssets inputKey must resolve to imageInputs. Every realAssetRefs inputKey may '
+        'resolve to imageInputs or textInputs, and must name a declared key. '
+        'Each realAssetRefs entry must contain exactly {"inputKey":"declaredKey","kind":"non_empty_descriptive_kind","required":true}; '
+        'kind is a non-empty descriptive string such as property_photo, interior_photo, brand_logo, property_address, or contact_details.'
         ' fonts must always be a JSON list such as [{"file":"manrope-400.woff2"},{"file":"manrope-700.woff2"}]; '
         'never return fonts as an object, named map, or record.'
     )

@@ -151,6 +151,11 @@ def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
     assert 'defaultCrop must be exactly {"x":0,"y":0,"width":1,"height":1}' in builder
     assert "overflowBehaviour must be exactly refuse, truncate, or scale_down" in builder
     assert 'fonts must always be a JSON list such as [{"file":"manrope-400.woff2"}' in builder
+    assert "shape must be exactly one of rect, rounded, circle, line, pill, notched, wave, or ring" in builder
+    assert "Every image_slot and logo inputKey must be declared exactly once in imageInputs" in builder
+    assert "Every text layer inputKey must be declared exactly once in textInputs" in builder
+    assert 'Each realAssetRefs entry must contain exactly {"inputKey":"declaredKey"' in builder
+    assert "Every layer assetKey, image defaultAssetKey, gallery sample assetKey" in builder
 
     invalid_fonts = json.loads(json.dumps(template))
     invalid_fonts["fonts"] = {"body": {"file": "manrope-400.woff2"}}
@@ -187,6 +192,38 @@ def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
     })
     with pytest.raises(AdTemplateProcessError, match=r"feedLayout\.layers\[1\]\.overflowBehaviour must be refuse, truncate, or scale_down"):
         process.validate_template_artifact(invalid_text)
+    invalid_vector = json.loads(json.dumps(template))
+    invalid_vector["feedLayout"]["layers"].append({
+        "type": "vector", "layerId": "feed-rule",
+        "geometry": {"x": 10, "y": 10, "width": 100, "height": 4},
+        "shape": "rectangle", "colourRole": "accent", "opacity": 1,
+    })
+    with pytest.raises(AdTemplateProcessError, match=r'feedLayout\.layers\[1\]\.shape="rectangle" must be one of rect, rounded'):
+        process.validate_template_artifact(invalid_vector)
+
+    invalid_logo = json.loads(json.dumps(template))
+    invalid_logo["feedLayout"]["layers"].append({
+        "type": "logo", "layerId": "feed-logo", "inputKey": "brandLogo",
+        "geometry": {"x": 10, "y": 10, "width": 100, "height": 100},
+    })
+    with pytest.raises(AdTemplateProcessError, match=r'feedLayout\.layers\[1\]\.inputKey="brandLogo" for logo is undeclared; declare it exactly once in imageInputs'):
+        process.validate_template_artifact(invalid_logo)
+
+    real_text_ref = json.loads(json.dumps(template))
+    real_text_ref["textInputs"] = [{"key": "address", "label": "Address", "placeholder": "1 Example St", "maxLength": 120}]
+    real_text_ref["metadata"]["realAssetRefs"] = [{"inputKey": "address", "kind": "property_address", "required": True}]
+    assert process.validate_template_artifact(real_text_ref) is real_text_ref
+
+    invalid_real_ref = json.loads(json.dumps(template))
+    invalid_real_ref["metadata"]["realAssetRefs"] = [{"inputKey": "missing", "kind": "property_photo", "required": True}]
+    with pytest.raises(AdTemplateProcessError, match=r'metadata\.realAssetRefs\[0\]\.inputKey="missing" is undeclared'):
+        process.validate_template_artifact(invalid_real_ref)
+
+    duplicate_input = json.loads(json.dumps(real_text_ref))
+    duplicate_input["imageInputs"] = [{"key": "address", "label": "Address image", "acceptedTypes": ["image/png"]}]
+    with pytest.raises(AdTemplateProcessError, match=r'input key "address" must be unique across imageInputs and textInputs'):
+        process.validate_template_artifact(duplicate_input)
+
 
 
 def test_orchestrator_calls_real_roles_and_persists_receipts(tmp_path, monkeypatch):
