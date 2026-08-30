@@ -143,6 +143,41 @@ def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
     assert 'Feed safeZones=[{"x":48,"y":48,"width":984,"height":1254}]' in builder
     assert 'Story safeZones=[{"x":60,"y":250,"width":960,"height":1420}]' in builder
     assert "width,height are positive sizes, not right/bottom coordinates" in builder
+    assert '"template": {...}, "assets": []' in builder
+    assert "mask must be exactly rounded_rect, circle, or none" in builder
+    assert 'defaultCrop must be exactly {"x":0,"y":0,"width":1,"height":1}' in builder
+    assert "overflowBehaviour must be exactly refuse, truncate, or scale_down" in builder
+
+    invalid_slot = json.loads(json.dumps(template))
+    invalid_slot["feedLayout"]["layers"].append({
+        "type": "image_slot", "layerId": "feed-hero", "inputKey": "heroImage",
+        "geometry": {"x": 10, "y": 10, "width": 100, "height": 100},
+        "mask": "rounded", "minSourceWidth": 100, "minSourceHeight": 100,
+        "defaultCrop": "cover", "allowedPlacementOverrides": ["story"],
+    })
+    with pytest.raises(AdTemplateProcessError, match=r"feedLayout\.layers\[1\]\.mask must be one of rounded_rect"):
+        process.validate_template_artifact(invalid_slot)
+
+    invalid_crop = json.loads(json.dumps(invalid_slot))
+    invalid_crop["feedLayout"]["layers"][1]["mask"] = "rounded_rect"
+    with pytest.raises(AdTemplateProcessError, match=r"feedLayout\.layers\[1\]\.defaultCrop must contain exactly"):
+        process.validate_template_artifact(invalid_crop)
+
+    invalid_override = json.loads(json.dumps(invalid_crop))
+    invalid_override["feedLayout"]["layers"][1]["defaultCrop"] = {"x": 0, "y": 0, "width": 1, "height": 1}
+    with pytest.raises(AdTemplateProcessError, match=r"feedLayout\.layers\[1\]\.allowedPlacementOverrides\[0\] must be crop or position"):
+        process.validate_template_artifact(invalid_override)
+
+    invalid_text = json.loads(json.dumps(template))
+    invalid_text["feedLayout"]["layers"].append({
+        "type": "text", "layerId": "feed-headline", "inputKey": "headline",
+        "font": {"file": "manrope-700.woff2"}, "fontSize": 32, "lineHeight": 1.1,
+        "tracking": 0, "alignment": "center", "maxCharacters": 80, "maxLines": 2,
+        "colourRole": "mainText", "overflowBehaviour": "ellipsis",
+        "geometry": {"x": 10, "y": 10, "width": 400, "height": 100},
+    })
+    with pytest.raises(AdTemplateProcessError, match=r"feedLayout\.layers\[1\]\.overflowBehaviour must be refuse, truncate, or scale_down"):
+        process.validate_template_artifact(invalid_text)
 
 
 def test_orchestrator_calls_real_roles_and_persists_receipts(tmp_path, monkeypatch):

@@ -240,18 +240,29 @@ def _validate_layout(layout: Any, *, placement: str, width: int, height: int) ->
         if layer_type == "plate" and not isinstance(layer["protected"], bool):
             raise AdTemplateProcessError("plate protected must be boolean")
         if layer_type == "image_slot":
-            if layer["mask"] not in {"rounded_rect", "circle", "none"} or not _positive_int(layer["minSourceWidth"]) or not _positive_int(layer["minSourceHeight"]) or not _rect(layer["defaultCrop"]):
-                raise AdTemplateProcessError("image slot constraints are invalid")
+            if layer["mask"] not in {"rounded_rect", "circle", "none"}:
+                raise AdTemplateProcessError(f"{layer_path}.mask must be one of rounded_rect, circle, or none")
+            if not _positive_int(layer["minSourceWidth"]):
+                raise AdTemplateProcessError(f"{layer_path}.minSourceWidth must be a positive integer")
+            if not _positive_int(layer["minSourceHeight"]):
+                raise AdTemplateProcessError(f"{layer_path}.minSourceHeight must be a positive integer")
+            if not _rect(layer["defaultCrop"]):
+                raise AdTemplateProcessError(f"{layer_path}.defaultCrop must contain exactly numeric x, y, width, and height with positive width and height")
             overrides = layer["allowedPlacementOverrides"]
-            if not isinstance(overrides, list) or any(item not in {"crop", "position"} for item in overrides):
-                raise AdTemplateProcessError("image slot placement overrides are invalid")
+            if not isinstance(overrides, list):
+                raise AdTemplateProcessError(f"{layer_path}.allowedPlacementOverrides must be a list containing only crop and/or position")
+            for override_index, item in enumerate(overrides):
+                if item not in {"crop", "position"}:
+                    raise AdTemplateProcessError(f"{layer_path}.allowedPlacementOverrides[{override_index}] must be crop or position")
         if layer_type in {"overlay_patch", "vector"} and (not _number_value(layer["opacity"]) or not 0 <= layer["opacity"] <= 1):
             raise AdTemplateProcessError(f"{layer_type} opacity is invalid")
         if layer_type == "text":
             if not _font(layer["font"]) or not _number_value(layer["fontSize"], positive=True) or not _number_value(layer["lineHeight"], positive=True) or not _number_value(layer["tracking"]) or not _positive_int(layer["maxCharacters"]) or not _positive_int(layer["maxLines"]):
                 raise AdTemplateProcessError("text layer sizing is invalid")
-            if layer["alignment"] not in {"left", "center", "right"} or layer["overflowBehaviour"] not in {"refuse", "truncate", "scale_down"}:
-                raise AdTemplateProcessError("text layer behaviour is invalid")
+            if layer["alignment"] not in {"left", "center", "right"}:
+                raise AdTemplateProcessError(f"{layer_path}.alignment must be left, center, or right")
+            if layer["overflowBehaviour"] not in {"refuse", "truncate", "scale_down"}:
+                raise AdTemplateProcessError(f"{layer_path}.overflowBehaviour must be refuse, truncate, or scale_down")
         if layer_type == "vector" and layer["shape"] not in {"rect", "rounded", "circle", "line", "pill", "notched", "wave", "ring"}:
             raise AdTemplateProcessError("vector shape is invalid")
 
@@ -513,9 +524,16 @@ def import_template(output: Mapping[str, Any], *, run_id: str, project_id: str) 
     return {"template_id": str(payload["templateId"]), "status": "replayed" if replayed else "imported", "asset_count": int(payload.get("assetCount") or len(assets)), "replayed": replayed}
 
 def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: Any, source: str, feedback: str = "", validation_feedback: str = "", repair_attempt: int = 0) -> str:
-    repair_clause = ""
+    repair_clause = (
+        ' Return one JSON object with exactly two top-level keys: {"template": {...}, "assets": []}; '
+        'never omit assets even when it is empty, and do not add prose or another wrapper. '
+        'For every image_slot, mask must be exactly rounded_rect, circle, or none; defaultCrop must be exactly '
+        '{"x":0,"y":0,"width":1,"height":1} for a full-source crop (not "cover"); allowedPlacementOverrides '
+        'must be a JSON list containing only crop and/or position (not feed/story). For every text layer, alignment '
+        'must be exactly left, center, or right and overflowBehaviour must be exactly refuse, truncate, or scale_down (never ellipsis).'
+    )
     if validation_feedback:
-        repair_clause = (
+        repair_clause += (
             f" STRICT SCHEMA REPAIR {repair_attempt} of {MAX_SCHEMA_REPAIRS_PER_ITERATION}: "
             f"the previous candidate was rejected before rendering with this exact validation error: {validation_feedback}. "
             "Return a complete corrected template-and-assets JSON object, not a patch."
