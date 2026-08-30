@@ -528,6 +528,145 @@ def test_schema_invalid_candidate_repairs_before_one_render_and_comparator(tmp_p
     assert "data:image/png;base64" not in persisted_blob
 
 
+def test_initial_non_json_builder_output_retries_cheap_then_escalates_without_extra_reviews(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    good = valid_candidate("structured-recovery")
+    calls, renders, imports, events = [], [], [], []
+
+    def call_agent(instance, prompt, route):
+        calls.append((instance, route))
+        if instance.startswith("builder-"):
+            if len([item for item in calls if item[0].startswith("builder-")]) <= 2:
+                raise process.AdTemplateStructuredOutputError(
+                    "Builder did not return one structured JSON result"
+                )
+            return good
+        if instance.startswith("comparator-"):
+            return evidence(9.6, "Recovered candidate passes")
+        return evidence(9.7, "Independent final pass")
+
+    monkeypatch.setattr(
+        process,
+        "run_generator_cli",
+        lambda candidate, workspace: fake_render(candidate, workspace, renders),
+    )
+    monkeypatch.setattr(
+        process,
+        "import_template",
+        lambda output, run_id, project_id: imports.append(output)
+        or {"template_id": "tpl-structured-recovery", "status": "imported"},
+    )
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent,
+        workspace=tmp_path / "run",
+        run_id="trun_structured_recovery",
+        project_id="blockwise",
+        emit=lambda kind, node, data: events.append((kind, node, data)),
+    ).run(
+        source=str(source),
+        brief="",
+        placements=["feed", "story"],
+        routes=[
+            {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+            {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+            {"provider": "deepseek", "model": "deepseek-v4-flash-vision-exp"},
+            {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+            {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        ],
+        require_quality_route=True,
+    )
+
+    assert calls[:3] == [
+        ("builder-1", "openai-codex/gpt-5.6-luna"),
+        ("builder-1-output-retry-1", "openai-codex/gpt-5.6-luna"),
+        ("builder-1-output-retry-2", "openai-codex/gpt-5.6-sol"),
+    ]
+    assert len([item for item in calls if item[0].startswith("comparator-")]) == 1
+    assert len([item for item in calls if item[0].startswith("final-reviewer-")]) == 2
+    assert len(renders) == 1 and len(imports) == 1
+    assert result["builder_escalated"] is True
+    assert result["builder_route"] == {
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+    }
+    retry = next(item for item in events if item[0] == "builder.output-retry")
+    assert retry[2] == {
+        "iteration": 1,
+        "attempt": 2,
+        "provider": "openai-codex",
+        "model": "gpt-5.6-luna",
+        "reason": "structured_output_invalid",
+    }
+    escalation = next(item for item in events if item[0] == "builder.escalated")
+    assert escalation[2]["reason"] == "structured_output_invalid"
+
+
+def test_invalid_builder_contract_retries_cheap_then_uses_quality_builder(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    bad = valid_candidate("invalid-contract")
+    bad["template"]["storyLayout"]["safeZones"] = [
+        {"x": 0, "y": 0, "width": 1080, "height": 1921}
+    ]
+    good = valid_candidate("quality-contract")
+    calls, renders, events = [], [], []
+
+    def call_agent(instance, prompt, route):
+        calls.append((instance, route))
+        if instance in {"builder-1", "builder-1-repair-1"}:
+            return json.loads(json.dumps(bad))
+        if instance == "builder-1-repair-2":
+            return good
+        if instance.startswith("comparator-"):
+            return evidence(9.6, "Quality builder candidate passes")
+        return evidence(9.7, "Independent final pass")
+
+    monkeypatch.setattr(
+        process,
+        "run_generator_cli",
+        lambda candidate, workspace: fake_render(candidate, workspace, renders),
+    )
+    monkeypatch.setattr(
+        process,
+        "import_template",
+        lambda output, run_id, project_id: {
+            "template_id": "tpl-quality-contract",
+            "status": "imported",
+        },
+    )
+    SoleProcessOrchestrator(
+        call_agent=call_agent,
+        workspace=tmp_path / "run",
+        run_id="trun_contract_recovery",
+        project_id="blockwise",
+        emit=lambda kind, node, data: events.append((kind, node, data)),
+    ).run(
+        source=str(source),
+        brief="",
+        placements=["feed", "story"],
+        routes=[
+            {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+            {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+            {"provider": "deepseek", "model": "deepseek-v4-flash-vision-exp"},
+            {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+            {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        ],
+        require_quality_route=True,
+    )
+
+    assert calls[:3] == [
+        ("builder-1", "openai-codex/gpt-5.6-luna"),
+        ("builder-1-repair-1", "openai-codex/gpt-5.6-luna"),
+        ("builder-1-repair-2", "openai-codex/gpt-5.6-sol"),
+    ]
+    assert len([item for item in calls if item[0].startswith("comparator-")]) == 1
+    assert len([item for item in calls if item[0].startswith("final-reviewer-")]) == 2
+    assert len(renders) == 1
+    escalation = next(item for item in events if item[0] == "builder.escalated")
+    assert escalation[2]["reason"] == "candidate_contract_invalid"
+
+
 def test_visual_revision_prompt_carries_prior_valid_candidate(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")

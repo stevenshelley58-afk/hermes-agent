@@ -328,6 +328,87 @@ def test_direct_orchestrator_result_does_not_weaken_generic_agent_parser():
 
 
 @pytest.mark.asyncio
+async def test_retry_reuses_persisted_source_after_staging_cleanup(tmp_path, monkeypatch):
+    home = tmp_path / "hermes-home"
+    staging = home / "tool_runs" / "staging"
+    staging.mkdir(parents=True)
+    source = staging / "source.png"
+    source.write_bytes(b"source-pixels")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = ToolRunStore(str(tmp_path / "retry-source.db"))
+    run, _ = store.create_run(
+        _command(str(source), idempotency_key="retry-durable-source")
+    )
+    api = _ToolRunHarness(store)
+    seen_sources = []
+
+    class _FailOnce:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run(self, *, source, **_kwargs):
+            seen_sources.append(source)
+            assert Path(source).read_bytes() == b"source-pixels"
+            raise process.AdTemplateProcessError("intentional first-run failure")
+
+    monkeypatch.setattr(tool_run_api, "SoleProcessOrchestrator", _FailOnce)
+    await api._execute_tool_run(run["run_id"])
+
+    assert store.get_run(run["run_id"])["status"] == "failed"
+    assert not source.exists()
+    durable = (
+        home
+        / "tool_runs"
+        / "ad-template-generator"
+        / run["run_id"]
+        / "previews"
+        / "source.png"
+    )
+    assert durable.read_bytes() == b"source-pixels"
+
+    class _SucceedOnRetry:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run(self, *, source, **_kwargs):
+            seen_sources.append(source)
+            assert Path(source).read_bytes() == b"source-pixels"
+            return {
+                "template": {},
+                "iterations": [],
+                "final_review": {},
+                "previews": [],
+                "documents": {},
+                "import": {"template_id": "tpl-retried", "status": "imported"},
+                "process": "only-ad-template-process",
+            }
+
+    monkeypatch.setattr(tool_run_api, "SoleProcessOrchestrator", _SucceedOnRetry)
+    monkeypatch.setattr(api, "_prepare_candidate_output", lambda _run_id, output: output)
+    started = []
+    monkeypatch.setattr(
+        api,
+        "_start_tool_task",
+        lambda run_id, finalize=False: started.append((run_id, finalize)),
+    )
+    response = await api._handle_retry_tool_run(
+        SimpleNamespace(match_info={"run_id": run["run_id"]})
+    )
+    assert response.status == 202
+    assert started == [(run["run_id"], False)]
+
+    await api._execute_tool_run(run["run_id"])
+
+    completed = store.get_run(run["run_id"])
+    assert completed["status"] == "completed"
+    assert completed["output"]["import"]["template_id"] == "tpl-retried"
+    assert seen_sources == [str(durable), str(durable)]
+    assert "command.queued" in {
+        event["kind"] for event in store.events(run["run_id"])
+    }
+
+
+@pytest.mark.asyncio
 async def test_real_orchestrator_successful_import_reaches_completed(tmp_path, monkeypatch):
     home = tmp_path / "hermes-home"
     home.mkdir()
@@ -394,6 +475,118 @@ async def test_real_orchestrator_successful_import_reaches_completed(tmp_path, m
     assert [part["type"] for part in comparator_message[1:]] == [
         "image_url", "image_url", "image_url",
     ]
+
+
+@pytest.mark.asyncio
+async def test_initial_builder_format_recovery_persists_events_and_all_role_costs(tmp_path, monkeypatch):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source-pixels")
+    template = _valid_template()
+    store = ToolRunStore(str(tmp_path / "format-recovery.db"))
+    run, _ = store.create_run(
+        _command(str(source), idempotency_key="format-recovery")
+    )
+
+    class _Agent:
+        def __init__(self, owner, instance_id):
+            self.owner = owner
+            self.instance_id = instance_id
+            self.session_prompt_tokens = 10
+            self.session_completion_tokens = 5
+            self.session_total_tokens = 15
+            self.session_estimated_cost_usd = 0.05
+
+        def run_conversation(self, **_kwargs):
+            self.owner.calls.append(self.instance_id)
+            if self.instance_id.startswith("builder-"):
+                self.owner.builder_calls += 1
+                if self.owner.builder_calls <= 2:
+                    return {"final_response": "not-json"}
+                payload = {"template": template, "assets": []}
+            else:
+                payload = {
+                    "reason": "All visible requirements pass",
+                    "hard_failures": [],
+                    "rubric": {
+                        field: 9.7 for field in process.RUBRIC_FIELDS
+                    },
+                }
+            return {"final_response": json.dumps(payload)}
+
+    class _Harness(_ToolRunHarness):
+        def __init__(self, run_store):
+            super().__init__(run_store)
+            self.calls = []
+            self.builder_calls = 0
+
+        def _create_agent(self, **kwargs):
+            self.agent_kwargs.append(kwargs)
+            instance_id = kwargs["session_id"].split(":", 2)[1]
+            return _Agent(self, instance_id)
+
+    api = _Harness(store)
+
+    def render(candidate, workspace: Path):
+        rendered = workspace / "rendered"
+        rendered.mkdir(parents=True, exist_ok=True)
+        feed = rendered / "feed.png"
+        story = rendered / "story.png"
+        feed.write_bytes(b"feed-pixels")
+        story.write_bytes(b"story-pixels")
+        artifact = workspace / "artifact.json"
+        artifact.write_text(json.dumps(candidate), encoding="utf-8")
+        return {
+            **candidate,
+            "previews": [
+                {"name": feed.name, "path": str(feed), "placement": "feed"},
+                {"name": story.name, "path": str(story), "placement": "story"},
+            ],
+            "render": {"feed": str(feed), "story": str(story)},
+            "receipt": {"outputs": {"feed": {}, "story": {}}},
+            "template_path": str(artifact),
+        }
+
+    monkeypatch.setattr(process, "run_generator_cli", render)
+    monkeypatch.setattr(
+        process,
+        "import_template",
+        lambda _output, *, run_id, project_id: {
+            "template_id": "tpl-format-recovery",
+            "status": "imported",
+            "project_id": project_id,
+        },
+    )
+
+    await api._execute_tool_run(run["run_id"])
+
+    completed = store.get_run(run["run_id"])
+    assert completed["status"] == "completed"
+    assert api.calls[:3] == [
+        "builder-1",
+        "builder-1-output-retry-1",
+        "builder-1-output-retry-2",
+    ]
+    assert len([name for name in api.calls if name.startswith("comparator-")]) == 1
+    assert len([name for name in api.calls if name.startswith("final-reviewer-")]) == 2
+    assert completed["output"]["usage"] == {
+        "input_tokens": 60,
+        "output_tokens": 30,
+        "total_tokens": 90,
+        "estimated_cost_usd": pytest.approx(0.30),
+    }
+    assert completed["output"]["cost"]["reported_usd"] == pytest.approx(0.30)
+    events = store.events(run["run_id"])
+    assert len([event for event in events if event["kind"] == "builder.output-retry"]) == 1
+    escalation = next(
+        event for event in events if event["kind"] == "builder.escalated"
+    )
+    assert escalation["data"]["reason"] == "structured_output_invalid"
+    assert len([event for event in events if event["kind"] == "iteration.compared"]) == 1
+    assert len([event for event in events if event["kind"] == "final-review.started"]) == 2
+    assert len([event for event in events if event["kind"] == "final-review.completed"]) == 1
 
 
 def test_isolated_role_prompt_forbids_discovery_and_orchestrator_work():

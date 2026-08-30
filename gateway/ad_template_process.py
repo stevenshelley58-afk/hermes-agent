@@ -8,11 +8,17 @@ from typing import Any, Callable, Dict, List, Mapping
 THRESHOLD = 9.5
 MIN_RUBRIC_SCORE = 9.2
 MAX_SCHEMA_REPAIRS_PER_ITERATION = 3
+MAX_CHEAP_STRUCTURED_OUTPUT_RETRIES = 1
 STAGES = ("source", "build", "render", "compare", "final-check", "live")
 MAX_CANDIDATE_CONTEXT_CHARS = 100_000
 MIN_MATERIAL_SCORE_GAIN = 0.5
 
 class AdTemplateProcessError(ValueError):
+    pass
+
+class AdTemplateStructuredOutputError(RuntimeError):
+    """A model role returned no complete JSON object for its declared contract."""
+
     pass
 
 def _number(value: Any) -> float:
@@ -812,20 +818,62 @@ class SoleProcessOrchestrator:
             self.emit("stage.started", "build", {"iteration": index, "role": "builder"})
             validation_feedback = ""
             rejected_candidate: Any = None
+            structured_output_failures = 0
+            output_retry_pending = False
             for repair_attempt in range(MAX_SCHEMA_REPAIRS_PER_ITERATION + 1):
                 self._check_stop()
-                instance = "builder-%d" % index if repair_attempt == 0 else "builder-%d-repair-%d" % (index, repair_attempt)
-                candidate = self.call_agent(
-                    instance,
-                    vision_message(generator_prompt(
-                        run_id=self.run_id, project_id=self.project_id, brief=brief,
-                        placements=placements, source=source, feedback=feedback,
-                        validation_feedback=validation_feedback, repair_attempt=repair_attempt,
-                        prior_candidate=iteration_prior if repair_attempt == 0 else None,
-                        rejected_candidate=rejected_candidate if repair_attempt > 0 else None,
-                    ), [source]),
-                    builder_route_identity(builder_route),
-                )
+                while True:
+                    if output_retry_pending:
+                        instance = "builder-%d-output-retry-%d" % (index, structured_output_failures)
+                    else:
+                        instance = "builder-%d" % index if repair_attempt == 0 else "builder-%d-repair-%d" % (index, repair_attempt)
+                    try:
+                        candidate = self.call_agent(
+                            instance,
+                            vision_message(generator_prompt(
+                                run_id=self.run_id, project_id=self.project_id, brief=brief,
+                                placements=placements, source=source, feedback=feedback,
+                                validation_feedback=validation_feedback,
+                                repair_attempt=max(repair_attempt, structured_output_failures),
+                                prior_candidate=iteration_prior if repair_attempt == 0 else None,
+                                rejected_candidate=rejected_candidate if repair_attempt > 0 else None,
+                            ), [source]),
+                            builder_route_identity(builder_route),
+                        )
+                        output_retry_pending = False
+                        break
+                    except AdTemplateStructuredOutputError:
+                        self._check_stop()
+                        structured_output_failures += 1
+                        output_retry_pending = True
+                        validation_feedback = (
+                            "builder returned no complete JSON object with exactly template and assets"
+                        )
+                        if structured_output_failures <= MAX_CHEAP_STRUCTURED_OUTPUT_RETRIES:
+                            self.emit("builder.output-retry", "build", {
+                                "iteration": index,
+                                "attempt": structured_output_failures + 1,
+                                "provider": builder_route["provider"],
+                                "model": builder_route["model"],
+                                "reason": "structured_output_invalid",
+                            })
+                            continue
+                        if quality_route is not None and builder_route_identity(builder_route) != builder_route_identity(quality_route):
+                            prior_route = builder_route
+                            builder_route = dict(quality_route)
+                            builder_escalated = True
+                            self.emit("builder.escalated", "build", {
+                                "iteration": index,
+                                "from_provider": prior_route["provider"],
+                                "from_model": prior_route["model"],
+                                "to_provider": builder_route["provider"],
+                                "to_model": builder_route["model"],
+                                "reason": "structured_output_invalid",
+                            })
+                            continue
+                        raise AdTemplateProcessError(
+                            "builder returned invalid structured output after bounded retry and quality escalation"
+                        ) from None
                 self._check_stop()
                 try:
                     validate_builder_candidate(candidate)
@@ -843,6 +891,22 @@ class SoleProcessOrchestrator:
                         "reason": validation_feedback, "decision": "repair",
                     })
                     self._check_stop()
+                    if (
+                        repair_attempt >= MAX_CHEAP_STRUCTURED_OUTPUT_RETRIES
+                        and quality_route is not None
+                        and builder_route_identity(builder_route) != builder_route_identity(quality_route)
+                    ):
+                        prior_route = builder_route
+                        builder_route = dict(quality_route)
+                        builder_escalated = True
+                        self.emit("builder.escalated", "build", {
+                            "iteration": index,
+                            "from_provider": prior_route["provider"],
+                            "from_model": prior_route["model"],
+                            "to_provider": builder_route["provider"],
+                            "to_model": builder_route["model"],
+                            "reason": "candidate_contract_invalid",
+                        })
                     if repair_attempt >= MAX_SCHEMA_REPAIRS_PER_ITERATION:
                         raise AdTemplateProcessError(
                             f"builder candidate remained schema-invalid after {MAX_SCHEMA_REPAIRS_PER_ITERATION} repairs: {validation_feedback}"

@@ -23,7 +23,7 @@ from aiohttp import web
 
 from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
-from gateway.ad_template_process import SoleProcessOrchestrator, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
+from gateway.ad_template_process import AdTemplateStructuredOutputError, SoleProcessOrchestrator, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
 from gateway.tool_runs import (
     AD_TEMPLATE_ROUTE_ORDER,
     TOOL_MODEL_POLICY_SCHEMA,
@@ -157,6 +157,36 @@ class ToolRunAPIMixin:
         return target
 
     @staticmethod
+    def _durable_tool_source(workspace: Path, raw_source: str) -> Path:
+        """Resolve a staged source, or the exact persisted preview on same-run retry."""
+        source_file = Path(str(raw_source)).expanduser().resolve()
+        if source_file.is_file():
+            return ToolRunAPIMixin._copy_source_preview(workspace, source_file)
+
+        preview_root = (workspace / "previews").resolve()
+        allowed = {
+            ".avif", ".bmp", ".gif", ".heic", ".heif", ".jpeg", ".jpg",
+            ".png", ".tif", ".tiff", ".webp",
+        }
+        candidates = []
+        if preview_root.is_dir():
+            for candidate in preview_root.glob("source.*"):
+                try:
+                    resolved = candidate.resolve(strict=True)
+                    resolved.relative_to(preview_root)
+                except (OSError, ValueError):
+                    continue
+                if (
+                    resolved.is_file()
+                    and not candidate.is_symlink()
+                    and resolved.suffix.lower() in allowed
+                ):
+                    candidates.append(resolved)
+        if len(candidates) != 1:
+            raise RuntimeError("durable run source preview is unavailable")
+        return candidates[0]
+
+    @staticmethod
     def _tool_json_output(value: Any, *, process_result: bool = False) -> Dict[str, Any]:
         if process_result:
             required = {
@@ -198,7 +228,9 @@ class ToolRunAPIMixin:
                         return parsed
                 except (TypeError, json.JSONDecodeError):
                     pass
-        raise RuntimeError("Builder did not return one structured JSON result")
+        raise AdTemplateStructuredOutputError(
+            "Builder did not return one structured JSON result"
+        )
 
     @staticmethod
     def _prepare_candidate_output(run_id: str, output: Dict[str, Any]) -> Dict[str, Any]:
@@ -214,7 +246,11 @@ class ToolRunAPIMixin:
         imported = output.get("import")
         if not isinstance(imported, dict) or not imported.get("template_id") or not imported.get("status"):
             raise RuntimeError("Blockwise import receipt is missing")
-        result = {key: output.get(key) for key in ("template", "previews", "documents", "template_path", "render_path", "import", "process")}
+        result = {key: output.get(key) for key in (
+            "template", "previews", "documents", "template_path", "render_path",
+            "import", "process", "usage", "cost", "builder_escalated",
+            "builder_route", "model_policy_revision",
+        )}
         result["iterations"] = iterations
         result["final_review"] = final_review
         result["deterministic_documents"] = docs
@@ -452,8 +488,7 @@ class ToolRunAPIMixin:
                 source = str((source_items[0] or {}).get("path") if source_items and isinstance(source_items[0], dict) else "")
                 if not source:
                     raise RuntimeError("source image is missing")
-                source_file = Path(source).resolve()
-                source = str(self._copy_source_preview(workspace, source_file))
+                source = str(self._durable_tool_source(workspace, source))
                 result = SoleProcessOrchestrator(
                     call_agent=call_agent, workspace=workspace, run_id=run_id,
                     project_id=str((run.get("scope") or {}).get("project_id") or ""), emit=emit,
