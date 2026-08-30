@@ -45,6 +45,28 @@ def metadata(title="Smoke"):
 def semantic_colours():
     return {"background": "#FFFFFF", "primary": "#1A56DB", "secondary": "#6B7280", "accent": "#F59E0B", "mainText": "#111827", "inverseText": "#FFFFFF"}
 
+def valid_candidate(template_id="candidate"):
+    def layout(placement, height):
+        return {"placement": placement, "layers": [{"type": "plate", "layerId": f"{placement}-bg", "colourRole": "background", "geometry": {"x": 0, "y": 0, "width": 1080, "height": height}, "protected": False}], "safeZones": [{"x": 0, "y": 0, "width": 1080, "height": height}]}
+    return {"template": {"schema": "blockwise.ad-template", "templateId": template_id, "createdAt": "2026-08-30T00:00:00.000Z", "feedLayout": layout("feed", 1350), "storyLayout": layout("story", 1920), "imageInputs": [], "textInputs": [], "semanticColours": semantic_colours(), "assets": {}, "fonts": [], "metadata": metadata()}, "assets": []}
+
+def fake_render(candidate, workspace, calls):
+    calls.append(candidate)
+    workspace.mkdir(parents=True, exist_ok=True)
+    feed = workspace / "feed.png"
+    story = workspace / "story.png"
+    feed.write_bytes(b"feed")
+    story.write_bytes(b"story")
+    return {
+        "template": candidate["template"], "assets": candidate["assets"],
+        "previews": [
+            {"name": feed.name, "path": str(feed), "placement": "feed"},
+            {"name": story.name, "path": str(story), "placement": "story"},
+        ],
+        "render": {"feed": str(feed), "story": str(story)},
+        "template_path": str(workspace / "artifact.json"),
+    }
+
 def test_one_comparator_per_iteration_and_final_review_only_after_pass():
     assert validate_iterations([iteration()])[0]["comparison"]["score"] == 9.4
     with pytest.raises(AdTemplateProcessError):
@@ -101,7 +123,8 @@ def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
     wrong_story = json.loads(json.dumps(template)); wrong_story["storyLayout"]["placement"] = "feed"
     with pytest.raises(AdTemplateProcessError): process.validate_template_artifact(wrong_story)
     unsafe_zone = json.loads(json.dumps(template)); unsafe_zone["storyLayout"]["safeZones"][0]["height"] = 1921
-    with pytest.raises(AdTemplateProcessError): process.validate_template_artifact(unsafe_zone)
+    with pytest.raises(AdTemplateProcessError, match=r"storyLayout\.safeZones\[0\].*y \+ height must be <= 1920"):
+        process.validate_template_artifact(unsafe_zone)
     extra_metadata = json.loads(json.dumps(template)); extra_metadata["metadata"]["version"] = 2
     with pytest.raises(AdTemplateProcessError): process.validate_template_artifact(extra_metadata)
     inline = json.loads(json.dumps(template)); inline["metadata"]["gallerySamples"]["bytesBase64"] = "forbidden"
@@ -117,6 +140,9 @@ def test_builder_contract_is_strict_and_prompts_require_five_visible_scores():
         assert key in builder
     assert "never emit bytesBase64 anywhere" in builder
     assert "home/open-home-living.webp" in builder
+    assert 'Feed safeZones=[{"x":48,"y":48,"width":984,"height":1254}]' in builder
+    assert 'Story safeZones=[{"x":60,"y":250,"width":960,"height":1420}]' in builder
+    assert "width,height are positive sizes, not right/bottom coordinates" in builder
 
 
 def test_orchestrator_calls_real_roles_and_persists_receipts(tmp_path, monkeypatch):
@@ -277,3 +303,121 @@ def test_late_builder_return_cannot_render_or_import(tmp_path, monkeypatch):
 
     assert rendered == []
     assert imported == []
+
+
+def test_schema_invalid_candidate_repairs_before_one_render_and_comparator(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    bad = json.loads(json.dumps(valid_candidate("bad")))
+    bad["template"]["feedLayout"]["safeZones"][0] = {"x": 48, "y": 48, "right": 1032, "bottom": 1302}
+    bad["template"]["metadata"]["private"] = "must-not-persist"
+    bad["template"]["metadata"]["hash"] = "must-not-persist"
+    good = valid_candidate("good")
+    calls, renders, imports, events = [], [], [], []
+
+    def call_agent(instance, prompt, route):
+        calls.append((instance, prompt, route))
+        if instance == "builder-1":
+            return bad
+        if instance == "builder-1-repair-1":
+            return good
+        if instance == "comparator-1":
+            return evidence(9.6, "Valid Feed and Story match")
+        return evidence(9.7, "Independent final pass")
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: imports.append(output) or {"template_id": "tpl-good", "status": "imported"})
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_repair",
+        project_id="blockwise", emit=lambda kind, node, data: events.append((kind, node, data)),
+    ).run(source=str(source), brief="", placements=["feed", "story"], routes=[
+        {"provider": "builder", "model": "vision"},
+        {"provider": "compare", "model": "vision"},
+        {"provider": "review-a", "model": "vision"},
+        {"provider": "review-b", "model": "vision"},
+    ])
+
+    assert [item[0] for item in calls[:3]] == ["builder-1", "builder-1-repair-1", "comparator-1"]
+    repair_prompt = calls[1][1][0]["text"]
+    exact_reason = "feedLayout.safeZones[0] must contain exactly x, y, width, and height (missing height, width; unexpected bottom, right)"
+    assert exact_reason in repair_prompt
+    assert len(renders) == 1 and renders[0]["template"]["templateId"] == "good"
+    assert len([item for item in calls if item[0].startswith("comparator-")]) == 1
+    assert len(imports) == 1 and result["import"]["template_id"] == "tpl-good"
+    kinds = [item[0] for item in events]
+    assert kinds.index("candidate.rejected") < kinds.index("iteration.started") < kinds.index("iteration.rendered") < kinds.index("iteration.compared")
+    rejected = next(item[2] for item in events if item[0] == "candidate.rejected")
+    assert rejected == {"iteration": 1, "attempt": 1, "reason": exact_reason, "decision": "repair"}
+    evidence_path = tmp_path / "run" / "iterations" / "01" / "rejected-candidate-01.json"
+    persisted = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert persisted["candidate"]["template"]["feedLayout"]["safeZones"][0]["right"] == 1032
+    assert "private" not in persisted["candidate"]["template"]["metadata"]
+    assert "hash" not in persisted["candidate"]["template"]["metadata"]
+
+
+def test_schema_repair_is_bounded_and_invalid_candidates_have_no_visual_side_effects(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    bad = valid_candidate("always-bad")
+    bad["template"]["storyLayout"]["safeZones"] = [{"x": 0, "y": 0, "width": 1080, "height": 1921}]
+    calls, renders, imports, events = [], [], [], []
+
+    def call_agent(instance, prompt, route):
+        calls.append(instance)
+        return json.loads(json.dumps(bad))
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: renders.append(candidate))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: imports.append(output))
+    orchestrator = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_bounded",
+        project_id="blockwise", emit=lambda kind, node, data: events.append((kind, data)),
+    )
+    with pytest.raises(AdTemplateProcessError, match="schema-invalid after 3 repairs"):
+        orchestrator.run(source=str(source), brief="", placements=["feed", "story"], routes=[
+            {"provider": "builder", "model": "vision"},
+            {"provider": "compare", "model": "vision"},
+            {"provider": "review-a", "model": "vision"},
+            {"provider": "review-b", "model": "vision"},
+        ])
+
+    assert calls == ["builder-1", "builder-1-repair-1", "builder-1-repair-2", "builder-1-repair-3"]
+    assert renders == [] and imports == []
+    assert [item[0] for item in events].count("candidate.rejected") == 4
+    assert not any(item[0] in {"iteration.started", "iteration.rendered", "iteration.compared", "final-review.started"} for item in events)
+    assert len(list((tmp_path / "run" / "iterations" / "01").glob("rejected-candidate-*.json"))) == 4
+
+
+def test_stop_during_schema_repair_prevents_render_import_and_rejection_write(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    bad = valid_candidate("bad")
+    bad["template"]["feedLayout"]["safeZones"] = [{"x": -1, "y": 0, "width": 1080, "height": 1350}]
+    stopped = {"value": False}
+    calls, renders, imports, events = [], [], [], []
+
+    def call_agent(instance, prompt, route):
+        calls.append(instance)
+        if instance == "builder-1":
+            return bad
+        stopped["value"] = True
+        return valid_candidate("late-good")
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: renders.append(candidate))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: imports.append(output))
+    orchestrator = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_stop_repair",
+        project_id="blockwise", emit=lambda kind, node, data: events.append((kind, data)),
+        should_stop=lambda: stopped["value"],
+    )
+    with pytest.raises(AdTemplateProcessError, match="cancelled"):
+        orchestrator.run(source=str(source), brief="", placements=["feed", "story"], routes=[
+            {"provider": "builder", "model": "vision"},
+            {"provider": "compare", "model": "vision"},
+            {"provider": "review-a", "model": "vision"},
+            {"provider": "review-b", "model": "vision"},
+        ])
+
+    assert calls == ["builder-1", "builder-1-repair-1"]
+    assert renders == [] and imports == []
+    assert [item[0] for item in events].count("candidate.rejected") == 1
+    assert not (tmp_path / "run" / "iterations" / "01" / "rejected-candidate-02.json").exists()

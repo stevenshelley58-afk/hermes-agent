@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping
 
 THRESHOLD = 9.5
+MAX_SCHEMA_REPAIRS_PER_ITERATION = 3
 STAGES = ("source", "build", "render", "compare", "final-check", "live")
 
 class AdTemplateProcessError(ValueError):
@@ -161,6 +162,36 @@ def _rect(value: Any, *, bounds: tuple[int, int] | None = None) -> bool:
         return False
     return True
 
+def _validate_rect(value: Any, *, path: str, bounds: tuple[int, int]) -> None:
+    expected = {"x", "y", "width", "height"}
+    if not isinstance(value, dict):
+        raise AdTemplateProcessError(f"{path} must be an object with exactly x, y, width, and height")
+    missing = sorted(expected - set(value))
+    extra = sorted(set(value) - expected)
+    if missing or extra:
+        details = []
+        if missing:
+            details.append(f"missing {', '.join(missing)}")
+        if extra:
+            details.append(f"unexpected {', '.join(extra)}")
+        raise AdTemplateProcessError(f"{path} must contain exactly x, y, width, and height ({'; '.join(details)})")
+    for key in ("x", "y", "width", "height"):
+        if not _number_value(value[key]):
+            raise AdTemplateProcessError(f"{path}.{key} must be a finite number")
+    if value["width"] <= 0:
+        raise AdTemplateProcessError(f"{path}.width must be greater than zero")
+    if value["height"] <= 0:
+        raise AdTemplateProcessError(f"{path}.height must be greater than zero")
+    if value["x"] < 0:
+        raise AdTemplateProcessError(f"{path}.x must be zero or greater")
+    if value["y"] < 0:
+        raise AdTemplateProcessError(f"{path}.y must be zero or greater")
+    width, height = bounds
+    if value["x"] + value["width"] > width:
+        raise AdTemplateProcessError(f"{path} exceeds the {width}x{height} canvas: x + width must be <= {width}")
+    if value["y"] + value["height"] > height:
+        raise AdTemplateProcessError(f"{path} exceeds the {width}x{height} canvas: y + height must be <= {height}")
+
 def _font(value: Any) -> bool:
     return isinstance(value, dict) and set(value) == {"file"} and _nonempty(value.get("file"))
 
@@ -175,26 +206,37 @@ def _reject_builder_bytes(value: Any) -> None:
             _reject_builder_bytes(child)
 
 def _validate_layout(layout: Any, *, placement: str, width: int, height: int) -> None:
+    layout_path = f"{placement}Layout"
     if not isinstance(layout, dict) or set(layout) != {"placement", "layers", "safeZones"} or layout.get("placement") != placement:
-        raise AdTemplateProcessError(f"{placement} layout does not match the Blockwise contract")
+        raise AdTemplateProcessError(f"{layout_path} must contain exactly placement='{placement}', layers, and safeZones")
     layers = layout.get("layers")
     safe_zones = layout.get("safeZones")
-    if not isinstance(layers, list) or not 1 <= len(layers) <= 256 or not isinstance(safe_zones, list) or len(safe_zones) > 32 or not all(_rect(item, bounds=(width, height)) for item in safe_zones):
-        raise AdTemplateProcessError(f"{placement} layout layers or safe zones are invalid")
+    if not isinstance(layers, list) or not 1 <= len(layers) <= 256:
+        raise AdTemplateProcessError(f"{layout_path}.layers must be a list with 1 to 256 layers")
+    if not isinstance(safe_zones, list) or len(safe_zones) > 32:
+        raise AdTemplateProcessError(f"{layout_path}.safeZones must be a list with at most 32 rectangles")
+    for zone_index, zone in enumerate(safe_zones):
+        _validate_rect(zone, path=f"{layout_path}.safeZones[{zone_index}]", bounds=(width, height))
     ids = set()
-    for layer in layers:
+    for layer_index, layer in enumerate(layers):
+        layer_path = f"{layout_path}.layers[{layer_index}]"
         if not isinstance(layer, dict) or layer.get("type") not in LAYER_FIELDS:
-            raise AdTemplateProcessError(f"{placement} layout contains an unsupported layer")
+            raise AdTemplateProcessError(f"{layer_path} has an unsupported layer type")
         required, optional = LAYER_FIELDS[layer["type"]]
-        if not _strict_keys(layer, required, optional) or not _nonempty(layer.get("layerId")) or layer["layerId"] in ids or not _rect(layer.get("geometry"), bounds=(width, height)):
-            raise AdTemplateProcessError(f"{placement} layout contains an invalid or duplicate layer")
+        if not _strict_keys(layer, required, optional):
+            raise AdTemplateProcessError(f"{layer_path} does not match the exact {layer['type']} layer shape")
+        if not _nonempty(layer.get("layerId")):
+            raise AdTemplateProcessError(f"{layer_path}.layerId must be a non-empty string")
+        if layer["layerId"] in ids:
+            raise AdTemplateProcessError(f"{layer_path}.layerId duplicates an earlier layer")
+        _validate_rect(layer.get("geometry"), path=f"{layer_path}.geometry", bounds=(width, height))
         ids.add(layer["layerId"])
         layer_type = layer["type"]
         for key in ("inputKey", "colourRole", "icon", "assetKey"):
             if key in layer and not _nonempty(layer[key]):
-                raise AdTemplateProcessError(f"{placement} {layer_type} layer has an empty {key}")
+                raise AdTemplateProcessError(f"{layer_path}.{key} must be a non-empty string")
         if "colourRole" in layer and layer["colourRole"] not in COLOUR_ROLES:
-            raise AdTemplateProcessError(f"{placement} {layer_type} colourRole is invalid")
+            raise AdTemplateProcessError(f"{layer_path}.colourRole is invalid")
         if layer_type == "plate" and not isinstance(layer["protected"], bool):
             raise AdTemplateProcessError("plate protected must be boolean")
         if layer_type == "image_slot":
@@ -311,6 +353,74 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
             raise AdTemplateProcessError("metadata real asset reference is invalid")
     return value
 
+def validate_builder_candidate(value: Any) -> Dict[str, Any]:
+    _reject_builder_bytes(value)
+    if not isinstance(value, dict) or set(value) != {"template", "assets"}:
+        raise AdTemplateProcessError("builder must return exactly template and assets")
+    template = validate_template_artifact(value.get("template"))
+    assets = value.get("assets")
+    if not isinstance(assets, list):
+        raise AdTemplateProcessError("builder assets must be a list")
+    declarations = template["assets"]
+    seen = set()
+    for asset_index, asset in enumerate(assets):
+        path = f"assets[{asset_index}]"
+        if not isinstance(asset, dict) or set(asset) != {"assetKey", "fileName", "mimeType"}:
+            raise AdTemplateProcessError(f"{path} must contain exactly assetKey, fileName, and mimeType")
+        key = asset.get("assetKey")
+        if not _nonempty(key):
+            raise AdTemplateProcessError(f"{path}.assetKey must be a non-empty string")
+        if key in seen:
+            raise AdTemplateProcessError(f"{path}.assetKey duplicates an earlier asset")
+        if key not in declarations or asset.get("fileName") != declarations[key].get("fileName") or asset.get("mimeType") != declarations[key].get("mimeType"):
+            raise AdTemplateProcessError(f"{path} must exactly match its template.assets declaration")
+        seen.add(key)
+    if set(declarations) != seen:
+        raise AdTemplateProcessError("builder assets must supply every template.assets declaration exactly once")
+    return value
+
+_PRIVATE_EVIDENCE_KEYS = frozenset({
+    "authorization", "bytesbase64", "credential", "credentials", "hash",
+    "private", "privatefields", "secret", "signature", "sourcepath", "token",
+})
+
+def _safe_rejected_candidate(value: Any, *, depth: int = 0) -> Any:
+    if depth > 12:
+        return "[truncated]"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:8000]
+    if isinstance(value, list):
+        return [_safe_rejected_candidate(item, depth=depth + 1) for item in value[:512]]
+    if isinstance(value, dict):
+        safe: Dict[str, Any] = {}
+        for raw_key, child in list(value.items())[:512]:
+            key = str(raw_key)[:160]
+            normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+            if normalized in _PRIVATE_EVIDENCE_KEYS:
+                continue
+            safe[key] = _safe_rejected_candidate(child, depth=depth + 1)
+        return safe
+    return str(value)[:1000]
+
+def persist_rejected_candidate(candidate: Any, iteration_workspace: Path, *, iteration: int, attempt: int, reason: str) -> Path:
+    safe_candidate = None
+    try:
+        _reject_builder_bytes(candidate)
+    except AdTemplateProcessError:
+        # The reason is retained, but model-supplied bytes are never written.
+        pass
+    else:
+        safe_candidate = _safe_rejected_candidate(candidate)
+    iteration_workspace.mkdir(parents=True, exist_ok=True)
+    path = iteration_workspace / f"rejected-candidate-{attempt:02d}.json"
+    evidence = {"iteration": iteration, "attempt": attempt, "reason": reason, "candidate": safe_candidate}
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(evidence, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, path)
+    return path
+
 def resolve_catalog_assets(template: Mapping[str, Any], assets: Any) -> List[Dict[str, Any]]:
     if not isinstance(assets, list): raise AdTemplateProcessError("builder assets must be a list")
     declarations = template.get("assets") if isinstance(template.get("assets"), dict) else {}
@@ -402,8 +512,15 @@ def import_template(output: Mapping[str, Any], *, run_id: str, project_id: str) 
     replayed = bool(payload.get("replayed"))
     return {"template_id": str(payload["templateId"]), "status": "replayed" if replayed else "imported", "asset_count": int(payload.get("assetCount") or len(assets)), "replayed": replayed}
 
-def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: Any, source: str, feedback: str = "") -> str:
-    return f"""Run the sole ad-template process as the builder agent. Inspect the attached source pixels, remove advertiser identity (names, logos, phones, URLs, portraits), and return JSON with exactly {{template, assets}}. template must contain exactly schema='blockwise.ad-template', templateId, createdAt (ISO datetime), feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata. semanticColours must contain exactly background, primary, secondary, accent, mainText, inverseText; every layer colourRole is one of those six. Each layout contains exactly placement, layers, safeZones; Feed is placement feed within 1080x1350 and Story is placement story within 1080x1920, including safeZones. Layer shapes are exact: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. Geometry is exactly {{x,y,width,height}}. imageInputs are {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs are {{key,label,placeholder,maxLength}}. fonts are {{file}} and every text-layer font must be declared; allowed bundled font files are {', '.join(sorted(ALLOWED_FONT_FILES))}. metadata is exact: title:string; description:string; gallerySamples={{feed?:{{assetKey?,placement,purpose}},story?:{{assetKey?,placement,purpose}}}}; metaCopyDefaults={{primaryText:string[],headlines:string[],descriptions:string[],cta:string}}; aiWritingGuidance={{summary:string,fields:record<string,string>}}; publishRequirements={{objective:string,specialAdCategory:string|null,instantForm:{{required:boolean,dependency:string|null,defaults?:record<string,string>}},destination:{{required:boolean,kind:'website'|'instant_form'|'none',dependency:string|null}},requiredCtaTypes?:string[]}}; replacementAssets={{inputKey,assetKey,purpose?}}[]; realAssetRefs={{inputKey,kind,required}}[]. Every layer/input/font/colour/asset metadata reference must resolve inside the same template. Declare source-free replacement assets in template.assets as assetKey -> {{fileName,mimeType}} and in top-level assets only as {{assetKey,fileName,mimeType}} with an exact match. Hermes resolves bytes from the fixed safe catalog; never emit bytesBase64 anywhere and never guess filenames. Allowed normalized relative catalog paths are home/open-home-living.webp, home/home-dusk.webp, home/mt-lawley-federation.webp, home/home-pool.webp, home/interior-styled.webp, home/subiaco-townhouse.webp, and adstudio-samples/photos/int-bedroom.png. Never include the source composite, source_path, hashes, signatures, private fields, or a full-source plate. Keep geometry inside canvas and Story native. Hermes renders, compares once per iteration, then runs two fresh final reviewers only after comparator >= {THRESHOLD}; never self-score or invent review evidence. Run {run_id}; project {project_id}; fixed placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback[:3000]}"""
+def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: Any, source: str, feedback: str = "", validation_feedback: str = "", repair_attempt: int = 0) -> str:
+    repair_clause = ""
+    if validation_feedback:
+        repair_clause = (
+            f" STRICT SCHEMA REPAIR {repair_attempt} of {MAX_SCHEMA_REPAIRS_PER_ITERATION}: "
+            f"the previous candidate was rejected before rendering with this exact validation error: {validation_feedback}. "
+            "Return a complete corrected template-and-assets JSON object, not a patch."
+        )
+    return f"""Run the sole ad-template process as the builder agent. Inspect the attached source pixels, remove advertiser identity (names, logos, phones, URLs, portraits), and return JSON with exactly {{template, assets}}. template must contain exactly schema='blockwise.ad-template', templateId, createdAt (ISO datetime), feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata. semanticColours must contain exactly background, primary, secondary, accent, mainText, inverseText; every layer colourRole is one of those six. Each layout contains exactly placement, layers, safeZones; Feed is placement feed within 1080x1350 and Story is placement story within 1080x1920, including safeZones. Geometry and every safe-zone rectangle contain exactly {{x,y,width,height}}: x,y are the top-left coordinates from canvas origin (0,0); width,height are positive sizes, not right/bottom coordinates; x + width must stay within canvas width and y + height within canvas height. Exact valid examples are Feed safeZones=[{{"x":48,"y":48,"width":984,"height":1254}}] within 1080x1350 and Story safeZones=[{{"x":60,"y":250,"width":960,"height":1420}}] within 1080x1920. Layer shapes are exact: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. imageInputs are {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs are {{key,label,placeholder,maxLength}}. fonts are {{file}} and every text-layer font must be declared; allowed bundled font files are {', '.join(sorted(ALLOWED_FONT_FILES))}. metadata is exact: title:string; description:string; gallerySamples={{feed?:{{assetKey?,placement,purpose}},story?:{{assetKey?,placement,purpose}}}}; metaCopyDefaults={{primaryText:string[],headlines:string[],descriptions:string[],cta:string}}; aiWritingGuidance={{summary:string,fields:record<string,string>}}; publishRequirements={{objective:string,specialAdCategory:string|null,instantForm:{{required:boolean,dependency:string|null,defaults?:record<string,string>}},destination:{{required:boolean,kind:'website'|'instant_form'|'none',dependency:string|null}},requiredCtaTypes?:string[]}}; replacementAssets={{inputKey,assetKey,purpose?}}[]; realAssetRefs={{inputKey,kind,required}}[]. Every layer/input/font/colour/asset metadata reference must resolve inside the same template. Declare source-free replacement assets in template.assets as assetKey -> {{fileName,mimeType}} and in top-level assets only as {{assetKey,fileName,mimeType}} with an exact match. Hermes resolves bytes from the fixed safe catalog; never emit bytesBase64 anywhere and never guess filenames. Allowed normalized relative catalog paths are home/open-home-living.webp, home/home-dusk.webp, home/mt-lawley-federation.webp, home/home-pool.webp, home/interior-styled.webp, home/subiaco-townhouse.webp, and adstudio-samples/photos/int-bedroom.png. Never include the source composite, source_path, hashes, signatures, private fields, or a full-source plate. Keep geometry inside canvas and Story native. Hermes renders, compares once per iteration, then runs two fresh final reviewers only after comparator >= {THRESHOLD}; never self-score or invent review evidence. Run {run_id}; project {project_id}; fixed placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback[:3000]}.{repair_clause}"""
 
 def review_prompt(*, final: bool) -> str:
     role = "fresh independent final reviewer" if final else "iteration comparator"
@@ -439,15 +556,46 @@ class SoleProcessOrchestrator:
         candidate: Dict[str, Any] = {}
         for offset in range(31 - total_iterations - 1):
             index = total_iterations + offset + 1
-            self.emit("stage.started", "build", {"iteration": index, "role": "builder"})
-            self._check_stop()
-            candidate = self.call_agent("builder-%d" % index, vision_message(generator_prompt(run_id=self.run_id, project_id=self.project_id, brief=brief, placements=placements, source=source, feedback=feedback), [source]), f"{routes[0].get('provider')}/{routes[0].get('model')}")
-            self._check_stop()
-            if not isinstance(candidate, dict): raise AdTemplateProcessError("builder returned invalid candidate")
-            self.emit("iteration.started", "build", {"iteration": index, "role": "builder"})
-            # Render every candidate before comparison. This makes each
-            # iteration preview a real generator artifact, not an agent claim.
             iteration_workspace = self.workspace / "iterations" / f"{index:02d}"
+            self._check_stop()
+            self.emit("stage.started", "build", {"iteration": index, "role": "builder"})
+            validation_feedback = ""
+            for repair_attempt in range(MAX_SCHEMA_REPAIRS_PER_ITERATION + 1):
+                self._check_stop()
+                instance = "builder-%d" % index if repair_attempt == 0 else "builder-%d-repair-%d" % (index, repair_attempt)
+                candidate = self.call_agent(
+                    instance,
+                    vision_message(generator_prompt(
+                        run_id=self.run_id, project_id=self.project_id, brief=brief,
+                        placements=placements, source=source, feedback=feedback,
+                        validation_feedback=validation_feedback, repair_attempt=repair_attempt,
+                    ), [source]),
+                    f"{routes[0].get('provider')}/{routes[0].get('model')}",
+                )
+                self._check_stop()
+                try:
+                    validate_builder_candidate(candidate)
+                except AdTemplateProcessError as exc:
+                    validation_feedback = str(exc)
+                    self._check_stop()
+                    persist_rejected_candidate(
+                        candidate, iteration_workspace, iteration=index,
+                        attempt=repair_attempt + 1, reason=validation_feedback,
+                    )
+                    self._check_stop()
+                    self.emit("candidate.rejected", "build", {
+                        "iteration": index, "attempt": repair_attempt + 1,
+                        "reason": validation_feedback, "decision": "repair",
+                    })
+                    self._check_stop()
+                    if repair_attempt >= MAX_SCHEMA_REPAIRS_PER_ITERATION:
+                        raise AdTemplateProcessError(
+                            f"builder candidate remained schema-invalid after {MAX_SCHEMA_REPAIRS_PER_ITERATION} repairs: {validation_feedback}"
+                        ) from None
+                    continue
+                break
+            self.emit("iteration.started", "build", {"iteration": index, "role": "builder"})
+            # Only a strictly valid candidate becomes a visual iteration.
             self._check_stop()
             rendered = run_generator_cli(candidate, iteration_workspace)
             self._check_stop()
