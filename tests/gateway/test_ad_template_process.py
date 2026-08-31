@@ -302,6 +302,48 @@ def test_comparator_retries_self_inconsistent_overlap_and_persists_event(tmp_pat
     assert result["iterations"][0]["decision"] == "accepted"
 
 
+def test_comparator_schema_recovery_survives_three_invalid_outputs(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    events, calls, renders = [], [], []
+    invalid = evidence(8.6, "Move the hero closer to the source")
+    invalid["required_changes"] = ["Move the hero lower"]
+    comparator_calls = 0
+
+    def call_agent(instance, prompt, route):
+        nonlocal comparator_calls
+        calls.append((instance, prompt[0]["text"]))
+        if instance.startswith("builder-"):
+            return overlap_candidate(f"candidate-{instance}")
+        if instance.startswith("comparator-"):
+            comparator_calls += 1
+            if comparator_calls <= 3:
+                return invalid
+        return evidence(9.7, "Schema-correct pass")
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: {"template_id": "tpl-comparator-retry", "status": "imported"})
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_comparator_three_retries",
+        project_id="blockwise", emit=lambda kind, node, data: events.append((kind, data)),
+    ).run(source=str(source), brief="", placements=["feed", "story"], routes=_quality_routes(), require_quality_route=True)
+
+    comparator_entries = [item for item in calls if item[0].startswith("comparator-")]
+    assert len(comparator_entries) == 4
+    assert comparator_entries[-1][0] == "comparator-1-retry-3"
+    assert "placement=Feed or Story" in comparator_entries[-1][1]
+    assert "current={x,y,width,height}" in comparator_entries[-1][1]
+    retry_events = [data for kind, data in events if kind == "comparator.retried"]
+    assert len(retry_events) == 3
+    assert [item["attempt"] for item in retry_events] == [1, 2, 3]
+    assert all(
+        item["reason"] == "comparator required_changes must name placement, layers, current geometry, target geometry, and change"
+        for item in retry_events
+    )
+    assert len(renders) == 1
+    assert result["iterations"][0]["decision"] == "accepted"
+
+
 def test_asset_envelope_is_mechanically_mirrored_without_changing_content():
     candidate = valid_candidate("asset-normalization")
     declaration = {
@@ -1140,6 +1182,53 @@ def test_invalid_final_review_output_retries_without_rebuilding_accepted_iterati
     assert len(retried) == 1
     assert retried[0]["attempt"] == 1
     assert retried[0]["reason"] == "final reviewer must provide a concrete required_changes list"
+    assert result["iterations"][0]["decision"] == "accepted"
+    assert result["final_review"]["decision"] == "accepted"
+
+
+def test_final_review_schema_recovery_survives_three_invalid_outputs(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    calls, events, renders, imports = [], [], [], []
+    invalid = evidence(9.2, "Final spacing needs revision")
+    invalid["required_changes"] = []
+    reviewer_a_calls = 0
+
+    def call_agent(instance, prompt, route):
+        nonlocal reviewer_a_calls
+        calls.append((instance, prompt[0]["text"], route))
+        if instance.startswith("builder-"):
+            return valid_candidate("final-output-three-retries")
+        if instance.startswith("comparator-"):
+            return evidence(9.7, "Comparator pass")
+        if route == "review-a/vision-a":
+            reviewer_a_calls += 1
+            if reviewer_a_calls <= 3:
+                return invalid
+        return evidence(9.7, "Independent final pass")
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: imports.append(output) or {"template_id": "tpl-three-retries", "status": "imported"})
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_final_three_retries",
+        project_id="blockwise", emit=lambda kind, node, data: events.append((kind, data)),
+    ).run(source=str(source), brief="", placements=["feed", "story"], routes=[
+        {"provider": "builder", "model": "vision"},
+        {"provider": "compare", "model": "vision"},
+        {"provider": "review-a", "model": "vision-a"},
+        {"provider": "review-b", "model": "vision-b"},
+    ])
+
+    assert [name.split("-")[0] for name, _, _ in calls].count("builder") == 1
+    assert len(renders) == 1 and len(imports) == 1
+    final_calls = [item for item in calls if item[0].startswith("final-reviewer-")]
+    assert len(final_calls) == 5
+    assert "-retry-3" in final_calls[3][0]
+    assert "feed_source_likeness < 9.5" in final_calls[3][1]
+    assert "exact keys placement, layers, current, target, and change" in final_calls[3][1]
+    retried = [data for kind, data in events if kind == "final-review.retried"]
+    assert len(retried) == 3
+    assert [item["attempt"] for item in retried] == [1, 2, 3]
     assert result["iterations"][0]["decision"] == "accepted"
     assert result["final_review"]["decision"] == "accepted"
 

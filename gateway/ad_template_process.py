@@ -15,8 +15,8 @@ STAGES = ("source", "build", "render", "compare", "final-check", "live")
 MAX_CANDIDATE_CONTEXT_CHARS = 100_000
 MIN_MATERIAL_SCORE_GAIN = 0.5
 STORY_CONTENT_SAFE_ZONE = {"x": 72, "y": 240, "width": 936, "height": 1380}
-MAX_COMPARATOR_SELF_CONSISTENCY_RETRIES = 2
-MAX_FINAL_REVIEW_OUTPUT_RETRIES = 1
+MAX_COMPARATOR_SELF_CONSISTENCY_RETRIES = 3
+MAX_FINAL_REVIEW_OUTPUT_RETRIES = 3
 MATERIAL_OVERLAP_RATIO = 0.08
 
 class AdTemplateProcessError(ValueError):
@@ -1185,27 +1185,33 @@ class SoleProcessOrchestrator:
                 retry_suffix = ""
                 if comparison_rejection:
                     retry_suffix = (
-                        "\n\nYour previous response was rejected because its proposed geometry contradicted the "
-                        f"current layered document: {comparison_rejection}. Reinspect the candidate JSON and pixels, "
-                        "then return a self-consistent comparison without introducing a new opaque overlap."
+                        "\n\nYour previous response was rejected by the strict comparison schema: "
+                        f"{comparison_rejection}. Reinspect the candidate JSON and pixels, then return the complete "
+                        "corrected JSON object. When the quality gate is not passed, required_changes MUST be a "
+                        "non-empty array. Every required_changes item MUST be one string containing placement=Feed "
+                        "or Story; layers=<real layer ids>; current={x,y,width,height}; target={x,y,width,height}; "
+                        "change=<concrete instruction>. Current geometry must match the current layered document. "
+                        "Target geometry must remain on-canvas and must not introduce a new opaque overlap unless "
+                        "that overlap is visible in the source and the change explicitly says source overlap. "
+                        "Return only the corrected JSON object."
                     )
-                comparison = self.call_agent(
-                    "comparator-%d" % index if comparison_attempt == 0 else f"comparator-{index}-retry-{comparison_attempt}",
-                    vision_message(
-                        comparison_prompt + retry_suffix,
-                        [
-                            source,
-                            str((rendered.get("render") or {}).get("feed") or ""),
-                            str((rendered.get("render") or {}).get("story") or ""),
-                        ],
-                    ),
-                    f"{routes[1].get('provider')}/{routes[1].get('model')}",
-                )
-                self._check_stop()
-                evidence = _assessment(comparison, "comparator", require_change_list=True)
                 try:
+                    comparison = self.call_agent(
+                        "comparator-%d" % index if comparison_attempt == 0 else f"comparator-{index}-retry-{comparison_attempt}",
+                        vision_message(
+                            comparison_prompt + retry_suffix,
+                            [
+                                source,
+                                str((rendered.get("render") or {}).get("feed") or ""),
+                                str((rendered.get("render") or {}).get("story") or ""),
+                            ],
+                        ),
+                        f"{routes[1].get('provider')}/{routes[1].get('model')}",
+                    )
+                    self._check_stop()
+                    evidence = _assessment(comparison, "comparator", require_change_list=True)
                     _validate_required_change_targets(evidence, candidate)
-                except ComparatorSelfConsistencyError as exc:
+                except (AdTemplateProcessError, AdTemplateStructuredOutputError, ComparatorSelfConsistencyError) as exc:
                     comparison_rejection = str(exc)
                     if comparison_attempt >= MAX_COMPARATOR_SELF_CONSISTENCY_RETRIES:
                         raise
@@ -1294,8 +1300,13 @@ class SoleProcessOrchestrator:
                 if rejection:
                     retry_suffix = (
                         "\n\nYour previous final-review response was rejected by the strict evidence schema: "
-                        f"{rejection}. Return the complete corrected JSON object. If any rubric score is below the "
-                        "gate, required_changes must contain concrete placement/layer/current/target geometry items."
+                        f"{rejection}. Return the complete corrected JSON object. required_changes MUST be a "
+                        "non-empty array when hard_failures is non-empty, feed_source_likeness < 9.5, the rubric "
+                        "mean < 9.5, or any rubric score < 9.3. Every required_changes item MUST contain the exact "
+                        "keys placement, layers, current, target, and change; placement must be Feed or Story; "
+                        "layers must name at least one real layer id; and current, target, and change must each be "
+                        "a concrete non-empty string. Do not lower the score to avoid this requirement. Return only "
+                        "the corrected JSON object."
                     )
                 attempt_identity = identity if output_attempt == 0 else f"{identity}-retry-{output_attempt}"
                 try:
