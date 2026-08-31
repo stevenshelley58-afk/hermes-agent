@@ -188,10 +188,24 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
     reason = str(value.get("reason") or value.get("mismatches") or "").strip()
     if len(reason) < 3: raise AdTemplateProcessError(f"{role} must explain its decision")
     differences = value.get("differences")
-    required_changes = value.get("required_changes")
+    raw_required_changes = value.get("required_changes")
+    declared_shape = value.get("required_changes_shape")
+    if role == "final reviewer" and declared_shape in {"missing", "null", "list"}:
+        required_changes_shape = declared_shape
+    elif "required_changes" not in value:
+        required_changes_shape = "missing"
+    elif raw_required_changes is None:
+        required_changes_shape = "null"
+    elif isinstance(raw_required_changes, list):
+        required_changes_shape = "list"
+    else:
+        required_changes_shape = "invalid"
+    required_changes = raw_required_changes
     if require_change_list:
         if not isinstance(differences, list) or not all(isinstance(item, str) and item.strip() for item in differences):
             raise AdTemplateProcessError(f"{role} must provide a concrete differences list")
+        if role == "final reviewer" and required_changes_shape in {"missing", "null"}:
+            required_changes = []
         if not isinstance(required_changes, list) or not all(isinstance(item, str) and item.strip() for item in required_changes):
             raise AdTemplateProcessError(f"{role} must provide a concrete required_changes list")
         differences = [item.strip() for item in differences]
@@ -221,6 +235,7 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
         "rubric": scores,
         "hard_failures": [str(item) for item in hard_failures],
         **({"differences": differences, "required_changes": required_changes} if require_change_list else {}),
+        **({"required_changes_shape": required_changes_shape} if role == "final reviewer" else {}),
     }
 
 def _passes_quality_gate(evidence: Mapping[str, Any]) -> bool:
@@ -978,16 +993,23 @@ def review_prompt(*, final: bool, candidate: Any = None) -> str:
     role = "fresh independent final reviewer" if final else "iteration comparator"
     candidate_context = _safe_candidate_prompt_json(candidate)
     change_list_contract = (
-        "As a final reviewer, required_changes may be [] for a negative verdict when the visible "
-        "reason and differences are valid but you cannot express a safe layer-geometry edit. An "
-        "empty list never makes a weak verdict pass; Hermes will combine both reviewers' complete "
-        "evidence for the next builder. If you include a required change, it must use the exact "
-        "actionable structure below."
+        "As a final reviewer, required_changes is optional. You may omit it, return null, or return [] "
+        "for a negative verdict when the visible reason and differences are valid but you cannot "
+        "express a safe layer-geometry edit. Omitting it never makes a weak verdict pass; Hermes will "
+        "combine both reviewers' complete evidence for the next builder. If you include any required "
+        "changes, the value must be a list and each item must use the exact actionable structure below."
         if final
         else
         "As the iteration comparator, required_changes must contain at least one actionable item "
         "whenever the candidate does not pass every gate. Return [] only when the candidate "
         "genuinely clears every gate."
+    )
+    output_contract = (
+        "Return JSON only with exactly reason, differences, hard_failures, and rubric, plus optional "
+        "required_changes."
+        if final
+        else
+        "Return JSON only with exactly reason, differences, required_changes, hard_failures, and rubric."
     )
     return f"""You are the {role} in a source-matching loop. The attached images are ordered: (1) the source reference, (2) the rendered Feed candidate, and (3) the rendered Story translation. Inspect the actual pixels together. The primary objective is not generic ad quality; it is faithful reconstruction of the source design as editable layers.
 
@@ -995,7 +1017,7 @@ Compare source versus Feed region by region: outer frame and margins; header/tit
 
 Use this scale strictly: 10.0 means the Feed is visually indistinguishable in structure at thumbnail size except permitted neutral content substitutions; 9.5 means only tiny finishing differences remain; 9.0 still has clearly visible spacing, scale, typography, or geometry differences; 8.0 is recognisably based on the source but materially different; 5.0 is merely the same category; 0 is missing or invalid. Do not award 9.5 to a design that a person can immediately distinguish from the source.
 
-Return JSON only with exactly reason, differences, required_changes, hard_failures, and rubric. differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. required_changes is the ordered list of material work the builder should apply next. {change_list_contract} Every required_changes string must use this exact actionable structure: placement=feed|story; layers=comma-separated layerIds; current={{x:...,y:...,width:...,height:...}}; target={{x:...,y:...,width:...,height:...}}; change=specific instruction. Name all affected layer IDs and use their current and intended target geometry. Copy current geometry exactly from Candidate contract JSON, then check every proposed target rectangle against every existing layer before returning it. Never propose a target that newly overlaps an image slot or opaque vector panel with another image slot unless that overlap is visibly present in the source and the change text explicitly identifies and justifies the source-visible overlap. Use a separate required_changes item when affected layers do not share identical current and target geometry. hard_failures is a list. rubric contains exactly these eight 0-10 numbers: feed_source_likeness, layout_geometry, spacing_proportions, typography_likeness, colour_likeness, image_slot_composition, editable_decomposition, native_story_translation. A passing candidate requires feed_source_likeness >= {THRESHOLD}, mean >= {THRESHOLD}, every field >= {MIN_RUBRIC_SCORE}, no hard failures, and no required changes.
+{output_contract} differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. required_changes is the ordered list of material work the builder should apply next. {change_list_contract} Every required_changes string must use this exact actionable structure: placement=feed|story; layers=comma-separated layerIds; current={{x:...,y:...,width:...,height:...}}; target={{x:...,y:...,width:...,height:...}}; change=specific instruction. Name all affected layer IDs and use their current and intended target geometry. Copy current geometry exactly from Candidate contract JSON, then check every proposed target rectangle against every existing layer before returning it. Never propose a target that newly overlaps an image slot or opaque vector panel with another image slot unless that overlap is visibly present in the source and the change text explicitly identifies and justifies the source-visible overlap. Use a separate required_changes item when affected layers do not share identical current and target geometry. hard_failures is a list. rubric contains exactly these eight 0-10 numbers: feed_source_likeness, layout_geometry, spacing_proportions, typography_likeness, colour_likeness, image_slot_composition, editable_decomposition, native_story_translation. A passing candidate requires feed_source_likeness >= {THRESHOLD}, mean >= {THRESHOLD}, every field >= {MIN_RUBRIC_SCORE}, no hard failures, and no required changes.
 
 Hard-fail source pixels flattened into the output, copied advertiser identity, missing/unreadable renders, clipping, canvas/safe-zone violations, non-editable critical roles, unknown assets, or a stretched/cropped/letterboxed Story. Do not infer another reviewer's score. Candidate contract JSON: {candidate_context}"""
 
@@ -1315,9 +1337,10 @@ class SoleProcessOrchestrator:
                 if rejection:
                     retry_suffix = (
                         "\n\nYour previous final-review response was rejected by the strict evidence schema: "
-                        f"{rejection}. Return the complete corrected JSON object. required_changes MUST be an "
-                        "array, but a negative final verdict may use [] when reason and differences fully explain "
-                        "the visible failure and no safe geometry edit can be stated. Every provided required_changes item MUST contain the exact "
+                        f"{rejection}. Return the complete corrected JSON object. required_changes is optional; "
+                        "if present and non-null it MUST be an array. A negative final verdict may omit it, use null, "
+                        "or use [] when reason and differences fully explain the visible failure and no safe geometry "
+                        "edit can be stated. Every provided required_changes item MUST contain the exact "
                         "keys placement, layers, current, target, and change; placement must be Feed or Story; "
                         "layers must name at least one real layer id; and current, target, and change must each be "
                         "a concrete non-empty string. Do not lower the score to avoid this requirement. Return only "
@@ -1381,6 +1404,7 @@ class SoleProcessOrchestrator:
                     "source_match_score": item["rubric"]["feed_source_likeness"],
                     "rubric": item["rubric"],
                     "hard_failures": item["hard_failures"],
+                    "required_changes_shape": item["required_changes_shape"],
                     "differences": item["differences"],
                     "required_changes": item["required_changes"],
                     "reason": item["reason"],
