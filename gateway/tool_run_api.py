@@ -36,6 +36,18 @@ from gateway.tool_runs import (
 logger = logging.getLogger(__name__)
 
 
+# Vision-capable template roles can spend several minutes inside a provider
+# request without yielding a stream delta.  Keep the watchdog finite, but do
+# not let the legacy 120-second policy mistake a healthy slow call for a hung
+# generator.  Explicit policies may lengthen this bound, never shorten it.
+AD_TEMPLATE_MIN_INACTIVITY_SECONDS = 300.0
+
+
+def _ad_template_inactivity_timeout(route_settings: Dict[str, Any]) -> float:
+    configured = max(1.0, float(route_settings.get("timeout_seconds") or 120))
+    return max(configured, AD_TEMPLATE_MIN_INACTIVITY_SECONDS)
+
+
 def _error(message: str, code: str) -> Dict[str, Any]:
     return {"error": {"message": message, "type": "invalid_request_error", "code": code}}
 
@@ -609,11 +621,20 @@ class ToolRunAPIMixin:
 
             result = usage = None
             failures = []
-            timeout = max(1.0, float(route_settings.get("timeout_seconds") or 120))
+            configured_timeout = max(
+                1.0, float(route_settings.get("timeout_seconds") or 120)
+            )
+            timeout = _ad_template_inactivity_timeout(route_settings)
             for attempt, candidate in enumerate(candidates, start=1):
                 self._tool_run_store.append_event(
                     run_id, "provider.attempt", status="running", node_id=route_stage,
-                    data={"attempt": attempt, "provider": candidate["provider"], "model": candidate["model"], "timeout_seconds": timeout},
+                    data={
+                        "attempt": attempt,
+                        "provider": candidate["provider"],
+                        "model": candidate["model"],
+                        "configured_timeout_seconds": configured_timeout,
+                        "timeout_seconds": timeout,
+                    },
                 )
                 future = None
                 try:

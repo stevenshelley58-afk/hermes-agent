@@ -865,6 +865,51 @@ class _TimedRoleHarness(_ToolRunHarness):
         return agent
 
 
+def test_ad_template_inactivity_timeout_has_finite_slow_call_allowance():
+    assert tool_run_api._ad_template_inactivity_timeout(
+        {"timeout_seconds": 120}
+    ) == 300.0
+    assert tool_run_api._ad_template_inactivity_timeout(
+        {"timeout_seconds": 600}
+    ) == 600.0
+    assert tool_run_api._ad_template_inactivity_timeout({}) == 300.0
+
+
+@pytest.mark.asyncio
+async def test_slow_silent_role_outlives_short_policy_but_remains_bounded(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(tool_run_api, "AD_TEMPLATE_MIN_INACTIVITY_SECONDS", 2.0)
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source-pixels")
+    store = ToolRunStore(str(tmp_path / "slow-silent-role.db"))
+    run, _ = store.create_run(_command(str(source), idempotency_key="slow-silent-role"))
+
+    def slow_but_healthy(_agent, _kwargs):
+        time.sleep(1.2)
+        return {"final_response": "{}"}
+
+    api = _TimedRoleHarness(store, slow_but_healthy)
+    monkeypatch.setattr(api, "_tool_candidates", _one_second_candidates)
+    monkeypatch.setattr(tool_run_api, "SoleProcessOrchestrator", _OneRoleOrchestrator)
+    monkeypatch.setattr(api, "_prepare_candidate_output", lambda _run_id, output: output)
+
+    await api._execute_tool_run(run["run_id"])
+
+    completed = store.get_run(run["run_id"])
+    assert completed["status"] == "completed"
+    assert api.created_agents[0].interrupts == []
+    attempt = next(
+        event for event in store.events(run["run_id"])
+        if event["kind"] == "provider.attempt"
+    )
+    assert attempt["data"]["configured_timeout_seconds"] == 1.0
+    assert attempt["data"]["timeout_seconds"] == 2.0
+
+
 @pytest.mark.asyncio
 async def test_stream_heartbeat_prevents_false_inactivity_timeout(tmp_path, monkeypatch):
     home = tmp_path / "hermes-home"
@@ -898,6 +943,7 @@ async def test_silent_timeout_interrupts_drains_and_consumes_late_exception(tmp_
     home = tmp_path / "hermes-home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(tool_run_api, "AD_TEMPLATE_MIN_INACTIVITY_SECONDS", 1.0)
     source = tmp_path / "source.png"
     source.write_bytes(b"source-pixels")
     store = ToolRunStore(str(tmp_path / "silent-timeout.db"))
@@ -928,6 +974,7 @@ async def test_late_timed_out_builder_cannot_render_or_import(tmp_path, monkeypa
     home = tmp_path / "hermes-home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(tool_run_api, "AD_TEMPLATE_MIN_INACTIVITY_SECONDS", 1.0)
     source = tmp_path / "source.png"
     source.write_bytes(b"source-pixels")
     store = ToolRunStore(str(tmp_path / "late-builder.db"))
