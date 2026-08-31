@@ -1141,6 +1141,54 @@ def test_final_review_revision_prompt_carries_accepted_candidate(tmp_path, monke
     assert result["import"]["template_id"] == "tpl-final-v2" and len(imports) == 1
 
 
+def test_final_check_resume_reuses_checkpoint_score_when_reviewers_request_revision(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    calls, renders, imports = [], [], []
+    reviewer_calls = 0
+    checkpoint = valid_candidate("resume-checkpoint")
+    checkpoint_feed = tmp_path / "checkpoint-feed.png"
+    checkpoint_story = tmp_path / "checkpoint-story.png"
+    checkpoint_feed.write_bytes(b"feed")
+    checkpoint_story.write_bytes(b"story")
+    checkpoint["render"] = {"feed": str(checkpoint_feed), "story": str(checkpoint_story)}
+
+    def call_agent(instance, prompt, route):
+        nonlocal reviewer_calls
+        calls.append((instance, prompt[0]["text"], route))
+        if instance.startswith("builder-"):
+            return valid_candidate("resume-revised")
+        if instance.startswith("comparator-"):
+            return evidence(9.7, "Comparator pass")
+        reviewer_calls += 1
+        if reviewer_calls <= 2:
+            return evidence(9.2, "Final spacing needs revision")
+        return evidence(9.7, "Independent final pass")
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: imports.append(output) or {"template_id": "tpl-resumed", "status": "imported"})
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_resume_final",
+        project_id="blockwise", emit=lambda *_args: None,
+    ).run(
+        source=str(source), brief="", placements=["feed", "story"], routes=[
+            {"provider": "builder", "model": "vision"},
+            {"provider": "compare", "model": "vision"},
+            {"provider": "review-a", "model": "vision-a"},
+            {"provider": "review-b", "model": "vision-b"},
+        ],
+        history=[iteration(9.7)], revision_candidate=checkpoint,
+        total_iterations=1, previous_score=9.7, resume_final_check=True,
+    )
+
+    assert reviewer_calls == 4
+    assert [item[0] for item in calls if item[0].startswith("builder-")] == ["builder-2"]
+    assert len(renders) == 1 and len(imports) == 1
+    assert result["iterations"][0]["final_review_failed"] is True
+    assert result["iterations"][1]["decision"] == "accepted"
+    assert result["import"]["template_id"] == "tpl-resumed"
+
+
 def test_invalid_final_review_output_retries_without_rebuilding_accepted_iteration(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")

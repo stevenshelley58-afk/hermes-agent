@@ -1287,6 +1287,7 @@ class SoleProcessOrchestrator:
             feedback = current_feedback
         accepted_records = history if resume_final_check else iterations
         if not accepted_records or accepted_records[-1]["decision"] != "accepted": raise AdTemplateProcessError(f"quality loop exhausted {MAX_ITERATIONS} iterations without a final-review-ready candidate")
+        accepted_score = _number((accepted_records[-1].get("comparison") or {}).get("score"))
         reviewers = []
         for n, route in enumerate(routes[2:4], 1):
             identity = f"final-reviewer-{self.run_id}-{n}-{uuid.uuid4().hex[:8]}"
@@ -1355,7 +1356,7 @@ class SoleProcessOrchestrator:
                 review_round=review_round + 1, total_iterations=len(history + iterations),
                 feedback=reasons, history=history + iterations, revision_candidate=candidate,
                 selected_builder_route=builder_route, builder_escalated=builder_escalated,
-                previous_score=score, low_gain_streak=low_gain_streak,
+                previous_score=accepted_score, low_gain_streak=low_gain_streak,
                 require_quality_route=require_quality_route,
             )
         self.emit("final-review.completed", "final-check", {"decision": "accepted", "reviewers": final_review["reviewers"]})
