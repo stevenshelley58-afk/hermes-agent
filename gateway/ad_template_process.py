@@ -7,13 +7,15 @@ from typing import Any, Callable, Dict, List, Mapping
 
 THRESHOLD = 9.5
 MIN_RUBRIC_SCORE = 9.2
+MAX_ITERATIONS = 60
+MAX_FINAL_REVIEW_ROUNDS = 10
 MAX_SCHEMA_REPAIRS_PER_ITERATION = 3
 MAX_CHEAP_STRUCTURED_OUTPUT_RETRIES = 1
 STAGES = ("source", "build", "render", "compare", "final-check", "live")
 MAX_CANDIDATE_CONTEXT_CHARS = 100_000
 MIN_MATERIAL_SCORE_GAIN = 0.5
 STORY_CONTENT_SAFE_ZONE = {"x": 72, "y": 240, "width": 936, "height": 1380}
-MAX_COMPARATOR_SELF_CONSISTENCY_RETRIES = 1
+MAX_COMPARATOR_SELF_CONSISTENCY_RETRIES = 2
 MAX_FINAL_REVIEW_OUTPUT_RETRIES = 1
 MATERIAL_OVERLAP_RATIO = 0.08
 
@@ -93,16 +95,6 @@ def _material_overlap(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool
     smaller_area = min(float(left["width"]) * float(left["height"]), float(right["width"]) * float(right["height"]))
     return smaller_area > 0 and overlap_area / smaller_area >= MATERIAL_OVERLAP_RATIO
 
-def _opaque_collision_layer(layer: Mapping[str, Any]) -> bool:
-    if layer.get("type") == "image_slot":
-        return True
-    return (
-        layer.get("type") == "vector"
-        and layer.get("shape") in {"rect", "rounded", "pill", "notched"}
-        and isinstance(layer.get("opacity"), (int, float))
-        and float(layer["opacity"]) >= 0.8
-    )
-
 def _validate_required_change_targets(evidence: Mapping[str, Any], candidate: Mapping[str, Any]) -> None:
     """Reject comparator targets that contradict or newly collide with the document."""
     template = candidate.get("template") if isinstance(candidate.get("template"), dict) else {}
@@ -161,9 +153,10 @@ def _validate_required_change_targets(evidence: Mapping[str, Any], candidate: Ma
                 right_id = str(right_layer["layerId"])
                 if not ({left_id, right_id} & changed):
                     continue
-                if not (_opaque_collision_layer(left_layer) and _opaque_collision_layer(right_layer)):
-                    continue
-                if "image_slot" not in {left_layer.get("type"), right_layer.get("type")}:
+                # Frames, patches and cards intentionally overlay images in the
+                # source designs. Only two independently replaceable media
+                # slots can create a destructive collision.
+                if {left_layer.get("type"), right_layer.get("type")} != {"image_slot"}:
                     continue
                 if _material_overlap(proposed_geometry[left_id], proposed_geometry[right_id]) and not _material_overlap(geometry_by_id[left_id], geometry_by_id[right_id]):
                     raise ComparatorSelfConsistencyError(
@@ -230,7 +223,7 @@ def _passes_quality_gate(evidence: Mapping[str, Any]) -> bool:
     )
 
 def validate_iterations(value: Any) -> List[Dict[str, Any]]:
-    if not isinstance(value, list) or not value or len(value) > 30: raise AdTemplateProcessError("iterations must contain 1 to 30 records")
+    if not isinstance(value, list) or not value or len(value) > MAX_ITERATIONS: raise AdTemplateProcessError(f"iterations must contain 1 to {MAX_ITERATIONS} records")
     result, accepted, retry_after_review = [], False, False
     for index, raw in enumerate(value, 1):
         if not isinstance(raw, dict) or raw.get("iteration", index) != index: raise AdTemplateProcessError("iterations must be consecutive and one-based")
@@ -976,7 +969,7 @@ def review_prompt(*, final: bool, candidate: Any = None) -> str:
     candidate_context = _safe_candidate_prompt_json(candidate)
     return f"""You are the {role} in a source-matching loop. The attached images are ordered: (1) the source reference, (2) the rendered Feed candidate, and (3) the rendered Story translation. Inspect the actual pixels together. The primary objective is not generic ad quality; it is faithful reconstruction of the source design as editable layers.
 
-Compare source versus Feed region by region: outer frame and margins; header/title block; image count, grid, aspect ratios and crop intent; logo/price panel; divider lines; body columns; feature list; footer/contact row; typography family/style/weight/scale/line wrapping; palette; alignment; whitespace; borders, corner radii, icons and decorative details. Neutral replacement photography and neutral advertiser identity must not reduce the score when their visual role, size, crop, and position match. Any simplification, omitted section, changed information density, different skeleton, moved panel, different image-slot structure, or generic redesign must reduce the score heavily. Story is scored only as a deliberate native 1080x1920 translation of the same visual system; it cannot compensate for a Feed mismatch. Assess Story dead space only inside the content-safe band y=240..1620. Empty space in y=0..239 and y=1620..1919 is mandatory platform-UI protection and must never be reported or scored as dead space, a spacing defect, a difference, or a required change.
+Compare source versus Feed region by region: outer frame and margins; header/title block; image count, grid, aspect ratios and crop intent; logo/price panel; divider lines; body columns; feature list; footer/contact row; typography family/style/weight/scale/line wrapping; palette; alignment; whitespace; borders, corner radii, icons and decorative details. Neutral replacement photography and neutral advertiser identity must not reduce the score when their visual role, size, crop, and position match. Treat source and replacement photographs as content-agnostic slot fill: never mention, score, or request changes for the neutral photo subject, scene, uniqueness, repetition, or pixels. Compare only slot count, geometry, mask, crop intent, and layering because source pixels are prohibited from shipping. Any simplification, omitted section, changed information density, different skeleton, moved panel, different image-slot structure, or generic redesign must reduce the score heavily. Story is scored only as a deliberate native 1080x1920 translation of the same visual system; it cannot compensate for a Feed mismatch. Assess Story dead space only inside the content-safe band y=240..1620. Empty space in y=0..239 and y=1620..1919 is mandatory platform-UI protection and must never be reported or scored as dead space, a spacing defect, a difference, or a required change.
 
 Use this scale strictly: 10.0 means the Feed is visually indistinguishable in structure at thumbnail size except permitted neutral content substitutions; 9.5 means only tiny finishing differences remain; 9.0 still has clearly visible spacing, scale, typography, or geometry differences; 8.0 is recognisably based on the source but materially different; 5.0 is merely the same category; 0 is missing or invalid. Do not award 9.5 to a design that a person can immediately distinguish from the source.
 
@@ -1047,7 +1040,7 @@ class SoleProcessOrchestrator:
 
         def builder_route_identity(route: Mapping[str, str]) -> str:
             return f"{route.get('provider')}/{route.get('model')}"
-        iteration_offsets = () if resume_final_check else range(31 - total_iterations - 1)
+        iteration_offsets = () if resume_final_check else range(MAX_ITERATIONS - total_iterations)
         for offset in iteration_offsets:
             index = total_iterations + offset + 1
             iteration_prior = working_candidate
@@ -1277,7 +1270,7 @@ class SoleProcessOrchestrator:
             previous_score = score
             feedback = current_feedback
         accepted_records = history if resume_final_check else iterations
-        if not accepted_records or accepted_records[-1]["decision"] != "accepted": raise AdTemplateProcessError("comparator never reached threshold")
+        if not accepted_records or accepted_records[-1]["decision"] != "accepted": raise AdTemplateProcessError(f"quality loop exhausted {MAX_ITERATIONS} iterations without a final-review-ready candidate")
         reviewers = []
         for n, route in enumerate(routes[2:4], 1):
             identity = f"final-reviewer-{self.run_id}-{n}-{uuid.uuid4().hex[:8]}"
@@ -1323,7 +1316,7 @@ class SoleProcessOrchestrator:
         final_review = validate_final_review({"reviewers": reviewers}, accepted=True)
         if final_review["decision"] != "accepted":
             self.emit("final-review.completed", "final-check", {"decision": "revise", "reviewers": final_review["reviewers"]})
-            if review_round >= 5 or total_iterations + len(iterations) >= 30:
+            if review_round >= MAX_FINAL_REVIEW_ROUNDS or total_iterations + len(iterations) >= MAX_ITERATIONS:
                 raise AdTemplateProcessError("final reviewers failed after the bounded automatic revision loop")
             accepted_records[-1]["final_review_failed"] = True
             reasons = json.dumps([

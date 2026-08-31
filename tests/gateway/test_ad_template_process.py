@@ -132,6 +132,31 @@ def test_quality_gate_rejects_one_weak_dimension_even_when_mean_passes():
     assert validate_final_review({"reviewers": reviewers}, accepted=True)["decision"] == "revise"
 
 
+def test_autonomous_loop_can_converge_after_thirty_iterations(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    scores = iter([9.0] * 30 + [9.7])
+    renders = []
+
+    def call_agent(instance, prompt, route):
+        if instance.startswith("builder-"):
+            return valid_candidate(f"candidate-{instance}")
+        if instance.startswith("comparator-"):
+            return evidence(next(scores), f"comparison {instance}")
+        return evidence(9.7, "Independent final pass")
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: {"template_id": "tpl-long-run", "status": "imported"})
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_long",
+        project_id="blockwise", emit=lambda *_args: None,
+    ).run(source=str(source), brief="", placements=["feed", "story"], routes=_quality_routes(), require_quality_route=True)
+
+    assert len(result["iterations"]) == 31
+    assert result["iterations"][-1]["decision"] == "accepted"
+    assert result["import"]["status"] == "imported"
+
+
 def test_source_match_and_concrete_change_list_are_hard_gates():
     weak_match = evidence(9.8, "Header and image grid still differ")
     weak_match["rubric"]["feed_source_likeness"] = 9.4
@@ -187,6 +212,21 @@ def test_comparator_target_overlap_rejects_exact_hero_thumbnail_collision():
     process._validate_required_change_targets(
         process._assessment(assessment, "comparator", require_change_list=True),
         preexisting,
+    )
+
+
+def test_comparator_allows_intentional_vector_frame_over_image():
+    candidate = overlap_candidate("vector-frame-overlap")
+    assessment = evidence(8.9, "Lower the gallery frame over the hero edge")
+    assessment["required_changes"] = [
+        "placement=feed; layers=feed-price-panel; "
+        "current={x:72,y:184,width:600,height:400}; "
+        "target={x:72,y:500,width:600,height:180}; "
+        "change=Overlap the source-visible frame across the lower hero edge"
+    ]
+    process._validate_required_change_targets(
+        process._assessment(assessment, "comparator", require_change_list=True),
+        candidate,
     )
 
 
@@ -338,6 +378,7 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
         assert "placement=feed|story; layers=comma-separated layerIds" in prompt
         assert "check every proposed target rectangle against every existing layer" in prompt
         assert "Never propose a target that newly overlaps an image slot or opaque vector panel" in prompt
+        assert "never mention, score, or request changes for the neutral photo subject" in prompt
         assert '"templateId":"strict"' in prompt
         assert '"assetKey":"hero"' in prompt
         assert "privateNote" not in prompt
