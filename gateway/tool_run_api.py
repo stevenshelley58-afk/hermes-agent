@@ -14,6 +14,8 @@ import os
 import re
 import uuid
 import shutil
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -21,11 +23,13 @@ from aiohttp import web
 
 from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
-from gateway.ad_template_process import SoleProcessOrchestrator, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
+from gateway.ad_template_process import AdTemplateStructuredOutputError, SoleProcessOrchestrator, validate_artifacts, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
 from gateway.tool_runs import (
+    AD_TEMPLATE_ROUTE_ORDER,
     TOOL_MODEL_POLICY_SCHEMA,
     ToolRunError,
     validate_generation_records,
+    validate_model_policy,
 )
 
 
@@ -78,7 +82,9 @@ class ToolRunAPIMixin:
             "iteration.rendered": "render",
             "iteration.compared": "compare",
             "iteration.revised": "build",
+            "builder.escalated": "build",
             "final-review.started": "final-check",
+            "final-review.retried": "final-check",
             "final-review.completed": "final-check",
             "template.imported": "live",
         }.get(kind)
@@ -152,6 +158,95 @@ class ToolRunAPIMixin:
         return target
 
     @staticmethod
+    def _durable_tool_source(workspace: Path, raw_source: str) -> Path:
+        """Resolve a staged source, or the exact persisted preview on same-run retry."""
+        source_file = Path(str(raw_source)).expanduser().resolve()
+        if source_file.is_file():
+            return ToolRunAPIMixin._copy_source_preview(workspace, source_file)
+
+        preview_root = (workspace / "previews").resolve()
+        allowed = {
+            ".avif", ".bmp", ".gif", ".heic", ".heif", ".jpeg", ".jpg",
+            ".png", ".tif", ".tiff", ".webp",
+        }
+        candidates = []
+        if preview_root.is_dir():
+            for candidate in preview_root.glob("source.*"):
+                try:
+                    resolved = candidate.resolve(strict=True)
+                    resolved.relative_to(preview_root)
+                except (OSError, ValueError):
+                    continue
+                if (
+                    resolved.is_file()
+                    and not candidate.is_symlink()
+                    and resolved.suffix.lower() in allowed
+                ):
+                    candidates.append(resolved)
+        if len(candidates) != 1:
+            raise RuntimeError("durable run source preview is unavailable")
+        return candidates[0]
+
+    def _final_check_checkpoint(self, run_id: str, workspace: Path) -> Dict[str, Any]:
+        """Load the last accepted render without rebuilding it on final-check retry."""
+        records: List[Dict[str, Any]] = []
+        for event in self._tool_run_store.events(run_id, limit=5000):
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            if event.get("kind") == "final-review.completed" and data.get("decision") == "revise" and records:
+                records[-1]["final_review_failed"] = True
+            if event.get("kind") != "iteration.compared":
+                continue
+            comparison = {
+                key: data.get(key)
+                for key in ("rubric", "reason", "hard_failures", "differences", "required_changes")
+            }
+            preview_names = data.get("preview_names") if isinstance(data.get("preview_names"), list) else []
+            records.append({
+                "iteration": data.get("iteration"),
+                "comparison": comparison,
+                "decision": data.get("decision"),
+                "candidate": {
+                    "previews": [
+                        {
+                            "name": str(name),
+                            "placement": "feed" if str(name).endswith("-feed.png") else "story",
+                        }
+                        for name in preview_names
+                    ],
+                },
+            })
+        history = validate_iterations(records)
+        if history[-1]["decision"] != "accepted":
+            raise RuntimeError("final-check retry has no accepted comparator checkpoint")
+        iteration = int(history[-1]["iteration"])
+        artifact_path = (workspace / "iterations" / f"{iteration:02d}" / "artifact.json").resolve()
+        workspace_root = workspace.resolve()
+        try:
+            artifact_path.relative_to(workspace_root)
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("accepted final-check artifact is unavailable") from exc
+        if not isinstance(artifact, dict) or set(artifact) != {"template", "assets"}:
+            raise RuntimeError("accepted final-check artifact is invalid")
+        previews = []
+        render = {}
+        for placement in ("feed", "story"):
+            preview = (workspace / "previews" / f"iteration-{iteration:02d}-{placement}.png").resolve()
+            try:
+                preview.relative_to(workspace_root)
+            except ValueError as exc:
+                raise RuntimeError("accepted final-check preview escapes the run workspace") from exc
+            render[placement] = str(preview)
+            previews.append({"name": preview.name, "path": str(preview), "placement": placement})
+        candidate = {**artifact, "previews": previews, "render": render, "template_path": str(artifact_path)}
+        validate_artifacts(candidate, workspace)
+        return {
+            "candidate": candidate,
+            "history": history,
+            "previous_score": history[-1]["comparison"]["score"],
+        }
+
+    @staticmethod
     def _tool_json_output(value: Any, *, process_result: bool = False) -> Dict[str, Any]:
         if process_result:
             required = {
@@ -193,7 +288,9 @@ class ToolRunAPIMixin:
                         return parsed
                 except (TypeError, json.JSONDecodeError):
                     pass
-        raise RuntimeError("Builder did not return one structured JSON result")
+        raise AdTemplateStructuredOutputError(
+            "Builder did not return one structured JSON result"
+        )
 
     @staticmethod
     def _prepare_candidate_output(run_id: str, output: Dict[str, Any]) -> Dict[str, Any]:
@@ -209,7 +306,11 @@ class ToolRunAPIMixin:
         imported = output.get("import")
         if not isinstance(imported, dict) or not imported.get("template_id") or not imported.get("status"):
             raise RuntimeError("Blockwise import receipt is missing")
-        result = {key: output.get(key) for key in ("template", "previews", "documents", "template_path", "render_path", "import", "process")}
+        result = {key: output.get(key) for key in (
+            "template", "previews", "documents", "template_path", "render_path",
+            "import", "process", "usage", "cost", "builder_escalated",
+            "builder_route", "model_policy_revision",
+        )}
         result["iterations"] = iterations
         result["final_review"] = final_review
         result["deterministic_documents"] = docs
@@ -256,6 +357,28 @@ class ToolRunAPIMixin:
             brief=str(payload.get("brief") or ""), placements=payload.get("placements") or [],
             source=str(source or ""))
 
+    def _drain_tool_future(self, future: "asyncio.Future[Any]") -> None:
+        """Consume a stopped executor future, including any late exception."""
+        async def consume() -> None:
+            try:
+                await asyncio.shield(future)
+            except BaseException:
+                # The Tool run already records the redacted failure. Retrieving
+                # the late exception here prevents an unhandled-future warning.
+                pass
+
+        task = asyncio.create_task(consume())
+        drains = getattr(self, "_tool_run_drain_tasks", None)
+        if drains is None:
+            drains = set()
+            self._tool_run_drain_tasks = drains
+        drains.add(task)
+        task.add_done_callback(drains.discard)
+        background = getattr(self, "_background_tasks", None)
+        if background is not None:
+            background.add(task)
+            task.add_done_callback(background.discard)
+
     def _start_tool_task(self, run_id: str, *, finalize: bool = False) -> None:
         task = self._tool_run_tasks.get(run_id)
         if task is not None and not task.done():
@@ -271,8 +394,17 @@ class ToolRunAPIMixin:
 
     async def _execute_tool_run(self, run_id: str, *, finalize: bool = False) -> None:
         current_stage = "source"
+        stop_events = getattr(self, "_tool_run_stop_events", None)
+        if stop_events is None:
+            stop_events = {}
+            self._tool_run_stop_events = stop_events
+        stop_event = threading.Event()
+        stop_events[run_id] = stop_event
         try:
             run = self._tool_run_store.get_run(run_id)
+            run["model_policy"] = validate_model_policy(
+                run.get("model_policy"), tool_id=str(run.get("tool_id") or ""),
+            )
             current_stage = self._canonical_tool_stage(run.get("stage"))
             self._tool_run_store.update_run(
                 run_id, status="running", stage=current_stage,
@@ -290,9 +422,15 @@ class ToolRunAPIMixin:
             reported_cost = 0.0
             cost_limit = float(route_settings.get("max_cost_usd") or 0)
             activity_sequence = 0
+            last_activity_at = time.monotonic()
+
+            def mark_activity() -> None:
+                nonlocal activity_sequence, last_activity_at
+                activity_sequence += 1
+                last_activity_at = time.monotonic()
 
             def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
-                nonlocal reported_cost, activity_sequence
+                nonlocal reported_cost
                 normalized_event = {
                     "generation-started": "iteration.started",
                     "generation-rendered": "iteration.rendered",
@@ -304,14 +442,14 @@ class ToolRunAPIMixin:
                 if event_type not in {"tool.started", "tool.completed", "subagent.start", "subagent.complete"} and normalized_event not in process_events:
                     return
                 if normalized_event in process_events:
-                    activity_sequence += 1
+                    mark_activity()
                     safe_data = {key: kwargs[key] for key in ("iteration", "score", "reason", "decision") if kwargs.get(key) is not None}
                     self._tool_run_store.append_event(
                         run_id, normalized_event, status="error" if kwargs.get("is_error") else "running",
                         node_id="compare" if normalized_event.startswith("iteration.") else "final-check", data=safe_data,
                     )
                     return
-                activity_sequence += 1
+                mark_activity()
                 data: Dict[str, Any] = {}
                 if tool_name:
                     data["tool"] = str(tool_name)[:160]
@@ -334,12 +472,26 @@ class ToolRunAPIMixin:
                     node_id=current_stage, data=data,
                 )
 
+            def role_heartbeat(*_args, **_kwargs) -> None:
+                mark_activity()
+
             def run_sync(_candidate: Dict[str, str]):
                 from hermes_constants import get_hermes_home
                 workspace = (get_hermes_home() / "tool_runs" / "ad-template-generator" / run_id).resolve()
                 workspace.mkdir(parents=True, exist_ok=True)
                 usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "estimated_cost_usd": 0.0}
                 run_cost_limit = float(os.environ.get("AD_TEMPLATE_MAX_RUN_COST_USD", "10.0"))
+
+                def should_stop() -> bool:
+                    if stop_event.is_set():
+                        return True
+                    try:
+                        return bool(self._tool_run_store.get_run(run_id).get("cancel_requested"))
+                    except Exception:
+                        # Side effects fail closed if cancellation state can no
+                        # longer be read from the durable ledger.
+                        return True
+
                 def call_agent(instance_id: str, prompt: Any, route_name: str):
                     provider, model = route_name.split("/", 1)
                     route = self._resolve_route(model)
@@ -349,6 +501,9 @@ class ToolRunAPIMixin:
                         tool_progress_callback=progress_callback,
                         requested_model=model, requested_provider=provider, route=route,
                         persistence_disabled=True,
+                        enabled_toolsets_override=[],
+                        stream_delta_callback=role_heartbeat,
+                        reasoning_callback=role_heartbeat,
                     )
                     active = self._tool_run_agents.setdefault(run_id, {})
                     active[instance_id] = agent
@@ -366,14 +521,14 @@ class ToolRunAPIMixin:
                         if not active:
                             self._tool_run_agents.pop(run_id, None)
                 routes = []
-                for role in ("analyse", "compare", "final-review-a", "final-review-b"):
+                for role in AD_TEMPLATE_ROUTE_ORDER:
                     stage_candidates, _ = self._tool_candidates(run, role)
                     if not stage_candidates:
                         raise RuntimeError(f"No route configured for {role}")
                     routes.append(stage_candidates[0])
                 route_names = [f"{item['provider']}/{item['model']}" for item in routes]
                 def emit(kind: str, node: str, data: Dict[str, Any]):
-                    nonlocal current_stage, activity_sequence
+                    nonlocal current_stage
                     event_stage = self._tool_stage_from_process_event(kind, node)
                     if event_stage is not None and event_stage != current_stage:
                         current_stage = event_stage
@@ -385,20 +540,30 @@ class ToolRunAPIMixin:
                                 run_id, "stage.started", status="running", node_id=event_stage,
                                 data={"summary": f"Started {event_stage.replace('-', ' ')}"},
                             )
-                            activity_sequence += 1
+                            mark_activity()
                     self._tool_run_store.append_event(run_id, kind, status="ok" if kind.endswith(("completed", "compared", "imported")) else "running", node_id=node, data=data)
-                    activity_sequence += 1
+                    mark_activity()
                 payload = run.get("payload") or {}
                 source_items = payload.get("sources") or []
                 source = str((source_items[0] or {}).get("path") if source_items and isinstance(source_items[0], dict) else "")
                 if not source:
                     raise RuntimeError("source image is missing")
-                source_file = Path(source).resolve()
-                source = str(self._copy_source_preview(workspace, source_file))
+                source = str(self._durable_tool_source(workspace, source))
+                checkpoint = self._final_check_checkpoint(run_id, workspace) if current_stage == "final-check" else None
                 result = SoleProcessOrchestrator(
                     call_agent=call_agent, workspace=workspace, run_id=run_id,
                     project_id=str((run.get("scope") or {}).get("project_id") or ""), emit=emit,
-                ).run(source=source, brief=str(payload.get("brief") or ""), placements=payload.get("placements") or [], routes=routes)
+                    should_stop=should_stop,
+                ).run(
+                    source=source, brief=str(payload.get("brief") or ""),
+                    placements=payload.get("placements") or [], routes=routes,
+                    require_quality_route=True,
+                    resume_final_check=checkpoint is not None,
+                    revision_candidate=(checkpoint or {}).get("candidate"),
+                    history=(checkpoint or {}).get("history"),
+                    total_iterations=len((checkpoint or {}).get("history") or []),
+                    previous_score=(checkpoint or {}).get("previous_score"),
+                )
                 return result, usage
 
             result = usage = None
@@ -409,16 +574,20 @@ class ToolRunAPIMixin:
                     run_id, "provider.attempt", status="running", node_id=route_stage,
                     data={"attempt": attempt, "provider": candidate["provider"], "model": candidate["model"], "timeout_seconds": timeout},
                 )
+                future = None
                 try:
                     future = loop.run_in_executor(None, run_sync, candidate)
                     observed_activity = activity_sequence
-                    # The route timeout is an inactivity limit for the current
-                    # model/tool stage, not a deadline for the whole pipeline.
-                    # Every durable stage/tool event resets it; otherwise a
-                    # healthy multi-stage VPS build is killed at 120 seconds.
-                    deadline = loop.time() + timeout
+                    # Anchor the inactivity deadline to the instant activity
+                    # happened, not the next polling instant. Otherwise a
+                    # heartbeat just after a poll can grant nearly two full
+                    # inactivity windows to a silent role.
+                    deadline = last_activity_at + timeout
                     while True:
-                        remaining = deadline - loop.time()
+                        if activity_sequence != observed_activity:
+                            observed_activity = activity_sequence
+                            deadline = last_activity_at + timeout
+                        remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             raise asyncio.TimeoutError(
                                 f"{current_stage} made no recorded progress for {timeout:.0f} seconds"
@@ -432,16 +601,27 @@ class ToolRunAPIMixin:
                             if future.done():
                                 result, usage = await future
                                 break
-                            if activity_sequence != observed_activity:
-                                observed_activity = activity_sequence
-                                deadline = loop.time() + timeout
                     break
-                except Exception as exc:
+                except asyncio.CancelledError:
+                    stop_event.set()
                     running_agents = self._tool_run_agents.get(run_id)
-                    if isinstance(exc, asyncio.TimeoutError) and running_agents is not None:
+                    if running_agents is not None:
                         agents = running_agents.values() if isinstance(running_agents, dict) else [running_agents]
                         for active_agent in list(agents):
-                            request_hard_interrupt(active_agent, "api_server_tool_run_stage_timeout")
+                            request_hard_interrupt(active_agent, "api_server_tool_run_cancel")
+                    if future is not None:
+                        self._drain_tool_future(future)
+                    raise
+                except Exception as exc:
+                    running_agents = self._tool_run_agents.get(run_id)
+                    if isinstance(exc, asyncio.TimeoutError):
+                        stop_event.set()
+                        if running_agents is not None:
+                            agents = running_agents.values() if isinstance(running_agents, dict) else [running_agents]
+                            for active_agent in list(agents):
+                                request_hard_interrupt(active_agent, "api_server_tool_run_stage_timeout")
+                        if future is not None:
+                            self._drain_tool_future(future)
                     failure = redact_sensitive_text(str(exc), force=True)[:600]
                     failures.append(failure)
                     if attempt < len(candidates):
@@ -508,6 +688,9 @@ class ToolRunAPIMixin:
                         candidate.unlink(missing_ok=True)
             except (KeyError, OSError):
                 pass
+            stop_event.set()
+            if stop_events.get(run_id) is stop_event:
+                stop_events.pop(run_id, None)
             self._tool_run_agents.pop(run_id, None)
             self._tool_run_tasks.pop(run_id, None)
 
@@ -698,8 +881,8 @@ class ToolRunAPIMixin:
                 }
 
             payload["ad_studio_capabilities"] = [
-                capability("openai-codex", "gpt-5.5", "vision_structured"),
-                capability("gemini", "gemini-3.6-flash", "vision_structured"),
+                capability("deepseek", "deepseek-v4-flash-vision-exp", "vision_structured"),
+                capability("openai-codex", "gpt-5.6-luna", "vision_structured"),
                 capability("gemini", "gemini-3.1-flash-image", "masked_image_edit"),
                 capability("gemini", "gemini-3-pro-image", "masked_image_edit"),
                 capability("openai-api", "gpt-image-2", "masked_image_edit"),
@@ -746,6 +929,9 @@ class ToolRunAPIMixin:
         run_id = request.match_info["run_id"]
         try:
             run = self._tool_run_store.request_cancel(run_id)
+            stop_event = getattr(self, "_tool_run_stop_events", {}).get(run_id)
+            if stop_event is not None:
+                stop_event.set()
             agents = self._tool_run_agents.get(run_id)
             if agents is not None:
                 values = agents.values() if isinstance(agents, dict) else [agents]

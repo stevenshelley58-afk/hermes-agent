@@ -1427,6 +1427,8 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
         self._tool_run_store = ToolRunStore()
         self._tool_run_tasks: Dict[str, "asyncio.Task"] = {}
         self._tool_run_agents: Dict[str, Any] = {}
+        self._tool_run_stop_events: Dict[str, Any] = {}
+        self._tool_run_drain_tasks: set["asyncio.Task"] = set()
         self._tool_run_shutdown = False
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
@@ -2652,6 +2654,7 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
         persistence_disabled: bool = False,
+        enabled_toolsets_override: Optional[List[str]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2685,6 +2688,10 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
         session ``/model`` override, disables the global fallback model
         chain, and fails closed if the locked provider's credentials cannot
         be resolved.
+
+        enabled_toolsets_override distinguishes an intentional empty
+        isolated-role tool surface from normal API-server toolset resolution.
+        An empty list therefore means exactly zero tools rather than defaults.
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -2916,7 +2923,11 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
             self._last_resolved_model["*"] = model
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        enabled_toolsets = (
+            sorted(_get_platform_tools(user_config, "api_server"))
+            if enabled_toolsets_override is None
+            else list(enabled_toolsets_override)
+        )
 
         max_iterations = _current_max_iterations()
 
@@ -2924,7 +2935,7 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = (
             None
-            if confirmed_runtime_lock
+            if confirmed_runtime_lock or persistence_disabled
             else GatewayRunner._load_fallback_model()
         )
 
@@ -7706,6 +7717,8 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
         """
         self._mark_disconnected()
         self._tool_run_shutdown = True
+        for stop_event in list(getattr(self, "_tool_run_stop_events", {}).values()):
+            stop_event.set()
         for agents in list(self._tool_run_agents.values()):
             values = agents.values() if isinstance(agents, dict) else [agents]
             for agent in list(values):
@@ -7718,8 +7731,13 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
             task.cancel()
         if tool_tasks:
             await asyncio.gather(*tool_tasks, return_exceptions=True)
+        drain_tasks = [task for task in getattr(self, "_tool_run_drain_tasks", set()) if not task.done()]
+        if drain_tasks:
+            await asyncio.gather(*drain_tasks, return_exceptions=True)
         self._tool_run_tasks.clear()
         self._tool_run_agents.clear()
+        getattr(self, "_tool_run_stop_events", {}).clear()
+        getattr(self, "_tool_run_drain_tasks", set()).clear()
         if self._tool_run_store is not None:
             try:
                 self._tool_run_store.close()
