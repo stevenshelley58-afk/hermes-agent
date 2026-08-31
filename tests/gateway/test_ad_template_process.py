@@ -120,13 +120,20 @@ def test_one_comparator_per_iteration_and_final_review_only_after_pass():
 def test_quality_gate_rejects_one_weak_dimension_even_when_mean_passes():
     weak = evidence(9.6, "Delivered-size copy remains too small")
     weak["rubric"]["layout_geometry"] = 9.1
+    weak["differences"] = ["The delivered-size copy block remains visibly misaligned"]
+    weak["required_changes"] = [
+        "placement=feed; layers=feed-bg; current={x:0,y:0,width:1080,height:1350}; "
+        "target={x:0,y:0,width:1080,height:1340}; change=Correct the visible layout geometry"
+    ]
     record = validate_iterations([{"iteration": 1, "comparison": weak, "decision": "revise"}])[0]
     assert record["comparison"]["score"] >= process.THRESHOLD
     assert record["comparison"]["minimum_score"] == 9.1
     assert record["decision"] == "revise"
 
+    final_weak = json.loads(json.dumps(weak))
+    final_weak["required_changes"] = []
     reviewers = [
-        {"id": "reviewer-a", "route": "a/m", **weak},
+        {"id": "reviewer-a", "route": "a/m", **final_weak},
         {"id": "reviewer-b", "route": "b/m", **evidence(9.8, "Strong")},
     ]
     assert validate_final_review({"reviewers": reviewers}, accepted=True)["decision"] == "revise"
@@ -161,11 +168,13 @@ def test_source_match_and_concrete_change_list_are_hard_gates():
     weak_match = evidence(9.8, "Header and image grid still differ")
     weak_match["rubric"]["feed_source_likeness"] = 9.4
     weak_match["required_changes"] = []
-    record = validate_iterations([
-        {"iteration": 1, "comparison": weak_match, "decision": "revise"}
-    ])[0]
-    assert record["comparison"]["score"] >= process.THRESHOLD
-    assert record["decision"] == "revise"
+    with pytest.raises(
+        AdTemplateProcessError,
+        match="comparator must provide a concrete required_changes list",
+    ):
+        validate_iterations([
+            {"iteration": 1, "comparison": weak_match, "decision": "revise"}
+        ])
 
     unfinished = evidence(9.8, "Footer remains too tall")
     unfinished["required_changes"] = [
@@ -436,6 +445,11 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
         assert "check every proposed target rectangle against every existing layer" in prompt
         assert "Never propose a target that newly overlaps an image slot or opaque vector panel" in prompt
         assert "never mention, score, or request changes for the neutral photo subject" in prompt
+        if final:
+            assert "required_changes may be [] for a negative verdict" in prompt
+            assert "Hermes will combine both reviewers' complete evidence" in prompt
+        else:
+            assert "required_changes must contain at least one actionable item" in prompt
         assert '"templateId":"strict"' in prompt
         assert '"assetKey":"hero"' in prompt
         assert "privateNote" not in prompt
@@ -1189,7 +1203,7 @@ def test_final_check_resume_reuses_checkpoint_score_when_reviewers_request_revis
     assert result["import"]["template_id"] == "tpl-resumed"
 
 
-def test_invalid_final_review_output_retries_without_rebuilding_accepted_iteration(tmp_path, monkeypatch):
+def test_negative_final_review_without_geometry_changes_revises_after_both_reviewers(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
     calls, events, renders, imports = [], [], [], []
@@ -1202,7 +1216,7 @@ def test_invalid_final_review_output_retries_without_rebuilding_accepted_iterati
             return valid_candidate("final-output-retry")
         if instance.startswith("comparator-"):
             return evidence(9.7, "Comparator pass")
-        if instance.startswith("final-reviewer-") and "-retry-" not in instance and len([
+        if instance.startswith("final-reviewer-") and len([
             item for item in calls if item[0].startswith("final-reviewer-")
         ]) == 1:
             return invalid
@@ -1220,17 +1234,28 @@ def test_invalid_final_review_output_retries_without_rebuilding_accepted_iterati
         {"provider": "review-b", "model": "vision-b"},
     ])
 
-    assert [name.split("-")[0] for name, _, _ in calls].count("builder") == 1
-    assert len(renders) == 1 and len(imports) == 1
+    assert [name.split("-")[0] for name, _, _ in calls].count("builder") == 2
+    assert len(renders) == 2 and len(imports) == 1
     final_calls = [item for item in calls if item[0].startswith("final-reviewer-")]
-    assert len(final_calls) == 3
-    assert "-retry-1" in final_calls[1][0]
-    assert "previous final-review response was rejected" in final_calls[1][1]
+    assert len(final_calls) == 4
+    first_round = next(
+        data for kind, data in events
+        if kind == "final-review.completed" and data["decision"] == "revise"
+    )
+    assert len(first_round["reviewers"]) == 2
+    assert first_round["reviewers"][0]["required_changes"] == []
     retried = [data for kind, data in events if kind == "final-review.retried"]
-    assert len(retried) == 1
-    assert retried[0]["attempt"] == 1
-    assert retried[0]["reason"] == "final reviewer must provide a concrete required_changes list"
-    assert result["iterations"][0]["decision"] == "accepted"
+    assert retried == []
+    revision_prompt = next(
+        text for name, text, _route in calls if name == "builder-2"
+    )
+    assert "Final spacing needs revision" in revision_prompt
+    assert '"required_changes": []' in revision_prompt
+    assert '"minimum_score": 9.2' in revision_prompt
+    assert '"rubric":' in revision_prompt
+    assert "When a final reviewer returns a negative verdict" in revision_prompt
+    assert result["iterations"][0]["final_review_failed"] is True
+    assert result["iterations"][1]["decision"] == "accepted"
     assert result["final_review"]["decision"] == "accepted"
 
 
@@ -1288,7 +1313,7 @@ def test_final_review_schema_recovery_survives_three_invalid_outputs(tmp_path, m
     source.write_bytes(b"source")
     calls, events, renders, imports = [], [], [], []
     invalid = evidence(9.2, "Final spacing needs revision")
-    invalid["required_changes"] = []
+    invalid["required_changes"] = ["Move the footer lower"]
     reviewer_a_calls = 0
 
     def call_agent(instance, prompt, route):
@@ -1321,8 +1346,8 @@ def test_final_review_schema_recovery_survives_three_invalid_outputs(tmp_path, m
     final_calls = [item for item in calls if item[0].startswith("final-reviewer-")]
     assert len(final_calls) == 5
     assert "-retry-3" in final_calls[3][0]
-    assert "feed_source_likeness < 9.5" in final_calls[3][1]
-    assert "exact keys placement, layers, current, target, and change" in final_calls[3][1]
+    assert "negative final verdict may use []" in final_calls[3][1]
+    assert "Every provided required_changes item MUST contain the exact" in final_calls[3][1]
     retried = [data for kind, data in events if kind == "final-review.retried"]
     assert len(retried) == 3
     assert [item["attempt"] for item in retried] == [1, 2, 3]
