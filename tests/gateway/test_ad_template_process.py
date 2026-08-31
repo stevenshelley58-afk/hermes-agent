@@ -230,6 +230,21 @@ def test_comparator_allows_intentional_vector_frame_over_image():
     )
 
 
+def test_comparator_allows_source_justified_overlapping_image_collage():
+    candidate = overlap_candidate("source-overlapping-collage")
+    assessment = evidence(8.9, "Match the overlapping source collage")
+    assessment["required_changes"] = [
+        "placement=feed; layers=feed-hero; "
+        "current={x:72,y:184,width:600,height:400}; "
+        "target={x:72,y:184,width:600,height:620}; "
+        "change=Create the source-visible overlapping photo collage by intentionally overlapping the hero with the thumbnail row"
+    ]
+    process._validate_required_change_targets(
+        process._assessment(assessment, "comparator", require_change_list=True),
+        candidate,
+    )
+
+
 def test_comparator_approximate_current_geometry_uses_actual_document_baseline():
     candidate = overlap_candidate("approximate-current")
     assessment = evidence(8.9, "Tighten the hero crop")

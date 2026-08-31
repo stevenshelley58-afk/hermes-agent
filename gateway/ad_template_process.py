@@ -100,6 +100,7 @@ def _validate_required_change_targets(evidence: Mapping[str, Any], candidate: Ma
     template = candidate.get("template") if isinstance(candidate.get("template"), dict) else {}
     proposals_by_placement: Dict[str, Dict[str, Dict[str, float]]] = {}
     changed_by_placement: Dict[str, set[str]] = {}
+    justified_overlap_layers: Dict[str, set[str]] = {}
     for raw in evidence.get("required_changes") or []:
         parsed = _parse_required_change(str(raw))
         if parsed is None:
@@ -127,6 +128,10 @@ def _validate_required_change_targets(evidence: Mapping[str, Any], candidate: Ma
             raise ComparatorSelfConsistencyError(f"required change target exceeds the {placement} canvas")
         proposals = proposals_by_placement.setdefault(placement, {})
         changed = changed_by_placement.setdefault(placement, set())
+        overlap_layers = justified_overlap_layers.setdefault(placement, set())
+        change_text = parsed["change"].lower()
+        if "overlap" in change_text and "source" in change_text:
+            overlap_layers.update(parsed["layer_ids"])
         for layer_id in parsed["layer_ids"]:
             layer = layer_map.get(layer_id)
             if layer is None:
@@ -147,6 +152,7 @@ def _validate_required_change_targets(evidence: Mapping[str, Any], candidate: Ma
         geometry_by_id = {str(layer["layerId"]): dict(layer["geometry"]) for layer in layers}
         proposed_geometry = {**geometry_by_id, **proposals}
         changed = changed_by_placement.get(placement, set())
+        justified = justified_overlap_layers.get(placement, set())
         for index, left_layer in enumerate(layers):
             left_id = str(left_layer["layerId"])
             for right_layer in layers[index + 1:]:
@@ -158,7 +164,11 @@ def _validate_required_change_targets(evidence: Mapping[str, Any], candidate: Ma
                 # slots can create a destructive collision.
                 if {left_layer.get("type"), right_layer.get("type")} != {"image_slot"}:
                     continue
-                if _material_overlap(proposed_geometry[left_id], proposed_geometry[right_id]) and not _material_overlap(geometry_by_id[left_id], geometry_by_id[right_id]):
+                if (
+                    _material_overlap(proposed_geometry[left_id], proposed_geometry[right_id])
+                    and not _material_overlap(geometry_by_id[left_id], geometry_by_id[right_id])
+                    and not ({left_id, right_id} & justified)
+                ):
                     raise ComparatorSelfConsistencyError(
                         f"required change newly overlaps {placement} layers {left_id} and {right_id}"
                     )
