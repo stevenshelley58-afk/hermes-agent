@@ -306,14 +306,53 @@ class ToolRunAPIMixin:
         imported = output.get("import")
         if not isinstance(imported, dict) or not imported.get("template_id") or not imported.get("status"):
             raise RuntimeError("Blockwise import receipt is missing")
+        # The complete layered template and deterministic documents are already
+        # stored in the run artifact and imported into Blockwise. Persist only
+        # a bounded control-plane projection here: real templates routinely
+        # exceed the generic 32k per-string Tool-run ledger limit.
+        template = output.get("template") or {}
+        metadata = template.get("metadata") if isinstance(template.get("metadata"), dict) else {}
+        artifact_ref = output.get("template_path")
         result = {key: output.get(key) for key in (
-            "template", "previews", "documents", "template_path", "render_path",
-            "import", "process", "usage", "cost", "builder_escalated",
-            "builder_route", "model_policy_revision",
+            "previews", "template_path", "render_path", "import", "process",
+            "usage", "cost", "builder_escalated", "builder_route",
+            "model_policy_revision",
         )}
-        result["iterations"] = iterations
-        result["final_review"] = final_review
-        result["deterministic_documents"] = docs
+        result["template"] = {
+            "schema": template.get("schema"),
+            "templateId": template.get("templateId"),
+            "title": metadata.get("title"),
+            "artifact": artifact_ref,
+        }
+        result["documents"] = {
+            name: {"bytes": len(value.encode("utf-8")), "artifact": artifact_ref}
+            for name, value in docs.items()
+        }
+        result["iterations"] = [
+            {
+                "iteration": item["iteration"],
+                "decision": item["decision"],
+                "score": item["comparison"]["score"],
+                "minimum_score": item["comparison"]["minimum_score"],
+                "rubric": item["comparison"]["rubric"],
+                "final_review_failed": bool(item.get("final_review_failed")),
+            }
+            for item in iterations
+        ]
+        result["final_review"] = {
+            "decision": final_review["decision"],
+            "threshold": final_review["threshold"],
+            "reviewers": [
+                {
+                    "id": item["id"],
+                    "route": item["route"],
+                    "score": item["score"],
+                    "minimum_score": item["minimum_score"],
+                    "rubric": item["rubric"],
+                }
+                for item in final_review["reviewers"]
+            ],
+        }
         result["process"] = "only-ad-template-process"
         return result
 
