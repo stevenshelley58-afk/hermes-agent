@@ -376,6 +376,53 @@ def test_direct_orchestrator_result_does_not_weaken_generic_agent_parser():
     assert ToolRunAPIMixin._tool_json_output(result, process_result=True) == result
 
 
+def test_completion_projection_keeps_large_layered_documents_out_of_the_ledger(tmp_path):
+    template = _valid_template()
+    template["metadata"]["description"] = "layered-template-content-" * 2_000
+    evidence = {
+        "reason": "The source and both placements match",
+        "differences": [],
+        "required_changes": [],
+        "hard_failures": [],
+        "rubric": {field: 9.7 for field in process.RUBRIC_FIELDS},
+    }
+    output = {
+        "template": template,
+        "iterations": [{
+            "iteration": 1,
+            "comparison": evidence,
+            "decision": "accepted",
+        }],
+        "final_review": {"reviewers": [
+            {"id": "reviewer-a", "route": "route-a", **evidence},
+            {"id": "reviewer-b", "route": "route-b", **evidence},
+        ]},
+        "previews": [],
+        "documents": process.deterministic_documents(template),
+        "template_path": "/run/artifact.json",
+        "render_path": "/run/feed.png",
+        "import": {"template_id": "completion-test", "status": "imported"},
+        "process": "only-ad-template-process",
+    }
+
+    projected = ToolRunAPIMixin._prepare_candidate_output("run", output)
+
+    assert projected["template"] == {
+        "schema": "blockwise.ad-template",
+        "templateId": "completion-test",
+        "title": "Completion test",
+        "artifact": "/run/artifact.json",
+    }
+    assert projected["documents"]["template.json"]["bytes"] > 32_000
+    assert all(not isinstance(value, str) for value in projected["documents"].values())
+    store = ToolRunStore(str(tmp_path / "compact-output.db"))
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    run, _ = store.create_run(_command(str(source), idempotency_key="compact-output"))
+    stored = store.update_run(run["run_id"], status="completed", output=projected)
+    assert stored["output"]["import"]["template_id"] == "completion-test"
+
+
 @pytest.mark.asyncio
 async def test_retry_reuses_persisted_source_after_staging_cleanup(tmp_path, monkeypatch):
     home = tmp_path / "hermes-home"
