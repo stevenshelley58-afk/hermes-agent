@@ -161,6 +161,22 @@ def test_final_check_requeue_loads_accepted_iteration_and_existing_artifacts(tmp
     for placement in ("feed", "story"):
         (workspace / "previews" / f"iteration-05-{placement}.png").write_bytes(placement.encode())
 
+    for stale_iteration in range(1, 3):
+        store.append_event(run["run_id"], "iteration.compared", node_id="compare", data={
+            "iteration": stale_iteration,
+            "rubric": {field: 9.0 for field in process.RUBRIC_FIELDS},
+            "reason": "Stale failed generation sequence",
+            "hard_failures": [],
+            "differences": ["Visible mismatch"],
+            "required_changes": [
+                "placement=feed; layers=feed-background; "
+                "current={x:0,y:0,width:1080,height:1350}; "
+                "target={x:0,y:0,width:1080,height:1350}; change=Continue matching the source"
+            ],
+            "decision": "revise",
+            "preview_names": [f"iteration-{stale_iteration:02d}-feed.png", f"iteration-{stale_iteration:02d}-story.png"],
+        })
+
     for iteration in range(1, 6):
         accepted = iteration == 5
         score = 9.7 if accepted else 9.0

@@ -192,6 +192,8 @@ class ToolRunAPIMixin:
         records: List[Dict[str, Any]] = []
         for event in self._tool_run_store.events(run_id, limit=5000):
             data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            if event.get("kind") == "iteration.compared" and data.get("iteration") == 1:
+                records = []
             if event.get("kind") == "final-review.completed" and data.get("decision") == "revise" and records:
                 records[-1]["final_review_failed"] = True
             if event.get("kind") != "iteration.compared":

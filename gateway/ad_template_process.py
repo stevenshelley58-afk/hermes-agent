@@ -1293,6 +1293,8 @@ class SoleProcessOrchestrator:
             identity = f"final-reviewer-{self.run_id}-{n}-{uuid.uuid4().hex[:8]}"
             provider_route = f"{route.get('provider')}/{route.get('model')}"
             route_identity = provider_route
+            quality_review_route = builder_route_identity(quality_route) if n == 1 and quality_route else ""
+            quality_route_used = False
             self.emit("final-review.started", "final-check", {"reviewer": identity, "route": route_identity})
             final_prompt = review_prompt(final=True, candidate=candidate)
             rejection = ""
@@ -1324,6 +1326,23 @@ class SoleProcessOrchestrator:
                     evidence = _assessment(review, "final reviewer", require_change_list=True)
                 except (AdTemplateProcessError, AdTemplateStructuredOutputError) as exc:
                     rejection = str(exc)
+                    if (
+                        isinstance(exc, AdTemplateStructuredOutputError)
+                        and quality_review_route
+                        and quality_review_route != route_identity
+                        and quality_review_route != builder_route_identity(routes[3])
+                        and not quality_route_used
+                    ):
+                        previous_route = route_identity
+                        provider_route = quality_review_route
+                        route_identity = quality_review_route
+                        quality_route_used = True
+                        identity = f"final-reviewer-{self.run_id}-{n}-quality-{uuid.uuid4().hex[:8]}"
+                        self.emit("final-review.route-escalated", "final-check", {
+                            "from_route": previous_route, "to_route": route_identity,
+                            "reason": rejection,
+                        })
+                        continue
                     if output_attempt >= MAX_FINAL_REVIEW_OUTPUT_RETRIES:
                         raise
                     self.emit("final-review.retried", "final-check", {

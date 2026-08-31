@@ -1234,6 +1234,55 @@ def test_invalid_final_review_output_retries_without_rebuilding_accepted_iterati
     assert result["final_review"]["decision"] == "accepted"
 
 
+def test_non_json_first_final_reviewer_escalates_to_quality_route_without_rebuilding(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    calls, events, renders, imports = [], [], [], []
+
+    def call_agent(instance, prompt, route):
+        calls.append((instance, route))
+        if instance.startswith("builder-"):
+            return valid_candidate("final-route-escalation")
+        if instance.startswith("comparator-"):
+            return evidence(9.7, "Comparator pass")
+        if route == "deepseek/deepseek-v4-flash-vision-exp":
+            raise process.AdTemplateStructuredOutputError(
+                "Builder did not return one structured JSON result"
+            )
+        return evidence(9.7, "Independent final pass")
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: imports.append(output) or {"template_id": "tpl-final-route-escalation", "status": "imported"})
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_final_route_escalation",
+        project_id="blockwise", emit=lambda kind, node, data: events.append((kind, data)),
+    ).run(source=str(source), brief="", placements=["feed", "story"], routes=[
+        {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+        {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+        {"provider": "deepseek", "model": "deepseek-v4-flash-vision-exp"},
+        {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+        {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+    ], require_quality_route=True)
+
+    assert len([item for item in calls if item[0].startswith("builder-")]) == 1
+    final_routes = [route for instance, route in calls if instance.startswith("final-reviewer-")]
+    assert final_routes == [
+        "deepseek/deepseek-v4-flash-vision-exp",
+        "openai-codex/gpt-5.6-sol",
+        "openai-codex/gpt-5.6-luna",
+    ]
+    escalations = [data for kind, data in events if kind == "final-review.route-escalated"]
+    assert escalations == [{
+        "from_route": "deepseek/deepseek-v4-flash-vision-exp",
+        "to_route": "openai-codex/gpt-5.6-sol",
+        "reason": "Builder did not return one structured JSON result",
+    }]
+    assert [item["route"] for item in result["final_review"]["reviewers"]] == [
+        "openai-codex/gpt-5.6-sol", "openai-codex/gpt-5.6-luna",
+    ]
+    assert len(renders) == 1 and len(imports) == 1
+
+
 def test_final_review_schema_recovery_survives_three_invalid_outputs(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
