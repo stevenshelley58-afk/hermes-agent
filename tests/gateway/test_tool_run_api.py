@@ -17,6 +17,10 @@ from gateway.tool_runs import (
 )
 
 
+def _visible_strings():
+    return {"source": ["SOURCE"], "feed": ["FEED"], "story": ["STORY"]}
+
+
 def _command(source: str, *, idempotency_key: str) -> dict:
     return {
         "schema": TOOL_RUN_COMMAND_SCHEMA,
@@ -147,6 +151,17 @@ class _ToolRunHarness(ToolRunAPIMixin):
         return None
 
 
+def test_main_chat_model_never_controls_ad_template_role_selection(tmp_path):
+    store = ToolRunStore(str(tmp_path / "chat-isolation.db"))
+    run, _ = store.create_run(_command(str(tmp_path / "source.png"), idempotency_key="chat-isolation"))
+    api = _ToolRunHarness(store)
+    api._model_name = "unrelated-chat-model-a"
+    first = api._tool_candidate(run, "analyse")
+    api._model_name = "unrelated-chat-model-b"
+    second = api._tool_candidate(run, "analyse")
+    assert first == second == {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+
+
 def test_final_check_requeue_loads_accepted_iteration_and_existing_artifacts(tmp_path):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
@@ -167,6 +182,7 @@ def test_final_check_requeue_loads_accepted_iteration_and_existing_artifacts(tmp
             "rubric": {field: 9.0 for field in process.RUBRIC_FIELDS},
             "reason": "Stale failed generation sequence",
             "hard_failures": [],
+            "visible_strings": _visible_strings(),
             "differences": ["Visible mismatch"],
             "required_changes": [
                 "placement=feed; layers=feed-background; "
@@ -190,6 +206,7 @@ def test_final_check_requeue_loads_accepted_iteration_and_existing_artifacts(tmp
             "rubric": {field: score for field in process.RUBRIC_FIELDS},
             "reason": "Accepted comparison" if accepted else "Continue matching",
             "hard_failures": [],
+            "visible_strings": _visible_strings(),
             "differences": [] if accepted else ["Visible mismatch"],
             "required_changes": required_changes,
             "decision": "accepted" if accepted else "revise",
@@ -241,6 +258,7 @@ def test_final_check_requeue_rebuilds_after_interrupted_accepted_artifact(tmp_pa
             "rubric": {field: score for field in process.RUBRIC_FIELDS},
             "reason": "Accepted comparison" if accepted else "Continue matching",
             "hard_failures": [],
+            "visible_strings": _visible_strings(),
             "differences": [] if accepted else ["Visible mismatch"],
             "required_changes": [] if accepted else [
                 "placement=feed; layers=feed-background; "
@@ -285,6 +303,7 @@ class _StructuredRoleAgent:
                 "differences": [],
                 "required_changes": [],
                 "hard_failures": [],
+                "visible_strings": _visible_strings(),
                 "rubric": {field: 9.7 for field in process.RUBRIC_FIELDS},
             }
         return {"final_response": json.dumps(payload)}
@@ -455,6 +474,7 @@ def test_completion_projection_keeps_large_layered_documents_out_of_the_ledger(t
         "differences": [],
         "required_changes": [],
         "hard_failures": [],
+        "visible_strings": _visible_strings(),
         "rubric": {field: 9.7 for field in process.RUBRIC_FIELDS},
     }
     output = {
@@ -576,7 +596,7 @@ async def test_retry_reuses_persisted_source_after_staging_cleanup(tmp_path, mon
 
 
 @pytest.mark.asyncio
-async def test_ad_template_retry_upgrades_stale_seed_policy_without_losing_run_state(tmp_path, monkeypatch):
+async def test_ad_template_retry_preserves_submitted_model_profile_snapshot(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source-pixels")
     store = ToolRunStore(str(tmp_path / "retry-policy.db"))
@@ -618,9 +638,8 @@ async def test_ad_template_retry_upgrades_stale_seed_policy_without_losing_run_s
 
     assert response.status == 202
     retried = store.get_run(run["run_id"])
-    assert retried["model_policy_revision"] == 9
-    assert retried["model_policy"]["seed_revision"] == 9
-    assert retried["model_policy"] == current_policy
+    assert retried["model_policy_revision"] == 8
+    assert retried["model_policy"] == stale_policy
     assert retried["scope"] == before["scope"]
     assert retried["payload"] == before["payload"]
     assert retried["output"] == checkpoint
@@ -628,11 +647,7 @@ async def test_ad_template_retry_upgrades_stale_seed_policy_without_losing_run_s
     assert started == [(run["run_id"], False)]
     assert store.get_policy("ad-template-generator") == before_default
     queued = [event for event in store.events(run["run_id"]) if event["kind"] == "command.queued"]
-    assert queued[-1]["data"]["policy_upgraded"] == {
-        "from_revision": 8,
-        "to_revision": 9,
-        "seed_revision": 9,
-    }
+    assert "policy_upgraded" not in queued[-1]["data"]
 
 
 @pytest.mark.asyncio
@@ -739,6 +754,7 @@ async def test_initial_builder_format_recovery_persists_events_and_all_role_cost
                     "differences": [],
                     "required_changes": [],
                     "hard_failures": [],
+                    "visible_strings": _visible_strings(),
                     "rubric": {
                         field: 9.7 for field in process.RUBRIC_FIELDS
                     },

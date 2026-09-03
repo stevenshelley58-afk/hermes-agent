@@ -26,8 +26,10 @@ from agent.redact import redact_sensitive_text
 from gateway.ad_template_process import AdTemplateProcessError, AdTemplateStructuredOutputError, SoleProcessOrchestrator, validate_artifacts, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
 from gateway.tool_runs import (
     AD_TEMPLATE_ROUTE_ORDER,
+    AD_TEMPLATE_OPTIONAL_ROUTE,
     TOOL_MODEL_POLICY_SCHEMA,
     ToolRunError,
+    ad_template_model_catalog,
     validate_generation_records,
     validate_model_policy,
 )
@@ -212,7 +214,7 @@ class ToolRunAPIMixin:
                 continue
             comparison = {
                 key: data.get(key)
-                for key in ("rubric", "reason", "hard_failures", "differences", "required_changes")
+                for key in ("rubric", "reason", "hard_failures", "visible_strings", "differences", "required_changes")
             }
             preview_names = data.get("preview_names") if isinstance(data.get("preview_names"), list) else []
             records.append({
@@ -430,7 +432,7 @@ class ToolRunAPIMixin:
         primary = selected.get("primary") or {}
         return {
             "provider": str(primary.get("provider") or "").strip(),
-            "model": str(primary.get("model") or self._model_name).strip(),
+            "model": str(primary.get("model") or "").strip(),
         }
 
     def _tool_candidates(self, run: Dict[str, Any], stage: str) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
@@ -621,6 +623,11 @@ class ToolRunAPIMixin:
                     if not stage_candidates:
                         raise RuntimeError(f"No route configured for {role}")
                     routes.append(stage_candidates[0])
+                fallback_candidates, _ = self._tool_candidates(run, AD_TEMPLATE_OPTIONAL_ROUTE)
+                if AD_TEMPLATE_OPTIONAL_ROUTE in ((run.get("model_policy") or {}).get("stages") or {}):
+                    if not fallback_candidates:
+                        raise RuntimeError(f"No route configured for {AD_TEMPLATE_OPTIONAL_ROUTE}")
+                    routes.append(fallback_candidates[0])
                 route_names = [f"{item['provider']}/{item['model']}" for item in routes]
                 def emit(kind: str, node: str, data: Dict[str, Any]):
                     nonlocal current_stage
@@ -985,8 +992,16 @@ class ToolRunAPIMixin:
                 }
 
             payload["ad_studio_capabilities"] = [
-                capability("deepseek", "deepseek-v4-flash-vision-exp", "vision_structured"),
-                capability("openai-codex", "gpt-5.6-luna", "vision_structured"),
+                {
+                    **item,
+                    "available": readiness.get(str(item["provider"]), False),
+                    "credential_ready": readiness.get(str(item["provider"]), False),
+                    "estimated_price": None,
+                    "price_checked_at": checked_at,
+                    "pricing_stale": True,
+                }
+                for item in ad_template_model_catalog()
+            ] + [
                 capability("gemini", "gemini-3.1-flash-image", "masked_image_edit"),
                 capability("gemini", "gemini-3-pro-image", "masked_image_edit"),
                 capability("openai-api", "gpt-image-2", "masked_image_edit"),

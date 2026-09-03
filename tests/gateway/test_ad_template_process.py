@@ -24,6 +24,9 @@ def evidence(score=9.4, reason="Improve spacing"):
         "differences": [reason] if score < 9.5 else [],
         "required_changes": [actionable_change] if score < 9.5 else [],
         "hard_failures": [],
+        "visible_strings": {
+            "source": ["SOURCE"], "feed": ["FEED"], "story": ["STORY"],
+        },
     }
 
 def iteration(score=9.4, number=1):
@@ -479,11 +482,14 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
         assert "placement=feed|story; layers=comma-separated layerIds" in prompt
         assert "check every proposed target rectangle against every existing layer" in prompt
         assert "Never propose a target that newly overlaps an image slot or opaque vector panel" in prompt
-        assert "never mention, score, or request changes for the neutral photo subject" in prompt
+        assert "same non-logo photograph repeated in distinct visible slots" in prompt
+        assert "Transcribe every visibly rendered word" in prompt
+        assert "missing/split/clipped/truncated/garbled visible text" in prompt
+        assert "absolute canvas pixels" in prompt
         if final:
             assert "do not return required_changes" in prompt
             assert "Hermes derives the next builder brief" in prompt
-            assert "Return JSON only with exactly reason, differences, hard_failures, and rubric" in prompt
+            assert "Return JSON only with exactly reason, differences, visible_strings, hard_failures, and rubric" in prompt
         else:
             assert "required_changes must contain at least one actionable item" in prompt
         assert '"templateId":"strict"' in prompt
@@ -630,6 +636,12 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
 
     blank_logo = json.loads(json.dumps(invalid_logo))
     blank_logo["imageInputs"] = [{"key": "brandLogo", "label": "Brand logo", "acceptedTypes": ["image/png"]}]
+    with pytest.raises(AdTemplateProcessError, match=r'visible logo input "brandLogo" must declare a non-blank defaultAssetKey'):
+        process.validate_template_artifact(blank_logo)
+    blank_logo["assets"] = {
+        "brand": {"fileName": "brand/neutral-real-estate.png", "mimeType": "image/png"},
+    }
+    blank_logo["imageInputs"][0]["defaultAssetKey"] = "brand"
     assert process.validate_template_artifact(blank_logo) is blank_logo
 
     real_text_ref = json.loads(json.dumps(template))
@@ -653,8 +665,11 @@ def test_story_essential_layers_stay_inside_content_safe_zone_but_visual_layers_
     template["storyLayout"]["safeZones"] = [dict(process.STORY_CONTENT_SAFE_ZONE)]
     template["imageInputs"] = [
         {"key": "story-photo", "label": "Story photo", "acceptedTypes": ["image/jpeg"]},
-        {"key": "story-logo", "label": "Story logo", "acceptedTypes": ["image/png"]},
+        {"key": "story-logo", "label": "Story logo", "acceptedTypes": ["image/png"], "defaultAssetKey": "brand"},
     ]
+    template["assets"] = {
+        "brand": {"fileName": "brand/neutral-real-estate.png", "mimeType": "image/png"},
+    }
     template["textInputs"] = [
         {"key": "story-headline", "label": "Story headline", "placeholder": "Just listed", "maxLength": 80},
     ]
@@ -702,6 +717,99 @@ def test_story_essential_layers_stay_inside_content_safe_zone_but_visual_layers_
         layer["geometry"] = geometry
         with pytest.raises(AdTemplateProcessError, match="Story content-safe zone"):
             process.validate_template_artifact(invalid)
+
+
+def test_production_035_split_letter_tracking_is_rejected_before_render():
+    template = valid_candidate("meta-035")['template']
+    template["textInputs"] = [
+        {"key": "headline", "label": "Headline", "placeholder": "NEW", "maxLength": 80},
+    ]
+    template["fonts"] = [{"file": "manrope-700.woff2"}]
+    template["feedLayout"]["layers"].append({
+        "type": "text", "layerId": "feed-headline", "inputKey": "headline",
+        "font": {"file": "manrope-700.woff2"}, "fontSize": 42, "lineHeight": 1.1,
+        "tracking": 48, "alignment": "left", "maxCharacters": 80, "maxLines": 1,
+        "colourRole": "mainText", "overflowBehaviour": "refuse",
+        "geometry": {"x": 72, "y": 96, "width": 400, "height": 80},
+    })
+    with pytest.raises(AdTemplateProcessError, match="absolute canvas-pixel value between -4 and 4"):
+        process.validate_template_artifact(template)
+
+
+def test_production_149_repeated_default_photos_are_rejected_before_render():
+    template = valid_candidate("meta-149")['template']
+    template["assets"] = {
+        "property": {"fileName": "home/open-home-living.webp", "mimeType": "image/webp"},
+    }
+    template["imageInputs"] = [
+        {"key": "hero", "label": "Hero", "acceptedTypes": ["image/webp"], "defaultAssetKey": "property"},
+        {"key": "detail", "label": "Detail", "acceptedTypes": ["image/webp"], "defaultAssetKey": "property"},
+    ]
+    for index, input_key in enumerate(("hero", "detail")):
+        template["feedLayout"]["layers"].append({
+            "type": "image_slot", "layerId": f"feed-{input_key}", "inputKey": input_key,
+            "geometry": {"x": 72 + index * 420, "y": 200, "width": 400, "height": 300},
+            "mask": "none", "minSourceWidth": 400, "minSourceHeight": 300,
+            "defaultCrop": {"x": 0, "y": 0, "width": 1, "height": 1},
+            "allowedPlacementOverrides": ["crop", "position"],
+        })
+    with pytest.raises(AdTemplateProcessError, match="must not repeat default asset"):
+        process.validate_template_artifact(template)
+
+
+@pytest.mark.parametrize("defect", ["blank_text", "missing_logo"])
+def test_production_180_blank_visible_roles_are_rejected_before_render(defect):
+    template = valid_candidate("meta-180")['template']
+    if defect == "blank_text":
+        template["textInputs"] = [
+            {"key": "price", "label": "Price", "placeholder": "   ", "maxLength": 80},
+        ]
+        template["fonts"] = [{"file": "manrope-700.woff2"}]
+        template["feedLayout"]["layers"].append({
+            "type": "text", "layerId": "feed-price", "inputKey": "price",
+            "font": {"file": "manrope-700.woff2"}, "fontSize": 42, "lineHeight": 1.1,
+            "tracking": 0, "alignment": "left", "maxCharacters": 80, "maxLines": 1,
+            "colourRole": "mainText", "overflowBehaviour": "refuse",
+            "geometry": {"x": 72, "y": 900, "width": 400, "height": 80},
+        })
+        expected = "must have a non-blank placeholder"
+    else:
+        template["assets"] = {
+            "brand": {"fileName": "brand/neutral-real-estate.png", "mimeType": "image/png"},
+        }
+        template["imageInputs"] = [{
+            "key": "brand", "label": "Brand", "acceptedTypes": ["image/png"],
+            "defaultAssetKey": "brand",
+        }]
+        template["metadata"]["realAssetRefs"] = [
+            {"inputKey": "brand", "kind": "brand_logo", "required": True},
+        ]
+        expected = "must have a visible logo layer"
+    with pytest.raises(AdTemplateProcessError, match=expected):
+        process.validate_template_artifact(template)
+
+
+def test_review_evidence_requires_visible_string_transcription():
+    missing = evidence(9.7, "Looks ready")
+    missing.pop("visible_strings")
+    with pytest.raises(process.ReviewEvidenceError, match="must transcribe visible source, Feed, and Story strings"):
+        process.validate_iterations([{"iteration": 1, "comparison": missing, "decision": "accepted"}])
+
+
+def test_review_vision_paths_append_renderer_meta_shells_after_native_renders(tmp_path):
+    paths = []
+    for name in ("source.png", "feed.png", "story.png", "feed-shell.png", "story-shell.png"):
+        path = tmp_path / name
+        path.write_bytes(name.encode())
+        paths.append(str(path))
+    candidate = {
+        "render": {"feed": paths[1], "story": paths[2]},
+        "review_previews": [
+            {"path": paths[3], "placement": "meta-feed"},
+            {"path": paths[4], "placement": "meta-story"},
+        ],
+    }
+    assert process.review_vision_paths(paths[0], candidate) == paths
 
 
 
@@ -1398,7 +1506,7 @@ def test_final_review_schema_recovery_survives_three_invalid_outputs(tmp_path, m
     final_calls = [item for item in calls if item[0].startswith("final-reviewer-")]
     assert len(final_calls) == 5
     assert "-retry-3" in final_calls[3][0]
-    assert "exactly reason, differences, hard_failures, and the eight-field rubric" in final_calls[3][1]
+    assert "exactly reason, differences, visible_strings, hard_failures, and the eight-field rubric" in final_calls[3][1]
     assert "Do not return required_changes" in final_calls[3][1]
     retried = [data for kind, data in events if kind == "final-review.retried"]
     assert len(retried) == 3

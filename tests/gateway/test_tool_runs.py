@@ -5,6 +5,7 @@ import pytest
 
 from gateway.tool_runs import (
     AD_TEMPLATE_ROUTE_ORDER,
+    AD_TEMPLATE_OPTIONAL_ROUTE,
     TOOL_MODEL_POLICY_SCHEMA,
     TOOL_RUN_COMMAND_SCHEMA,
     ToolRunError,
@@ -85,6 +86,42 @@ def test_model_policy_revisions_are_immutable_and_run_pinned(tmp_path):
     assert store.get_policy("ad-template-generator", 1)["policy"]["name"] == "Sole ad-template process"
 
 
+def test_ad_studio_profile_picker_changes_only_new_runs_and_persists_exact_snapshot(tmp_path):
+    store = ToolRunStore(str(tmp_path / "ad-profile.db"))
+    first_command = command(idempotency_key="profile-first")
+    first_command.pop("model_policy_revision")
+    first, _ = store.create_run(first_command)
+
+    selected = default_ad_template_policy()
+    selected["name"] = "Operator-selected Ad Studio profile"
+    selected["stages"]["analyse"]["primary"] = dict(
+        selected["stages"]["compare"]["primary"]
+    )
+    selected_record = store.create_policy("ad-template-generator", selected)
+    second_command = command(request_id="req-2", idempotency_key="profile-second")
+    second_command.pop("model_policy_revision")
+    second, _ = store.create_run(second_command)
+
+    assert first["model_policy_revision"] == 1
+    assert first["model_policy"]["stages"]["analyse"]["primary"]["model"] == "gpt-5.6-sol"
+    assert second["model_policy_revision"] == selected_record["revision"]
+    assert second["model_policy"]["stages"]["analyse"]["primary"]["model"] == "gpt-5.6-luna"
+    assert store.get_run(first["run_id"])["model_policy"] == first["model_policy"]
+
+    accepted = store.events(second["run_id"])[0]
+    assert accepted["data"]["policy_revision"] == selected_record["revision"]
+    assert accepted["data"]["model_profile"] == {
+        "profile_revision": selected_record["revision"],
+        "builder": {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+        "comparator": {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+        "final-review-a": {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+        "final-review-b": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        "fallback": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+    }
+    with pytest.raises(ToolRunError, match="immutable after submission"):
+        store.replace_remaining_policy(first["run_id"], selected)
+
+
 def test_builtin_policy_uses_only_audited_native_vision_roles():
     policy = default_ad_template_policy()
     expected = {
@@ -95,7 +132,8 @@ def test_builtin_policy_uses_only_audited_native_vision_roles():
         "quality-escalation": ("openai-codex", "gpt-5.6-sol"),
     }
     assert policy["seed_revision"] == 9
-    assert AD_TEMPLATE_ROUTE_ORDER == tuple(expected)
+    assert AD_TEMPLATE_ROUTE_ORDER == tuple(expected)[:-1]
+    assert AD_TEMPLATE_OPTIONAL_ROUTE == "quality-escalation"
     for stage_id, route in expected.items():
         stage = policy["stages"][stage_id]
         candidate = stage["primary"]
@@ -112,7 +150,7 @@ def test_builtin_policy_uses_only_audited_native_vision_roles():
 def test_ad_template_policy_contract_rejects_missing_swapped_or_fallback_roles():
     missing = default_ad_template_policy()
     missing["stages"].pop("compare")
-    with pytest.raises(ToolRunError, match="exactly the five audited vision roles"):
+    with pytest.raises(ToolRunError, match="requires builder, comparator, and two final-review roles"):
         validate_model_policy(missing)
 
     wrong_capability = default_ad_template_policy()
@@ -120,12 +158,11 @@ def test_ad_template_policy_contract_rejects_missing_swapped_or_fallback_roles()
     with pytest.raises(ToolRunError, match="requires audited structured vision"):
         validate_model_policy(wrong_capability)
 
-    swapped = default_ad_template_policy()
-    swapped["stages"]["analyse"]["primary"] = dict(
-        swapped["stages"]["final-review-a"]["primary"]
+    selected = default_ad_template_policy()
+    selected["stages"]["analyse"]["primary"] = dict(
+        selected["stages"]["final-review-a"]["primary"]
     )
-    with pytest.raises(ToolRunError, match="must use its audited model route"):
-        validate_model_policy(swapped)
+    assert validate_model_policy(selected) == selected
 
     fallback = default_ad_template_policy()
     fallback["stages"]["analyse"]["fallbacks"] = [
@@ -193,12 +230,13 @@ def test_stale_sole_revisions_one_to_eight_are_preserved_and_revision_nine_selec
     assert current["policy"]["seed_revision"] == 9
     assert current["policy"]["stages"]["analyse"]["primary"]["model"] == "gpt-5.6-sol"
     assert current["policy"]["stages"]["quality-escalation"]["primary"]["model"] == "gpt-5.6-sol"
-    with pytest.raises(ToolRunError, match="audited"):
-        migrated.create_run(command(
-            request_id="req-stale",
-            idempotency_key="stale-policy-pin",
-            model_policy_revision=8,
-        ))
+    pinned, _ = migrated.create_run(command(
+        request_id="req-stale",
+        idempotency_key="stale-policy-pin",
+        model_policy_revision=8,
+    ))
+    assert pinned["model_policy_revision"] == 8
+    assert pinned["model_policy"] == stale
 
 
 

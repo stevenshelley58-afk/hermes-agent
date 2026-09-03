@@ -207,6 +207,21 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
     if not isinstance(reason, str) or len(reason.strip()) < 3:
         raise ReviewEvidenceError(f"{role} must explain its decision", field="reason")
     reason = reason.strip()
+    visible_strings = value.get("visible_strings")
+    if (
+        not isinstance(visible_strings, dict)
+        or set(visible_strings) != {"source", "feed", "story"}
+        or not all(
+            isinstance(visible_strings[placement], list)
+            and bool(visible_strings[placement])
+            and all(isinstance(item, str) and item.strip() for item in visible_strings[placement])
+            for placement in ("source", "feed", "story")
+        )
+    ):
+        raise ReviewEvidenceError(
+            f"{role} must transcribe visible source, Feed, and Story strings",
+            field="visible_strings",
+        )
     differences = value.get("differences")
     raw_required_changes = value.get("required_changes")
     # Final reviewers judge the finished candidate. They do not own layer
@@ -248,6 +263,10 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
         "reason": reason,
         "rubric": scores,
         "hard_failures": [item.strip() for item in hard_failures],
+        "visible_strings": {
+            placement: [item.strip() for item in visible_strings[placement]]
+            for placement in ("source", "feed", "story")
+        },
         **({"differences": differences, "required_changes": required_changes} if require_change_list else {}),
     }
 
@@ -499,6 +518,10 @@ def _validate_layout(layout: Any, *, placement: str, width: int, height: int) ->
         if layer_type == "text":
             if not _font(layer["font"]) or not _number_value(layer["fontSize"], positive=True) or not _number_value(layer["tracking"]) or not _positive_int(layer["maxCharacters"]) or not _positive_int(layer["maxLines"]):
                 raise AdTemplateProcessError("text layer sizing is invalid")
+            if not -4 <= layer["tracking"] <= 4:
+                raise AdTemplateProcessError(
+                    f"{layer_path}.tracking must be an absolute canvas-pixel value between -4 and 4"
+                )
             line_height = layer["lineHeight"]
             if not _number_value(line_height) or not LINE_HEIGHT_MIN <= line_height <= LINE_HEIGHT_MAX:
                 offending = json.dumps(line_height, ensure_ascii=True)[:160]
@@ -544,12 +567,14 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
             raise AdTemplateProcessError("image input keys must be unique")
         image_keys.add(item["key"])
     text_keys: set[str] = set()
+    text_inputs_by_key: Dict[str, Mapping[str, Any]] = {}
     for item in value["textInputs"]:
         if not isinstance(item, dict) or set(item) != {"key", "label", "placeholder", "maxLength"} or not _nonempty(item["key"]) or not _nonempty(item["label"]) or not isinstance(item["placeholder"], str) or not _positive_int(item["maxLength"]):
             raise AdTemplateProcessError("text input does not match the Blockwise contract")
         if item["key"] in text_keys:
             raise AdTemplateProcessError("text input keys must be unique")
         text_keys.add(item["key"])
+        text_inputs_by_key[item["key"]] = item
     duplicate_input_keys = sorted(image_keys & text_keys)
     if duplicate_input_keys:
         raise AdTemplateProcessError(f"input key {json.dumps(duplicate_input_keys[0])} must be unique across imageInputs and textInputs")
@@ -569,9 +594,13 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
             raise AdTemplateProcessError(f"fonts[{font_index}].file must name one of the allowed bundled font files")
     font_files = {item["file"] for item in value["fonts"]}
     asset_keys = set(value["assets"])
+    image_inputs_by_key = {str(item["key"]): item for item in value["imageInputs"]}
     for item in value["imageInputs"]:
         if item.get("defaultAssetKey") and item["defaultAssetKey"] not in asset_keys:
             raise AdTemplateProcessError("image input default asset is undeclared")
+    visible_media_inputs: set[str] = set()
+    visible_logo_inputs: set[str] = set()
+    visible_text_inputs: set[str] = set()
     for layout_name, layout in (("feedLayout", value["feedLayout"]), ("storyLayout", value["storyLayout"])):
         for layer_index, layer in enumerate(layout["layers"]):
             layer_path = f"{layout_name}.layers[{layer_index}]"
@@ -586,6 +615,12 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
                 offending = json.dumps(layer["inputKey"], ensure_ascii=True)[:160]
                 allowed = ", ".join(sorted(text_keys)) or "(none declared)"
                 raise AdTemplateProcessError(f"{layer_path}.inputKey={offending} for text is undeclared (declared: {allowed})")
+            if layer["type"] == "text":
+                visible_text_inputs.add(str(layer["inputKey"]))
+            elif layer["type"] == "logo":
+                visible_logo_inputs.add(str(layer["inputKey"]))
+            elif layer["type"] == "image_slot":
+                visible_media_inputs.add(str(layer["inputKey"]))
             if layer["type"] == "text" and layer["font"]["file"] not in font_files:
                 offending = json.dumps(layer["font"]["file"], ensure_ascii=True)[:160]
                 allowed = ", ".join(sorted(font_files)) or "(none declared)"
@@ -596,6 +631,28 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
                 raise AdTemplateProcessError(f"{layer_path}.assetKey={offending} is undeclared (declared: {allowed})")
             if layer.get("colourRole") and layer["colourRole"] not in value["semanticColours"]:
                 raise AdTemplateProcessError("layer colourRole is undeclared")
+    for input_key in sorted(visible_text_inputs):
+        if not _nonempty(text_inputs_by_key[input_key].get("placeholder")):
+            raise AdTemplateProcessError(
+                f"visible text input {json.dumps(input_key)} must have a non-blank placeholder"
+            )
+    default_asset_owners: Dict[str, str] = {}
+    for input_key in sorted(visible_media_inputs):
+        default_asset_key = image_inputs_by_key[input_key].get("defaultAssetKey")
+        if not _nonempty(default_asset_key):
+            continue
+        prior_owner = default_asset_owners.get(str(default_asset_key))
+        if prior_owner is not None and prior_owner != input_key:
+            raise AdTemplateProcessError(
+                f"visible non-logo image inputs {json.dumps(prior_owner)} and {json.dumps(input_key)} "
+                f"must not repeat default asset {json.dumps(default_asset_key)}"
+            )
+        default_asset_owners[str(default_asset_key)] = input_key
+    for input_key in sorted(visible_logo_inputs):
+        if not _nonempty(image_inputs_by_key[input_key].get("defaultAssetKey")):
+            raise AdTemplateProcessError(
+                f"visible logo input {json.dumps(input_key)} must declare a non-blank defaultAssetKey"
+            )
     metadata = value["metadata"]
     if not isinstance(metadata, dict) or set(metadata) != METADATA_FIELDS or not _nonempty(metadata["title"]) or not isinstance(metadata["description"], str):
         raise AdTemplateProcessError("template metadata does not match the Blockwise contract")
@@ -644,6 +701,16 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
             raise AdTemplateProcessError(f"{path}.kind must be a non-empty descriptive string")
         if not isinstance(item["required"], bool):
             raise AdTemplateProcessError(f"{path}.required must be boolean")
+    required_logo_inputs = {
+        str(item["inputKey"])
+        for item in real_assets
+        if item.get("required") and "logo" in str(item.get("kind") or "").lower()
+    }
+    missing_logo_layers = sorted(required_logo_inputs - visible_logo_inputs)
+    if missing_logo_layers:
+        raise AdTemplateProcessError(
+            f"required logo input {json.dumps(missing_logo_layers[0])} must have a visible logo layer"
+        )
     return value
 
 def normalize_asset_declarations(value: Any) -> Any:
@@ -914,7 +981,22 @@ def run_generator_cli(candidate: Mapping[str, Any], workspace: Path) -> Dict[str
     if not isinstance(outputs, dict) or not all(isinstance(outputs.get(place), dict) and isinstance(outputs[place].get("path"), str) for place in ("feed", "story")):
         raise AdTemplateProcessError("shared renderer receipt is incomplete")
     previews = [{"name": Path(outputs[place]["path"]).name, "path": outputs[place]["path"], "placement": place, "width": outputs[place].get("width"), "height": outputs[place].get("height")} for place in ("feed", "story")]
-    result = {"template": template, "assets": assets, "previews": previews, "render": {place: outputs[place]["path"] for place in ("feed", "story")}, "receipt": receipt, "template_path": str(artifact_path)}
+    review_previews: List[Dict[str, str]] = []
+    raw_review_previews = receipt.get("reviewPreviews") if isinstance(receipt, dict) else None
+    if isinstance(raw_review_previews, list):
+        for index, item in enumerate(raw_review_previews):
+            path = item.get("path") if isinstance(item, dict) else None
+            if not isinstance(path, str):
+                raise AdTemplateProcessError("shared renderer review preview is invalid")
+            resolved = Path(path).resolve()
+            if not _under(resolved, workspace.resolve()) or not resolved.is_file():
+                raise AdTemplateProcessError("shared renderer review preview is missing or outside the run workspace")
+            review_previews.append({
+                "name": str(item.get("name") or resolved.name),
+                "path": str(resolved),
+                "placement": str(item.get("placement") or f"meta-shell-{index + 1}"),
+            })
+    result = {"template": template, "assets": assets, "previews": previews, "review_previews": review_previews, "render": {place: outputs[place]["path"] for place in ("feed", "story")}, "receipt": receipt, "template_path": str(artifact_path)}
     validate_artifacts(result, workspace)
     return result
 
@@ -984,6 +1066,7 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
         '{"x":0,"y":0,"width":1,"height":1} for a full-source crop (not "cover"); allowedPlacementOverrides '
         'must be a JSON list containing only crop and/or position (not feed/story). For every text layer, alignment '
         'must be exactly left, center, or right and overflowBehaviour must be exactly refuse, truncate, or scale_down (never ellipsis). '
+        'tracking is an absolute canvas-pixel value from -4 to 4, never em, percent, a multiplier, or arbitrary letter spacing. '
         'lineHeight is a unitless multiplier between 0.8 and 2.5, normally 1.1 to 1.6; never supply lineHeight in pixels. '
         ' For every vector layer, shape must be exactly one of rect, rounded, circle, line, pill, notched, wave, or ring; '
         'never use aliases such as rectangle or rounded_rect_stroke. Every icon layer must use exactly arrow, check, phone, mail, globe, or pin; '
@@ -1025,11 +1108,11 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
     # Source fidelity is the sole visual objective. The source bitmap is never
     # shipped, but its observable design must be reconstructed as editable
     # layers instead of being simplified into a different archetype.
-    return f"""Build one layered Blockwise ad template by recreating the attached source image as closely as possible. The rendered Feed must be a near-match to the source at thumbnail and full size: preserve its layout regions, relative geometry, spacing, image-slot count and shapes, crop intent, border and divider treatment, typography scale and style, palette, information hierarchy, and visible content structure. Do not redesign, simplify, modernise, improve, or reinterpret the source. The only acceptable visual substitutions are neutral editable replacements for advertiser identity and source photography. Remove source names, logos, phone numbers, URLs, portraits, contact identity, and source pixels, but keep equivalent editable logo, text, icon, patch, and image-slot roles in the same visual positions. Never flatten the source image into a plate.
+    return f"""Build one layered Blockwise ad template by recreating the attached source image as closely as possible. The rendered Feed must be a near-match to the source at thumbnail and full size: preserve its layout regions, relative geometry, spacing, image-slot count and shapes, crop intent, border and divider treatment, typography scale and style, palette, information hierarchy, and visible content structure. Do not redesign, simplify, modernise, improve, or reinterpret the source. The only acceptable visual substitutions are neutral editable replacements for advertiser identity and source photography. Remove source names, logos, phone numbers, URLs, portraits, contact identity, and source pixels, but keep equivalent editable logo, text, icon, patch, and image-slot roles in the same visual positions. Never flatten the source image into a plate. Every visible text input must have a non-blank placeholder. Every visible non-logo image input must have its own default asset; never bind two distinct visible inputs to the same photograph. Every required brand-logo reference must have a visible logo layer and a non-blank neutral default logo.
 
 The attached source is the authority. For a revision, apply every item in prior reviewer feedback to the prior valid candidate and leave already-matching regions unchanged. Story must be a native 1080x1920 translation of the same design system and hierarchy, with essential content outside the top 240px and bottom 300px platform zones; it is not evidence that Feed may diverge from the source.
 
-Return JSON only with exactly {{"template":{{...}},"assets":[]}}. template must use schema "blockwise.ad-template" and contain exactly templateId, createdAt, feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata plus schema. Feed is 1080x1350 with safeZones=[{{"x":72,"y":96,"width":936,"height":1158}}]. Story is 1080x1920 with safeZones=[{{"x":72,"y":240,"width":936,"height":1380}}]. Geometry is always {{x,y,width,height}} from the top-left and must remain inside the canvas. Each layout contains exactly placement, layers, and safeZones. Every layer must match one exact shape: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. Do not omit layerId, opacity, protected, or any other required field. Text uses a declared bundled font, native-canvas fontSize, unitless lineHeight 0.8-2.5, tracking 0-4 canvas pixels, alignment left|center|right, maxCharacters, maxLines, colourRole, overflowBehaviour refuse|truncate|scale_down, and geometry. image_slot mask is rounded_rect|circle|none and defaultCrop is normalized {{"x":0,"y":0,"width":1,"height":1}}. imageInputs entries are exactly {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs entries are exactly {{key,label,placeholder,maxLength}}; fonts entries are exactly {{file}}. Every reference must resolve.
+Return JSON only with exactly {{"template":{{...}},"assets":[]}}. template must use schema "blockwise.ad-template" and contain exactly templateId, createdAt, feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata plus schema. Feed is 1080x1350 with safeZones=[{{"x":72,"y":96,"width":936,"height":1158}}]. Story is 1080x1920 with safeZones=[{{"x":72,"y":240,"width":936,"height":1380}}]. Geometry is always {{x,y,width,height}} from the top-left and must remain inside the canvas. Each layout contains exactly placement, layers, and safeZones. Every layer must match one exact shape: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. Do not omit layerId, opacity, protected, or any other required field. Text uses a declared bundled font, native-canvas fontSize, unitless lineHeight 0.8-2.5, tracking as an absolute canvas-pixel value from -4 to 4 (never em, percent, or a multiplier), alignment left|center|right, maxCharacters, maxLines, colourRole, overflowBehaviour refuse|truncate|scale_down, and geometry. image_slot mask is rounded_rect|circle|none and defaultCrop is normalized {{"x":0,"y":0,"width":1,"height":1}}. imageInputs entries are exactly {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs entries are exactly {{key,label,placeholder,maxLength}}; fonts entries are exactly {{file}}. Every reference must resolve.
 
 semanticColours contains exactly background, primary, secondary, accent, mainText, inverseText. Allowed font files are {', '.join(sorted(ALLOWED_FONT_FILES))}. metadata contains exactly title:string, description:string, gallerySamples:{{feed?:{{assetKey?,placement,purpose}},story?:{{assetKey?,placement,purpose}}}}, metaCopyDefaults:{{primaryText:string[],headlines:string[],descriptions:string[],cta:string}}, aiWritingGuidance:{{summary:string,fields:record<string,string>}}, publishRequirements:{{objective:string,specialAdCategory:string|null,instantForm:{{required:boolean,dependency:string|null,defaults?:record<string,string>}},destination:{{required:boolean,kind:'website'|'instant_form'|'none',dependency:string|null}},requiredCtaTypes?:string[]}}, replacementAssets:{{inputKey,assetKey,purpose?}}[], realAssetRefs:{{inputKey,kind,required}}[]. For property ads set specialAdCategory to HOUSING. Every layer, input, font, colour, asset, replacement, gallery, and realAsset reference must resolve inside the same template. template.assets is required and is a declaration record shaped exactly {{"asset-key":{{"fileName":"normalized/catalog/path.webp","mimeType":"image/webp"}}}}; it is never a list and may be {{}} only when no asset is used. Top-level assets is always a list of {{assetKey,fileName,mimeType}} and must exactly mirror template.assets; never emit bytesBase64 anywhere. Allowed catalog files are brand/neutral-real-estate.png, home/open-home-living.webp, home/home-dusk.webp, home/mt-lawley-federation.webp, home/home-pool.webp, home/interior-styled.webp, home/subiaco-townhouse.webp, and adstudio-samples/photos/int-bedroom.png. Use one coherent property across slots. When the source contains a logo, declare the neutral brand asset and bind it as the logo imageInput defaultAssetKey so the logo is visible in every rendered iteration.
 
@@ -1051,20 +1134,20 @@ def review_prompt(*, final: bool, candidate: Any = None) -> str:
         "genuinely clears every gate."
     )
     output_contract = (
-        "Return JSON only with exactly reason, differences, hard_failures, and rubric."
+        "Return JSON only with exactly reason, differences, visible_strings, hard_failures, and rubric."
         if final
         else
-        "Return JSON only with exactly reason, differences, required_changes, hard_failures, and rubric."
+        "Return JSON only with exactly reason, differences, required_changes, visible_strings, hard_failures, and rubric."
     )
     return f"""You are the {role} in a source-matching loop. The attached images are ordered: (1) the source reference, (2) the rendered Feed candidate, and (3) the rendered Story translation. Inspect the actual pixels together. The primary objective is not generic ad quality; it is faithful reconstruction of the source design as editable layers.
 
-Compare source versus Feed region by region: outer frame and margins; header/title block; image count, grid, aspect ratios and crop intent; logo/price panel; divider lines; body columns; feature list; footer/contact row; typography family/style/weight/scale/line wrapping; palette; alignment; whitespace; borders, corner radii, icons and decorative details. Neutral replacement photography and neutral advertiser identity must not reduce the score when their visual role, size, crop, and position match. Treat source and replacement photographs as content-agnostic slot fill: never mention, score, or request changes for the neutral photo subject, scene, uniqueness, repetition, or pixels. Compare only slot count, geometry, mask, crop intent, and layering because source pixels are prohibited from shipping. Any simplification, omitted section, changed information density, different skeleton, moved panel, different image-slot structure, or generic redesign must reduce the score heavily. Story is scored only as a deliberate native 1080x1920 translation of the same visual system; it cannot compensate for a Feed mismatch. Assess Story dead space only inside the content-safe band y=240..1620. Empty space in y=0..239 and y=1620..1919 is mandatory platform-UI protection and must never be reported or scored as dead space, a spacing defect, a difference, or a required change.
+Compare source versus Feed region by region: outer frame and margins; header/title block; image count, grid, aspect ratios and crop intent; logo/price panel; divider lines; body columns; feature list; footer/contact row; typography family/style/weight/scale/line wrapping; palette; alignment; whitespace; borders, corner radii, icons and decorative details. Neutral replacement photography and neutral advertiser identity must not reduce the score when their visual role, size, crop, and position match. Source pixels are prohibited, but the replacement set must still be coherent: hard-fail a wrong-subject image, the same non-logo photograph repeated in distinct visible slots, or distinct slots that should show different views but visibly reuse one crop. Any simplification, omitted section, changed information density, different skeleton, moved panel, different image-slot structure, or generic redesign must reduce the score heavily. Story is scored only as a deliberate native 1080x1920 translation of the same visual system; it cannot compensate for a Feed mismatch. Assess Story dead space only inside the content-safe band y=240..1620. Empty space in y=0..239 and y=1620..1919 is mandatory platform-UI protection and must never be reported or scored as dead space, a spacing defect, a difference, or a required change.
 
 Use this scale strictly: 10.0 means the Feed is visually indistinguishable in structure at thumbnail size except permitted neutral content substitutions; 9.5 means only tiny finishing differences remain; 9.0 still has clearly visible spacing, scale, typography, or geometry differences; 8.0 is recognisably based on the source but materially different; 5.0 is merely the same category; 0 is missing or invalid. Do not award 9.5 to a design that a person can immediately distinguish from the source.
 
-{output_contract} differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. required_changes is the ordered list of material work the builder should apply next. {change_list_contract} Every required_changes string must use this exact actionable structure: placement=feed|story; layers=comma-separated layerIds; current={{x:...,y:...,width:...,height:...}}; target={{x:...,y:...,width:...,height:...}}; change=specific instruction. Name all affected layer IDs and use their current and intended target geometry. Copy current geometry exactly from Candidate contract JSON, then check every proposed target rectangle against every existing layer before returning it. Never propose a target that newly overlaps an image slot or opaque vector panel with another image slot unless that overlap is visibly present in the source and the change text explicitly identifies and justifies the source-visible overlap. Use a separate required_changes item when affected layers do not share identical current and target geometry. hard_failures is a list. rubric contains exactly these eight 0-10 numbers: feed_source_likeness, layout_geometry, spacing_proportions, typography_likeness, colour_likeness, image_slot_composition, editable_decomposition, native_story_translation. A passing candidate requires feed_source_likeness >= {THRESHOLD}, mean >= {THRESHOLD}, every field >= {MIN_RUBRIC_SCORE}, no hard failures, and no required changes.
+{output_contract} visible_strings must be exactly an object with source, feed, and story arrays. Transcribe every visibly rendered word, number, currency value, CTA and logo wordmark in reading order; preserve visible splitting, missing glyphs and truncation exactly (for example, a broken HOUSE rendered as H U / O S / E must be transcribed that way, not silently corrected). differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. required_changes is the ordered list of material work the builder should apply next. {change_list_contract} Every required_changes string must use this exact actionable structure: placement=feed|story; layers=comma-separated layerIds; current={{x:...,y:...,width:...,height:...}}; target={{x:...,y:...,width:...,height:...}}; change=specific instruction. Name all affected layer IDs and use their current and intended target geometry. Copy current geometry exactly from Candidate contract JSON, then check every proposed target rectangle against every existing layer before returning it. Never propose a target that newly overlaps an image slot or opaque vector panel with another image slot unless that overlap is visibly present in the source and the change text explicitly identifies and justifies the source-visible overlap. Use a separate required_changes item when affected layers do not share identical current and target geometry. hard_failures is a list. rubric contains exactly these eight 0-10 numbers: feed_source_likeness, layout_geometry, spacing_proportions, typography_likeness, colour_likeness, image_slot_composition, editable_decomposition, native_story_translation. A passing candidate requires feed_source_likeness >= {THRESHOLD}, mean >= {THRESHOLD}, every field >= {MIN_RUBRIC_SCORE}, no hard failures, and no required changes.
 
-Hard-fail source pixels flattened into the output, copied advertiser identity, missing/unreadable renders, clipping, canvas/safe-zone violations, non-editable critical roles, unknown assets, or a stretched/cropped/letterboxed Story. Do not infer another reviewer's score. Candidate contract JSON: {candidate_context}"""
+Hard-fail source pixels flattened into the output, copied advertiser identity, missing/unreadable renders, any missing/split/clipped/truncated/garbled visible text, a malformed or blank logo, repeated/wrong photographs, canvas/safe-zone violations, non-editable critical roles, unknown assets, or a stretched/cropped/letterboxed Story. The numeric tracking field in Candidate JSON is absolute canvas pixels, never em, percent, or a font-size multiplier. Inspect both native Feed/Story renders and any subsequently attached Meta-shell previews; a shell-only defect is still a defect. Do not infer another reviewer's score. Candidate contract JSON: {candidate_context}"""
 
     role = "fresh independent final reviewer" if final else "iteration comparator"
     role += (
@@ -1089,6 +1172,19 @@ def vision_message(text: str, paths: List[str]) -> List[Dict[str, Any]]:
     if len(parts) == 1:
         raise AdTemplateProcessError("vision role requires attached image pixels")
     return parts
+
+
+def review_vision_paths(source: str, candidate: Mapping[str, Any]) -> List[str]:
+    """Attach native renders first, then any renderer-authored Meta-shell previews."""
+    render = candidate.get("render") if isinstance(candidate.get("render"), Mapping) else {}
+    paths = [source, str(render.get("feed") or ""), str(render.get("story") or "")]
+    optional = candidate.get("review_previews")
+    if isinstance(optional, list):
+        for item in optional:
+            path = item.get("path") if isinstance(item, Mapping) else None
+            if isinstance(path, str) and path and path not in paths:
+                paths.append(path)
+    return paths
 
 class SoleProcessOrchestrator:
     """Runs builder, comparator, final reviewers, renderer, and importer as separate roles."""
@@ -1281,11 +1377,7 @@ class SoleProcessOrchestrator:
                         "comparator-%d" % index if comparison_attempt == 0 else f"comparator-{index}-retry-{comparison_attempt}",
                         vision_message(
                             comparison_prompt + retry_suffix,
-                            [
-                                source,
-                                str((rendered.get("render") or {}).get("feed") or ""),
-                                str((rendered.get("render") or {}).get("story") or ""),
-                            ],
+                            review_vision_paths(source, rendered),
                         ),
                         f"{routes[1].get('provider')}/{routes[1].get('model')}",
                     )
@@ -1325,6 +1417,7 @@ class SoleProcessOrchestrator:
                 "reason": reason,
                 "rubric": evidence["rubric"],
                 "hard_failures": evidence["hard_failures"],
+                "visible_strings": evidence["visible_strings"],
                 "differences": evidence["differences"],
                 "required_changes": evidence["required_changes"],
                 "decision": decision,
@@ -1385,7 +1478,7 @@ class SoleProcessOrchestrator:
                     retry_suffix = (
                         "\n\nYour previous final-review response was rejected by the strict evidence schema: "
                         f"{rejection}. Return the complete corrected JSON object with exactly reason, differences, "
-                        "hard_failures, and the eight-field rubric. Do not return required_changes. Do not lower "
+                        "visible_strings, hard_failures, and the eight-field rubric. Do not return required_changes. Do not lower "
                         "scores to avoid the schema. Return only the corrected JSON object."
                     )
                 attempt_identity = identity if output_attempt == 0 else f"{identity}-retry-{output_attempt}"
@@ -1395,7 +1488,7 @@ class SoleProcessOrchestrator:
                         attempt_identity,
                         vision_message(
                             final_prompt + retry_suffix,
-                            [source, str((candidate.get("render") or {}).get("feed") or ""), str((candidate.get("render") or {}).get("story") or "")],
+                            review_vision_paths(source, candidate),
                         ),
                         provider_route,
                     )

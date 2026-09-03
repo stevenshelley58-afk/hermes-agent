@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 from gateway.ad_template_process import validate_iterations, validate_final_review, deterministic_documents
 
 
@@ -46,20 +46,48 @@ AD_TEMPLATE_ROUTE_ORDER = (
     "compare",
     "final-review-a",
     "final-review-b",
-    "quality-escalation",
 )
+AD_TEMPLATE_OPTIONAL_ROUTE = "quality-escalation"
 _AUDITED_NATIVE_VISION_MODELS = frozenset({
     ("deepseek", "deepseek-v4-flash-vision-exp"),
     ("openai-codex", "gpt-5.6-luna"),
     ("openai-codex", "gpt-5.6-sol"),
 })
-_AD_TEMPLATE_ROLE_MODELS = {
-    "analyse": ("openai-codex", "gpt-5.6-sol"),
-    "compare": ("openai-codex", "gpt-5.6-luna"),
-    "final-review-a": ("openai-codex", "gpt-5.6-luna"),
-    "final-review-b": ("openai-codex", "gpt-5.6-sol"),
-    "quality-escalation": ("openai-codex", "gpt-5.6-sol"),
-}
+
+
+def ad_template_model_catalog() -> List[Dict[str, Any]]:
+    """Return the same audited capability catalogue used by policy validation."""
+    return [
+        {
+            "provider": provider,
+            "model": model,
+            "capabilities": ["vision_structured"],
+            "supports_vision": True,
+            "supports_tools": True,
+        }
+        for provider, model in sorted(_AUDITED_NATIVE_VISION_MODELS)
+    ]
+
+
+def _ad_template_profile_snapshot(policy: Mapping[str, Any], *, revision: int) -> Dict[str, Any]:
+    stages = policy.get("stages") if isinstance(policy.get("stages"), dict) else {}
+    aliases = {
+        "builder": "analyse",
+        "comparator": "compare",
+        "final-review-a": "final-review-a",
+        "final-review-b": "final-review-b",
+        "fallback": "quality-escalation",
+    }
+    snapshot: Dict[str, Any] = {"profile_revision": revision}
+    for public_name, stage_name in aliases.items():
+        stage = stages.get(stage_name)
+        primary = stage.get("primary") if isinstance(stage, dict) else None
+        if isinstance(primary, dict):
+            snapshot[public_name] = {
+                "provider": str(primary.get("provider") or ""),
+                "model": str(primary.get("model") or ""),
+            }
+    return snapshot
 _GENERATION_EVENT_KINDS = frozenset({
     "generation.started", "generation.rendered", "generation.scored",
     "generation.revision-requested", "generation.accepted", "generation.failed",
@@ -225,11 +253,13 @@ def validate_model_policy(policy: Any, *, tool_id: Optional[str] = None) -> Dict
             if value is not None and (not isinstance(value, (int, float)) or value < 0):
                 raise ToolRunError(f"model policy stage {stage_id}.{numeric} is invalid")
     if policy_tool == "ad-template-generator":
-        if set(stages) != set(AD_TEMPLATE_ROUTE_ORDER):
+        if not set(AD_TEMPLATE_ROUTE_ORDER).issubset(stages) or set(stages) - (
+            set(AD_TEMPLATE_ROUTE_ORDER) | {AD_TEMPLATE_OPTIONAL_ROUTE}
+        ):
             raise ToolRunError(
-                "ad-template policy requires exactly the five audited vision roles"
+                "ad-template policy requires builder, comparator, and two final-review roles, plus optional fallback"
             )
-        for stage_id, expected_route in _AD_TEMPLATE_ROLE_MODELS.items():
+        for stage_id in stages:
             stage = stages[stage_id]
             if stage.get("capability") != "vision_structured":
                 raise ToolRunError(
@@ -248,10 +278,20 @@ def validate_model_policy(policy: Any, *, tool_id: Optional[str] = None) -> Dict
                 str(primary.get("provider") or "").strip().lower(),
                 str(primary.get("model") or "").strip().lower(),
             )
-            if route != expected_route:
+            if route not in _AUDITED_NATIVE_VISION_MODELS:
                 raise ToolRunError(
-                    f"ad-template role {stage_id} must use its audited model route"
+                    f"ad-template role {stage_id} must use a model from the Hermes audited capability catalogue"
                 )
+        final_a = stages["final-review-a"]["primary"]
+        final_b = stages["final-review-b"]["primary"]
+        if (
+            str(final_a.get("provider") or "").strip().lower(),
+            str(final_a.get("model") or "").strip().lower(),
+        ) == (
+            str(final_b.get("provider") or "").strip().lower(),
+            str(final_b.get("model") or "").strip().lower(),
+        ):
+            raise ToolRunError("ad-template final reviewers must use independent model routes")
     return result
 
 
@@ -527,7 +567,13 @@ class ToolRunStore:
                 ),
             )
             self._conn.commit()
-        self.append_event(run_id, "command.accepted", status="queued", node_id="source", data={"policy_revision": policy_record["revision"]})
+        self.append_event(run_id, "command.accepted", status="queued", node_id="source", data={
+            "policy_revision": policy_record["revision"],
+            "model_profile": _ad_template_profile_snapshot(
+                policy_record["policy"], revision=policy_record["revision"]
+            )
+            if tool_id == "ad-template-generator" else None,
+        })
         return self.get_run(run_id), True
 
     def _row_to_run(self, row: sqlite3.Row) -> Dict[str, Any]:
@@ -703,17 +749,6 @@ class ToolRunStore:
     def requeue(self, run_id: str, *, stage: Optional[str] = None) -> Dict[str, Any]:
         run = self.get_run(run_id)
         next_stage = _clean_id(stage or run.get("stage") or "source", "stage")
-        policy_upgrade: Dict[str, Any] | None = None
-        if run["tool_id"] == "ad-template-generator" and _is_stale_audited_ad_template_policy(run.get("model_policy")):
-            project_id = str((run.get("scope") or {}).get("project_id") or "")
-            policy_upgrade = self.get_policy("ad-template-generator", project_id=project_id)
-            if _is_legacy_seed_policy(policy_upgrade.get("policy")) and project_id:
-                policy_upgrade = self.get_policy("ad-template-generator", project_id="")
-            policy_upgrade["policy"] = validate_model_policy(
-                policy_upgrade["policy"], tool_id="ad-template-generator"
-            )
-            if _is_legacy_seed_policy(policy_upgrade["policy"]):
-                raise ToolRunError("current ad-template policy is stale")
         updates = {
             "status": "queued",
             "stage": next_stage,
@@ -723,20 +758,11 @@ class ToolRunStore:
             "completed_at": None,
             "updated_at": _now(),
         }
-        if policy_upgrade is not None:
-            updates["policy_revision"] = policy_upgrade["revision"]
-            updates["policy_json"] = _json(policy_upgrade["policy"], "model_policy")
         with self._lock:
             columns = ",".join(f"{key}=?" for key in updates)
             self._conn.execute(f"UPDATE tool_runs SET {columns} WHERE run_id=?", (*updates.values(), run_id))
             self._conn.commit()
         event_data: Dict[str, Any] = {"resume_from": next_stage}
-        if policy_upgrade is not None:
-            event_data["policy_upgraded"] = {
-                "from_revision": run["model_policy_revision"],
-                "to_revision": policy_upgrade["revision"],
-                "seed_revision": policy_upgrade["policy"]["seed_revision"],
-            }
         self.append_event(
             run_id, "command.queued", status="queued", node_id=next_stage,
             data=event_data,
@@ -745,6 +771,10 @@ class ToolRunStore:
 
     def replace_remaining_policy(self, run_id: str, policy: Dict[str, Any]) -> Dict[str, Any]:
         run = self.get_run(run_id)
+        if run["tool_id"] == "ad-template-generator":
+            raise ToolRunError(
+                "ad-template model profiles are immutable after submission; save the profile for new runs"
+            )
         if run["status"] in _TERMINAL_STATUSES:
             raise ToolRunError("completed Tool runs cannot change model policy")
         policy = validate_model_policy(policy, tool_id=run["tool_id"])
