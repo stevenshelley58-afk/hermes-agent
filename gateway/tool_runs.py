@@ -162,6 +162,16 @@ def _is_legacy_seed_policy(policy: Any) -> bool:
     return not isinstance(revision, int) or revision < _AD_TEMPLATE_POLICY_SEED_REVISION
 
 
+def _is_stale_audited_ad_template_policy(policy: Any) -> bool:
+    """Identify a previously audited sole-process seed without blessing corrupt policy data."""
+    return (
+        isinstance(policy, dict)
+        and policy.get("name") == "Sole ad-template process"
+        and isinstance(policy.get("seed_revision"), int)
+        and policy["seed_revision"] < _AD_TEMPLATE_POLICY_SEED_REVISION
+    )
+
+
 def validate_model_policy(policy: Any, *, tool_id: Optional[str] = None) -> Dict[str, Any]:
     if not isinstance(policy, dict) or policy.get("schema") != TOOL_MODEL_POLICY_SCHEMA:
         raise ToolRunError("invalid Tool model policy schema")
@@ -693,16 +703,43 @@ class ToolRunStore:
     def requeue(self, run_id: str, *, stage: Optional[str] = None) -> Dict[str, Any]:
         run = self.get_run(run_id)
         next_stage = _clean_id(stage or run.get("stage") or "source", "stage")
-        with self._lock:
-            self._conn.execute(
-                """UPDATE tool_runs SET status='queued',stage=?,cancel_requested=0,
-                   attention=0,error=NULL,completed_at=NULL,updated_at=? WHERE run_id=?""",
-                (next_stage, _now(), run_id),
+        policy_upgrade: Dict[str, Any] | None = None
+        if run["tool_id"] == "ad-template-generator" and _is_stale_audited_ad_template_policy(run.get("model_policy")):
+            project_id = str((run.get("scope") or {}).get("project_id") or "")
+            policy_upgrade = self.get_policy("ad-template-generator", project_id=project_id)
+            if _is_legacy_seed_policy(policy_upgrade.get("policy")) and project_id:
+                policy_upgrade = self.get_policy("ad-template-generator", project_id="")
+            policy_upgrade["policy"] = validate_model_policy(
+                policy_upgrade["policy"], tool_id="ad-template-generator"
             )
+            if _is_legacy_seed_policy(policy_upgrade["policy"]):
+                raise ToolRunError("current ad-template policy is stale")
+        updates = {
+            "status": "queued",
+            "stage": next_stage,
+            "cancel_requested": 0,
+            "attention": 0,
+            "error": None,
+            "completed_at": None,
+            "updated_at": _now(),
+        }
+        if policy_upgrade is not None:
+            updates["policy_revision"] = policy_upgrade["revision"]
+            updates["policy_json"] = _json(policy_upgrade["policy"], "model_policy")
+        with self._lock:
+            columns = ",".join(f"{key}=?" for key in updates)
+            self._conn.execute(f"UPDATE tool_runs SET {columns} WHERE run_id=?", (*updates.values(), run_id))
             self._conn.commit()
+        event_data: Dict[str, Any] = {"resume_from": next_stage}
+        if policy_upgrade is not None:
+            event_data["policy_upgraded"] = {
+                "from_revision": run["model_policy_revision"],
+                "to_revision": policy_upgrade["revision"],
+                "seed_revision": policy_upgrade["policy"]["seed_revision"],
+            }
         self.append_event(
             run_id, "command.queued", status="queued", node_id=next_stage,
-            data={"resume_from": next_stage},
+            data=event_data,
         )
         return self.get_run(run_id)
 

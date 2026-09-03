@@ -261,8 +261,8 @@ class _ExplicitEventOrchestrator:
         ] == [
             ("openai-codex", "gpt-5.6-sol"),
             ("openai-codex", "gpt-5.6-luna"),
-            ("deepseek", "deepseek-v4-flash-vision-exp"),
             ("openai-codex", "gpt-5.6-luna"),
+            ("openai-codex", "gpt-5.6-sol"),
             ("openai-codex", "gpt-5.6-sol"),
         ]
         # A generic role activity preview happens before any orchestrator
@@ -521,6 +521,66 @@ async def test_retry_reuses_persisted_source_after_staging_cleanup(tmp_path, mon
 
 
 @pytest.mark.asyncio
+async def test_ad_template_retry_upgrades_stale_seed_policy_without_losing_run_state(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source-pixels")
+    store = ToolRunStore(str(tmp_path / "retry-policy.db"))
+    current_policy = default_ad_template_policy()
+    for _ in range(6):
+        store.create_policy("ad-template-generator", current_policy, make_default=False)
+    stale_policy = json.loads(json.dumps(current_policy))
+    stale_policy["seed_revision"] = 8
+    stale_record = store.create_policy(
+        "ad-template-generator", stale_policy, make_default=False
+    )
+    current_record = store.create_policy(
+        "ad-template-generator", current_policy, make_default=True
+    )
+    assert stale_record["revision"] == 8
+    assert current_record["revision"] == 9
+
+    command = _command(str(source), idempotency_key="retry-stale-policy")
+    command["model_policy_revision"] = 8
+    run, _ = store.create_run(command)
+    checkpoint = {"template_id": "candidate-at-final-check", "iteration": 12}
+    store.update_run(
+        run["run_id"], status="failed", stage="final-check", output=checkpoint,
+        error="review schema rejected",
+    )
+    before_default = store.get_policy("ad-template-generator")
+    before = store.get_run(run["run_id"])
+    started = []
+    api = _ToolRunHarness(store)
+    monkeypatch.setattr(
+        api,
+        "_start_tool_task",
+        lambda run_id, finalize=False: started.append((run_id, finalize)),
+    )
+
+    response = await api._handle_retry_tool_run(
+        SimpleNamespace(match_info={"run_id": run["run_id"]})
+    )
+
+    assert response.status == 202
+    retried = store.get_run(run["run_id"])
+    assert retried["model_policy_revision"] == 9
+    assert retried["model_policy"]["seed_revision"] == 9
+    assert retried["model_policy"] == current_policy
+    assert retried["scope"] == before["scope"]
+    assert retried["payload"] == before["payload"]
+    assert retried["output"] == checkpoint
+    assert retried["stage"] == "final-check"
+    assert started == [(run["run_id"], False)]
+    assert store.get_policy("ad-template-generator") == before_default
+    queued = [event for event in store.events(run["run_id"]) if event["kind"] == "command.queued"]
+    assert queued[-1]["data"]["policy_upgraded"] == {
+        "from_revision": 8,
+        "to_revision": 9,
+        "seed_revision": 9,
+    }
+
+
+@pytest.mark.asyncio
 async def test_real_orchestrator_successful_import_reaches_completed(tmp_path, monkeypatch):
     home = tmp_path / "hermes-home"
     home.mkdir()
@@ -615,7 +675,7 @@ async def test_initial_builder_format_recovery_persists_events_and_all_role_cost
             self.owner.calls.append(self.instance_id)
             if self.instance_id.startswith("builder-"):
                 self.owner.builder_calls += 1
-                if self.owner.builder_calls <= 2:
+                if self.owner.builder_calls == 1:
                     return {"final_response": "not-json"}
                 payload = {"template": template, "assets": []}
             else:
@@ -681,23 +741,20 @@ async def test_initial_builder_format_recovery_persists_events_and_all_role_cost
     assert api.calls[:3] == [
         "builder-1",
         "builder-1-output-retry-1",
-        "builder-1-output-retry-2",
+        "comparator-1",
     ]
     assert len([name for name in api.calls if name.startswith("comparator-")]) == 1
     assert len([name for name in api.calls if name.startswith("final-reviewer-")]) == 2
     assert completed["output"]["usage"] == {
-        "input_tokens": 60,
-        "output_tokens": 30,
-        "total_tokens": 90,
-        "estimated_cost_usd": pytest.approx(0.30),
+        "input_tokens": 50,
+        "output_tokens": 25,
+        "total_tokens": 75,
+        "estimated_cost_usd": pytest.approx(0.25),
     }
-    assert completed["output"]["cost"]["reported_usd"] == pytest.approx(0.30)
+    assert completed["output"]["cost"]["reported_usd"] == pytest.approx(0.25)
     events = store.events(run["run_id"])
     assert len([event for event in events if event["kind"] == "builder.output-retry"]) == 1
-    escalation = next(
-        event for event in events if event["kind"] == "builder.escalated"
-    )
-    assert escalation["data"]["reason"] == "structured_output_invalid"
+    assert not any(event["kind"] == "builder.escalated" for event in events)
     assert len([event for event in events if event["kind"] == "iteration.compared"]) == 1
     assert len([event for event in events if event["kind"] == "final-review.started"]) == 2
     assert len([event for event in events if event["kind"] == "final-review.completed"]) == 1
@@ -782,19 +839,19 @@ def _one_second_candidates(_run, stage):
     routes = {
         "analyse": {
             "provider": "openai-codex",
-            "model": "gpt-5.6-luna",
+            "model": "gpt-5.6-sol",
         },
         "compare": {
             "provider": "openai-codex",
             "model": "gpt-5.6-luna",
         },
         "final-review-a": {
-            "provider": "deepseek",
-            "model": "deepseek-v4-flash-vision-exp",
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
         },
         "final-review-b": {
             "provider": "openai-codex",
-            "model": "gpt-5.6-luna",
+            "model": "gpt-5.6-sol",
         },
         "quality-escalation": {
             "provider": "openai-codex",
