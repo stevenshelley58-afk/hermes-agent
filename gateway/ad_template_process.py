@@ -1,6 +1,6 @@
 """Executable orchestration for the sole ad-template process."""
 from __future__ import annotations
-import base64, json, math, mimetypes, os, re, shlex, shutil, subprocess, sys, urllib.error, urllib.request, uuid
+import base64, hashlib, hmac, json, math, mimetypes, os, re, shlex, shutil, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping
@@ -932,7 +932,27 @@ def import_template(output: Mapping[str, Any], *, run_id: str, project_id: str) 
         if not isinstance(asset, dict) or not all(asset.get(key) for key in ("assetKey", "fileName", "mimeType", "bytesBase64")):
             raise AdTemplateProcessError("Blockwise asset payload is invalid")
     body = json.dumps({"template": template, "assets": assets}).encode()
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+    timestamp = str(int(time.time()))
+    nonce = uuid.uuid4().hex
+    scope = "adstudio.templates"
+    parsed_url = urllib.parse.urlsplit(url)
+    request_path = parsed_url.path or "/"
+    if parsed_url.query:
+        request_path = f"{request_path}?{parsed_url.query}"
+    body_hash = hashlib.sha256(body).hexdigest()
+    signing_payload = "\n".join((
+        "v1", timestamp, nonce, scope, "POST", request_path, body_hash,
+    ))
+    signature = hmac.new(
+        token.encode("utf-8"), signing_payload.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Blockwise-Timestamp": timestamp,
+        "X-Blockwise-Nonce": nonce,
+        "X-Blockwise-Scope": scope,
+        "X-Blockwise-Signature": signature,
+    }
     import_host = os.environ.get("BLOCKWISE_TEMPLATE_IMPORT_HOST", "").strip()
     if import_host:
         if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(?::[0-9]{1,5})?", import_host):
@@ -941,6 +961,16 @@ def import_template(output: Mapping[str, Any], *, run_id: str, project_id: str) 
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=30) as response: payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            error_payload = json.loads(exc.read().decode("utf-8"))
+            error_code = str(error_payload.get("error") or "http_error")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            error_code = "http_error"
+        safe_code = re.sub(r"[^a-zA-Z0-9_.-]", "_", error_code)[:120]
+        raise AdTemplateProcessError(
+            f"Blockwise template import failed ({exc.code}: {safe_code})"
+        ) from exc
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc: raise AdTemplateProcessError("Blockwise template import failed") from exc
     if not isinstance(payload, dict) or not payload.get("templateId"): raise AdTemplateProcessError("Blockwise import returned no templateId")
     replayed = bool(payload.get("replayed"))
