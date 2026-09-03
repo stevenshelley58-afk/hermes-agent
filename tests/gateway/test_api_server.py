@@ -2558,6 +2558,54 @@ class TestModelRoutesHandlers:
 
 class TestModelRoutesAgentCreation:
 
+    def test_confirmed_request_lock_bypasses_broken_global_provider(self, monkeypatch):
+        captured = {}
+        global_calls = []
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+
+        def broken_global_runtime():
+            global_calls.append(True)
+            raise RuntimeError("Unknown provider 'custom:venice'")
+
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            broken_global_runtime,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._resolve_request_runtime_agent_kwargs",
+            lambda provider, target_model=None: {
+                "provider": provider,
+                "api_key": "subscription-credential",
+                "base_url": "https://locked.example/v1",
+                "api_mode": "codex_responses",
+                "command": None,
+                "args": [],
+                "credential_pool": None,
+                "max_tokens": None,
+            },
+        )
+        adapter = _make_routing_adapter({})
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+
+        agent = adapter._create_agent(
+            session_id="isolated-tool-role",
+            requested_model="gpt-5.6-sol",
+            requested_provider="openai-codex",
+            confirmed_runtime_lock=True,
+            persistence_disabled=True,
+        )
+
+        assert isinstance(agent, FakeAgent)
+        assert global_calls == []
+        assert captured["provider"] == "openai-codex"
+        assert captured["model"] == "gpt-5.6-sol"
+
     def test_route_provider_resolves_provider_credentials(self, monkeypatch):
         captured = {}
 
@@ -2892,4 +2940,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-

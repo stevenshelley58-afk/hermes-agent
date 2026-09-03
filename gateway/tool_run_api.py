@@ -601,6 +601,7 @@ class ToolRunAPIMixin:
                         session_id=f"{run_id}:{instance_id}:{uuid.uuid4().hex}",
                         tool_progress_callback=progress_callback,
                         requested_model=model, requested_provider=provider, route=route,
+                        confirmed_runtime_lock=True,
                         persistence_disabled=True,
                         enabled_toolsets_override=[],
                         stream_delta_callback=role_heartbeat,

@@ -2712,8 +2712,23 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
         # _ProviderAuthResolutionError lets _run_agent() (and
         # _handle_runs()) distinguish this from an unrelated RuntimeError
         # elsewhere in the call graph.
+        request_model = _clean_request_string(requested_model)
+        request_provider = _clean_request_string(requested_provider)
+        route_model = _clean_request_string(route.get("model")) if isinstance(route, dict) else None
+        route_provider = _clean_request_string(route.get("provider")) if isinstance(route, dict) else None
+        locked_provider = request_provider or route_provider
+        locked_model = request_model or route_model
         try:
-            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            if confirmed_runtime_lock and locked_provider:
+                # A confirmed request lock is an execution boundary. Resolve
+                # its provider directly so an unrelated, broken global model
+                # selection cannot prevent the locked request from starting.
+                runtime_kwargs = _resolve_request_runtime_agent_kwargs(
+                    locked_provider,
+                    target_model=locked_model or None,
+                )
+            else:
+                runtime_kwargs = _resolve_runtime_agent_kwargs()
         except RuntimeError as exc:
             raise _ProviderAuthResolutionError(str(exc)) from exc
         model = _resolve_gateway_model()
@@ -2733,10 +2748,6 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
         request_reasoning_config = _request_reasoning_config(model_options)
         request_service_tier = _request_service_tier(model_options)
 
-        request_model = _clean_request_string(requested_model)
-        request_provider = _clean_request_string(requested_provider)
-        route_model = _clean_request_string(route.get("model")) if isinstance(route, dict) else None
-        route_provider = _clean_request_string(route.get("provider")) if isinstance(route, dict) else None
         route_api_key = _clean_request_string(route.get("api_key")) if isinstance(route, dict) else None
         route_base_url = _clean_request_string(route.get("base_url")) if isinstance(route, dict) else None
 

@@ -445,6 +445,7 @@ async def test_generic_terminal_preview_never_advances_or_emits_stage(tmp_path, 
     assert api.system_prompts == [ToolRunAPIMixin._isolated_tool_role_prompt()]
     assert api.agent_kwargs[0]["enabled_toolsets_override"] == []
     assert api.agent_kwargs[0]["persistence_disabled"] is True
+    assert api.agent_kwargs[0]["confirmed_runtime_lock"] is True
     assert callable(api.agent_kwargs[0]["stream_delta_callback"])
     assert callable(api.agent_kwargs[0]["reasoning_callback"])
     assert "thinking_callback" not in api.agent_kwargs[0]
