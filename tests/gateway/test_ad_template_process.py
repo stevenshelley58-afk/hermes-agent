@@ -139,13 +139,8 @@ def test_quality_gate_rejects_one_weak_dimension_even_when_mean_passes():
     assert validate_final_review({"reviewers": reviewers}, accepted=True)["decision"] == "revise"
 
 
-@pytest.mark.parametrize(
-    ("shape", "raw_value"),
-    (("missing", ...), ("null", None)),
-)
-def test_final_review_normalizes_absent_change_list_without_weakening_gate(
-    shape, raw_value
-):
+@pytest.mark.parametrize("raw_value", (..., None, "move it", {"change": "move it"}, 1))
+def test_final_review_ignores_optional_change_field_without_weakening_gate(raw_value):
     weak = evidence(9.2, "Final spacing still differs visibly")
     if raw_value is ...:
         weak.pop("required_changes")
@@ -160,24 +155,7 @@ def test_final_review_normalizes_absent_change_list_without_weakening_gate(
 
     assert result["decision"] == "revise"
     assert result["reviewers"][0]["required_changes"] == []
-    assert result["reviewers"][0]["required_changes_shape"] == shape
     assert len(result["reviewers"]) == 2
-
-
-@pytest.mark.parametrize("raw_value", ("move it", {"change": "move it"}, 1))
-def test_final_review_rejects_non_list_non_null_change_shape(raw_value):
-    weak = evidence(9.2, "Final spacing still differs visibly")
-    weak["required_changes"] = raw_value
-    with pytest.raises(
-        AdTemplateProcessError,
-        match="final reviewer must provide a concrete required_changes list",
-    ):
-        validate_final_review({
-            "reviewers": [
-                {"id": "reviewer-a", "route": "a/vision", **weak},
-                {"id": "reviewer-b", "route": "b/vision", **evidence(9.7, "Independent pass")},
-            ],
-        }, accepted=True)
 
 
 @pytest.mark.parametrize("raw_value", (..., None))
@@ -503,10 +481,9 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
         assert "Never propose a target that newly overlaps an image slot or opaque vector panel" in prompt
         assert "never mention, score, or request changes for the neutral photo subject" in prompt
         if final:
-            assert "required_changes is optional" in prompt
-            assert "You may omit it, return null, or return []" in prompt
-            assert "plus optional required_changes" in prompt
-            assert "Hermes will combine both reviewers' complete evidence" in prompt
+            assert "do not return required_changes" in prompt
+            assert "Hermes derives the next builder brief" in prompt
+            assert "Return JSON only with exactly reason, differences, hard_failures, and rubric" in prompt
         else:
             assert "required_changes must contain at least one actionable item" in prompt
         assert '"templateId":"strict"' in prompt
@@ -1303,7 +1280,6 @@ def test_negative_final_review_without_geometry_changes_revises_after_both_revie
     )
     assert len(first_round["reviewers"]) == 2
     assert first_round["reviewers"][0]["required_changes"] == []
-    assert first_round["reviewers"][0]["required_changes_shape"] == "missing"
     retried = [data for kind, data in events if kind == "final-review.retried"]
     assert retried == []
     revision_prompt = next(
@@ -1311,7 +1287,6 @@ def test_negative_final_review_without_geometry_changes_revises_after_both_revie
     )
     assert "Final spacing needs revision" in revision_prompt
     assert '"required_changes": []' in revision_prompt
-    assert '"required_changes_shape": "missing"' in revision_prompt
     assert '"minimum_score": 9.2' in revision_prompt
     assert '"rubric":' in revision_prompt
     assert "When a final reviewer returns a negative verdict" in revision_prompt
@@ -1374,7 +1349,7 @@ def test_final_review_schema_recovery_survives_three_invalid_outputs(tmp_path, m
     source.write_bytes(b"source")
     calls, events, renders, imports = [], [], [], []
     invalid = evidence(9.2, "Final spacing needs revision")
-    invalid["required_changes"] = ["Move the footer lower"]
+    invalid["differences"] = "Footer spacing differs"
     reviewer_a_calls = 0
 
     def call_agent(instance, prompt, route):
@@ -1407,11 +1382,15 @@ def test_final_review_schema_recovery_survives_three_invalid_outputs(tmp_path, m
     final_calls = [item for item in calls if item[0].startswith("final-reviewer-")]
     assert len(final_calls) == 5
     assert "-retry-3" in final_calls[3][0]
-    assert "negative final verdict may omit it, use null" in final_calls[3][1]
-    assert "Every provided required_changes item MUST contain the exact" in final_calls[3][1]
+    assert "exactly reason, differences, hard_failures, and the eight-field rubric" in final_calls[3][1]
+    assert "Do not return required_changes" in final_calls[3][1]
     retried = [data for kind, data in events if kind == "final-review.retried"]
     assert len(retried) == 3
     assert [item["attempt"] for item in retried] == [1, 2, 3]
+    rejected = [data for kind, data in events if kind == "final-review.schema-rejected"]
+    assert len(rejected) == 3
+    assert {item["field"] for item in rejected} == {"differences"}
+    assert {item["category"] for item in rejected} == {"mandatory-field-invalid"}
     assert result["iterations"][0]["decision"] == "accepted"
     assert result["final_review"]["decision"] == "accepted"
 

@@ -22,6 +22,13 @@ MATERIAL_OVERLAP_RATIO = 0.08
 class AdTemplateProcessError(ValueError):
     pass
 
+class ReviewEvidenceError(AdTemplateProcessError):
+    """A safely classifiable mandatory review-evidence schema failure."""
+
+    def __init__(self, message: str, *, field: str):
+        super().__init__(message)
+        self.field = field
+
 class ComparatorSelfConsistencyError(AdTemplateProcessError):
     """Comparator feedback contradicts the current layered document."""
 
@@ -175,38 +182,45 @@ def _validate_required_change_targets(evidence: Mapping[str, Any], candidate: Ma
 
 def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> Dict[str, Any]:
     if not isinstance(value, dict):
-        raise AdTemplateProcessError(f"{role} returned invalid evidence")
+        raise ReviewEvidenceError(f"{role} returned invalid evidence", field="evidence")
     rubric = value.get("rubric")
     if not isinstance(rubric, dict):
-        raise AdTemplateProcessError(f"{role} must provide all rubric subscores")
+        raise ReviewEvidenceError(f"{role} must provide all rubric subscores", field="rubric")
     if set(rubric) != set(RUBRIC_FIELDS):
-        raise AdTemplateProcessError(f"{role} rubric must contain exactly the eight required fields")
-    scores = {field: _number(rubric.get(field)) for field in RUBRIC_FIELDS}
-    hard_failures = value.get("hard_failures") or value.get("hard_fail") or []
-    if isinstance(hard_failures, str): hard_failures = [hard_failures]
-    if not isinstance(hard_failures, list): raise AdTemplateProcessError(f"{role} hard_failures must be a list")
-    reason = str(value.get("reason") or value.get("mismatches") or "").strip()
-    if len(reason) < 3: raise AdTemplateProcessError(f"{role} must explain its decision")
+        raise ReviewEvidenceError(
+            f"{role} rubric must contain exactly the eight required fields", field="rubric"
+        )
+    scores: Dict[str, float] = {}
+    for field in RUBRIC_FIELDS:
+        try:
+            scores[field] = _number(rubric.get(field))
+        except AdTemplateProcessError as exc:
+            raise ReviewEvidenceError(str(exc), field=f"rubric.{field}") from exc
+    hard_failures = value.get("hard_failures")
+    if not isinstance(hard_failures, list) or not all(
+        isinstance(item, str) and item.strip() for item in hard_failures
+    ):
+        raise ReviewEvidenceError(
+            f"{role} hard_failures must be a list of non-empty strings", field="hard_failures"
+        )
+    reason = value.get("reason")
+    if not isinstance(reason, str) or len(reason.strip()) < 3:
+        raise ReviewEvidenceError(f"{role} must explain its decision", field="reason")
+    reason = reason.strip()
     differences = value.get("differences")
     raw_required_changes = value.get("required_changes")
-    declared_shape = value.get("required_changes_shape")
-    if role == "final reviewer" and declared_shape in {"missing", "null", "list"}:
-        required_changes_shape = declared_shape
-    elif "required_changes" not in value:
-        required_changes_shape = "missing"
-    elif raw_required_changes is None:
-        required_changes_shape = "null"
-    elif isinstance(raw_required_changes, list):
-        required_changes_shape = "list"
-    else:
-        required_changes_shape = "invalid"
-    required_changes = raw_required_changes
+    # Final reviewers judge the finished candidate. They do not own layer
+    # geometry, so this optional model-authored extra is deliberately ignored.
+    required_changes = [] if role == "final reviewer" else raw_required_changes
     if require_change_list:
         if not isinstance(differences, list) or not all(isinstance(item, str) and item.strip() for item in differences):
-            raise AdTemplateProcessError(f"{role} must provide a concrete differences list")
-        if role == "final reviewer" and required_changes_shape in {"missing", "null"}:
-            required_changes = []
-        if not isinstance(required_changes, list) or not all(isinstance(item, str) and item.strip() for item in required_changes):
+            raise ReviewEvidenceError(
+                f"{role} must provide a concrete differences list", field="differences"
+            )
+        if role != "final reviewer" and (
+            not isinstance(required_changes, list)
+            or not all(isinstance(item, str) and item.strip() for item in required_changes)
+        ):
             raise AdTemplateProcessError(f"{role} must provide a concrete required_changes list")
         differences = [item.strip() for item in differences]
         required_changes = [item.strip() for item in required_changes]
@@ -233,9 +247,8 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
         "minimum_score": min(scores.values()),
         "reason": reason,
         "rubric": scores,
-        "hard_failures": [str(item) for item in hard_failures],
+        "hard_failures": [item.strip() for item in hard_failures],
         **({"differences": differences, "required_changes": required_changes} if require_change_list else {}),
-        **({"required_changes_shape": required_changes_shape} if role == "final reviewer" else {}),
     }
 
 def _passes_quality_gate(evidence: Mapping[str, Any]) -> bool:
@@ -993,11 +1006,9 @@ def review_prompt(*, final: bool, candidate: Any = None) -> str:
     role = "fresh independent final reviewer" if final else "iteration comparator"
     candidate_context = _safe_candidate_prompt_json(candidate)
     change_list_contract = (
-        "As a final reviewer, required_changes is optional. You may omit it, return null, or return [] "
-        "for a negative verdict when the visible reason and differences are valid but you cannot "
-        "express a safe layer-geometry edit. Omitting it never makes a weak verdict pass; Hermes will "
-        "combine both reviewers' complete evidence for the next builder. If you include any required "
-        "changes, the value must be a list and each item must use the exact actionable structure below."
+        "As a final reviewer, do not return required_changes. Final reviewers judge the completed "
+        "candidate; Hermes derives the next builder brief from reason, differences, hard_failures, "
+        "and weak rubric fields."
         if final
         else
         "As the iteration comparator, required_changes must contain at least one actionable item "
@@ -1005,8 +1016,7 @@ def review_prompt(*, final: bool, candidate: Any = None) -> str:
         "genuinely clears every gate."
     )
     output_contract = (
-        "Return JSON only with exactly reason, differences, hard_failures, and rubric, plus optional "
-        "required_changes."
+        "Return JSON only with exactly reason, differences, hard_failures, and rubric."
         if final
         else
         "Return JSON only with exactly reason, differences, required_changes, hard_failures, and rubric."
@@ -1337,14 +1347,9 @@ class SoleProcessOrchestrator:
                 if rejection:
                     retry_suffix = (
                         "\n\nYour previous final-review response was rejected by the strict evidence schema: "
-                        f"{rejection}. Return the complete corrected JSON object. required_changes is optional; "
-                        "if present and non-null it MUST be an array. A negative final verdict may omit it, use null, "
-                        "or use [] when reason and differences fully explain the visible failure and no safe geometry "
-                        "edit can be stated. Every provided required_changes item MUST contain the exact "
-                        "keys placement, layers, current, target, and change; placement must be Feed or Story; "
-                        "layers must name at least one real layer id; and current, target, and change must each be "
-                        "a concrete non-empty string. Do not lower the score to avoid this requirement. Return only "
-                        "the corrected JSON object."
+                        f"{rejection}. Return the complete corrected JSON object with exactly reason, differences, "
+                        "hard_failures, and the eight-field rubric. Do not return required_changes. Do not lower "
+                        "scores to avoid the schema. Return only the corrected JSON object."
                     )
                 attempt_identity = identity if output_attempt == 0 else f"{identity}-retry-{output_attempt}"
                 try:
@@ -1361,6 +1366,14 @@ class SoleProcessOrchestrator:
                     evidence = _assessment(review, "final reviewer", require_change_list=True)
                 except (AdTemplateProcessError, AdTemplateStructuredOutputError) as exc:
                     rejection = str(exc)
+                    if isinstance(exc, ReviewEvidenceError):
+                        self.emit("final-review.schema-rejected", "final-check", {
+                            "reviewer": identity,
+                            "route": route_identity,
+                            "attempt": output_attempt + 1,
+                            "category": "mandatory-field-invalid",
+                            "field": exc.field,
+                        })
                     if (
                         isinstance(exc, AdTemplateStructuredOutputError)
                         and quality_review_route
@@ -1404,7 +1417,6 @@ class SoleProcessOrchestrator:
                     "source_match_score": item["rubric"]["feed_source_likeness"],
                     "rubric": item["rubric"],
                     "hard_failures": item["hard_failures"],
-                    "required_changes_shape": item["required_changes_shape"],
                     "differences": item["differences"],
                     "required_changes": item["required_changes"],
                     "reason": item["reason"],
