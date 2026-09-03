@@ -1,6 +1,6 @@
 """Executable orchestration for the sole ad-template process."""
 from __future__ import annotations
-import base64, hashlib, hmac, json, math, mimetypes, os, re, shlex, shutil, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, uuid
+import base64, copy, hashlib, hmac, json, math, mimetypes, os, re, shlex, shutil, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping
@@ -54,6 +54,10 @@ RUBRIC_FIELDS = (
     "image_slot_composition",
     "editable_decomposition",
     "native_story_translation",
+)
+MACRO_FIELDS = (
+    "source_topology", "hierarchy", "balance", "visual_identity",
+    "conversion_focus", "native_story_composition",
 )
 
 def _parse_required_change(value: str) -> Dict[str, Any] | None:
@@ -227,6 +231,55 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
     # Final reviewers judge the finished candidate. They do not own layer
     # geometry, so this optional model-authored extra is deliberately ignored.
     required_changes = [] if role == "final reviewer" else raw_required_changes
+    macro: Dict[str, float] = {}
+    critical_regions: List[Dict[str, Any]] = []
+    regressions: List[str] = []
+    ranked_changes: List[str] = []
+    declared_decision = None
+    if role == "comparator":
+        raw_macro = value.get("macro")
+        if not isinstance(raw_macro, dict) or set(raw_macro) != set(MACRO_FIELDS):
+            raise ReviewEvidenceError(
+                "comparator macro must contain exactly the six global-design fields", field="macro"
+            )
+        macro = {field: _number(raw_macro[field]) for field in MACRO_FIELDS}
+        raw_regions = value.get("critical_regions")
+        if not isinstance(raw_regions, list) or not raw_regions:
+            raise ReviewEvidenceError("comparator must report critical region checks", field="critical_regions")
+        for item in raw_regions:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"region", "status", "findings"}
+                or not _nonempty(item.get("region"))
+                or item.get("status") not in {"pass", "blocker"}
+                or not isinstance(item.get("findings"), list)
+                or not all(isinstance(finding, str) and finding.strip() for finding in item["findings"])
+            ):
+                raise ReviewEvidenceError(
+                    "comparator critical regions must contain region, pass|blocker status, and findings",
+                    field="critical_regions",
+                )
+            critical_regions.append({
+                "region": item["region"].strip(), "status": item["status"],
+                "findings": [finding.strip() for finding in item["findings"]],
+            })
+        raw_regressions = value.get("regressions")
+        if not isinstance(raw_regressions, list) or not all(
+            isinstance(item, str) and item.strip() for item in raw_regressions
+        ):
+            raise ReviewEvidenceError("comparator regressions must be a string list", field="regressions")
+        regressions = [item.strip() for item in raw_regressions]
+        raw_ranked = value.get("ranked_changes")
+        if not isinstance(raw_ranked, list) or len(raw_ranked) > 3 or not all(
+            isinstance(item, str) and item.strip() for item in raw_ranked
+        ):
+            raise ReviewEvidenceError(
+                "comparator ranked_changes must contain at most three strings", field="ranked_changes"
+            )
+        ranked_changes = [item.strip() for item in raw_ranked]
+        declared_decision = value.get("decision", value.get("declared_decision"))
+        if declared_decision not in {"accept", "revise"}:
+            raise ReviewEvidenceError("comparator decision must be accept or revise", field="decision")
     if require_change_list:
         if not isinstance(differences, list) or not all(isinstance(item, str) and item.strip() for item in differences):
             raise ReviewEvidenceError(
@@ -245,6 +298,8 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
             and not required_changes
             and (
                 hard_failures
+                or critical_regions and any(item["status"] == "blocker" for item in critical_regions)
+                or regressions
                 or scores["feed_source_likeness"] < THRESHOLD
                 or preliminary_score < THRESHOLD
                 or min(scores.values()) < MIN_RUBRIC_SCORE
@@ -255,8 +310,14 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
             raise AdTemplateProcessError(
                 f"{role} required_changes must name placement, layers, current geometry, target geometry, and change"
             )
+        if role == "comparator" and ranked_changes != required_changes:
+            raise AdTemplateProcessError(
+                "comparator ranked_changes must exactly equal required_changes in priority order"
+            )
     score = round(sum(scores.values()) / len(scores), 2)
-    if hard_failures: score = 0.0
+    critical_blocker = any(item["status"] == "blocker" for item in critical_regions)
+    macro_regression = bool(regressions)
+    if hard_failures or critical_blocker or macro_regression: score = 0.0
     return {
         "score": score,
         "minimum_score": min(scores.values()),
@@ -267,6 +328,12 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
             placement: [item.strip() for item in visible_strings[placement]]
             for placement in ("source", "feed", "story")
         },
+        **({
+            "macro": macro, "critical_regions": critical_regions,
+            "regressions": regressions, "ranked_changes": ranked_changes,
+            "declared_decision": declared_decision,
+            "critical_blocker": critical_blocker, "macro_regression": macro_regression,
+        } if role == "comparator" else {}),
         **({"differences": differences, "required_changes": required_changes} if require_change_list else {}),
     }
 
@@ -274,6 +341,9 @@ def _passes_quality_gate(evidence: Mapping[str, Any]) -> bool:
     return (
         not evidence.get("hard_failures")
         and not evidence.get("required_changes")
+        and not evidence.get("critical_blocker")
+        and not evidence.get("macro_regression")
+        and min((evidence.get("macro") or {"default": 10}).values()) >= MIN_RUBRIC_SCORE
         and _number((evidence.get("rubric") or {}).get("feed_source_likeness")) >= THRESHOLD
         and _number(evidence.get("score")) >= THRESHOLD
         and _number(evidence.get("minimum_score")) >= MIN_RUBRIC_SCORE
@@ -292,6 +362,8 @@ def validate_iterations(value: Any) -> List[Dict[str, Any]]:
         passes = _passes_quality_gate(evidence)
         decision = str(raw.get("decision") or ("accepted" if passes else "revise"))
         expected = "accepted" if passes else "revise"
+        if evidence.get("declared_decision") != ("accept" if passes else "revise"):
+            raise AdTemplateProcessError("comparator decision does not match hierarchical gates")
         if decision != expected: raise AdTemplateProcessError("iteration decision does not match comparator score")
         reason = evidence["reason"]
         if accepted and not retry_after_review:
@@ -1120,7 +1192,7 @@ Hermes will render the candidate, attach the source and render to a vision compa
 
     return f"""Run the sole ad-template process as the builder agent. Inspect the attached source pixels, remove advertiser identity (names, logos, phones, URLs, portraits), and return JSON with exactly {{template, assets}}. Treat the source as structural inspiration, not a quality ceiling: explicitly avoid inheriting brochure density, tiny copy, weak hierarchy, duplicated contact details, incoherent photography, or a Feed layout stretched into Story. Build a conversion-focused Meta ad around one dominant idea: a strong hook, one coherent hero treatment, only essential proof or facts, and one clear CTA. Dense descriptions and contact lists belong in Meta primary text or the destination, not inside the image. At native pixels use type large enough to remain legible inside a 500px, 390px and 320px-wide Meta shell; do not rely on scale-down or truncation to rescue excess copy. Feed must use a deliberate 72px horizontal and 96px vertical protected content margin. Story must be independently composed with its top 240px and bottom 300px protected from platform UI. Use true editable text, image, logo, CTA, patch and icon roles. Use one coherent property/photo subject across default slots; never mix unrelated properties. For a property listing, publishRequirements.specialAdCategory must be HOUSING. template must contain exactly schema='blockwise.ad-template', templateId, createdAt (ISO datetime), feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata. semanticColours must contain exactly background, primary, secondary, accent, mainText, inverseText; every layer colourRole is one of those six. Each layout contains exactly placement, layers, safeZones; Feed is placement feed within 1080x1350 and Story is placement story within 1080x1920, including safeZones. Geometry and every safe-zone rectangle contain exactly {{x,y,width,height}}: x,y are the top-left coordinates from canvas origin (0,0); width,height are positive sizes, not right/bottom coordinates; x + width must stay within canvas width and y + height within canvas height. Exact safe areas are Feed safeZones=[{{"x":72,"y":96,"width":936,"height":1158}}] within 1080x1350 and Story safeZones=[{{"x":72,"y":240,"width":936,"height":1380}}] within 1080x1920. Layer shapes are exact: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. imageInputs are {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs are {{key,label,placeholder,maxLength}}. fonts are {{file}} and every text-layer font must be declared; allowed bundled font files are {', '.join(sorted(ALLOWED_FONT_FILES))}. metadata is exact: title:string; description:string; gallerySamples={{feed?:{{assetKey?,placement,purpose}},story?:{{assetKey?,placement,purpose}}}}; metaCopyDefaults={{primaryText:string[],headlines:string[],descriptions:string[],cta:string}}; aiWritingGuidance={{summary:string,fields:record<string,string>}}; publishRequirements={{objective:string,specialAdCategory:string|null,instantForm:{{required:boolean,dependency:string|null,defaults?:record<string,string>}},destination:{{required:boolean,kind:'website'|'instant_form'|'none',dependency:string|null}},requiredCtaTypes?:string[]}}; replacementAssets={{inputKey,assetKey,purpose?}}[]; realAssetRefs={{inputKey,kind,required}}[]. Every layer/input/font/colour/asset metadata reference must resolve inside the same template. Declare source-free replacement assets in template.assets as assetKey -> {{fileName,mimeType}} and in top-level assets only as {{assetKey,fileName,mimeType}} with an exact match. Hermes resolves bytes from the fixed safe catalog; never emit bytesBase64 anywhere and never guess filenames. Allowed normalized relative catalog paths are home/open-home-living.webp, home/home-dusk.webp, home/mt-lawley-federation.webp, home/home-pool.webp, home/interior-styled.webp, home/subiaco-townhouse.webp, and adstudio-samples/photos/int-bedroom.png. Never include the source composite, source_path, hashes, signatures, private fields, or a full-source plate. Keep geometry inside canvas and Story native. Hermes renders, compares once per iteration, then runs two fresh final reviewers only after the comparator clears both the {THRESHOLD} mean and {MIN_RUBRIC_SCORE} subscore floor; never self-score or invent review evidence. Run {run_id}; project {project_id}; fixed placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback[:3000]}.{repair_clause}"""
 
-def review_prompt(*, final: bool, candidate: Any = None) -> str:
+def review_prompt(*, final: bool, candidate: Any = None, has_previous_best: bool = False) -> str:
     role = "fresh independent final reviewer" if final else "iteration comparator"
     candidate_context = _safe_candidate_prompt_json(candidate)
     change_list_contract = (
@@ -1137,29 +1209,40 @@ def review_prompt(*, final: bool, candidate: Any = None) -> str:
         "Return JSON only with exactly reason, differences, visible_strings, hard_failures, and rubric."
         if final
         else
-        "Return JSON only with exactly reason, differences, required_changes, visible_strings, hard_failures, and rubric."
+        "Return JSON only with exactly reason, differences, required_changes, ranked_changes, visible_strings, "
+        "macro, critical_regions, regressions, decision, hard_failures, and rubric."
     )
-    return f"""You are the {role} in a source-matching loop. The attached images are ordered: (1) the source reference, (2) the rendered Feed candidate, and (3) the rendered Story translation. Inspect the actual pixels together. The primary objective is not generic ad quality; it is faithful reconstruction of the source design as editable layers.
+    image_order = (
+        "(1) source, (2) immutable previous-best Feed, (3) immutable previous-best Story, "
+        "(4) current Feed, (5) current Story, followed by current renderer/editor/Meta-shell previews"
+        if has_previous_best and not final else
+        "(1) source, (2) current Feed, (3) current Story, followed by current renderer/editor/Meta-shell previews"
+    )
+    previous_best_clause = (
+        "Regressions must name every way the current candidate is worse than the immutable previous-best. "
+        "Judge the current candidate against both source and previous-best; never trade away a region the previous-best got right."
+        if has_previous_best and not final else
+        "No previous-best is attached for this first comparison, so regressions must be []."
+    )
+    hierarchical_contract = "" if final else (
+        "For the comparator, macro contains exactly six 0-10 fields: source_topology, hierarchy, balance, "
+        "visual_identity, conversion_focus, native_story_composition. First judge that global design, then inspect "
+        "micro regions for exact text/OCR, tracking, clipping, alignment, crop, logo integrity, colour/contrast, "
+        "placeholders, and duplicate media. critical_regions is a non-empty list of objects shaped exactly "
+        '{"region":"name","status":"pass|blocker","findings":[]}. '
+        f"{previous_best_clause} Any regression or critical blocker forces revise regardless of the mean. decision "
+        "is accept or revise. ranked_changes contains at most three highest-impact changes and must exactly equal "
+        "required_changes in the same priority order."
+    )
+    return f"""You are the {role} in a source-matching loop. The attached images are ordered: {image_order}. Inspect the actual pixels together. The primary objective is not generic ad quality; it is faithful reconstruction of the source design as editable layers.
 
 Compare source versus Feed region by region: outer frame and margins; header/title block; image count, grid, aspect ratios and crop intent; logo/price panel; divider lines; body columns; feature list; footer/contact row; typography family/style/weight/scale/line wrapping; palette; alignment; whitespace; borders, corner radii, icons and decorative details. Neutral replacement photography and neutral advertiser identity must not reduce the score when their visual role, size, crop, and position match. Source pixels are prohibited, but the replacement set must still be coherent: hard-fail a wrong-subject image, the same non-logo photograph repeated in distinct visible slots, or distinct slots that should show different views but visibly reuse one crop. Any simplification, omitted section, changed information density, different skeleton, moved panel, different image-slot structure, or generic redesign must reduce the score heavily. Story is scored only as a deliberate native 1080x1920 translation of the same visual system; it cannot compensate for a Feed mismatch. Assess Story dead space only inside the content-safe band y=240..1620. Empty space in y=0..239 and y=1620..1919 is mandatory platform-UI protection and must never be reported or scored as dead space, a spacing defect, a difference, or a required change.
 
 Use this scale strictly: 10.0 means the Feed is visually indistinguishable in structure at thumbnail size except permitted neutral content substitutions; 9.5 means only tiny finishing differences remain; 9.0 still has clearly visible spacing, scale, typography, or geometry differences; 8.0 is recognisably based on the source but materially different; 5.0 is merely the same category; 0 is missing or invalid. Do not award 9.5 to a design that a person can immediately distinguish from the source.
 
-{output_contract} visible_strings must be exactly an object with source, feed, and story arrays. Transcribe every visibly rendered word, number, currency value, CTA and logo wordmark in reading order; preserve visible splitting, missing glyphs and truncation exactly (for example, a broken HOUSE rendered as H U / O S / E must be transcribed that way, not silently corrected). differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. required_changes is the ordered list of material work the builder should apply next. {change_list_contract} Every required_changes string must use this exact actionable structure: placement=feed|story; layers=comma-separated layerIds; current={{x:...,y:...,width:...,height:...}}; target={{x:...,y:...,width:...,height:...}}; change=specific instruction. Name all affected layer IDs and use their current and intended target geometry. Copy current geometry exactly from Candidate contract JSON, then check every proposed target rectangle against every existing layer before returning it. Never propose a target that newly overlaps an image slot or opaque vector panel with another image slot unless that overlap is visibly present in the source and the change text explicitly identifies and justifies the source-visible overlap. Use a separate required_changes item when affected layers do not share identical current and target geometry. hard_failures is a list. rubric contains exactly these eight 0-10 numbers: feed_source_likeness, layout_geometry, spacing_proportions, typography_likeness, colour_likeness, image_slot_composition, editable_decomposition, native_story_translation. A passing candidate requires feed_source_likeness >= {THRESHOLD}, mean >= {THRESHOLD}, every field >= {MIN_RUBRIC_SCORE}, no hard failures, and no required changes.
+{output_contract} {hierarchical_contract} visible_strings must be exactly an object with source, feed, and story arrays. Transcribe every visibly rendered word, number, currency value, CTA and logo wordmark in reading order; preserve visible splitting, missing glyphs and truncation exactly (for example, a broken HOUSE rendered as H U / O S / E must be transcribed that way, not silently corrected). differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. required_changes is the ordered list of material work the builder should apply next. {change_list_contract} Every required_changes string must use this exact actionable structure: placement=feed|story; layers=comma-separated layerIds; current={{x:...,y:...,width:...,height:...}}; target={{x:...,y:...,width:...,height:...}}; change=specific instruction. Name all affected layer IDs and use their current and intended target geometry. Copy current geometry exactly from Candidate contract JSON, then check every proposed target rectangle against every existing layer before returning it. Never propose a target that newly overlaps an image slot or opaque vector panel with another image slot unless that overlap is visibly present in the source and the change text explicitly identifies and justifies the source-visible overlap. Use a separate required_changes item when affected layers do not share identical current and target geometry. hard_failures is a list. rubric contains exactly these eight 0-10 numbers: feed_source_likeness, layout_geometry, spacing_proportions, typography_likeness, colour_likeness, image_slot_composition, editable_decomposition, native_story_translation. A passing candidate requires feed_source_likeness >= {THRESHOLD}, mean >= {THRESHOLD}, every field{'' if final else ' and every macro field'} >= {MIN_RUBRIC_SCORE}, no critical-region blocker, no regression, no hard failure, and no required change.
 
 Hard-fail source pixels flattened into the output, copied advertiser identity, missing/unreadable renders, any missing/split/clipped/truncated/garbled visible text, a malformed or blank logo, repeated/wrong photographs, canvas/safe-zone violations, non-editable critical roles, unknown assets, or a stretched/cropped/letterboxed Story. The numeric tracking field in Candidate JSON is absolute canvas pixels, never em, percent, or a font-size multiplier. Inspect both native Feed/Story renders and any subsequently attached Meta-shell previews; a shell-only defect is still a defect. Do not infer another reviewer's score. Candidate contract JSON: {candidate_context}"""
-
-    role = "fresh independent final reviewer" if final else "iteration comparator"
-    role += (
-        ". Treat the source only as a structural reference whose defects must not be inherited. Mandatory removal of source advertiser identities, "
-        "logos, names, phones, URLs, portraits, contact details, source photography, and all source pixels must not be penalized. "
-        "Instead, score whether its useful archetype has been elevated into a persuasive, legible Meta ad with source-free photography and "
-        "neutral editable logo, image, copy, icon, patch, and CTA layers. Do not reward literal reproduction of brochure density, tiny type, "
-        "duplicated contact details, weak hierarchy, or unrelated default photography. A neutral editable replacement is correct; copied "
-        "source identity or pixels, or a missing editable role, is not"
-    )
-    candidate_context = _safe_candidate_prompt_json(candidate)
-    return f"""Act as the {role}. Compare the attached source image with the attached rendered Feed and native Story previews. Evaluate the renders as they will appear inside real Meta shells at 500px, 390px and 320px wide, not only at full-resolution zoom. Return JSON only with exactly reason, hard_failures, and rubric. rubric must contain exactly these eight numeric 0-10 fields: source_inspired_direction (retains useful structural intent while improving source defects), ad_effectiveness (one clear hook, persuasive hierarchy, essential proof and CTA without brochure clutter), hierarchy_typography (strong type hierarchy, intentional wrapping and delivered-screen readability), real_shell_legibility (all essential content remains clear in Meta Feed and Story shells at the stated sizes), colour_art_direction (cohesive palette, contrast, photographic tone and finish), editable_decomposition (the supplied candidate JSON has genuine editable text, logo, CTA, patches, icons and media roles), replacement_robustness (slot geometry, masks, logo treatment and copy bounds plausibly survive realistic replacement content), native_story (a deliberate 1080x1920 composition, not a stretched, cropped, padded or letterboxed Feed). Explain concrete visible mismatches in reason. hard_failures must be a JSON list. Add a hard failure if any source advertiser name, logo, phone, URL, portrait, contact identity, or source composite pixel is reused; if Feed or Story is missing, clipped, distorted, unreadable at delivered size, outside its canvas or protected zones; if the design is a dense brochure rather than a Meta ad; if default photographs visibly represent unrelated subjects; if critical text, logo, CTA, patch, icon or media is flattened/non-editable; if Story is a Feed crop, stretch, letterbox, or has essential content in the top 240px or bottom 300px platform UI zones; or if an asset is missing/unknown. Any hard failure makes the score zero. Do not reuse or infer another reviewer's score. Passing requires a mean of at least {THRESHOLD}, every subscore at least {MIN_RUBRIC_SCORE}, and no hard failures. Candidate contract JSON: {candidate_context}"""
 
 def vision_message(text: str, paths: List[str]) -> List[Dict[str, Any]]:
     parts: List[Dict[str, Any]] = [{"type": "text", "text": text}]
@@ -1174,10 +1257,18 @@ def vision_message(text: str, paths: List[str]) -> List[Dict[str, Any]]:
     return parts
 
 
-def review_vision_paths(source: str, candidate: Mapping[str, Any]) -> List[str]:
-    """Attach native renders first, then any renderer-authored Meta-shell previews."""
+def review_vision_paths(
+    source: str,
+    candidate: Mapping[str, Any],
+    previous_best: Mapping[str, Any] | None = None,
+) -> List[str]:
+    """Attach source, optional immutable best, current natives, then real shell previews."""
+    paths = [source]
+    if previous_best:
+        best_render = previous_best.get("render") if isinstance(previous_best.get("render"), Mapping) else {}
+        paths.extend([str(best_render.get("feed") or ""), str(best_render.get("story") or "")])
     render = candidate.get("render") if isinstance(candidate.get("render"), Mapping) else {}
-    paths = [source, str(render.get("feed") or ""), str(render.get("story") or "")]
+    paths.extend([str(render.get("feed") or ""), str(render.get("story") or "")])
     optional = candidate.get("review_previews")
     if isinstance(optional, list):
         for item in optional:
@@ -1212,16 +1303,15 @@ class SoleProcessOrchestrator:
         iterations = []
         candidate: Dict[str, Any] = dict(revision_candidate or {}) if resume_final_check else {}
         working_candidate: Mapping[str, Any] | None = revision_candidate
+        best_candidate: Mapping[str, Any] | None = copy.deepcopy(revision_candidate) if revision_candidate else None
+        best_score = previous_score if revision_candidate else None
         if resume_final_check:
             validated_history = validate_iterations(history)
             if not candidate or validated_history[-1]["decision"] != "accepted":
                 raise AdTemplateProcessError("final-check resume requires one accepted candidate checkpoint")
             history = validated_history
-        # This is an iterative editing loop, not a best-of sampler. Every
-        # revision must start from the immediately preceding rendered document
-        # and consume that document's own comparison. A high-scoring older
-        # document may be retained in the trace, but must never replace the
-        # working document or feedback for the next turn.
+        # Revisions start from an immutable best-so-far. A regressing render is
+        # retained in the trace but can never become the next builder base.
 
         def builder_route_identity(route: Mapping[str, str]) -> str:
             return f"{route.get('provider')}/{route.get('model')}"
@@ -1356,7 +1446,10 @@ class SoleProcessOrchestrator:
             self.emit("iteration.rendered", "render", {"iteration": index, "previews": [{"name": str(x.get("name") or ""), "placement": str(x.get("placement") or "")} for x in public_previews]})
             candidate = {**candidate, **rendered}
             self._check_stop()
-            comparison_prompt = review_prompt(final=False, candidate=candidate)
+            previous_best = copy.deepcopy(best_candidate) if best_candidate else None
+            comparison_prompt = review_prompt(
+                final=False, candidate=candidate, has_previous_best=previous_best is not None,
+            )
             comparison_rejection = ""
             for comparison_attempt in range(MAX_COMPARATOR_SELF_CONSISTENCY_RETRIES + 1):
                 retry_suffix = ""
@@ -1377,12 +1470,21 @@ class SoleProcessOrchestrator:
                         "comparator-%d" % index if comparison_attempt == 0 else f"comparator-{index}-retry-{comparison_attempt}",
                         vision_message(
                             comparison_prompt + retry_suffix,
-                            review_vision_paths(source, rendered),
+                            review_vision_paths(source, rendered, previous_best),
                         ),
                         f"{routes[1].get('provider')}/{routes[1].get('model')}",
                     )
                     self._check_stop()
                     evidence = _assessment(comparison, "comparator", require_change_list=True)
+                    if previous_best is None and evidence["regressions"]:
+                        raise ComparatorSelfConsistencyError(
+                            "first comparison cannot report regressions without a previous-best"
+                        )
+                    expected_comparator_decision = "accept" if _passes_quality_gate(evidence) else "revise"
+                    if evidence["declared_decision"] != expected_comparator_decision:
+                        raise ComparatorSelfConsistencyError(
+                            "comparator decision does not match hierarchical gates"
+                        )
                     _validate_required_change_targets(evidence, candidate)
                 except (AdTemplateProcessError, AdTemplateStructuredOutputError, ComparatorSelfConsistencyError) as exc:
                     comparison_rejection = str(exc)
@@ -1420,6 +1522,11 @@ class SoleProcessOrchestrator:
                 "visible_strings": evidence["visible_strings"],
                 "differences": evidence["differences"],
                 "required_changes": evidence["required_changes"],
+                "ranked_changes": evidence["ranked_changes"],
+                "macro": evidence["macro"],
+                "critical_regions": evidence["critical_regions"],
+                "regressions": evidence["regressions"],
+                "declared_decision": evidence["declared_decision"],
                 "decision": decision,
                 "preview_names": [str(x.get("name")) for x in candidate.get("previews", []) if isinstance(x, dict)],
             })
@@ -1429,12 +1536,33 @@ class SoleProcessOrchestrator:
                 "hard_failures": evidence["hard_failures"],
                 "differences": evidence["differences"],
                 "required_changes": evidence["required_changes"],
+                "ranked_changes": evidence["ranked_changes"],
+                "macro": evidence["macro"],
+                "critical_regions": evidence["critical_regions"],
+                "regressions": evidence["regressions"],
                 "reason": reason,
             }, ensure_ascii=False)
-            working_candidate = candidate
             if _passes_quality_gate(evidence):
+                best_candidate = copy.deepcopy(candidate)
+                best_score = score
+                working_candidate = best_candidate
                 previous_score = score
                 break
+
+            eligible_for_best = not (
+                evidence["hard_failures"]
+                or evidence["critical_blocker"]
+                or evidence["macro_regression"]
+            )
+            if best_candidate is None or (eligible_for_best and (best_score is None or score > best_score)):
+                best_candidate = copy.deepcopy(candidate)
+                best_score = score
+            working_candidate = best_candidate
+            current_feedback = json.dumps({
+                "instruction": "Revise the immutable best-so-far candidate; do not continue from a regressing render.",
+                "best_score": best_score,
+                "current_review": json.loads(current_feedback),
+            }, ensure_ascii=False)
 
             escalation_reason = ""
             if not builder_escalated and quality_route is not None and previous_score is not None:

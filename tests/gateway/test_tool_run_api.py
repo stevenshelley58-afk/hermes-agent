@@ -21,6 +21,16 @@ def _visible_strings():
     return {"source": ["SOURCE"], "feed": ["FEED"], "story": ["STORY"]}
 
 
+def _hierarchical_comparison(score: float, required_changes: list[str]) -> dict:
+    return {
+        "macro": {field: score for field in process.MACRO_FIELDS},
+        "critical_regions": [{"region": "full composition", "status": "pass", "findings": []}],
+        "regressions": [],
+        "ranked_changes": required_changes,
+        "declared_decision": "accept" if score >= 9.5 else "revise",
+    }
+
+
 def _command(source: str, *, idempotency_key: str) -> dict:
     return {
         "schema": TOOL_RUN_COMMAND_SCHEMA,
@@ -184,11 +194,12 @@ def test_final_check_requeue_loads_accepted_iteration_and_existing_artifacts(tmp
             "hard_failures": [],
             "visible_strings": _visible_strings(),
             "differences": ["Visible mismatch"],
-            "required_changes": [
+            "required_changes": (required_changes := [
                 "placement=feed; layers=feed-background; "
                 "current={x:0,y:0,width:1080,height:1350}; "
                 "target={x:0,y:0,width:1080,height:1350}; change=Continue matching the source"
-            ],
+            ]),
+            **_hierarchical_comparison(9.0, required_changes),
             "decision": "revise",
             "preview_names": [f"iteration-{stale_iteration:02d}-feed.png", f"iteration-{stale_iteration:02d}-story.png"],
         })
@@ -209,6 +220,7 @@ def test_final_check_requeue_loads_accepted_iteration_and_existing_artifacts(tmp
             "visible_strings": _visible_strings(),
             "differences": [] if accepted else ["Visible mismatch"],
             "required_changes": required_changes,
+            **_hierarchical_comparison(score, required_changes),
             "decision": "accepted" if accepted else "revise",
             "preview_names": [f"iteration-{iteration:02d}-feed.png", f"iteration-{iteration:02d}-story.png"],
         })
@@ -260,11 +272,12 @@ def test_final_check_requeue_rebuilds_after_interrupted_accepted_artifact(tmp_pa
             "hard_failures": [],
             "visible_strings": _visible_strings(),
             "differences": [] if accepted else ["Visible mismatch"],
-            "required_changes": [] if accepted else [
+            "required_changes": (required_changes := [] if accepted else [
                 "placement=feed; layers=feed-background; "
                 "current={x:0,y:0,width:1080,height:1350}; "
                 "target={x:0,y:0,width:1080,height:1350}; change=Continue matching"
-            ],
+            ]),
+            **_hierarchical_comparison(score, required_changes),
             "decision": "accepted" if accepted else "revise",
             "preview_names": [
                 f"iteration-{iteration:02d}-feed.png",
@@ -306,6 +319,16 @@ class _StructuredRoleAgent:
                 "visible_strings": _visible_strings(),
                 "rubric": {field: 9.7 for field in process.RUBRIC_FIELDS},
             }
+            if self._instance_id.startswith("comparator-"):
+                payload.update({
+                    "macro": {field: 9.7 for field in process.MACRO_FIELDS},
+                    "critical_regions": [{
+                        "region": "full composition", "status": "pass", "findings": [],
+                    }],
+                    "regressions": [],
+                    "ranked_changes": [],
+                    "decision": "accept",
+                })
         return {"final_response": json.dumps(payload)}
 
 
@@ -476,6 +499,11 @@ def test_completion_projection_keeps_large_layered_documents_out_of_the_ledger(t
         "hard_failures": [],
         "visible_strings": _visible_strings(),
         "rubric": {field: 9.7 for field in process.RUBRIC_FIELDS},
+        "macro": {field: 9.7 for field in process.MACRO_FIELDS},
+        "critical_regions": [{"region": "full composition", "status": "pass", "findings": []}],
+        "regressions": [],
+        "ranked_changes": [],
+        "decision": "accept",
     }
     output = {
         "template": template,
@@ -759,6 +787,16 @@ async def test_initial_builder_format_recovery_persists_events_and_all_role_cost
                         field: 9.7 for field in process.RUBRIC_FIELDS
                     },
                 }
+                if self.instance_id.startswith("comparator-"):
+                    payload.update({
+                        "macro": {field: 9.7 for field in process.MACRO_FIELDS},
+                        "critical_regions": [{
+                            "region": "full composition", "status": "pass", "findings": [],
+                        }],
+                        "regressions": [],
+                        "ranked_changes": [],
+                        "decision": "accept",
+                    })
             return {"final_response": json.dumps(payload)}
 
     class _Harness(_ToolRunHarness):

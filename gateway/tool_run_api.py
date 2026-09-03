@@ -214,7 +214,11 @@ class ToolRunAPIMixin:
                 continue
             comparison = {
                 key: data.get(key)
-                for key in ("rubric", "reason", "hard_failures", "visible_strings", "differences", "required_changes")
+                for key in (
+                    "rubric", "reason", "hard_failures", "visible_strings", "differences",
+                    "required_changes", "ranked_changes", "macro", "critical_regions",
+                    "regressions", "declared_decision",
+                )
             }
             preview_names = data.get("preview_names") if isinstance(data.get("preview_names"), list) else []
             records.append({

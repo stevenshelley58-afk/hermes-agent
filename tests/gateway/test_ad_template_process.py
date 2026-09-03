@@ -18,11 +18,17 @@ def evidence(score=9.4, reason="Improve spacing"):
         "target={x:0,y:0,width:1080,height:1350}; "
         f"change={reason}"
     )
+    required_changes = [actionable_change] if score < 9.5 else []
     return {
         "rubric": {field: score for field in process.RUBRIC_FIELDS},
+        "macro": {field: score for field in process.MACRO_FIELDS},
+        "critical_regions": [{"region": "full composition", "status": "pass", "findings": []}],
+        "regressions": [],
+        "ranked_changes": required_changes,
+        "decision": "accept" if score >= 9.5 else "revise",
         "reason": reason,
         "differences": [reason] if score < 9.5 else [],
-        "required_changes": [actionable_change] if score < 9.5 else [],
+        "required_changes": required_changes,
         "hard_failures": [],
         "visible_strings": {
             "source": ["SOURCE"], "feed": ["FEED"], "story": ["STORY"],
@@ -128,6 +134,8 @@ def test_quality_gate_rejects_one_weak_dimension_even_when_mean_passes():
         "placement=feed; layers=feed-bg; current={x:0,y:0,width:1080,height:1350}; "
         "target={x:0,y:0,width:1080,height:1340}; change=Correct the visible layout geometry"
     ]
+    weak["ranked_changes"] = weak["required_changes"]
+    weak["decision"] = "revise"
     record = validate_iterations([{"iteration": 1, "comparison": weak, "decision": "revise"}])[0]
     assert record["comparison"]["score"] >= process.THRESHOLD
     assert record["comparison"]["minimum_score"] == 9.1
@@ -219,6 +227,8 @@ def test_source_match_and_concrete_change_list_are_hard_gates():
         "placement=feed; layers=feed-footer; current={x:72,y:1120,width:936,height:140}; "
         "target={x:72,y:1140,width:936,height:120}; change=Reduce footer height to match the source"
     ]
+    unfinished["ranked_changes"] = unfinished["required_changes"]
+    unfinished["decision"] = "revise"
     record = validate_iterations([
         {"iteration": 1, "comparison": unfinished, "decision": "revise"}
     ])[0]
@@ -226,6 +236,7 @@ def test_source_match_and_concrete_change_list_are_hard_gates():
 
     vague = evidence(9.4, "Footer remains too tall")
     vague["required_changes"] = ["Reduce footer height to match the source"]
+    vague["ranked_changes"] = vague["required_changes"]
     with pytest.raises(AdTemplateProcessError, match="placement, layers, current geometry, target geometry"):
         validate_iterations([{"iteration": 1, "comparison": vague, "decision": "revise"}])
 
@@ -239,6 +250,7 @@ def test_comparator_target_overlap_rejects_exact_hero_thumbnail_collision():
         "target={x:72,y:184,width:600,height:620}; "
         "change=Extend the hero and price panel to y=804"
     ]
+    assessment["ranked_changes"] = assessment["required_changes"]
     parsed = process._assessment(assessment, "comparator", require_change_list=True)
     with pytest.raises(
         process.ComparatorSelfConsistencyError,
@@ -256,6 +268,7 @@ def test_comparator_target_overlap_rejects_exact_hero_thumbnail_collision():
         "target={x:72,y:184,width:600,height:600}; "
         "change=Reduce an overlap that already exists"
     ]
+    assessment["ranked_changes"] = assessment["required_changes"]
     process._validate_required_change_targets(
         process._assessment(assessment, "comparator", require_change_list=True),
         preexisting,
@@ -271,6 +284,7 @@ def test_comparator_allows_intentional_vector_frame_over_image():
         "target={x:72,y:500,width:600,height:180}; "
         "change=Overlap the source-visible frame across the lower hero edge"
     ]
+    assessment["ranked_changes"] = assessment["required_changes"]
     process._validate_required_change_targets(
         process._assessment(assessment, "comparator", require_change_list=True),
         candidate,
@@ -286,6 +300,7 @@ def test_comparator_allows_source_justified_overlapping_image_collage():
         "target={x:72,y:184,width:600,height:620}; "
         "change=Create the source-visible overlapping photo collage by intentionally overlapping the hero with the thumbnail row"
     ]
+    assessment["ranked_changes"] = assessment["required_changes"]
     process._validate_required_change_targets(
         process._assessment(assessment, "comparator", require_change_list=True),
         candidate,
@@ -301,6 +316,7 @@ def test_comparator_approximate_current_geometry_uses_actual_document_baseline()
         "target={x:72,y:184,width:600,height:380}; "
         "change=Tighten the hero without touching the thumbnail row"
     ]
+    assessment["ranked_changes"] = assessment["required_changes"]
     process._validate_required_change_targets(
         process._assessment(assessment, "comparator", require_change_list=True),
         candidate,
@@ -319,6 +335,7 @@ def test_comparator_retries_self_inconsistent_overlap_and_persists_event(tmp_pat
         "target={x:72,y:184,width:600,height:620}; "
         "change=Extend the hero and price panel to y=804"
     ]
+    bad["ranked_changes"] = bad["required_changes"]
 
     def call_agent(instance, prompt, route):
         calls.append((instance, prompt[0]["text"]))
@@ -355,6 +372,7 @@ def test_comparator_schema_recovery_survives_three_invalid_outputs(tmp_path, mon
     events, calls, renders = [], [], []
     invalid = evidence(8.6, "Move the hero closer to the source")
     invalid["required_changes"] = ["Move the hero lower"]
+    invalid["ranked_changes"] = invalid["required_changes"]
     comparator_calls = 0
 
     def call_agent(instance, prompt, route):
@@ -810,6 +828,68 @@ def test_review_vision_paths_append_renderer_meta_shells_after_native_renders(tm
         ],
     }
     assert process.review_vision_paths(paths[0], candidate) == paths
+
+
+def test_review_vision_paths_places_immutable_best_before_current_and_shells(tmp_path):
+    names = (
+        "source.png", "best-feed.png", "best-story.png", "current-feed.png",
+        "current-story.png", "editor.png", "meta.png",
+    )
+    paths = []
+    for name in names:
+        path = tmp_path / name
+        path.write_bytes(name.encode())
+        paths.append(str(path))
+    previous_best = {"render": {"feed": paths[1], "story": paths[2]}}
+    candidate = {
+        "render": {"feed": paths[3], "story": paths[4]},
+        "review_previews": [
+            {"path": paths[5], "placement": "editor"},
+            {"path": paths[6], "placement": "meta-feed"},
+        ],
+    }
+    assert process.review_vision_paths(paths[0], candidate, previous_best) == paths
+
+
+def test_hierarchical_comparator_blocks_regression_and_critical_region_despite_high_mean():
+    regressed = evidence(9.4, "Restore previous-best logo integrity")
+    regressed["rubric"] = {field: 9.8 for field in process.RUBRIC_FIELDS}
+    regressed["macro"] = {field: 9.8 for field in process.MACRO_FIELDS}
+    regressed["regressions"] = ["Logo integrity regressed versus previous-best"]
+    regressed["decision"] = "revise"
+    parsed = process._assessment(regressed, "comparator", require_change_list=True)
+    assert parsed["score"] == 0
+    assert parsed["macro_regression"] is True
+    assert process._passes_quality_gate(parsed) is False
+
+    blocked = evidence(9.4, "Restore full price glyphs")
+    blocked["rubric"] = {field: 9.8 for field in process.RUBRIC_FIELDS}
+    blocked["macro"] = {field: 9.8 for field in process.MACRO_FIELDS}
+    blocked["critical_regions"] = [{
+        "region": "price", "status": "blocker", "findings": ["Last digit is clipped"],
+    }]
+    blocked["decision"] = "revise"
+    parsed = process._assessment(blocked, "comparator", require_change_list=True)
+    assert parsed["score"] == 0
+    assert parsed["critical_blocker"] is True
+    assert process._passes_quality_gate(parsed) is False
+
+
+def test_hierarchical_comparator_rejects_more_than_three_ranked_changes():
+    review = evidence(9.0)
+    review["ranked_changes"] = review["required_changes"] * 4
+    with pytest.raises(process.ReviewEvidenceError, match="at most three"):
+        process._assessment(review, "comparator", require_change_list=True)
+
+
+def test_hierarchical_comparator_rejects_macro_weakness_despite_passing_micro_mean():
+    review = evidence(9.4, "Restore native Story hierarchy")
+    review["rubric"] = {field: 9.8 for field in process.RUBRIC_FIELDS}
+    review["macro"] = {field: 9.8 for field in process.MACRO_FIELDS}
+    review["macro"]["native_story_composition"] = 9.1
+    parsed = process._assessment(review, "comparator", require_change_list=True)
+    assert parsed["score"] == 9.8
+    assert process._passes_quality_gate(parsed) is False
 
 
 
@@ -1667,7 +1747,7 @@ def test_builder_quality_escalates_on_regression_or_two_low_gains(tmp_path, monk
     assert len(result["iterations"]) == len(scores)
 
 
-def test_regressed_candidate_is_traced_and_next_revision_uses_current_candidate(tmp_path, monkeypatch):
+def test_regressed_candidate_is_traced_but_next_revision_uses_immutable_best(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
     scores = iter([8.6, 8.1, 9.6])
@@ -1690,7 +1770,8 @@ def test_regressed_candidate_is_traced_and_next_revision_uses_current_candidate(
 
     builder_prompts = {instance: prompt for instance, _, prompt in calls if instance.startswith("builder-")}
     assert '"templateId":"candidate-builder-1"' in builder_prompts["builder-2"]
-    assert '"templateId":"candidate-builder-2"' in builder_prompts["builder-3"]
+    assert '"templateId":"candidate-builder-1"' in builder_prompts["builder-3"]
+    assert '"templateId":"candidate-builder-2"' not in builder_prompts["builder-3"]
     assert "comparison comparator-2" in builder_prompts["builder-3"]
     for field in ("rubric", "minimum_score", "hard_failures", "differences", "required_changes", "reason"):
         assert f'"{field}"' in builder_prompts["builder-2"]
@@ -1739,7 +1820,8 @@ def test_final_review_revision_continues_from_the_reviewed_then_current_candidat
 
     builder_prompts = {instance: prompt for instance, _, prompt in calls if instance.startswith("builder-")}
     assert '"templateId":"candidate-builder-1"' in builder_prompts["builder-2"]
-    assert '"templateId":"candidate-builder-2"' in builder_prompts["builder-3"]
+    assert '"templateId":"candidate-builder-1"' in builder_prompts["builder-3"]
+    assert '"templateId":"candidate-builder-2"' not in builder_prompts["builder-3"]
     assert [item["candidate"]["template"]["templateId"] for item in result["iterations"]] == [
         "candidate-builder-1", "candidate-builder-2", "candidate-builder-3",
     ]
