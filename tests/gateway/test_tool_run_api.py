@@ -208,6 +208,61 @@ def test_final_check_requeue_loads_accepted_iteration_and_existing_artifacts(tmp
         "feed": str((workspace / "previews" / "iteration-05-feed.png").resolve()),
         "story": str((workspace / "previews" / "iteration-05-story.png").resolve()),
     }
+    assert checkpoint["resume_final_check"] is True
+
+
+def test_final_check_requeue_rebuilds_after_interrupted_accepted_artifact(tmp_path):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    store = ToolRunStore(str(tmp_path / "tool-runs.db"))
+    run, _ = store.create_run(_command(str(source), idempotency_key="final-check-corrupt"))
+    workspace = tmp_path / "run"
+    (workspace / "iterations" / "04").mkdir(parents=True)
+    (workspace / "iterations" / "05").mkdir(parents=True)
+    (workspace / "previews").mkdir(parents=True)
+    (workspace / "iterations" / "04" / "artifact.json").write_text(json.dumps({
+        "template": _valid_template(), "assets": [],
+    }), encoding="utf-8")
+    # This is the exact crash residue observed in production after a gateway
+    # restart interrupted final review: the ledger says accepted, while the
+    # latest artifact and previews are empty.
+    (workspace / "iterations" / "05" / "artifact.json").write_bytes(b"")
+    for placement in ("feed", "story"):
+        (workspace / "previews" / f"iteration-04-{placement}.png").write_bytes(
+            placement.encode()
+        )
+        (workspace / "previews" / f"iteration-05-{placement}.png").write_bytes(b"")
+
+    for iteration in range(1, 6):
+        accepted = iteration == 5
+        score = 9.7 if accepted else 9.0
+        store.append_event(run["run_id"], "iteration.compared", node_id="compare", data={
+            "iteration": iteration,
+            "rubric": {field: score for field in process.RUBRIC_FIELDS},
+            "reason": "Accepted comparison" if accepted else "Continue matching",
+            "hard_failures": [],
+            "differences": [] if accepted else ["Visible mismatch"],
+            "required_changes": [] if accepted else [
+                "placement=feed; layers=feed-background; "
+                "current={x:0,y:0,width:1080,height:1350}; "
+                "target={x:0,y:0,width:1080,height:1350}; change=Continue matching"
+            ],
+            "decision": "accepted" if accepted else "revise",
+            "preview_names": [
+                f"iteration-{iteration:02d}-feed.png",
+                f"iteration-{iteration:02d}-story.png",
+            ],
+        })
+
+    store.update_run(run["run_id"], status="failed", stage="final-check", attention=True)
+    checkpoint = _ToolRunHarness(store)._final_check_checkpoint(run["run_id"], workspace)
+
+    assert checkpoint["resume_final_check"] is False
+    assert checkpoint["history"][-1]["final_review_failed"] is True
+    assert checkpoint["candidate"]["template"]["templateId"] == "completion-test"
+    assert checkpoint["candidate"]["template_path"] == str(
+        (workspace / "iterations" / "04" / "artifact.json").resolve()
+    )
 
 
 class _StructuredRoleAgent:

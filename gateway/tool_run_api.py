@@ -23,7 +23,7 @@ from aiohttp import web
 
 from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
-from gateway.ad_template_process import AdTemplateStructuredOutputError, SoleProcessOrchestrator, validate_artifacts, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
+from gateway.ad_template_process import AdTemplateProcessError, AdTemplateStructuredOutputError, SoleProcessOrchestrator, validate_artifacts, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
 from gateway.tool_runs import (
     AD_TEMPLATE_ROUTE_ORDER,
     TOOL_MODEL_POLICY_SCHEMA,
@@ -232,32 +232,74 @@ class ToolRunAPIMixin:
         history = validate_iterations(records)
         if history[-1]["decision"] != "accepted":
             raise RuntimeError("final-check retry has no accepted comparator checkpoint")
-        iteration = int(history[-1]["iteration"])
-        artifact_path = (workspace / "iterations" / f"{iteration:02d}" / "artifact.json").resolve()
         workspace_root = workspace.resolve()
-        try:
-            artifact_path.relative_to(workspace_root)
-            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise RuntimeError("accepted final-check artifact is unavailable") from exc
-        if not isinstance(artifact, dict) or set(artifact) != {"template", "assets"}:
-            raise RuntimeError("accepted final-check artifact is invalid")
-        previews = []
-        render = {}
-        for placement in ("feed", "story"):
-            preview = (workspace / "previews" / f"iteration-{iteration:02d}-{placement}.png").resolve()
+
+        def load_candidate(iteration: int) -> Dict[str, Any]:
+            artifact_path = (
+                workspace / "iterations" / f"{iteration:02d}" / "artifact.json"
+            ).resolve()
             try:
-                preview.relative_to(workspace_root)
-            except ValueError as exc:
-                raise RuntimeError("accepted final-check preview escapes the run workspace") from exc
-            render[placement] = str(preview)
-            previews.append({"name": preview.name, "path": str(preview), "placement": placement})
-        candidate = {**artifact, "previews": previews, "render": render, "template_path": str(artifact_path)}
-        validate_artifacts(candidate, workspace)
+                artifact_path.relative_to(workspace_root)
+                artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("accepted final-check artifact is unavailable") from exc
+            if not isinstance(artifact, dict) or set(artifact) != {"template", "assets"}:
+                raise RuntimeError("accepted final-check artifact is invalid")
+            previews = []
+            render = {}
+            for placement in ("feed", "story"):
+                preview = (
+                    workspace / "previews" / f"iteration-{iteration:02d}-{placement}.png"
+                ).resolve()
+                try:
+                    preview.relative_to(workspace_root)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "accepted final-check preview escapes the run workspace"
+                    ) from exc
+                render[placement] = str(preview)
+                previews.append(
+                    {"name": preview.name, "path": str(preview), "placement": placement}
+                )
+            candidate = {
+                **artifact,
+                "previews": previews,
+                "render": render,
+                "template_path": str(artifact_path),
+            }
+            try:
+                validate_artifacts(candidate, workspace)
+            except (AdTemplateProcessError, OSError, ValueError) as exc:
+                raise RuntimeError("accepted final-check artifact is unavailable") from exc
+            return candidate
+
+        accepted_iteration = int(history[-1]["iteration"])
+        try:
+            candidate = load_candidate(accepted_iteration)
+            resume_final_check = True
+        except RuntimeError as accepted_error:
+            # A gateway/process interruption can occur after the comparator has
+            # accepted an iteration but while the final review is running.  An
+            # interrupted non-atomic writer historically left the latest
+            # artifact/previews empty.  Never review or import that candidate;
+            # rebuild the next iteration from the newest intact predecessor and
+            # require the comparator and both final reviewers to pass again.
+            candidate = None
+            for iteration in range(accepted_iteration - 1, 0, -1):
+                try:
+                    candidate = load_candidate(iteration)
+                    break
+                except RuntimeError:
+                    continue
+            if candidate is None:
+                raise accepted_error
+            history[-1]["final_review_failed"] = True
+            resume_final_check = False
         return {
             "candidate": candidate,
             "history": history,
             "previous_score": history[-1]["comparison"]["score"],
+            "resume_final_check": resume_final_check,
         }
 
     @staticmethod
@@ -611,7 +653,7 @@ class ToolRunAPIMixin:
                     source=source, brief=str(payload.get("brief") or ""),
                     placements=payload.get("placements") or [], routes=routes,
                     require_quality_route=True,
-                    resume_final_check=checkpoint is not None,
+                    resume_final_check=bool((checkpoint or {}).get("resume_final_check")),
                     revision_candidate=(checkpoint or {}).get("candidate"),
                     history=(checkpoint or {}).get("history"),
                     total_iterations=len((checkpoint or {}).get("history") or []),

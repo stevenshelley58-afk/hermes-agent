@@ -897,7 +897,12 @@ def run_generator_cli(candidate: Mapping[str, Any], workspace: Path) -> Dict[str
     _reject_builder_bytes(candidate)
     template = validate_template_artifact(candidate.get("template"))
     assets = resolve_catalog_assets(template, candidate["assets"])
-    artifact_path.write_text(json.dumps({"template": template, "assets": assets}, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    artifact_bytes = json.dumps(
+        {"template": template, "assets": assets}, ensure_ascii=False, sort_keys=True
+    ).encode("utf-8")
+    temporary_artifact = artifact_path.with_suffix(".json.tmp")
+    temporary_artifact.write_bytes(artifact_bytes)
+    os.replace(temporary_artifact, artifact_path)
     out_dir = workspace / "rendered"
     argv = shlex.split(command) + ["--input", str(artifact_path), "--assets-dir", str(workspace), "--out-dir", str(out_dir)]
     proc = subprocess.run(argv, text=True, capture_output=True, timeout=600, check=False)
@@ -1211,7 +1216,9 @@ class SoleProcessOrchestrator:
             for item in rendered.get("previews", []):
                 placement = str(item.get("placement") or "preview").lower()
                 destination = public_preview_root / f"iteration-{index:02d}-{placement}.png"
-                shutil.copyfile(str(item["path"]), destination)
+                temporary_destination = destination.with_suffix(".png.tmp")
+                shutil.copyfile(str(item["path"]), temporary_destination)
+                os.replace(temporary_destination, destination)
                 public_previews.append({"name": destination.name, "path": str(destination), "placement": placement})
             public_render = {}
             for placement in ("feed", "story"):
