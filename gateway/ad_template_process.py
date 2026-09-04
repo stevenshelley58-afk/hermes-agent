@@ -615,6 +615,15 @@ def _validate_layout(layout: Any, *, placement: str, width: int, height: int) ->
         raise AdTemplateProcessError(f"{layout_path}.safeZones must be a list with at most 32 rectangles")
     for zone_index, zone in enumerate(safe_zones):
         _validate_rect(zone, path=f"{layout_path}.safeZones[{zone_index}]", bounds=(width, height))
+    if not any(
+        isinstance(layer, Mapping)
+        and layer.get("type") == "plate"
+        and layer.get("geometry") == {"x": 0, "y": 0, "width": width, "height": height}
+        for layer in layers
+    ):
+        raise AdTemplateProcessError(
+            f"{layout_path} must contain one full-canvas background plate"
+        )
     ids = set()
     for layer_index, layer in enumerate(layers):
         layer_path = f"{layout_path}.layers[{layer_index}]"
@@ -670,6 +679,12 @@ def _validate_layout(layout: Any, *, placement: str, width: int, height: int) ->
         if layer_type == "text":
             if not _font(layer["font"]) or not _number_value(layer["fontSize"], positive=True) or not _number_value(layer["tracking"]) or not _positive_int(layer["maxCharacters"]) or not _positive_int(layer["maxLines"]):
                 raise AdTemplateProcessError("text layer sizing is invalid")
+            minimum_font_size = 32 if placement == "story" else 24
+            if layer["fontSize"] < minimum_font_size:
+                raise AdTemplateProcessError(
+                    f"{layer_path}.fontSize must be at least {minimum_font_size} native canvas pixels "
+                    f"for readable {placement} text"
+                )
             if not -4 <= layer["tracking"] <= 4:
                 raise AdTemplateProcessError(
                     f"{layer_path}.tracking must be an absolute canvas-pixel value between -4 and 4"
@@ -686,6 +701,15 @@ def _validate_layout(layout: Any, *, placement: str, width: int, height: int) ->
             allowed = ", ".join(VECTOR_SHAPES)
             offending = json.dumps(layer["shape"], ensure_ascii=True)[:160]
             raise AdTemplateProcessError(f"{layer_path}.shape={offending} must be one of {allowed}")
+        if (
+            layer_type == "vector"
+            and layer["shape"] == "ring"
+            and layer["geometry"]["width"] != layer["geometry"]["height"]
+        ):
+            raise AdTemplateProcessError(
+                f"{layer_path}.shape=ring is circular-only and requires square geometry; "
+                "use nested inset rounded vectors for a rounded rectangular border"
+            )
         if layer_type == "icon" and layer["icon"] not in SUPPORTED_ICONS:
             allowed = ", ".join(SUPPORTED_ICONS)
             offending = json.dumps(layer["icon"], ensure_ascii=True)[:160]
@@ -753,6 +777,7 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
     visible_media_inputs: set[str] = set()
     visible_logo_inputs: set[str] = set()
     visible_text_inputs: set[str] = set()
+    visible_text_line_caps: Dict[str, List[int]] = {}
     for layout_name, layout in (("feedLayout", value["feedLayout"]), ("storyLayout", value["storyLayout"])):
         for layer_index, layer in enumerate(layout["layers"]):
             layer_path = f"{layout_name}.layers[{layer_index}]"
@@ -769,6 +794,9 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
                 raise AdTemplateProcessError(f"{layer_path}.inputKey={offending} for text is undeclared (declared: {allowed})")
             if layer["type"] == "text":
                 visible_text_inputs.add(str(layer["inputKey"]))
+                visible_text_line_caps.setdefault(str(layer["inputKey"]), []).append(
+                    int(layer["maxLines"])
+                )
             elif layer["type"] == "logo":
                 visible_logo_inputs.add(str(layer["inputKey"]))
             elif layer["type"] == "image_slot":
@@ -784,9 +812,16 @@ def validate_template_artifact(value: Any) -> Dict[str, Any]:
             if layer.get("colourRole") and layer["colourRole"] not in value["semanticColours"]:
                 raise AdTemplateProcessError("layer colourRole is undeclared")
     for input_key in sorted(visible_text_inputs):
-        if not _nonempty(text_inputs_by_key[input_key].get("placeholder")):
+        placeholder = text_inputs_by_key[input_key].get("placeholder")
+        if not _nonempty(placeholder):
             raise AdTemplateProcessError(
                 f"visible text input {json.dumps(input_key)} must have a non-blank placeholder"
+            )
+        hard_lines = str(placeholder).count("\n") + 1
+        if hard_lines > min(visible_text_line_caps[input_key]):
+            raise AdTemplateProcessError(
+                f"visible text input {json.dumps(input_key)} placeholder has {hard_lines} hard lines, "
+                f"exceeding a referencing layer maxLines={min(visible_text_line_caps[input_key])}"
             )
     default_asset_owners: Dict[str, str] = {}
     for input_key in sorted(visible_media_inputs):
@@ -1058,14 +1093,28 @@ def _compact_revision_feedback(value: Any) -> str:
         decoded = value
     if not isinstance(decoded, Mapping):
         return str(value)[:3000]
-    if "best_quality_score" in decoded and "required_changes" in decoded:
-        return json.dumps(
-            decoded, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )[:6000]
-    review = decoded.get("current_review")
-    if not isinstance(review, Mapping):
-        review = decoded
-    regions = review.get("critical_regions")
+
+    current_review = decoded.get("current_review")
+    if not isinstance(current_review, Mapping):
+        current_review = decoded
+    best_review = decoded.get("best_review")
+    if not isinstance(best_review, Mapping):
+        best_review = {}
+
+    def compact_list(items: Any, *, limit: int, width: int) -> List[str]:
+        return [str(item)[:width] for item in (items or [])[:limit]]
+
+    def merged_list(*groups: Any, limit: int, width: int) -> List[str]:
+        result: List[str] = []
+        for group in groups:
+            for item in compact_list(group, limit=limit, width=width):
+                if item and item not in result:
+                    result.append(item)
+                if len(result) >= limit:
+                    return result
+        return result
+
+    regions = current_review.get("critical_regions")
     blocking_regions = [
         {
             "region": str(item.get("region") or "")[:160],
@@ -1076,15 +1125,27 @@ def _compact_revision_feedback(value: Any) -> str:
     ]
     projected = {
         "instruction": str(decoded.get("instruction") or "Apply every required change to the immutable best candidate.")[:300],
-        "best_quality_score": decoded.get("best_score", decoded.get("best_quality_score")),
-        "minimum_score": review.get("minimum_score"),
-        "rubric": review.get("rubric") if isinstance(review.get("rubric"), Mapping) else {},
-        "macro": review.get("macro") if isinstance(review.get("macro"), Mapping) else {},
-        "hard_failures": [str(item)[:600] for item in (review.get("hard_failures") or [])[:6]],
-        "regressions": [str(item)[:600] for item in (review.get("regressions") or [])[:6]],
+        "best_quality_score": decoded.get("best_quality_score", decoded.get("best_score")),
+        "minimum_score": current_review.get("minimum_score"),
+        "rubric": current_review.get("rubric") if isinstance(current_review.get("rubric"), Mapping) else {},
+        "macro": current_review.get("macro") if isinstance(current_review.get("macro"), Mapping) else {},
+        "hard_failures": merged_list(
+            current_review.get("hard_failures"), best_review.get("hard_failures"),
+            limit=6, width=600,
+        ),
+        "regression_guards": merged_list(
+            current_review.get("regressions"), decoded.get("regression_guards"),
+            limit=6, width=600,
+        ),
         "blocking_regions": blocking_regions[:6],
-        "required_changes": [str(item)[:1200] for item in (review.get("required_changes") or [])[:3]],
-        "reason": str(review.get("reason") or "")[:1200],
+        # Best-first ordering prevents a regressing current render from erasing
+        # unresolved work on the immutable builder base. Current hard failures
+        # and regression guards remain in the same bounded instruction.
+        "required_changes": merged_list(
+            best_review.get("required_changes"), current_review.get("required_changes"),
+            decoded.get("required_changes"), limit=6, width=1200,
+        ),
+        "reason": str(current_review.get("reason") or "")[:1200],
     }
     return json.dumps(projected, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -1198,6 +1259,7 @@ def persist_iteration_checkpoint(
     previous_score: float | None,
     low_gain_streak: int,
     feedback: str,
+    best_quality_score: float | None = None,
 ) -> Path:
     """Persist an append-only iteration boundary for restart-safe continuation."""
     root = workspace / "iterations" / f"{iteration:02d}"
@@ -1214,8 +1276,9 @@ def persist_iteration_checkpoint(
         },
         "builder_escalated": bool(builder_escalated),
         "previous_score": previous_score,
+        "best_quality_score": best_quality_score,
         "low_gain_streak": int(low_gain_streak),
-        "feedback": str(feedback)[:3000],
+        "feedback": _compact_revision_feedback(feedback),
     }
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(
@@ -1365,9 +1428,13 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
         'must be a JSON list containing only crop and/or position (not feed/story). For every text layer, alignment '
         'must be exactly left, center, or right and overflowBehaviour must be exactly refuse, truncate, or scale_down (never ellipsis). '
         'tracking is an absolute canvas-pixel value from -4 to 4, never em, percent, a multiplier, or arbitrary letter spacing. '
+        'fontSize must be at least 24 native canvas pixels in Feed and 32 in Story; never shrink body or contact copy below these floors. '
         'lineHeight is a unitless multiplier between 0.8 and 2.5, normally 1.1 to 1.6; never supply lineHeight in pixels. '
         ' For every vector layer, shape must be exactly one of rect, rounded, circle, line, pill, notched, wave, or ring; '
         'never use aliases such as rectangle or rounded_rect_stroke. Every icon layer must use exactly arrow, check, phone, mail, globe, or pin; '
+        'Every layout requires one full-canvas background plate. A plate is only a plain rectangular fill and cannot express corners '
+        'or an outline. ring is circular-only and requires square geometry. Build a rounded rectangular border with nested inset rounded '
+        'vectors (outer border colour, inner background colour); never use same-bounds stacked filled plates. '
         'other icon names render as empty circles and are invalid. Every image_slot inputKey must be declared exactly once '
         'in imageInputs. When the source has a visible brand/logo role, preserve it with a real logo layer bound to an optional '
         'imageInput whose defaultAssetKey resolves to brand/neutral-real-estate.png, so the rendered comparison contains a visible '
@@ -1411,7 +1478,8 @@ REVIEW EVIDENCE: {feedback_text}
 
 Reinspect the attached source pixels for every requested correction. Keep Feed faithful to the source geometry and information structure. Story must be an intentional 1080x1920 recomposition, not the Feed canvas scaled, contained, or rearranged with the same horizontal split and two-column topology. Reflow at least one major Feed side-by-side group into a vertical 9:16 hierarchy; for a listing like 006 use a full-width hero, the price/brand card below it, then stacked facts and readable contact. UI-unsafe Story bands y=0..239 and y=1620..1919 may contain backgrounds, frames, decoration, or nonessential full-bleed media, but essential text/logo/icon/CTA stays within x=72..1008 and y=240..1620.
 
-Never copy source identity, contact details, portraits, logos, URLs, or pixels. Keep their visual roles as neutral editable inputs. Do not duplicate facts or photographs. tracking remains absolute canvas pixels -4..4; lineHeight remains unitless 0.8..2.5. Preserve the existing exact schema and use only these manifest-backed assets if a requested role must change:
+Never copy source identity, contact details, portraits, logos, URLs, or pixels. Keep their visual roles as neutral editable inputs. Do not duplicate facts or photographs. tracking remains absolute canvas pixels -4..4; lineHeight remains unitless 0.8..2.5. fontSize is at least 24 native canvas pixels in Feed and 32 in Story, including body and contact copy. Preserve the existing exact schema and use only these manifest-backed assets if a requested role must change:
+Every layout requires one full-canvas background plate. A plate is only a plain rectangular fill and cannot express corners or an outline. ring is circular-only and requires square geometry. Build a rounded rectangular border with nested inset rounded vectors (outer border colour, inner background colour); never use same-bounds stacked filled plates.
 {catalog_lines}
 Run {run_id}; project {project_id}; placements {json.dumps(placements)}; brief {brief[:2000]}."""
 
@@ -1420,9 +1488,9 @@ Run {run_id}; project {project_id}; placements {json.dumps(placements)}; brief {
     # layers instead of being simplified into a different archetype.
     return f"""Build one layered Blockwise ad template by recreating the attached source image as closely as possible. The rendered Feed must be a near-match to the source at thumbnail and full size: preserve its layout regions, relative geometry, spacing, image-slot count and shapes, crop intent, border and divider treatment, typography scale and style, palette, information hierarchy, and visible content structure. Do not redesign, simplify, modernise, improve, or reinterpret the source. The only acceptable visual substitutions are neutral editable replacements for advertiser identity and source photography. Remove source names, logos, phone numbers, URLs, portraits, contact identity, and source pixels, but keep equivalent editable logo, text, icon, patch, and image-slot roles in the same visual positions. Never flatten the source image into a plate. Every visible text input must have a non-blank placeholder. Every visible non-logo image input must have its own default asset; never bind two distinct visible inputs to the same photograph. Every required brand-logo reference must have a visible logo layer and a non-blank neutral default logo.
 
-The attached source is the authority. For a revision, apply every item in prior reviewer feedback to the prior valid candidate and leave already-matching regions unchanged. Story must be a native 1080x1920 translation of the same design system and hierarchy, with essential content outside the top 240px and bottom 300px platform zones; it is not evidence that Feed may diverge from the source. Story must not retain the Feed's horizontal split or two-column topology: reflow major Feed groups into a deliberate vertical hierarchy. For a listing like 006 use a full-width hero, price/brand card below, then stacked facts and readable contact.
+The attached source is the authority. For a revision, apply every item in prior reviewer feedback to the prior valid candidate and leave already-matching regions unchanged. Story must be a native 1080x1920 translation of the same design system and hierarchy, with essential content outside the top 240px and bottom 300px platform zones; it is not evidence that Feed may diverge from the source. Story must not retain the Feed's horizontal split or two-column topology: reflow major Feed groups into a deliberate vertical hierarchy. For a listing like 006 use a full-width hero, price/brand card below, then stacked facts and readable contact. Every layout requires one full-canvas background plate. A plate is only a plain rectangular fill and cannot express corners or an outline. ring is circular-only and requires square geometry. Build a rounded rectangular border with nested inset rounded vectors (outer border colour, inner background colour); never use same-bounds stacked filled plates.
 
-Return JSON only with exactly {{"template":{{...}},"assets":[]}}. template must use schema "blockwise.ad-template" and contain exactly templateId, createdAt, feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata plus schema. Feed is 1080x1350 with safeZones=[{{"x":72,"y":96,"width":936,"height":1158}}]. Story is 1080x1920 with safeZones=[{{"x":72,"y":240,"width":936,"height":1380}}]. Geometry is always {{x,y,width,height}} from the top-left and must remain inside the canvas. Each layout contains exactly placement, layers, and safeZones. Every layer must match one exact shape: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. Do not omit layerId, opacity, protected, or any other required field. Text uses a declared bundled font, native-canvas fontSize, unitless lineHeight 0.8-2.5, tracking as an absolute canvas-pixel value from -4 to 4 (never em, percent, or a multiplier), alignment left|center|right, maxCharacters, maxLines, colourRole, overflowBehaviour refuse|truncate|scale_down, and geometry. image_slot mask is rounded_rect|circle|none and defaultCrop is normalized {{"x":0,"y":0,"width":1,"height":1}}. imageInputs entries are exactly {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs entries are exactly {{key,label,placeholder,maxLength}}; fonts entries are exactly {{file}}. Every reference must resolve.
+Return JSON only with exactly {{"template":{{...}},"assets":[]}}. template must use schema "blockwise.ad-template" and contain exactly templateId, createdAt, feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata plus schema. Feed is 1080x1350 with safeZones=[{{"x":72,"y":96,"width":936,"height":1158}}]. Story is 1080x1920 with safeZones=[{{"x":72,"y":240,"width":936,"height":1380}}]. Geometry is always {{x,y,width,height}} from the top-left and must remain inside the canvas. Each layout contains exactly placement, layers, and safeZones. Every layer must match one exact shape: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. Do not omit layerId, opacity, protected, or any other required field. Text uses a declared bundled font, native-canvas fontSize of at least 24 in Feed and 32 in Story, unitless lineHeight 0.8-2.5, tracking as an absolute canvas-pixel value from -4 to 4 (never em, percent, or a multiplier), alignment left|center|right, maxCharacters, maxLines, colourRole, overflowBehaviour refuse|truncate|scale_down, and geometry. image_slot mask is rounded_rect|circle|none and defaultCrop is normalized {{"x":0,"y":0,"width":1,"height":1}}. imageInputs entries are exactly {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs entries are exactly {{key,label,placeholder,maxLength}}; fonts entries are exactly {{file}}. Every reference must resolve.
 
 semanticColours contains exactly background, primary, secondary, accent, mainText, inverseText. Allowed font files are {', '.join(sorted(ALLOWED_FONT_FILES))}. metadata contains exactly title:string, description:string, gallerySamples:{{feed?:{{assetKey?,placement,purpose}},story?:{{assetKey?,placement,purpose}}}}, metaCopyDefaults:{{primaryText:string[],headlines:string[],descriptions:string[],cta:string}}, aiWritingGuidance:{{summary:string,fields:record<string,string>}}, publishRequirements:{{objective:string,specialAdCategory:string|null,instantForm:{{required:boolean,dependency:string|null,defaults?:record<string,string>}},destination:{{required:boolean,kind:'website'|'instant_form'|'none',dependency:string|null}},requiredCtaTypes?:string[]}}, replacementAssets:{{inputKey,assetKey,purpose?}}[], realAssetRefs:{{inputKey,kind,required}}[]. For property ads set specialAdCategory to HOUSING. Every layer, input, font, colour, asset, replacement, gallery, and realAsset reference must resolve inside the same template. template.assets is required and is a declaration record shaped exactly {{"asset-key":{{"fileName":"normalized/catalog/path.webp","mimeType":"image/webp"}}}}; it is never a list and may be {{}} only when no asset is used. Top-level assets is always a list of {{assetKey,fileName,mimeType}} and must exactly mirror template.assets; never emit bytesBase64 anywhere. Choose only from this exact role-tagged safe catalog; prefer photo-default assets and use neutral-placeholder only when no suitable photo role exists:
 {catalog_lines}
@@ -1563,7 +1631,7 @@ class SoleProcessOrchestrator:
         if self.should_stop():
             raise AdTemplateProcessError("sole ad-template process was cancelled")
 
-    def run(self, *, source: str, brief: str, placements: Any, routes: List[Dict[str, str]], review_round: int = 0, total_iterations: int = 0, feedback: str = "", history: List[Dict[str, Any]] | None = None, revision_candidate: Mapping[str, Any] | None = None, selected_builder_route: Mapping[str, str] | None = None, builder_escalated: bool = False, previous_score: float | None = None, low_gain_streak: int = 0, require_quality_route: bool = False, resume_final_check: bool = False, best_iteration: int | None = None) -> Dict[str, Any]:
+    def run(self, *, source: str, brief: str, placements: Any, routes: List[Dict[str, str]], review_round: int = 0, total_iterations: int = 0, feedback: str = "", history: List[Dict[str, Any]] | None = None, revision_candidate: Mapping[str, Any] | None = None, selected_builder_route: Mapping[str, str] | None = None, builder_escalated: bool = False, previous_score: float | None = None, low_gain_streak: int = 0, require_quality_route: bool = False, resume_final_check: bool = False, best_iteration: int | None = None, best_quality_score: float | None = None) -> Dict[str, Any]:
         if len(routes) < 4: raise AdTemplateProcessError("builder, comparator, and two final reviewers require four configured roles")
         quality_route = routes[4] if len(routes) > 4 else None
         if require_quality_route and quality_route is None:
@@ -1580,7 +1648,7 @@ class SoleProcessOrchestrator:
         candidate: Dict[str, Any] = dict(revision_candidate or {}) if resume_final_check else {}
         working_candidate: Mapping[str, Any] | None = revision_candidate
         best_candidate: Mapping[str, Any] | None = copy.deepcopy(revision_candidate) if revision_candidate else None
-        best_score = previous_score if revision_candidate else None
+        best_score = best_quality_score if revision_candidate else None
         if best_iteration is None and best_candidate is not None:
             best_iteration = total_iterations
         if resume_final_check:
@@ -1893,6 +1961,7 @@ class SoleProcessOrchestrator:
                     previous_score=previous_score,
                     low_gain_streak=low_gain_streak,
                     feedback=feedback,
+                    best_quality_score=best_score,
                 )
                 break
 
@@ -1908,9 +1977,20 @@ class SoleProcessOrchestrator:
                 best_score = quality_score
                 best_iteration = index
             working_candidate = best_candidate
+            best_record = next(
+                (
+                    item for item in history + iterations
+                    if int(item.get("iteration") or 0) == int(best_iteration or 0)
+                ),
+                None,
+            )
             current_feedback = json.dumps({
                 "instruction": "Revise the immutable best-so-far candidate; do not continue from a regressing render.",
-                "best_score": best_score,
+                "best_quality_score": best_score,
+                "best_review": (
+                    best_record.get("comparison")
+                    if isinstance(best_record, Mapping) else {}
+                ),
                 "current_review": json.loads(current_feedback),
             }, ensure_ascii=False)
 
@@ -1947,6 +2027,7 @@ class SoleProcessOrchestrator:
                 previous_score=previous_score,
                 low_gain_streak=low_gain_streak,
                 feedback=feedback,
+                best_quality_score=best_score,
             )
         accepted_records = history if resume_final_check else iterations
         if not accepted_records or accepted_records[-1]["decision"] != "accepted": raise AdTemplateProcessError(f"quality loop exhausted {MAX_ITERATIONS} iterations without a final-review-ready candidate")
@@ -2060,6 +2141,7 @@ class SoleProcessOrchestrator:
                 previous_score=accepted_score,
                 low_gain_streak=low_gain_streak,
                 feedback=reasons,
+                best_quality_score=best_score,
             )
             return self.run(
                 source=source, brief=brief, placements=placements, routes=routes,
@@ -2069,6 +2151,7 @@ class SoleProcessOrchestrator:
                 previous_score=accepted_score, low_gain_streak=low_gain_streak,
                 require_quality_route=require_quality_route,
                 best_iteration=best_iteration,
+                best_quality_score=best_score,
             )
         self.emit("final-review.completed", "final-check", {"decision": "accepted", "reviewers": final_review["reviewers"]})
         generated = candidate

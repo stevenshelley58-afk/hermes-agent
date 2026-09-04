@@ -302,10 +302,80 @@ def test_build_restart_loads_two_iterations_and_best_for_iteration_three(tmp_pat
     assert checkpoint["candidate"]["template"]["templateId"] == "completion-test"
     assert checkpoint["resume_final_check"] is False
     assert checkpoint["previous_score"] == 9.1
+    assert checkpoint["best_quality_score"] == 9.1
     recovered_feedback = json.loads(checkpoint["feedback"])
     assert recovered_feedback["best_quality_score"] == 9.1
     assert recovered_feedback["minimum_score"] == 9.1
     assert recovered_feedback["required_changes"] == changes
+
+
+def test_restart_keeps_best_quality_separate_from_latest_regressing_score(tmp_path):
+    store = ToolRunStore(str(tmp_path / "checkpoint-best-score.db"))
+    workspace = tmp_path / "run"
+    (workspace / "previews").mkdir(parents=True)
+    changes = [
+        "placement=story; layers=story-background; "
+        "current={x:0,y:0,width:1080,height:1920}; "
+        "target={x:0,y:0,width:1080,height:1920}; change=Restore the native Story hierarchy"
+    ]
+    for iteration, quality, regressions in (
+        (1, 8.7, []),
+        (2, 8.9, ["Story reverted to the Feed topology"]),
+    ):
+        template = _valid_template()
+        template["templateId"] = f"candidate-{iteration}"
+        root = workspace / "iterations" / f"{iteration:02d}"
+        root.mkdir(parents=True)
+        (root / "artifact.json").write_text(
+            json.dumps({"template": template, "assets": []}), encoding="utf-8"
+        )
+        for placement in ("feed", "story"):
+            (workspace / "previews" / f"iteration-{iteration:02d}-{placement}.png").write_bytes(
+                placement.encode()
+            )
+        comparison = {
+            "rubric": {field: quality for field in process.RUBRIC_FIELDS},
+            "reason": "Continue from the immutable best",
+            "hard_failures": [],
+            "visible_strings": _visible_strings(),
+            "differences": ["Visible mismatch"],
+            "required_changes": changes,
+            "macro": {field: quality for field in process.MACRO_FIELDS},
+            "critical_regions": [{"region": "full composition", "status": "pass", "findings": []}],
+            "regressions": regressions,
+            "ranked_changes": changes,
+            "declared_decision": "revise",
+        }
+        process.persist_iteration_checkpoint(
+            workspace,
+            iteration=iteration,
+            record={
+                "iteration": iteration,
+                "candidate": {"template": template, "assets": [], "previews": []},
+                "comparison": comparison,
+                "decision": "revise",
+            },
+            best_iteration=1,
+            builder_route={"provider": "openai-codex", "model": "gpt-5.6-sol"},
+            builder_escalated=True,
+            previous_score=quality,
+            best_quality_score=8.7,
+            low_gain_streak=0,
+            feedback=json.dumps({
+                "best_quality_score": 8.7,
+                "best_review": comparison if iteration == 1 else {},
+                "current_review": comparison,
+            }),
+        )
+
+    checkpoint = _ToolRunHarness(store)._ad_template_iteration_checkpoint(
+        "trun_best_score", workspace, "build"
+    )
+    assert checkpoint is not None
+    assert checkpoint["best_iteration"] == 1
+    assert checkpoint["candidate"]["template"]["templateId"] == "candidate-1"
+    assert checkpoint["previous_score"] == 8.9
+    assert checkpoint["best_quality_score"] == 8.7
 
 
 def test_final_check_requeue_rebuilds_after_interrupted_accepted_artifact(tmp_path):
@@ -1149,12 +1219,14 @@ class _TimedRoleHarness(_ToolRunHarness):
 
 def test_ad_template_inactivity_timeout_has_finite_slow_call_allowance():
     assert tool_run_api._ad_template_inactivity_timeout(
-        {"timeout_seconds": 120}
-    ) == 300.0
+        {"timeout_seconds": 120}, stage="compare"
+    ) == 180.0
     assert tool_run_api._ad_template_inactivity_timeout(
-        {"timeout_seconds": 600}
+        {"timeout_seconds": 600}, stage="build"
     ) == 600.0
-    assert tool_run_api._ad_template_inactivity_timeout({}) == 300.0
+    assert tool_run_api._ad_template_inactivity_timeout(
+        {}, stage="final-check"
+    ) == 180.0
 
 
 @pytest.mark.asyncio
@@ -1171,6 +1243,9 @@ async def test_slow_silent_role_outlives_short_policy_but_remains_bounded(
     run, _ = store.create_run(_command(str(source), idempotency_key="slow-silent-role"))
 
     def slow_but_healthy(_agent, _kwargs):
+        assert _agent._try_recover_primary_transport(
+            RuntimeError("transport timeout"), retry_count=1, max_retries=1
+        ) is False
         time.sleep(1.2)
         return {"final_response": "{}"}
 

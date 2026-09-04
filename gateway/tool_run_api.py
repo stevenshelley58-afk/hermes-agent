@@ -23,7 +23,7 @@ from aiohttp import web
 
 from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
-from gateway.ad_template_process import AdTemplateProcessError, AdTemplateStructuredOutputError, AdTemplateTransportError, SoleProcessOrchestrator, _compact_revision_feedback, validate_artifacts, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
+from gateway.ad_template_process import AdTemplateProcessError, AdTemplateStructuredOutputError, AdTemplateTransportError, SoleProcessOrchestrator, _compact_revision_feedback, _quality_ranking_score, validate_artifacts, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
 from gateway.tool_runs import (
     AD_TEMPLATE_ROUTE_ORDER,
     AD_TEMPLATE_OPTIONAL_ROUTE,
@@ -38,16 +38,31 @@ from gateway.tool_runs import (
 logger = logging.getLogger(__name__)
 
 
-# Vision-capable template roles can spend several minutes inside a provider
-# request without yielding a stream delta.  Keep the watchdog finite, but do
-# not let the legacy 120-second policy mistake a healthy slow call for a hung
-# generator.  Explicit policies may lengthen this bound, never shorten it.
-AD_TEMPLATE_MIN_INACTIVITY_SECONDS = 300.0
+# Vision-capable template roles can spend more than two minutes inside a
+# provider request without yielding a stream delta (the production Sol builder
+# has completed at about 144 seconds).  Keep a small safety margin above that
+# observed latency, while bounding a silent comparator tightly enough for the
+# role-owned Sol fallback to run instead of waiting five minutes.  The helper is
+# evaluated again whenever the process changes role/stage so future role floors
+# can diverge without changing the watchdog contract.
+AD_TEMPLATE_MIN_INACTIVITY_SECONDS = 180.0
+AD_TEMPLATE_STAGE_INACTIVITY_MULTIPLIERS = {
+    "build": 1.0,
+    "render": 1.0,
+    "compare": 1.0,
+    "final-check": 1.0,
+    "live": 1.0,
+}
 
 
-def _ad_template_inactivity_timeout(route_settings: Dict[str, Any]) -> float:
+def _ad_template_inactivity_timeout(
+    route_settings: Dict[str, Any], *, stage: str | None = None,
+) -> float:
     configured = max(1.0, float(route_settings.get("timeout_seconds") or 120))
-    return max(configured, AD_TEMPLATE_MIN_INACTIVITY_SECONDS)
+    stage_floor = AD_TEMPLATE_MIN_INACTIVITY_SECONDS * (
+        AD_TEMPLATE_STAGE_INACTIVITY_MULTIPLIERS.get(str(stage or ""), 1.0)
+    )
+    return max(configured, stage_floor)
 
 
 def _error(message: str, code: str) -> Dict[str, Any]:
@@ -305,6 +320,9 @@ class ToolRunAPIMixin:
             "candidate": candidate,
             "history": history,
             "previous_score": history[-1]["comparison"]["score"],
+            "best_quality_score": _quality_ranking_score(
+                history[-1]["comparison"]
+            ),
             "resume_final_check": resume_final_check,
         }
 
@@ -390,19 +408,30 @@ class ToolRunAPIMixin:
         selected_route = state.get("builder_route")
         if not isinstance(selected_route, dict):
             raise RuntimeError("persisted builder route is invalid")
+        best_quality_score = state.get("best_quality_score")
+        if not isinstance(best_quality_score, (int, float)):
+            # Checkpoints written before best_quality_score existed carried
+            # only the latest render score. Recompute from the persisted best
+            # review rather than assigning a regressing render's score to the
+            # immutable best candidate.
+            best_quality_score = _quality_ranking_score(
+                history[best_iteration - 1]["comparison"]
+            )
         raw_feedback = str(state.get("feedback") or "")
         try:
             decoded_feedback = json.loads(raw_feedback) if raw_feedback else {}
         except json.JSONDecodeError:
             decoded_feedback = {
                 "instruction": "Revise the immutable best-so-far candidate; do not continue from a regressing render.",
-                "best_score": state.get("previous_score"),
+                "best_quality_score": best_quality_score,
+                "best_review": history[best_iteration - 1]["comparison"],
                 "current_review": last["comparison"],
             }
         return {
             "candidate": candidate,
             "history": history,
             "previous_score": state.get("previous_score"),
+            "best_quality_score": float(best_quality_score),
             "resume_final_check": resume_final_check,
             "best_iteration": best_iteration,
             "selected_builder_route": selected_route,
@@ -763,6 +792,15 @@ class ToolRunAPIMixin:
                     # generic agent's nested three-attempt loop so one stalled
                     # vision route cannot multiply every orchestrator retry.
                     agent._api_max_retries = 1
+                    # A durable Tool role must also skip the generic Agent's
+                    # one-time primary-transport rebuild. The orchestrator owns
+                    # the frozen role fallback (for example Luna comparator ->
+                    # Sol quality escalation); silently rebuilding Luna here
+                    # previously doubled a 120-second TTFB failure before that
+                    # fallback could run.
+                    agent._try_recover_primary_transport = (
+                        lambda *_args, **_kwargs: False
+                    )
                     active = self._tool_run_agents.setdefault(run_id, {})
                     active[instance_id] = agent
                     try:
@@ -825,6 +863,7 @@ class ToolRunAPIMixin:
                     history=(checkpoint or {}).get("history"),
                     total_iterations=len((checkpoint or {}).get("history") or []),
                     previous_score=(checkpoint or {}).get("previous_score"),
+                    best_quality_score=(checkpoint or {}).get("best_quality_score"),
                     best_iteration=(checkpoint or {}).get("best_iteration"),
                     selected_builder_route=(checkpoint or {}).get("selected_builder_route"),
                     builder_escalated=bool((checkpoint or {}).get("builder_escalated")),
@@ -838,7 +877,9 @@ class ToolRunAPIMixin:
             configured_timeout = max(
                 1.0, float(route_settings.get("timeout_seconds") or 120)
             )
-            timeout = _ad_template_inactivity_timeout(route_settings)
+            timeout = _ad_template_inactivity_timeout(
+                route_settings, stage=current_stage
+            )
             for attempt, candidate in enumerate(candidates, start=1):
                 self._tool_run_store.append_event(
                     run_id, "provider.attempt", status="running", node_id=route_stage,
@@ -862,6 +903,9 @@ class ToolRunAPIMixin:
                     while True:
                         if activity_sequence != observed_activity:
                             observed_activity = activity_sequence
+                            timeout = _ad_template_inactivity_timeout(
+                                route_settings, stage=current_stage
+                            )
                             deadline = last_activity_at + timeout
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:

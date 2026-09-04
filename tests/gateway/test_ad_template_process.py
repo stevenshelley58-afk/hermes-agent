@@ -614,7 +614,12 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
     assert "overflowBehaviour must be exactly refuse, truncate, or scale_down" in builder
     assert 'fonts must always be a JSON list such as [{"file":"manrope-400.woff2"}' in builder
     assert "shape must be exactly one of rect, rounded, circle, line, pill, notched, wave, or ring" in builder
+    assert "Every layout requires one full-canvas background plate" in builder
+    assert "ring is circular-only and requires square geometry" in builder
+    assert "A plate is only a plain rectangular fill and cannot express corners" in builder
+    assert "never use same-bounds stacked filled plates" in builder
     assert "lineHeight is a unitless multiplier between 0.8 and 2.5" in builder
+    assert "fontSize must be at least 24 native canvas pixels in Feed and 32 in Story" in builder
     assert "Every icon layer must use exactly arrow, check, phone, mail, globe, or pin" in builder
     assert "Every image_slot inputKey must be declared exactly once in imageInputs" in builder
     assert "real logo layer" in builder
@@ -710,6 +715,23 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
     invalid_line_height["feedLayout"]["layers"][1]["lineHeight"] = 29
     with pytest.raises(AdTemplateProcessError, match=r"feedLayout\.layers\[1\]\.lineHeight=29 must be a unitless multiplier between 0\.8 and 2\.5"):
         process.validate_template_artifact(invalid_line_height)
+
+    micro_feed_text = json.loads(json.dumps(invalid_line_height))
+    micro_feed_text["feedLayout"]["layers"][1]["lineHeight"] = 1.2
+    micro_feed_text["feedLayout"]["layers"][1]["fontSize"] = 18
+    with pytest.raises(AdTemplateProcessError, match=r"fontSize must be at least 24 native canvas pixels"):
+        process.validate_template_artifact(micro_feed_text)
+
+    micro_story_text = json.loads(json.dumps(template))
+    micro_story_text["storyLayout"]["layers"].append({
+        "type": "text", "layerId": "story-contact", "inputKey": "contact",
+        "font": {"file": "manrope-400.woff2"}, "fontSize": 28, "lineHeight": 1.2,
+        "tracking": 0, "alignment": "left", "maxCharacters": 100, "maxLines": 2,
+        "colourRole": "mainText", "overflowBehaviour": "refuse",
+        "geometry": {"x": 72, "y": 1400, "width": 600, "height": 100},
+    })
+    with pytest.raises(AdTemplateProcessError, match=r"fontSize must be at least 32 native canvas pixels"):
+        process.validate_template_artifact(micro_story_text)
     invalid_vector = json.loads(json.dumps(template))
     invalid_vector["feedLayout"]["layers"].append({
         "type": "vector", "layerId": "feed-rule",
@@ -718,6 +740,41 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
     })
     with pytest.raises(AdTemplateProcessError, match=r'feedLayout\.layers\[1\]\.shape="rectangle" must be one of rect, rounded'):
         process.validate_template_artifact(invalid_vector)
+
+    elongated_ring = json.loads(json.dumps(template))
+    elongated_ring["feedLayout"]["layers"].append({
+        "type": "vector", "layerId": "feed-border",
+        "geometry": {"x": 22, "y": 22, "width": 1036, "height": 1306},
+        "shape": "ring", "colourRole": "accent", "opacity": 1,
+    })
+    with pytest.raises(AdTemplateProcessError, match=r"shape=ring is circular-only and requires square geometry"):
+        process.validate_template_artifact(elongated_ring)
+
+    missing_background = json.loads(json.dumps(template))
+    missing_background["storyLayout"]["layers"][0] = {
+        "type": "vector", "layerId": "story-fill",
+        "geometry": {"x": 0, "y": 0, "width": 1080, "height": 1920},
+        "shape": "rect", "colourRole": "background", "opacity": 1,
+    }
+    with pytest.raises(AdTemplateProcessError, match=r"storyLayout must contain one full-canvas background plate"):
+        process.validate_template_artifact(missing_background)
+
+    hard_line_overflow = json.loads(json.dumps(template))
+    hard_line_overflow["textInputs"] = [{
+        "key": "facts", "label": "Facts",
+        "placeholder": "One\nTwo\nThree\nFour\nFive\nSix", "maxLength": 160,
+    }]
+    hard_line_overflow["fonts"] = [{"file": "manrope-400.woff2"}]
+    for placement, max_lines in (("feed", 6), ("story", 3)):
+        hard_line_overflow[f"{placement}Layout"]["layers"].append({
+            "type": "text", "layerId": f"{placement}-facts", "inputKey": "facts",
+            "font": {"file": "manrope-400.woff2"}, "fontSize": 32, "lineHeight": 1.2,
+            "tracking": 0, "alignment": "left", "maxCharacters": 160,
+            "maxLines": max_lines, "colourRole": "mainText", "overflowBehaviour": "scale_down",
+            "geometry": {"x": 72, "y": 240 if placement == "story" else 96, "width": 600, "height": 500},
+        })
+    with pytest.raises(AdTemplateProcessError, match=r'visible text input "facts" placeholder has 6 hard lines.*maxLines=3'):
+        process.validate_template_artifact(hard_line_overflow)
 
     invalid_icon = json.loads(json.dumps(template))
     invalid_icon["feedLayout"]["layers"].append({
@@ -2061,8 +2118,10 @@ def test_regressed_candidate_is_traced_but_next_revision_uses_immutable_best(tmp
     assert '"templateId":"candidate-builder-1"' in builder_prompts["builder-2"]
     assert '"templateId":"candidate-builder-1"' in builder_prompts["builder-3"]
     assert '"templateId":"candidate-builder-2"' not in builder_prompts["builder-3"]
+    assert "change=comparison comparator-1" in builder_prompts["builder-3"]
     assert "comparison comparator-2" in builder_prompts["builder-3"]
-    for field in ("rubric", "minimum_score", "hard_failures", "differences", "required_changes", "reason"):
+    assert len(builder_prompts["builder-3"].encode("utf-8")) < 80_000
+    for field in ("rubric", "minimum_score", "hard_failures", "required_changes", "reason"):
         assert f'"{field}"' in builder_prompts["builder-2"]
     compared_events = [data for kind, data in events if kind == "iteration.compared"]
     assert len(compared_events) == 3
@@ -2124,6 +2183,7 @@ def test_blocked_but_improved_candidate_remains_restart_best_by_quality_subscore
     )
     assert checkpoint["best_iteration"] == 2
     assert checkpoint["previous_score"] == 9.1
+    assert checkpoint["best_quality_score"] == 9.1
     assert checkpoint["record"]["comparison"]["score"] == 0.0
     assert checkpoint["record"]["comparison"]["quality_score"] == 9.1
     third_prompt = next(prompt for instance, prompt, _route in calls if instance == "builder-3")
