@@ -535,16 +535,15 @@ def test_layered_documents_are_stable():
     with pytest.raises(AdTemplateProcessError): deterministic_documents({"feed": {}, "story": {}})
 
 def test_catalog_asset_resolution_rejects_unknown_and_traversal(tmp_path, monkeypatch):
-    (tmp_path / "home").mkdir()
-    (tmp_path / "home" / "property-photo.webp").write_bytes(b"catalog-photo")
-    template = {"schema": "blockwise.ad-template", "assets": {"property-photo": {"fileName": "home/property-photo.webp", "mimeType": "image/webp"}}}
-    monkeypatch.setenv("AD_TEMPLATE_ASSET_CATALOG_DIR", str(tmp_path))
-    resolved = process.resolve_catalog_assets(template, [{"assetKey": "property-photo", "fileName": "home/property-photo.webp", "mimeType": "image/webp"}])
-    assert resolved[0]["bytesBase64"] == "Y2F0YWxvZy1waG90bw=="
-    with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets(template, [{"assetKey": "missing", "fileName": "home/property-photo.webp", "mimeType": "image/webp"}])
+    catalog = Path(process.__file__).resolve().parents[1] / "assets" / "ad-template-generator" / "catalog"
+    template = {"schema": "blockwise.ad-template", "assets": {"property-photo": {"fileName": "interior/kitchen.webp", "mimeType": "image/webp"}}}
+    monkeypatch.setenv("AD_TEMPLATE_ASSET_CATALOG_DIR", str(catalog))
+    resolved = process.resolve_catalog_assets(template, [{"assetKey": "property-photo", "fileName": "interior/kitchen.webp", "mimeType": "image/webp"}])
+    assert resolved[0]["bytesBase64"].startswith("UklGR")
+    with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets(template, [{"assetKey": "missing", "fileName": "interior/kitchen.webp", "mimeType": "image/webp"}])
     with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets({"schema": "blockwise.ad-template", "assets": {"x": {"fileName": "../property-photo.webp", "mimeType": "image/webp"}}}, [{"assetKey": "x", "fileName": "../property-photo.webp", "mimeType": "image/webp"}])
-    with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets(template, [{"assetKey": "property-photo", "fileName": "home/property-photo.webp", "mimeType": "image/png"}])
-    with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets(template, [{"assetKey": "property-photo", "fileName": "home/property-photo.webp", "mimeType": "image/webp", "bytesBase64": ""}])
+    with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets(template, [{"assetKey": "property-photo", "fileName": "interior/kitchen.webp", "mimeType": "image/png"}])
+    with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets(template, [{"assetKey": "property-photo", "fileName": "interior/kitchen.webp", "mimeType": "image/webp", "bytesBase64": ""}])
 
 
 def test_builder_contract_is_strict_and_prompts_require_quality_scores():
@@ -597,7 +596,11 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
     for key in process.METADATA_FIELDS:
         assert key in builder
     assert "never emit bytesBase64 anywhere" in builder
-    assert "home/open-home-living.webp" in builder
+    assert "interior/living-bright.webp" in builder
+    assert "procedural/tower-skyline.webp" in builder
+    assert "roles=living_room,lounge,bright_interior" in builder
+    assert "usage=neutral-placeholder" in builder
+    assert "home/open-home-living.webp" not in builder
     assert "brand/neutral-real-estate.png" in builder
     assert "Never leave a source-visible logo region blank" in builder
     assert 'Feed is 1080x1350 with safeZones=[{"x":72,"y":96,"width":936,"height":1158}]' in builder
