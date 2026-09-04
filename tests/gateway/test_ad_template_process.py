@@ -2323,6 +2323,115 @@ def test_renderer_aggregated_rejection_targets_every_layer_and_tracks_each_noop(
     assert third.count("UNCHANGED NAMED LAYER DETECTED") == 1
 
 
+def test_renderer_layout_rejections_enrich_bounds_and_overlap_targets():
+    candidate = valid_candidate("renderer-layout-rejections")
+    candidate["template"]["textInputs"].extend([
+        {
+            "key": "propertyAddress", "label": "Address",
+            "placeholder": "123 Example Street,\nSample City, ST 12345", "maxLength": 80,
+        },
+        {
+            "key": "aboutCopy", "label": "About",
+            "placeholder": "A neutral six-line property description.", "maxLength": 180,
+        },
+        {
+            "key": "featuresHeading", "label": "Features heading",
+            "placeholder": "PROPERTY FEATURES", "maxLength": 30,
+        },
+    ])
+    candidate["template"]["storyLayout"]["layers"].extend([
+        {
+            "type": "text", "layerId": "story-address", "inputKey": "propertyAddress",
+            "font": {"file": "manrope-400.woff2"}, "fontSize": 32,
+            "lineHeight": 1.1, "tracking": 0, "alignment": "right",
+            "maxCharacters": 80, "maxLines": 2, "colourRole": "mainText",
+            "overflowBehaviour": "scale_down",
+            "geometry": {"x": 624, "y": 928, "width": 344, "height": 76},
+        },
+        {
+            "type": "text", "layerId": "story-about-copy", "inputKey": "aboutCopy",
+            "font": {"file": "manrope-400.woff2"}, "fontSize": 32,
+            "lineHeight": 1.2, "tracking": 0, "alignment": "left",
+            "maxCharacters": 180, "maxLines": 6, "colourRole": "mainText",
+            "overflowBehaviour": "scale_down",
+            "geometry": {"x": 72, "y": 1120, "width": 420, "height": 232},
+        },
+        {
+            "type": "text", "layerId": "story-features-heading",
+            "inputKey": "featuresHeading", "font": {"file": "manrope-700.woff2"},
+            "fontSize": 32, "lineHeight": 1.1, "tracking": 0, "alignment": "left",
+            "maxCharacters": 30, "maxLines": 1, "colourRole": "mainText",
+            "overflowBehaviour": "scale_down",
+            "geometry": {"x": 560, "y": 1246, "width": 420, "height": 46},
+        },
+    ])
+    reasons = [
+        "story text layer story-address painted bounds exceed geometry by 4px on right",
+        (
+            "story essential text layers story-about-copy and story-features-heading "
+            "overlap by 106px vertically"
+        ),
+    ]
+    stderr = "AD_TEMPLATE_TEXT_PREFLIGHT_FAILED " + json.dumps({
+        "code": "AD_TEMPLATE_TEXT_PREFLIGHT_FAILED",
+        "violations": [
+            {
+                "placement": "story", "layerId": "story-address",
+                "kind": "painted_bounds_outside_geometry", "overflowPx": 4,
+                "edge": "right", "reason": reasons[0],
+            },
+            {
+                "placement": "story", "firstLayerId": "story-about-copy",
+                "secondLayerId": "story-features-heading",
+                "kind": "essential_text_overlap", "overlapPx": 106,
+                "axis": "vertical", "reason": reasons[1],
+            },
+        ],
+    })
+
+    assert process._deterministic_renderer_rejections(stderr) == reasons
+    first, signatures, unchanged = process._renderer_rejection_instructions(
+        candidate, reasons,
+    )
+    assert unchanged == []
+    assert list(signatures) == [
+        "story:story-address",
+        "story:story-about-copy+story-features-heading",
+    ]
+    for expected in (
+        '"layerId":"story-address"',
+        '"geometry":{"height":76,"width":344,"x":624,"y":928}',
+        '"placeholder":"123 Example Street,\\nSample City, ST 12345"',
+        '"paintedOverflowPx":4',
+        '"overflowEdge":"right"',
+        "clearing at least 4px on right",
+        '"layerId":"story-about-copy"',
+        '"layerId":"story-features-heading"',
+        '"overlapPx":106',
+        '"axis":"vertically"',
+        "separate the two named layers vertically by at least 106px",
+    ):
+        assert expected in first
+
+    second, second_signatures, second_unchanged = process._renderer_rejection_instructions(
+        candidate, reasons, previous_target_signatures=signatures,
+    )
+    assert second_signatures == signatures
+    assert second_unchanged == [
+        "story:story-address",
+        "story:story-about-copy+story-features-heading",
+    ]
+    assert second.count("UNCHANGED NAMED LAYER DETECTED") == 1
+    assert second.count("UNCHANGED NAMED LAYERS DETECTED") == 1
+
+    candidate["template"]["storyLayout"]["layers"][-3]["geometry"]["width"] = 352
+    candidate["template"]["storyLayout"]["layers"][-1]["geometry"]["y"] = 1380
+    _third, _third_signatures, third_unchanged = process._renderer_rejection_instructions(
+        candidate, reasons, previous_target_signatures=second_signatures,
+    )
+    assert third_unchanged == []
+
+
 def test_initial_non_json_builder_output_retries_cheap_then_escalates_without_extra_reviews(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")

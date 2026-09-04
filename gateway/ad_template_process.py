@@ -2311,6 +2311,17 @@ _DETERMINISTIC_RENDERER_REJECTIONS = (
         r"must use lineHeight at least 1",
         re.IGNORECASE,
     ),
+    re.compile(
+        r"(?:feed|story) text layer [A-Za-z0-9._:-]{1,160} painted bounds exceed "
+        r"geometry by \d+(?:\.\d+)?px on (?:left|right|top|bottom)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:feed|story) essential text layers [A-Za-z0-9._:-]{1,160} and "
+        r"[A-Za-z0-9._:-]{1,160} overlap by \d+(?:\.\d+)?px "
+        r"(?:vertically|horizontally)",
+        re.IGNORECASE,
+    ),
     re.compile(r"ring vector [A-Za-z0-9._:-]{1,160} must use square geometry", re.IGNORECASE),
 )
 
@@ -2322,6 +2333,19 @@ _TEXT_RENDERER_REJECTION = re.compile(
 _MULTILINE_RENDERER_REJECTION = re.compile(
     r"(?P<placement>feed|story) text layer (?P<layer_id>[A-Za-z0-9._:-]{1,160}) "
     r"with maxLines (?P<max_lines>\d+) must use lineHeight at least 1",
+    re.IGNORECASE,
+)
+_PAINTED_BOUNDS_RENDERER_REJECTION = re.compile(
+    r"(?P<placement>feed|story) text layer (?P<layer_id>[A-Za-z0-9._:-]{1,160}) "
+    r"painted bounds exceed geometry by (?P<overflow>\d+(?:\.\d+)?)px on "
+    r"(?P<edge>left|right|top|bottom)",
+    re.IGNORECASE,
+)
+_ESSENTIAL_TEXT_OVERLAP_RENDERER_REJECTION = re.compile(
+    r"(?P<placement>feed|story) essential text layers "
+    r"(?P<first_layer_id>[A-Za-z0-9._:-]{1,160}) and "
+    r"(?P<second_layer_id>[A-Za-z0-9._:-]{1,160}) overlap by "
+    r"(?P<overlap>\d+(?:\.\d+)?)px (?P<axis>vertically|horizontally)",
     re.IGNORECASE,
 )
 
@@ -2357,47 +2381,84 @@ def _renderer_rejection_instruction(
     reason_text = str(reason or "").strip()
     fit_match = _TEXT_RENDERER_REJECTION.fullmatch(reason_text)
     multiline_match = _MULTILINE_RENDERER_REJECTION.fullmatch(reason_text)
-    match = fit_match or multiline_match
+    bounds_match = _PAINTED_BOUNDS_RENDERER_REJECTION.fullmatch(reason_text)
+    overlap_match = _ESSENTIAL_TEXT_OVERLAP_RENDERER_REJECTION.fullmatch(reason_text)
+    match = fit_match or multiline_match or bounds_match or overlap_match
     template = candidate.get("template") if isinstance(candidate, Mapping) else None
     if match is None or not isinstance(template, Mapping):
         return reason, None, False
     placement = match.group("placement").lower()
     layout = template.get(f"{placement}Layout")
     layers = layout.get("layers") if isinstance(layout, Mapping) else None
-    layer_id = match.group("layer_id")
-    layer = next(
-        (
-            item
-            for item in layers or []
-            if isinstance(item, Mapping) and str(item.get("layerId") or "") == layer_id
-        ),
-        None,
-    )
-    if not isinstance(layer, Mapping):
-        return reason, None, False
-    input_key = str(layer.get("inputKey") or "")[:160]
     text_inputs = template.get("textInputs")
-    text_input = next(
-        (
-            item
-            for item in text_inputs or []
-            if isinstance(item, Mapping) and str(item.get("key") or "") == input_key
-        ),
-        {},
-    )
-    target = {
-        "placement": placement,
-        "layerId": layer_id,
-        "inputKey": input_key,
-        "geometry": _prompt_rect(layer.get("geometry")),
-        "font": _prompt_object(layer.get("font"), ("file",)),
-        "fontSize": _prompt_value(layer.get("fontSize")),
-        "lineHeight": _prompt_value(layer.get("lineHeight")),
-        "maxCharacters": _prompt_value(layer.get("maxCharacters")),
-        "maxLines": _prompt_value(layer.get("maxLines")),
-        "fit": str(layer.get("overflowBehaviour") or "")[:80],
-        "placeholder": str(text_input.get("placeholder") or "")[:320],
-    }
+
+    def text_target(layer_id: str) -> tuple[Mapping[str, Any] | None, Dict[str, Any] | None]:
+        layer = next(
+            (
+                item for item in layers or []
+                if isinstance(item, Mapping) and str(item.get("layerId") or "") == layer_id
+            ),
+            None,
+        )
+        if not isinstance(layer, Mapping):
+            return None, None
+        input_key = str(layer.get("inputKey") or "")[:160]
+        text_input = next(
+            (
+                item for item in text_inputs or []
+                if isinstance(item, Mapping) and str(item.get("key") or "") == input_key
+            ),
+            {},
+        )
+        return layer, {
+            "placement": placement,
+            "layerId": layer_id,
+            "inputKey": input_key,
+            "geometry": _prompt_rect(layer.get("geometry")),
+            "font": _prompt_object(layer.get("font"), ("file",)),
+            "fontSize": _prompt_value(layer.get("fontSize")),
+            "lineHeight": _prompt_value(layer.get("lineHeight")),
+            "maxCharacters": _prompt_value(layer.get("maxCharacters")),
+            "maxLines": _prompt_value(layer.get("maxLines")),
+            "fit": str(layer.get("overflowBehaviour") or "")[:80],
+            "placeholder": str(text_input.get("placeholder") or "")[:320],
+        }
+
+    if overlap_match is not None:
+        first_id = overlap_match.group("first_layer_id")
+        second_id = overlap_match.group("second_layer_id")
+        _first_layer, first_target = text_target(first_id)
+        _second_layer, second_target = text_target(second_id)
+        if first_target is None or second_target is None:
+            return reason, None, False
+        overlap_px = float(overlap_match.group("overlap"))
+        pair_target = {
+            "placement": placement,
+            "axis": overlap_match.group("axis").lower(),
+            "overlapPx": int(overlap_px) if overlap_px.is_integer() else overlap_px,
+            "layers": [first_target, second_target],
+        }
+        signature = json.dumps(
+            pair_target, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        unchanged = bool(previous_target_signature and signature == previous_target_signature)
+        no_op_warning = (
+            " UNCHANGED NAMED LAYERS DETECTED: the prior retry returned these exact failing "
+            "target contracts; move or resize the named layers now."
+            if unchanged else ""
+        )
+        instruction = (
+            f"{reason}. TARGETED TEXT PAIR: {signature}.{no_op_warning} Allowed fix: separate "
+            f"the two named layers {overlap_match.group('axis').lower()} by at least "
+            f"{overlap_match.group('overlap')}px so their painted bounds do not intersect; "
+            "preserve reading order, exact visible text, line structure, and readability floors."
+        )
+        return instruction, signature, unchanged
+
+    layer_id = match.group("layer_id")
+    layer, target = text_target(layer_id)
+    if layer is None or target is None:
+        return reason, None, False
     minimum_height = None
     if fit_match is not None:
         try:
@@ -2410,6 +2471,12 @@ def _renderer_rejection_instruction(
             minimum_height = None
         if minimum_height is not None:
             target["minimumHeight"] = minimum_height
+    if bounds_match is not None:
+        overflow_px = float(bounds_match.group("overflow"))
+        target["paintedOverflowPx"] = (
+            int(overflow_px) if overflow_px.is_integer() else overflow_px
+        )
+        target["overflowEdge"] = bounds_match.group("edge").lower()
     signature = json.dumps(
         target, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
@@ -2424,6 +2491,13 @@ def _renderer_rejection_instruction(
         allowed_fix = (
             "Allowed fix: set this named multiline layer lineHeight to at least 1.0; "
             "preserve its distinct stacked lines, maxLines contract, and readability floor."
+        )
+    elif bounds_match is not None:
+        allowed_fix = (
+            "Allowed fix: expand or shift this named text geometry enough to contain all "
+            f"painted bounds, clearing at least {bounds_match.group('overflow')}px on "
+            f"{bounds_match.group('edge').lower()}; preserve exact visible text, font, "
+            "alignment, punctuation, line structure, and every source-derived invariant."
         )
     else:
         allowed_fix = (
@@ -2444,8 +2518,21 @@ def _renderer_rejection_target_key(reason: str) -> str:
     if match is None:
         match = _MULTILINE_RENDERER_REJECTION.fullmatch(str(reason or "").strip())
     if match is None:
+        match = _PAINTED_BOUNDS_RENDERER_REJECTION.fullmatch(str(reason or "").strip())
+    if match is not None:
+        return f"{match.group('placement').lower()}:{match.group('layer_id')}"
+    overlap_match = _ESSENTIAL_TEXT_OVERLAP_RENDERER_REJECTION.fullmatch(
+        str(reason or "").strip()
+    )
+    if overlap_match is not None:
+        return (
+            f"{overlap_match.group('placement').lower()}:"
+            f"{overlap_match.group('first_layer_id')}+"
+            f"{overlap_match.group('second_layer_id')}"
+        )
+    if match is None:
         return str(reason)[:320]
-    return f"{match.group('placement').lower()}:{match.group('layer_id')}"
+    raise AssertionError("unreachable")
 
 
 def _renderer_rejection_instructions(
