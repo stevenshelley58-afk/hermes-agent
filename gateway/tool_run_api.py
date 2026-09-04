@@ -24,7 +24,7 @@ from aiohttp import web
 
 from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
-from gateway.ad_template_process import AdTemplateProcessError, AdTemplateRendererRejection, AdTemplateStructuredOutputError, AdTemplateTransportError, SoleProcessOrchestrator, _compact_revision_feedback, _quality_ranking_score, _renderer_rejection_instructions, validate_artifacts, validate_builder_candidate, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, run_generator_cli, THRESHOLD as AD_TEMPLATE_THRESHOLD
+from gateway.ad_template_process import AdTemplateProcessError, AdTemplateRendererRejection, AdTemplateStructuredOutputError, AdTemplateTransportError, SoleProcessOrchestrator, _compact_revision_feedback, _quality_ranking_score, _renderer_rejection_instructions, validate_artifacts, validate_builder_candidate, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, run_generator_cli, MAX_ITERATIONS as AD_TEMPLATE_MAX_ITERATIONS, THRESHOLD as AD_TEMPLATE_THRESHOLD
 from gateway.tool_runs import (
     AD_TEMPLATE_ROUTE_ORDER,
     AD_TEMPLATE_OPTIONAL_ROUTE,
@@ -251,7 +251,14 @@ class ToolRunAPIMixin:
                     ],
                 },
             })
-        history = validate_iterations(records)
+        retry_intent = self._latest_build_from_best_retry_intent(run_id)
+        iteration_budget_extension = (
+            int(retry_intent.get("iteration_budget_extension") or 0)
+            if retry_intent is not None else 0
+        )
+        history = validate_iterations(
+            records, iteration_budget_extension=iteration_budget_extension,
+        )
         if history[-1]["decision"] != "accepted":
             raise RuntimeError("final-check retry has no accepted comparator checkpoint")
         workspace_root = workspace.resolve()
@@ -325,6 +332,7 @@ class ToolRunAPIMixin:
                 history[-1]["comparison"]
             ),
             "resume_final_check": resume_final_check,
+            "iteration_budget_extension": iteration_budget_extension,
         }
 
     @staticmethod
@@ -374,9 +382,16 @@ class ToolRunAPIMixin:
         self, run_id: str, workspace: Path, current_stage: str
     ) -> Dict[str, Any] | None:
         """Load the last complete append-only boundary for restart continuation."""
+        durable_retry_intent = self._latest_build_from_best_retry_intent(run_id)
+        iteration_budget_extension = (
+            int(durable_retry_intent.get("iteration_budget_extension") or 0)
+            if durable_retry_intent is not None else 0
+        )
         records: List[Dict[str, Any]] = []
         state: Dict[str, Any] | None = None
-        for iteration in range(1, 61):
+        for iteration in range(
+            1, AD_TEMPLATE_MAX_ITERATIONS + iteration_budget_extension + 1
+        ):
             path = workspace / "iterations" / f"{iteration:02d}" / "checkpoint.json"
             if not path.is_file():
                 break
@@ -397,16 +412,16 @@ class ToolRunAPIMixin:
             if current_stage == "final-check":
                 return self._final_check_checkpoint(run_id, workspace)
             return None
-        history = validate_iterations(records)
+        history = validate_iterations(
+            records, iteration_budget_extension=iteration_budget_extension,
+        )
         best_iteration = int(state.get("best_iteration") or 0)
         if not 1 <= best_iteration <= len(history):
             raise RuntimeError("persisted best iteration is invalid")
         candidate = self._load_ad_template_iteration_candidate(workspace, best_iteration)
         last = history[-1]
         resume_final_check = (
-            current_stage == "final-check"
-            and last["decision"] == "accepted"
-            and not last.get("final_review_failed")
+            last["decision"] == "accepted" and not last.get("final_review_failed")
         )
         selected_route = state.get("builder_route")
         if not isinstance(selected_route, dict):
@@ -432,14 +447,18 @@ class ToolRunAPIMixin:
             }
         retry_intent = self._build_from_best_retry_intent(run_id, current_stage)
         if retry_intent is not None:
+            starting_length = retry_intent.get("history_length")
+            if not isinstance(starting_length, int) or len(history) < starting_length:
+                raise RuntimeError("build-from-best retry seed no longer matches its checkpoint")
             if (
-                retry_intent.get("seed_iteration") != best_iteration
-                or retry_intent.get("history_length") != len(history)
+                len(history) == starting_length
+                and retry_intent.get("seed_iteration") != best_iteration
             ):
                 raise RuntimeError("build-from-best retry seed no longer matches its checkpoint")
             decoded_feedback = retry_intent.get("seed_feedback")
             if not isinstance(decoded_feedback, str) or not decoded_feedback:
                 raise RuntimeError("build-from-best retry has no persisted terminal feedback")
+            resume_final_check = False
         return {
             "candidate": candidate,
             "history": history,
@@ -451,18 +470,30 @@ class ToolRunAPIMixin:
             "builder_escalated": bool(state.get("builder_escalated")),
             "low_gain_streak": int(state.get("low_gain_streak") or 0),
             "feedback": _compact_revision_feedback(decoded_feedback),
-            "iteration_budget_extension": (
-                int(retry_intent.get("iteration_budget_extension") or 0)
-                if retry_intent is not None else 0
-            ),
+            "iteration_budget_extension": iteration_budget_extension,
         }
+
+    def _latest_build_from_best_retry_intent(
+        self, run_id: str
+    ) -> Dict[str, Any] | None:
+        for event in self._tool_run_store.events(
+            run_id, limit=5000, newest_first=True,
+        ):
+            if event.get("kind") != "command.queued":
+                continue
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            if data.get("retry_mode") == "build-from-best":
+                return data
+        return None
 
     def _build_from_best_retry_intent(
         self, run_id: str, current_stage: str
     ) -> Dict[str, Any] | None:
         if current_stage != "build":
             return None
-        for event in reversed(self._tool_run_store.events(run_id, limit=5000)):
+        for event in self._tool_run_store.events(
+            run_id, limit=5000, newest_first=True,
+        ):
             if event.get("kind") != "command.queued":
                 continue
             data = event.get("data") if isinstance(event.get("data"), dict) else {}
@@ -477,22 +508,37 @@ class ToolRunAPIMixin:
     ) -> str:
         raw_feedback = checkpoint.get("feedback")
         try:
-            base = json.loads(raw_feedback) if isinstance(raw_feedback, str) else {}
+            decoded = json.loads(raw_feedback) if isinstance(raw_feedback, str) else {}
         except json.JSONDecodeError:
-            base = {}
-        if not isinstance(base, dict):
+            decoded = {}
+        final_review_evidence = [
+            item for item in decoded[:2] if isinstance(item, dict)
+        ] if isinstance(decoded, list) else []
+        if isinstance(decoded, dict):
+            base = decoded
+            final_review_evidence.extend(
+                item for item in (decoded.get("final_review_evidence") or [])[:2]
+                if isinstance(item, dict)
+            )
+        elif final_review_evidence:
+            base = min(
+                final_review_evidence,
+                key=lambda item: float(item.get("minimum_score") or item.get("score") or 0),
+            )
+        else:
             base = {}
         terminal_reasons: List[str] = []
         final_hard_failures: List[str] = []
         final_required_changes: List[str] = []
         final_events: List[Dict[str, Any]] = []
-        for event in self._tool_run_store.events(str(run["run_id"]), limit=5000):
+        for event in self._tool_run_store.events(
+            str(run["run_id"]), limit=5000, newest_first=True,
+        ):
             if event.get("kind") == "iteration.compared":
-                final_events = []
-                continue
+                break
             if str(event.get("kind") or "").startswith("final-review."):
                 final_events.append(event)
-        for event in final_events[-16:]:
+        for event in reversed(final_events[:16]):
             data = event.get("data") if isinstance(event.get("data"), dict) else {}
             reason = data.get("reason")
             if reason:
@@ -501,6 +547,7 @@ class ToolRunAPIMixin:
             for reviewer in reviewers[:2]:
                 if not isinstance(reviewer, dict):
                     continue
+                final_review_evidence.append(reviewer)
                 final_hard_failures.extend(
                     str(item)[:600] for item in (reviewer.get("hard_failures") or [])[:6]
                 )
@@ -536,6 +583,7 @@ class ToolRunAPIMixin:
             "best_review": current_review,
             "current_review": current_review,
             "source_invariants": base.get("source_invariants"),
+            "final_review_evidence": final_review_evidence[-2:],
         })
 
     @staticmethod
@@ -593,7 +641,7 @@ class ToolRunAPIMixin:
             raise ToolRunError("persisted source contract does not match the submitted source")
         try:
             checkpoint = self._ad_template_iteration_checkpoint(
-                str(run["run_id"]), workspace, "build"
+                str(run["run_id"]), workspace, "retry-validation"
             )
         except (AdTemplateProcessError, OSError, RuntimeError, ValueError) as exc:
             raise ToolRunError("validated best checkpoint is unavailable") from exc
@@ -704,7 +752,11 @@ class ToolRunAPIMixin:
         missing = sorted(key for key in required if key not in output)
         if missing:
             raise RuntimeError(f"Generator result is incomplete: {', '.join(missing)}")
-        iterations = validate_iterations(output.get("iterations"))
+        iteration_budget_extension = int(output.get("iteration_budget_extension") or 0)
+        iterations = validate_iterations(
+            output.get("iterations"),
+            iteration_budget_extension=iteration_budget_extension,
+        )
         final_review = validate_final_review(output.get("final_review"), accepted=iterations[-1]["decision"] == "accepted")
         if final_review.get("decision") != "accepted":
             raise RuntimeError("final reviewers did not pass")
@@ -723,6 +775,7 @@ class ToolRunAPIMixin:
             "previews", "template_path", "render_path", "import", "process",
             "usage", "cost", "builder_escalated", "builder_route",
             "model_policy_revision",
+            "iteration_budget_extension",
         )}
         result["template"] = {
             "schema": template.get("schema"),
@@ -766,7 +819,10 @@ class ToolRunAPIMixin:
     def _validated_generation_gate(output: Any) -> Dict[str, Any]:
         if not isinstance(output, dict):
             raise ToolRunError("generator output is required")
-        iterations = validate_iterations(output.get("iterations"))
+        iterations = validate_iterations(
+            output.get("iterations"),
+            iteration_budget_extension=int(output.get("iteration_budget_extension") or 0),
+        )
         return validate_final_review(output.get("final_review"), accepted=iterations[-1]["decision"] == "accepted")
 
     def _project_generation_events(self, run_id: str, records: List[Dict[str, Any]]) -> None:

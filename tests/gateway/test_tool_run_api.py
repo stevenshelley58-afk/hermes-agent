@@ -1134,6 +1134,98 @@ async def test_build_from_best_fails_closed_when_persisted_seed_is_incomplete(
 
 
 @pytest.mark.asyncio
+async def test_ordinary_retry_keeps_accepted_checkpoint_final_resume_semantics(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / "hermes-home"
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = ToolRunStore(str(tmp_path / "ordinary-resume.db"))
+    run, _ = store.create_run(_command(str(source), idempotency_key="ordinary-resume"))
+    workspace = home / "tool_runs" / "ad-template-generator" / run["run_id"]
+    _write_build_retry_checkpoint(workspace)
+    (workspace / "previews" / "source.png").write_bytes(source.read_bytes())
+    store.update_run(run["run_id"], status="failed", stage="render", error="interrupted")
+    api = _ToolRunHarness(store)
+    monkeypatch.setattr(api, "_start_tool_task", lambda *_args, **_kwargs: None)
+
+    response = await api._handle_retry_tool_run(
+        SimpleNamespace(match_info={"run_id": run["run_id"]})
+    )
+    assert response.status == 202
+    assert store.get_run(run["run_id"])["stage"] == "render"
+
+    observed = {}
+
+    class _OrdinaryResume:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run(self, **kwargs):
+            observed.update(kwargs)
+            return {
+                "template": {}, "iterations": [], "final_review": {},
+                "previews": [], "documents": {},
+                "import": {"template_id": "tpl-ordinary", "status": "imported"},
+                "process": "only-ad-template-process",
+            }
+
+    monkeypatch.setattr(tool_run_api, "SoleProcessOrchestrator", _OrdinaryResume)
+    monkeypatch.setattr(api, "_prepare_candidate_output", lambda _run_id, output: output)
+    await api._execute_tool_run(run["run_id"])
+
+    assert observed["resume_final_check"] is True
+    assert observed["iteration_budget_extension"] == 0
+    assert observed["revision_candidate"]["template"]["templateId"] == "retry-seed-2"
+
+
+def test_latest_special_retry_intent_survives_more_than_one_event_page(tmp_path):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    store = ToolRunStore(str(tmp_path / "long-event-history.db"))
+    run, _ = store.create_run(_command(str(source), idempotency_key="long-events"))
+    with store._lock:
+        first_sequence = int(store._conn.execute(
+            "SELECT COALESCE(MAX(sequence),-1)+1 FROM tool_run_events WHERE run_id=?",
+            (run["run_id"],),
+        ).fetchone()[0])
+        store._conn.executemany(
+            """INSERT INTO tool_run_events(
+                run_id,sequence,schema,kind,status,timestamp,node_id,trace_id,span_id,data_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            [
+                (
+                    run["run_id"], first_sequence + index,
+                    "schema://hermes.tool-run-event/v1", "test.noise", "ok",
+                    time.time(), "build", run["trace_id"], None,
+                    json.dumps({"index": index}),
+                )
+                for index in range(5001)
+            ],
+        )
+        store._conn.commit()
+    store.update_run(run["run_id"], status="failed", stage="final-check")
+    store.requeue(
+        run["run_id"], stage="build", expected_statuses={"failed"},
+        event_data={
+            "retry_mode": "build-from-best", "seed_iteration": 2,
+            "history_length": 2, "iteration_budget_extension": 1,
+            "seed_feedback": "{}",
+        },
+    )
+
+    intent = _ToolRunHarness(store)._build_from_best_retry_intent(
+        run["run_id"], "build"
+    )
+    assert intent is not None
+    assert intent["seed_iteration"] == 2
+    assert store.events(
+        run["run_id"], limit=1, newest_first=True,
+    )[0]["kind"] == "command.queued"
+
+
+@pytest.mark.asyncio
 async def test_ad_template_retry_preserves_submitted_model_profile_snapshot(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source-pixels")

@@ -909,8 +909,13 @@ def _quality_ranking_score(evidence: Mapping[str, Any]) -> float:
         return 0.0
     return round(min(values), 2)
 
-def validate_iterations(value: Any) -> List[Dict[str, Any]]:
-    if not isinstance(value, list) or not value or len(value) > MAX_ITERATIONS: raise AdTemplateProcessError(f"iterations must contain 1 to {MAX_ITERATIONS} records")
+def validate_iterations(
+    value: Any, *, iteration_budget_extension: int = 0,
+) -> List[Dict[str, Any]]:
+    if isinstance(iteration_budget_extension, bool) or iteration_budget_extension not in (0, 1):
+        raise AdTemplateProcessError("iteration budget extension must be zero or one")
+    iteration_limit = MAX_ITERATIONS + iteration_budget_extension
+    if not isinstance(value, list) or not value or len(value) > iteration_limit: raise AdTemplateProcessError(f"iterations must contain 1 to {iteration_limit} records")
     result, accepted, retry_after_review = [], False, False
     for index, raw in enumerate(value, 1):
         if not isinstance(raw, dict) or raw.get("iteration", index) != index: raise AdTemplateProcessError("iterations must be consecutive and one-based")
@@ -2020,8 +2025,32 @@ def _compact_revision_feedback(value: Any) -> str:
             return value[:3000]
     else:
         decoded = value
+    final_review_evidence: List[Mapping[str, Any]] = []
+    if isinstance(decoded, list):
+        final_review_evidence = [
+            item for item in decoded[:2] if isinstance(item, Mapping)
+        ]
+        if not final_review_evidence:
+            return str(value)[:3000]
+        current = min(
+            final_review_evidence,
+            key=lambda item: _number(
+                item.get("minimum_score", item.get("score", 0))
+            ),
+        )
+        decoded = {
+            "instruction": "Apply every terminal final-review correction to the immutable best candidate.",
+            "current_review": current,
+            "best_review": current,
+            "final_review_evidence": final_review_evidence,
+        }
     if not isinstance(decoded, Mapping):
         return str(value)[:3000]
+    if not final_review_evidence:
+        final_review_evidence = [
+            item for item in (decoded.get("final_review_evidence") or [])[:2]
+            if isinstance(item, Mapping)
+        ]
 
     current_review = decoded.get("current_review")
     if not isinstance(current_review, Mapping):
@@ -2082,6 +2111,15 @@ def _compact_revision_feedback(value: Any) -> str:
         "reason": str(current_review.get("reason") or "")[:1200],
         "source_invariants": source_invariants,
     }
+    if final_review_evidence:
+        projected["final_review_evidence"] = [
+            _prompt_object(item, (
+                "id", "route", "score", "minimum_score", "rubric",
+                "hard_failures", "differences", "semantic_glyph_inventory",
+                "mark_badge_treatment", "required_changes", "reason",
+            ))
+            for item in final_review_evidence
+        ]
     return json.dumps(projected, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
@@ -2956,7 +2994,9 @@ class SoleProcessOrchestrator:
         if best_iteration is None and best_candidate is not None:
             best_iteration = total_iterations
         if resume_final_check:
-            validated_history = validate_iterations(history)
+            validated_history = validate_iterations(
+                history, iteration_budget_extension=iteration_budget_extension,
+            )
             if not candidate or validated_history[-1]["decision"] != "accepted":
                 raise AdTemplateProcessError("final-check resume requires one accepted candidate checkpoint")
             history = validated_history
@@ -3630,4 +3670,4 @@ class SoleProcessOrchestrator:
         imported = import_template({**generated, "documents": documents}, run_id=self.run_id, project_id=self.project_id)
         self._check_stop()
         self.emit("template.imported", "live", imported)
-        return {"template": generated.get("template") or candidate.get("template"), "iterations": history + iterations, "final_review": final_review, "previews": generated.get("previews"), "documents": documents, "template_path": generated.get("template_path"), "render_path": generated.get("render_path") or generated.get("render", {}).get("feed"), "import": imported, "process": "only-ad-template-process", "builder_escalated": builder_escalated, "builder_route": {"provider": builder_route["provider"], "model": builder_route["model"]}}
+        return {"template": generated.get("template") or candidate.get("template"), "iterations": history + iterations, "final_review": final_review, "previews": generated.get("previews"), "documents": documents, "template_path": generated.get("template_path"), "render_path": generated.get("render_path") or generated.get("render", {}).get("feed"), "import": imported, "process": "only-ad-template-process", "builder_escalated": builder_escalated, "builder_route": {"provider": builder_route["provider"], "model": builder_route["model"]}, "iteration_budget_extension": iteration_budget_extension}

@@ -678,16 +678,23 @@ class ToolRunStore:
             "data": _loads(data_json, {}),
         }
 
-    def events(self, run_id: str, *, after: int = -1, limit: int = 1000) -> List[Dict[str, Any]]:
+    def events(
+        self, run_id: str, *, after: int = -1, limit: int = 1000,
+        newest_first: bool = False,
+    ) -> List[Dict[str, Any]]:
         _clean_id(run_id, "run_id")
         if not isinstance(after, int) or after < -1:
             raise ToolRunError("event cursor is invalid")
         if not isinstance(limit, int) or limit < 1 or limit > 5000:
             raise ToolRunError("event limit is invalid")
+        if not isinstance(newest_first, bool):
+            raise ToolRunError("event ordering is invalid")
+        order = "DESC" if newest_first else "ASC"
         with self._lock:
             rows = self._conn.execute(
                 """SELECT sequence,schema,kind,status,timestamp,node_id,trace_id,span_id,data_json
-                   FROM tool_run_events WHERE run_id=? AND sequence>? ORDER BY sequence ASC LIMIT ?""",
+                   FROM tool_run_events WHERE run_id=? AND sequence>? ORDER BY sequence """
+                + order + " LIMIT ?",
                 (run_id, after, limit),
             ).fetchall()
         return [

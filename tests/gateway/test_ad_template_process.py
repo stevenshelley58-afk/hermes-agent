@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 import gateway.ad_template_process as process
+import gateway.tool_run_api as tool_run_api
 from gateway.ad_template_process import (
     AdTemplateProcessError, deterministic_documents, import_template,
     validate_artifacts, validate_final_review, validate_iterations, SoleProcessOrchestrator, vision_message,
@@ -3498,13 +3499,7 @@ def test_build_from_best_budget_appends_iteration_after_normal_max(tmp_path, mon
     source.write_bytes(b"source")
     workspace = tmp_path / "run"
     old_checkpoint = workspace / "iterations" / "02" / "checkpoint.json"
-    old_checkpoint.parent.mkdir(parents=True)
-    old_checkpoint.write_text("historical-boundary", encoding="utf-8")
     (workspace / "previews").mkdir(parents=True)
-    for placement in ("feed", "story"):
-        (workspace / "previews" / f"iteration-02-{placement}.png").write_bytes(
-            f"historical-{placement}".encode()
-        )
     seed = valid_candidate("persisted-best")
     seed["render"] = {
         placement: str(workspace / "previews" / f"iteration-02-{placement}.png")
@@ -3512,13 +3507,31 @@ def test_build_from_best_budget_appends_iteration_after_normal_max(tmp_path, mon
     }
     history = []
     for iteration in (1, 2):
+        iteration_root = workspace / "iterations" / f"{iteration:02d}"
+        iteration_root.mkdir(parents=True)
+        (iteration_root / "artifact.json").write_text(
+            json.dumps({"template": seed["template"], "assets": []}), encoding="utf-8"
+        )
+        for placement in ("feed", "story"):
+            (workspace / "previews" / f"iteration-{iteration:02d}-{placement}.png").write_bytes(
+                f"historical-{iteration}-{placement}".encode()
+            )
         comparison = evidence(9.0, f"historical comparison {iteration}")
-        history.append({
+        record = {
             "iteration": iteration,
             "candidate": process._candidate_trace_projection(seed),
             "comparison": comparison,
             "decision": "revise",
-        })
+        }
+        history.append(record)
+        process.persist_iteration_checkpoint(
+            workspace, iteration=iteration, record=record,
+            best_iteration=iteration,
+            builder_route={"provider": "openai-codex", "model": "gpt-5.6-sol"},
+            builder_escalated=True, previous_score=9.0, best_quality_score=9.0,
+            low_gain_streak=0, feedback=json.dumps(comparison),
+        )
+    old_checkpoint_bytes = old_checkpoint.read_bytes()
     calls, renders = [], []
 
     def call_agent(instance, prompt, route):
@@ -3529,13 +3542,16 @@ def test_build_from_best_budget_appends_iteration_after_normal_max(tmp_path, mon
             return evidence(9.7, "Appended candidate passes")
         return evidence(9.7, "Independent final passes")
 
+    def render(candidate, iteration_workspace):
+        rendered = fake_render(candidate, iteration_workspace, renders)
+        (iteration_workspace / "artifact.json").write_text(
+            json.dumps(candidate), encoding="utf-8"
+        )
+        return rendered
+
     monkeypatch.setattr(process, "MAX_ITERATIONS", 2)
-    monkeypatch.setattr(
-        process, "run_generator_cli",
-        lambda candidate, iteration_workspace: fake_render(
-            candidate, iteration_workspace, renders,
-        ),
-    )
+    monkeypatch.setattr(tool_run_api, "AD_TEMPLATE_MAX_ITERATIONS", 2)
+    monkeypatch.setattr(process, "run_generator_cli", render)
     monkeypatch.setattr(
         process, "import_template",
         lambda output, run_id, project_id: {
@@ -3560,7 +3576,47 @@ def test_build_from_best_budget_appends_iteration_after_normal_max(tmp_path, mon
     assert all(item[0].startswith("final-reviewer-") for item in calls[2:])
     assert result["iterations"][-1]["iteration"] == 3
     assert (workspace / "iterations" / "03" / "checkpoint.json").is_file()
-    assert old_checkpoint.read_text(encoding="utf-8") == "historical-boundary"
+    assert old_checkpoint.read_bytes() == old_checkpoint_bytes
+    assert ToolRunAPIMixin._prepare_candidate_output(
+        "trun_append_after_max", result,
+    )["iteration_budget_extension"] == 1
+
+    from gateway.tool_runs import ToolRunStore
+    command = {
+        "schema": "schema://hermes.tool-run-command/v1",
+        "request_id": "req-restart-after-max",
+        "tool_id": "ad-template-generator",
+        "action": "build-template",
+        "scope": {"project_id": "blockwise"},
+        "payload": {
+            "brief": "immutable brief",
+            "placements": ["feed", "story"],
+            "sources": [{"name": "source.png", "path": str(source)}],
+        },
+        "idempotency_key": "restart-after-max",
+        "model_policy_revision": 1,
+    }
+    store = ToolRunStore(str(tmp_path / "restart-after-max.db"))
+    run, _ = store.create_run(command)
+    store.update_run(run["run_id"], status="failed", stage="final-check")
+    store.requeue(
+        run["run_id"], stage="build", expected_statuses={"failed"},
+        event_data={
+            "retry_mode": "build-from-best", "seed_iteration": 2,
+            "history_length": 2, "iteration_budget_extension": 1,
+            "seed_feedback": json.dumps({"reason": "terminal final failure"}),
+        },
+    )
+    api = ToolRunAPIMixin()
+    api._tool_run_store = store
+    checkpoint = api._ad_template_iteration_checkpoint(
+        run["run_id"], workspace, "build",
+    )
+    assert checkpoint is not None
+    assert len(checkpoint["history"]) == 3
+    assert checkpoint["best_iteration"] == 3
+    assert checkpoint["iteration_budget_extension"] == 1
+    assert checkpoint["resume_final_check"] is False
 
 
 def test_terminal_final_rejection_persists_feedback_before_bounded_failure(
@@ -3601,3 +3657,50 @@ def test_terminal_final_rejection_persists_feedback_before_bounded_failure(
     )
     assert checkpoint["record"]["final_review_failed"] is True
     assert "Final reviewer requires address correction" in checkpoint["feedback"]
+
+
+def test_terminal_final_evidence_survives_compaction_into_builder_repair_prompt():
+    weak = evidence(9.1, "Two-roof silhouette and dark phone badge still differ")
+    weak["required_changes"] = []
+    weak["rubric"]["feed_source_likeness"] = 8.8
+    weak["mark_badge_treatment"]["feed_observation"][
+        "brand_silhouette_features"
+    ] = ["single-roof"]
+    weak["mark_badge_treatment"]["feed_observation"]["phone_badge"] = {
+        "shape": "circle", "fillTreatment": "outline",
+    }
+    weak["mark_badge_treatment"]["status"] = "mismatch"
+    weak["mark_badge_treatment"]["findings"] = [
+        "Two-roof silhouette and dark phone badge still differ",
+    ]
+    final = validate_final_review({
+        "reviewers": [
+            {"id": "reviewer-a", "route": "luna/vision", **weak},
+            {"id": "reviewer-b", "route": "deepseek/vision", **weak},
+        ],
+    }, accepted=True)
+    assert final["decision"] == "revise"
+
+    compact = process._compact_revision_feedback(
+        json.dumps(final["reviewers"], ensure_ascii=False)
+    )
+    projected = json.loads(compact)
+    retained = projected["final_review_evidence"][0]
+    assert retained["rubric"]["feed_source_likeness"] == 8.8
+    assert retained["differences"] == [
+        "Two-roof silhouette and dark phone badge still differ",
+    ]
+    assert retained["mark_badge_treatment"]["feed_observation"][
+        "brand_silhouette_features"
+    ] == ["single-roof"]
+    assert retained["mark_badge_treatment"]["feed_observation"]["phone_badge"][
+        "fillTreatment"
+    ] == "outline"
+    prompt = process.generator_prompt(
+        run_id="run", project_id="blockwise", brief="immutable brief",
+        placements=["feed", "story"], source="source.png", feedback=compact,
+        prior_candidate=valid_candidate("persisted-best"),
+    )
+    assert "Two-roof silhouette and dark phone badge still differ" in prompt
+    assert '"fillTreatment":"outline"' in prompt
+    assert '"feed_source_likeness":8.8' in prompt
