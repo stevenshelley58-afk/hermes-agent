@@ -1804,7 +1804,11 @@ class SoleProcessOrchestrator:
                     )
                     self._check_stop()
                     evidence = _assessment(review, "final reviewer", require_change_list=True)
-                except (AdTemplateProcessError, AdTemplateStructuredOutputError) as exc:
+                except (
+                    AdTemplateProcessError,
+                    AdTemplateStructuredOutputError,
+                    AdTemplateTransportError,
+                ) as exc:
                     rejection = str(exc)
                     if isinstance(exc, ReviewEvidenceError):
                         self.emit("final-review.schema-rejected", "final-check", {
@@ -1815,7 +1819,10 @@ class SoleProcessOrchestrator:
                             "field": exc.field,
                         })
                     if (
-                        isinstance(exc, AdTemplateStructuredOutputError)
+                        isinstance(
+                            exc,
+                            (AdTemplateStructuredOutputError, AdTemplateTransportError),
+                        )
                         and quality_review_route
                         and quality_review_route != route_identity
                         and quality_review_route != builder_route_identity(routes[3])
