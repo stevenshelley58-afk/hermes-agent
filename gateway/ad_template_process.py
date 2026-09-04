@@ -26,6 +26,7 @@ MAX_CANDIDATE_CONTEXT_CHARS = 100_000
 MIN_MATERIAL_SCORE_GAIN = 0.5
 STORY_CONTENT_SAFE_ZONE = {"x": 72, "y": 240, "width": 936, "height": 1380}
 MAX_COMPARATOR_SELF_CONSISTENCY_RETRIES = 3
+MAX_COMPARATOR_REQUIRED_CHANGES = 32
 MAX_FINAL_REVIEW_OUTPUT_RETRIES = 3
 MATERIAL_OVERLAP_RATIO = 0.08
 VISION_MAX_SERIALIZED_IMAGE_BYTES = 140_000
@@ -106,6 +107,22 @@ RUBRIC_FIELDS = (
 MACRO_FIELDS = (
     "source_topology", "hierarchy", "balance", "visual_identity",
     "conversion_focus", "native_story_composition",
+)
+COMPARATOR_MACRO_INVENTORY_REGIONS = (
+    "frame_header",
+    "hero_offer_panel",
+    "image_gallery",
+    "about_features",
+    "contact_footer",
+    "story_recomposition",
+)
+COMPARATOR_MICRO_INVENTORY_CHECKS = (
+    "brand_text",
+    "dividers",
+    "bullet_count_stacking",
+    "typography_spacing",
+    "overlap",
+    "punctuation",
 )
 
 def _parse_required_change(value: str) -> Dict[str, Any] | None:
@@ -268,6 +285,203 @@ def _validate_required_change_targets(evidence: Mapping[str, Any], candidate: Ma
                         f"required change newly overlaps {placement} layers {left_id} and {right_id}"
                     )
 
+def _comparator_source_inventory(
+    value: Any,
+    *,
+    differences: Any,
+    required_changes: Any,
+) -> Dict[str, Any]:
+    """Validate one comparator's exhaustive source/candidate inventory."""
+    if not isinstance(value, dict) or set(value) != {"macro_regions", "micro_checks"}:
+        raise ReviewEvidenceError(
+            "comparator source_inventory must contain exactly macro_regions and micro_checks",
+            field="source_inventory",
+        )
+    if not isinstance(required_changes, list):
+        raise ReviewEvidenceError(
+            "comparator source_inventory requires a required_changes list",
+            field="source_inventory",
+        )
+
+    required_change_count = len(required_changes)
+    referenced_changes: set[int] = set()
+    inventory_findings: set[str] = set()
+
+    def normalized_refs(item: Mapping[str, Any], label: str) -> List[int]:
+        refs = item.get("required_change_refs")
+        if (
+            not isinstance(refs, list)
+            or any(isinstance(ref, bool) or not isinstance(ref, int) for ref in refs)
+            or len(set(refs)) != len(refs)
+            or any(ref < 1 or ref > required_change_count for ref in refs)
+        ):
+            raise ReviewEvidenceError(
+                f"comparator {label} required_change_refs must be unique 1-based required_changes indexes",
+                field="source_inventory",
+            )
+        status = item.get("status")
+        material = item.get("material")
+        findings = item.get("findings")
+        if not isinstance(material, bool):
+            raise ReviewEvidenceError(
+                f"comparator {label} material must be boolean",
+                field="source_inventory",
+            )
+        if status == "match" and (material or refs or findings):
+            raise ComparatorSelfConsistencyError(
+                f"comparator {label} declares match but also declares mismatch evidence"
+            )
+        if status == "mismatch" and not findings:
+            raise ComparatorSelfConsistencyError(
+                f"comparator {label} mismatch must include concrete findings"
+            )
+        if material and (status != "mismatch" or not refs):
+            raise ComparatorSelfConsistencyError(
+                f"comparator {label} material mismatch must map to a concrete required_change"
+            )
+        if not material and refs:
+            raise ComparatorSelfConsistencyError(
+                f"comparator {label} non-material observation cannot map to a required_change"
+            )
+        referenced_changes.update(refs)
+        inventory_findings.update(str(finding).strip() for finding in findings)
+        return list(refs)
+
+    raw_regions = value.get("macro_regions")
+    if not isinstance(raw_regions, list):
+        raise ReviewEvidenceError(
+            "comparator source_inventory macro_regions must be a list",
+            field="source_inventory",
+        )
+    macro_regions: List[Dict[str, Any]] = []
+    seen_regions: List[str] = []
+    macro_keys = {
+        "region", "source_components", "feed_components", "story_components",
+        "source_count", "feed_count", "story_count", "status", "material",
+        "findings", "required_change_refs",
+    }
+    for item in raw_regions:
+        if not isinstance(item, dict) or set(item) != macro_keys:
+            raise ReviewEvidenceError(
+                "comparator macro inventory entries must use the exact component/count schema",
+                field="source_inventory.macro_regions",
+            )
+        region = item.get("region")
+        if region not in COMPARATOR_MACRO_INVENTORY_REGIONS:
+            raise ReviewEvidenceError(
+                "comparator macro inventory contains an unknown region",
+                field="source_inventory.macro_regions",
+            )
+        seen_regions.append(region)
+        normalized_item = dict(item)
+        for placement in ("source", "feed", "story"):
+            components = item.get(f"{placement}_components")
+            count = item.get(f"{placement}_count")
+            if (
+                not isinstance(components, list)
+                or not all(isinstance(component, str) and component.strip() for component in components)
+                or isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 0
+                or count != len(components)
+            ):
+                raise ReviewEvidenceError(
+                    f"comparator {region} {placement} components/count are inconsistent",
+                    field="source_inventory.macro_regions",
+                )
+            normalized_item[f"{placement}_components"] = [component.strip() for component in components]
+        if item.get("status") not in {"match", "mismatch"}:
+            raise ReviewEvidenceError(
+                f"comparator {region} status must be match or mismatch",
+                field="source_inventory.macro_regions",
+            )
+        findings = item.get("findings")
+        if not isinstance(findings, list) or not all(
+            isinstance(finding, str) and finding.strip() for finding in findings
+        ):
+            raise ReviewEvidenceError(
+                f"comparator {region} findings must be a string list",
+                field="source_inventory.macro_regions",
+            )
+        normalized_item["findings"] = [finding.strip() for finding in findings]
+        normalized_item["required_change_refs"] = normalized_refs(normalized_item, region)
+        macro_regions.append(normalized_item)
+    if tuple(seen_regions) != COMPARATOR_MACRO_INVENTORY_REGIONS:
+        raise ComparatorSelfConsistencyError(
+            "comparator macro inventory must cover every required region exactly once in contract order"
+        )
+
+    raw_checks = value.get("micro_checks")
+    if not isinstance(raw_checks, list):
+        raise ReviewEvidenceError(
+            "comparator source_inventory micro_checks must be a list",
+            field="source_inventory",
+        )
+    micro_checks: List[Dict[str, Any]] = []
+    seen_checks: List[str] = []
+    micro_keys = {
+        "check", "source_observation", "feed_observation", "story_observation",
+        "status", "material", "findings", "required_change_refs",
+    }
+    for item in raw_checks:
+        if not isinstance(item, dict) or set(item) != micro_keys:
+            raise ReviewEvidenceError(
+                "comparator micro inventory entries must use the exact observation schema",
+                field="source_inventory.micro_checks",
+            )
+        check = item.get("check")
+        if check not in COMPARATOR_MICRO_INVENTORY_CHECKS:
+            raise ReviewEvidenceError(
+                "comparator micro inventory contains an unknown check",
+                field="source_inventory.micro_checks",
+            )
+        seen_checks.append(check)
+        normalized_item = dict(item)
+        for placement in ("source", "feed", "story"):
+            observation = item.get(f"{placement}_observation")
+            if not isinstance(observation, str) or not observation.strip():
+                raise ReviewEvidenceError(
+                    f"comparator {check} must record a {placement} observation",
+                    field="source_inventory.micro_checks",
+                )
+            normalized_item[f"{placement}_observation"] = observation.strip()
+        if item.get("status") not in {"match", "mismatch"}:
+            raise ReviewEvidenceError(
+                f"comparator {check} status must be match or mismatch",
+                field="source_inventory.micro_checks",
+            )
+        findings = item.get("findings")
+        if not isinstance(findings, list) or not all(
+            isinstance(finding, str) and finding.strip() for finding in findings
+        ):
+            raise ReviewEvidenceError(
+                f"comparator {check} findings must be a string list",
+                field="source_inventory.micro_checks",
+            )
+        normalized_item["findings"] = [finding.strip() for finding in findings]
+        normalized_item["required_change_refs"] = normalized_refs(normalized_item, check)
+        micro_checks.append(normalized_item)
+    if tuple(seen_checks) != COMPARATOR_MICRO_INVENTORY_CHECKS:
+        raise ComparatorSelfConsistencyError(
+            "comparator micro inventory must cover brand text, dividers, bullet count/stacking, "
+            "typography/spacing, overlap, and punctuation exactly once in contract order"
+        )
+
+    normalized_differences = [item.strip() for item in differences] if isinstance(differences, list) else []
+    missing_findings = [item for item in normalized_differences if item not in inventory_findings]
+    if missing_findings:
+        raise ComparatorSelfConsistencyError(
+            "comparator differences must each appear verbatim in the structured source_inventory findings"
+        )
+    unreferenced_changes = [
+        index for index in range(1, required_change_count + 1) if index not in referenced_changes
+    ]
+    if unreferenced_changes:
+        raise ComparatorSelfConsistencyError(
+            "comparator required_changes must each be referenced by a material source_inventory mismatch"
+        )
+    return {"macro_regions": macro_regions, "micro_checks": micro_checks}
+
 def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ReviewEvidenceError(f"{role} returned invalid evidence", field="evidence")
@@ -319,6 +533,7 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
     critical_regions: List[Dict[str, Any]] = []
     regressions: List[str] = []
     ranked_changes: List[str] = []
+    source_inventory: Dict[str, Any] = {}
     declared_decision = None
     if role == "comparator":
         raw_macro = value.get("macro")
@@ -354,11 +569,12 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
             raise ReviewEvidenceError("comparator regressions must be a string list", field="regressions")
         regressions = [item.strip() for item in raw_regressions]
         raw_ranked = value.get("ranked_changes")
-        if not isinstance(raw_ranked, list) or len(raw_ranked) > 3 or not all(
+        if not isinstance(raw_ranked, list) or len(raw_ranked) > MAX_COMPARATOR_REQUIRED_CHANGES or not all(
             isinstance(item, str) and item.strip() for item in raw_ranked
         ):
             raise ReviewEvidenceError(
-                "comparator ranked_changes must contain at most three strings", field="ranked_changes"
+                f"comparator ranked_changes must contain at most {MAX_COMPARATOR_REQUIRED_CHANGES} strings",
+                field="ranked_changes",
             )
         ranked_changes = [item.strip() for item in raw_ranked]
         declared_decision = value.get("decision", value.get("declared_decision"))
@@ -376,6 +592,11 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
             raise AdTemplateProcessError(f"{role} must provide a concrete required_changes list")
         differences = [item.strip() for item in differences]
         required_changes = [item.strip() for item in required_changes]
+        if role == "comparator" and len(required_changes) > MAX_COMPARATOR_REQUIRED_CHANGES:
+            raise ReviewEvidenceError(
+                f"comparator required_changes must contain at most {MAX_COMPARATOR_REQUIRED_CHANGES} strings",
+                field="required_changes",
+            )
         preliminary_score = sum(scores.values()) / len(scores)
         if (
             role == "comparator"
@@ -398,6 +619,12 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
             raise AdTemplateProcessError(
                 "comparator ranked_changes must exactly equal required_changes in priority order"
             )
+        if role == "comparator":
+            source_inventory = _comparator_source_inventory(
+                value.get("source_inventory"),
+                differences=differences,
+                required_changes=required_changes,
+            )
     score = round(sum(scores.values()) / len(scores), 2)
     critical_blocker = any(item["status"] == "blocker" for item in critical_regions)
     macro_regression = bool(regressions)
@@ -415,6 +642,7 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
         **({
             "macro": macro, "critical_regions": critical_regions,
             "regressions": regressions, "ranked_changes": ranked_changes,
+            "source_inventory": source_inventory,
             "declared_decision": declared_decision,
             "critical_blocker": critical_blocker, "macro_regression": macro_regression,
         } if role == "comparator" else {}),
@@ -1746,7 +1974,7 @@ def review_prompt(*, final: bool, candidate: Any = None, has_previous_best: bool
         if final
         else
         "Return JSON only with exactly reason, differences, required_changes, ranked_changes, visible_strings, "
-        "macro, critical_regions, regressions, decision, hard_failures, and rubric."
+        "source_inventory, macro, critical_regions, regressions, decision, hard_failures, and rubric."
     )
     image_order = (
         "(1) source, (2) immutable previous-best Feed, (3) immutable previous-best Story, "
@@ -1767,8 +1995,9 @@ def review_prompt(*, final: bool, candidate: Any = None, has_previous_best: bool
         "placeholders, and duplicate media. critical_regions is a non-empty list of objects shaped exactly "
         '{"region":"name","status":"pass|blocker","findings":[]}. '
         f"{previous_best_clause} Any regression or critical blocker forces revise regardless of the mean. decision "
-        "is accept or revise. ranked_changes contains at most three highest-impact changes and must exactly equal "
-        "required_changes in the same priority order."
+        "is accept or revise. ranked_changes must exactly equal required_changes in the same priority order; include "
+        f"every material repair (up to {MAX_COMPARATOR_REQUIRED_CHANGES}), not merely the top three. source_inventory "
+        "is the mandatory exhaustive source-versus-candidate inspection described below."
     )
     return f"""You are the {role} in a source-matching loop. The attached images are ordered: {image_order}. Inspect the actual pixels together. The primary objective is not generic ad quality; it is faithful reconstruction of the source design as editable layers.
 
@@ -1776,7 +2005,11 @@ Compare source versus Feed region by region: outer frame and margins; header/tit
 
 Use this scale strictly: 10.0 means the Feed is visually indistinguishable in structure at thumbnail size except permitted neutral content substitutions; 9.5 means only tiny finishing differences remain; 9.0 still has clearly visible spacing, scale, typography, or geometry differences; 8.0 is recognisably based on the source but materially different; 5.0 is merely the same category; 0 is missing or invalid. Do not award 9.5 to a design that a person can immediately distinguish from the source.
 
-{output_contract} {hierarchical_contract} visible_strings must be exactly an object with source, feed, and story arrays. Transcribe every visibly rendered word, number, currency value, CTA and logo wordmark in reading order; preserve visible splitting, missing glyphs and truncation exactly (for example, a broken HOUSE rendered as H U / O S / E must be transcribed that way, not silently corrected). differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. required_changes is the ordered list of material work the builder should apply next. {change_list_contract} Every required_changes string must use this exact actionable structure: placement=feed|story; layers=comma-separated layerIds; current={{x:...,y:...,width:...,height:...}}; target={{x:...,y:...,width:...,height:...}}; change=specific instruction. Name all affected layer IDs and use their current and intended target geometry. Copy current geometry exactly from Candidate contract JSON, then check every proposed target rectangle against every existing layer before returning it. Never propose a target that newly overlaps an image slot or opaque vector panel with another image slot unless that overlap is visibly present in the source and the change text explicitly identifies and justifies the source-visible overlap. Use a separate required_changes item when affected layers do not share identical current and target geometry. hard_failures is a list. rubric contains exactly these eight 0-10 numbers: feed_source_likeness, layout_geometry, spacing_proportions, typography_likeness, colour_likeness, image_slot_composition, editable_decomposition, native_story_translation. A passing candidate requires feed_source_likeness >= {THRESHOLD}, mean >= {THRESHOLD}, every field{'' if final else ' and every macro field'} >= {MIN_RUBRIC_SCORE}, no critical-region blocker, no regression, no hard failure, and no required change.
+{output_contract} {hierarchical_contract} visible_strings must be exactly an object with source, feed, and story arrays. Transcribe every visibly rendered word, number, currency value, CTA and logo wordmark in reading order; preserve visible splitting, missing glyphs and truncation exactly (for example, a broken HOUSE rendered as H U / O S / E must be transcribed that way, not silently corrected). differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. Every differences string must also appear verbatim in one source_inventory findings array. required_changes is the ordered list of all material work the builder should apply next. {change_list_contract} Every required_changes string must use this exact actionable structure: placement=feed|story; layers=comma-separated layerIds; current={{x:...,y:...,width:...,height:...}}; target={{x:...,y:...,width:...,height:...}}; change=specific instruction. Name all affected layer IDs and use their current and intended target geometry. Copy current geometry exactly from Candidate contract JSON, then check every proposed target rectangle against every existing layer before returning it. Never propose a target that newly overlaps an image slot or opaque vector panel with another image slot unless that overlap is visibly present in the source and the change text explicitly identifies and justifies the source-visible overlap. Use a separate required_changes item when affected layers do not share identical current and target geometry.
+
+For the comparator only, source_inventory must contain exactly macro_regions and micro_checks. macro_regions must contain these entries exactly once and in this order: frame_header, hero_offer_panel, image_gallery, about_features, contact_footer, story_recomposition. Each entry has exactly region, source_components, feed_components, story_components, source_count, feed_count, story_count, status, material, findings, required_change_refs. The component fields are arrays of visible component descriptions; each count is a non-negative integer exactly equal to its array length. micro_checks must contain these entries exactly once and in this order: brand_text, dividers, bullet_count_stacking, typography_spacing, overlap, punctuation. Each entry has exactly check, source_observation, feed_observation, story_observation, status, material, findings, required_change_refs. status is match or mismatch; material is boolean. A match has findings=[] and required_change_refs=[]. A mismatch has concrete findings. Every material mismatch has one or more 1-based required_change_refs pointing into required_changes; a non-material mismatch has none. Every required_change must be referenced. Inspect brand_text for a source-visible wordmark or brand-role text footprint and require a coherent neutral editable replacement when identity substitution is permitted; an icon alone does not replace source-visible brand text. Count divider rules and state their orientation/position. Count bullet glyphs and separately count stacked visible bullet lines; run-on bullets are not stacked. Compare type family/style/weight/scale/tracking/line height and region spacing. Report every visible overlap, including text crowding even when pixel bounds pass. Compare punctuation character-for-character for otherwise corresponding visible strings, including price separators. Do not mark any of these six checks match without recording what is visibly present in source, Feed, and Story.
+
+hard_failures is a list. rubric contains exactly these eight 0-10 numbers: feed_source_likeness, layout_geometry, spacing_proportions, typography_likeness, colour_likeness, image_slot_composition, editable_decomposition, native_story_translation. A passing candidate requires feed_source_likeness >= {THRESHOLD}, mean >= {THRESHOLD}, every field{'' if final else ' and every macro field'} >= {MIN_RUBRIC_SCORE}, no critical-region blocker, no regression, no hard failure, and no required change.
 
 Hard-fail source pixels flattened into the output, copied advertiser identity, missing/unreadable renders, any missing/split/clipped/truncated/garbled visible text, a malformed or blank logo, repeated/wrong photographs, canvas/safe-zone violations, non-editable critical roles, unknown assets, a stretched/cropped/letterboxed Story, or a Story that repeats the Feed topology instead of reflowing major groups for 9:16. The numeric tracking field in Candidate JSON is absolute canvas pixels, never em, percent, or a font-size multiplier. Inspect both native Feed/Story renders and any subsequently attached Meta-shell previews; a shell-only defect is still a defect. Do not infer another reviewer's score. Candidate contract JSON: {candidate_context}"""
 
@@ -2108,6 +2341,10 @@ class SoleProcessOrchestrator:
                         "change=<concrete instruction>. Current geometry must match the current layered document. "
                         "Target geometry must remain on-canvas and must not introduce a new opaque overlap unless "
                         "that overlap is visible in the source and the change explicitly says source overlap. "
+                        "This is schema/self-consistency correction of the same comparison, not a second review. "
+                        "Return the complete source_inventory with every mandatory macro region and micro check; "
+                        "map every material mismatch to concrete required_changes and every required_change back "
+                        "to at least one mismatch. Every differences string must appear verbatim in findings. "
                         "Return only the corrected JSON object."
                     )
                 try:
@@ -2223,6 +2460,7 @@ class SoleProcessOrchestrator:
                 "differences": evidence["differences"],
                 "required_changes": evidence["required_changes"],
                 "ranked_changes": evidence["ranked_changes"],
+                "source_inventory": evidence["source_inventory"],
                 "macro": evidence["macro"],
                 "critical_regions": evidence["critical_regions"],
                 "regressions": evidence["regressions"],
@@ -2237,6 +2475,7 @@ class SoleProcessOrchestrator:
                 "differences": evidence["differences"],
                 "required_changes": evidence["required_changes"],
                 "ranked_changes": evidence["ranked_changes"],
+                "source_inventory": evidence["source_inventory"],
                 "macro": evidence["macro"],
                 "critical_regions": evidence["critical_regions"],
                 "regressions": evidence["regressions"],

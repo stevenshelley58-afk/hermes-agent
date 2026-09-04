@@ -21,6 +21,38 @@ def evidence(score=9.4, reason="Improve spacing"):
         f"change={reason}"
     )
     required_changes = [actionable_change] if score < 9.5 else []
+    differences = [reason] if score < 9.5 else []
+    source_inventory = {
+        "macro_regions": [
+            {
+                "region": region,
+                "source_components": [region],
+                "feed_components": [region],
+                "story_components": [region],
+                "source_count": 1,
+                "feed_count": 1,
+                "story_count": 1,
+                "status": "match",
+                "material": False,
+                "findings": [],
+                "required_change_refs": [],
+            }
+            for region in process.COMPARATOR_MACRO_INVENTORY_REGIONS
+        ],
+        "micro_checks": [
+            {
+                "check": check,
+                "source_observation": f"source {check}",
+                "feed_observation": f"feed {check}",
+                "story_observation": f"story {check}",
+                "status": "mismatch" if differences and check == "typography_spacing" else "match",
+                "material": bool(differences and check == "typography_spacing"),
+                "findings": differences if differences and check == "typography_spacing" else [],
+                "required_change_refs": [1] if differences and check == "typography_spacing" else [],
+            }
+            for check in process.COMPARATOR_MICRO_INVENTORY_CHECKS
+        ],
+    }
     return {
         "rubric": {field: score for field in process.RUBRIC_FIELDS},
         "macro": {field: score for field in process.MACRO_FIELDS},
@@ -29,13 +61,30 @@ def evidence(score=9.4, reason="Improve spacing"):
         "ranked_changes": required_changes,
         "decision": "accept" if score >= 9.5 else "revise",
         "reason": reason,
-        "differences": [reason] if score < 9.5 else [],
+        "differences": differences,
         "required_changes": required_changes,
         "hard_failures": [],
         "visible_strings": {
             "source": ["SOURCE"], "feed": ["FEED"], "story": ["STORY"],
         },
+        "source_inventory": source_inventory,
     }
+
+def remap_inventory(review, *, check="typography_spacing"):
+    """Keep a mutated test review's inventory aligned with its material changes."""
+    findings = list(review.get("differences") or [])
+    refs = list(range(1, len(review.get("required_changes") or []) + 1))
+    for item in review["source_inventory"]["macro_regions"]:
+        item.update(status="match", material=False, findings=[], required_change_refs=[])
+    for item in review["source_inventory"]["micro_checks"]:
+        is_target = item["check"] == check and bool(findings or refs)
+        item.update(
+            status="mismatch" if is_target else "match",
+            material=bool(is_target and refs),
+            findings=findings if is_target else [],
+            required_change_refs=refs if is_target else [],
+        )
+    return review
 
 def iteration(score=9.4, number=1):
     return {"iteration": number, "comparison": evidence(score), "decision": "accepted" if score >= 9.5 else "revise"}
@@ -138,6 +187,7 @@ def test_quality_gate_rejects_one_weak_dimension_even_when_mean_passes():
     ]
     weak["ranked_changes"] = weak["required_changes"]
     weak["decision"] = "revise"
+    remap_inventory(weak)
     record = validate_iterations([{"iteration": 1, "comparison": weak, "decision": "revise"}])[0]
     assert record["comparison"]["score"] >= process.THRESHOLD
     assert record["comparison"]["minimum_score"] == 9.1
@@ -230,7 +280,9 @@ def test_source_match_and_concrete_change_list_are_hard_gates():
         "target={x:72,y:1140,width:936,height:120}; change=Reduce footer height to match the source"
     ]
     unfinished["ranked_changes"] = unfinished["required_changes"]
+    unfinished["differences"] = ["Footer remains too tall"]
     unfinished["decision"] = "revise"
+    remap_inventory(unfinished)
     record = validate_iterations([
         {"iteration": 1, "comparison": unfinished, "decision": "revise"}
     ])[0]
@@ -394,6 +446,10 @@ def test_comparator_retries_self_inconsistent_overlap_and_persists_event(tmp_pat
     retry_prompt = next(prompt for name, prompt in calls if name == "comparator-1-retry-1")
     assert "previous response was rejected" in retry_prompt
     assert "feed-hero and feed-thumb-1" in retry_prompt
+    assert "schema/self-consistency correction of the same comparison" in retry_prompt
+    compared_events = [data for kind, data in events if kind == "iteration.compared"]
+    assert len(compared_events) == 1
+    assert compared_events[0]["source_inventory"] == result["iterations"][0]["comparison"]["source_inventory"]
     assert result["iterations"][0]["decision"] == "accepted"
 
 
@@ -1016,10 +1072,58 @@ def test_hierarchical_comparator_blocks_regression_and_critical_region_despite_h
     assert process._passes_quality_gate(parsed) is False
 
 
-def test_hierarchical_comparator_rejects_more_than_three_ranked_changes():
+def test_hierarchical_comparator_keeps_all_material_changes_beyond_top_three():
     review = evidence(9.0)
-    review["ranked_changes"] = review["required_changes"] * 4
-    with pytest.raises(process.ReviewEvidenceError, match="at most three"):
+    review["required_changes"] *= 4
+    review["ranked_changes"] = list(review["required_changes"])
+    remap_inventory(review)
+    parsed = process._assessment(review, "comparator", require_change_list=True)
+    assert len(parsed["required_changes"]) == 4
+
+
+def test_comparator_inventory_requires_all_explicit_micro_checks_and_change_coverage():
+    missing_check = evidence(9.0, "Missing source-visible neutral brand text")
+    missing_check["source_inventory"]["micro_checks"] = [
+        item for item in missing_check["source_inventory"]["micro_checks"]
+        if item["check"] != "brand_text"
+    ]
+    with pytest.raises(
+        process.ComparatorSelfConsistencyError,
+        match="must cover brand text, dividers, bullet count/stacking",
+    ):
+        process._assessment(missing_check, "comparator", require_change_list=True)
+
+    uncovered = evidence(9.0, "Divider missing between About and Features")
+    uncovered["source_inventory"]["micro_checks"][3].update(
+        status="mismatch", material=True,
+        findings=["Divider missing between About and Features"],
+        required_change_refs=[],
+    )
+    with pytest.raises(
+        process.ComparatorSelfConsistencyError,
+        match="material mismatch must map to a concrete required_change",
+    ):
+        process._assessment(uncovered, "comparator", require_change_list=True)
+
+
+def test_comparator_inventory_requires_verbatim_difference_and_every_change_reference():
+    review = evidence(9.0, "Six source bullets collapsed into two run-on lines")
+    review["differences"] = [
+        *review["differences"], "Price punctuation differs from the source",
+    ]
+    with pytest.raises(
+        process.ComparatorSelfConsistencyError,
+        match="differences must each appear verbatim",
+    ):
+        process._assessment(review, "comparator", require_change_list=True)
+
+    review = evidence(9.0, "Six source bullets collapsed into two run-on lines")
+    review["required_changes"].append(review["required_changes"][0])
+    review["ranked_changes"] = list(review["required_changes"])
+    with pytest.raises(
+        process.ComparatorSelfConsistencyError,
+        match="required_changes must each be referenced",
+    ):
         process._assessment(review, "comparator", require_change_list=True)
 
 
