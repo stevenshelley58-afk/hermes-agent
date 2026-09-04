@@ -2779,7 +2779,10 @@ def test_non_json_first_final_reviewer_escalates_to_quality_route_without_rebuil
     assert len(renders) == 1 and len(imports) == 1
 
 
-def test_exhausted_non_json_final_b_falls_back_once_to_independent_quality_route(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failure_kind", ["non_json", "schema_invalid"])
+def test_exhausted_invalid_final_b_falls_back_once_to_independent_quality_route(
+    tmp_path, monkeypatch, failure_kind,
+):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
     calls, events, renders, imports = [], [], [], []
@@ -2791,9 +2794,13 @@ def test_exhausted_non_json_final_b_falls_back_once_to_independent_quality_route
         if instance.startswith("comparator-"):
             return evidence(9.7, "Comparator pass")
         if route == "deepseek/deepseek-v4-flash-vision-exp":
-            raise process.AdTemplateStructuredOutputError(
-                "Builder did not return one structured JSON result"
-            )
+            if failure_kind == "non_json":
+                raise process.AdTemplateStructuredOutputError(
+                    "Builder did not return one structured JSON result"
+                )
+            invalid = evidence(9.7, "Invalid final evidence")
+            invalid["differences"] = "not-a-list"
+            return invalid
         return evidence(9.7, "Independent final pass")
 
     monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
