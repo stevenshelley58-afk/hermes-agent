@@ -9,7 +9,7 @@ It contains editable-input defaults, not finished ads or source-ad pixels.
   `fb6d88911fc0bbe748c4dd24e17366345cf9624a`, whose commit message explicitly
   describes its fixture assets as safe and fictional. Each manifest entry binds
   the original repository path and source SHA-256.
-- The six neutral placeholders are project-owned SVG drawings in `sources/`.
+- The neutral placeholders are project-owned SVG drawings in `sources/`.
   They contain no copied pixels, text, contact details, faces, or advertiser
   identity. The committed raster output and its SVG master are both bound in
   the manifest.

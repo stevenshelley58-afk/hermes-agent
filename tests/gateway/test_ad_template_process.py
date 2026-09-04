@@ -2,6 +2,7 @@ import base64
 import json
 import re
 import shlex
+import shutil
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -928,6 +929,82 @@ def test_catalog_asset_resolution_rejects_unknown_and_traversal(tmp_path, monkey
     with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets({"schema": "blockwise.ad-template", "assets": {"x": {"fileName": "../property-photo.webp", "mimeType": "image/webp"}}}, [{"assetKey": "x", "fileName": "../property-photo.webp", "mimeType": "image/webp"}])
     with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets(template, [{"assetKey": "property-photo", "fileName": "interior/kitchen.webp", "mimeType": "image/png"}])
     with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets(template, [{"assetKey": "property-photo", "fileName": "interior/kitchen.webp", "mimeType": "image/webp", "bytesBase64": ""}])
+
+
+def test_required_logo_capability_fails_before_provider_iteration(tmp_path, monkeypatch):
+    committed = (
+        Path(process.__file__).resolve().parents[1]
+        / "assets" / "ad-template-generator" / "catalog"
+    )
+    catalog = tmp_path / "catalog-without-multi-gable"
+    shutil.copytree(committed, catalog)
+    (catalog / "brand" / "neutral-multi-gable.png").unlink()
+    manifest_path = catalog / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["assets"] = [
+        asset for asset in manifest["assets"]
+        if asset["fileName"] != "brand/neutral-multi-gable.png"
+    ]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setenv("AD_TEMPLATE_ASSET_CATALOG_DIR", str(catalog))
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    provider_calls = []
+    brief = (
+        "Emblem must be the source-free transparent multi-peak/two-gable silhouette; "
+        "generic single-roof or baked cream backdrop fails. "
+        "C15_TAIL_SENTINEL=TWO_GABLE_ONLY."
+    )
+
+    with pytest.raises(
+        AdTemplateProcessError,
+        match="add one source-free allowlisted brand/logo asset with roles=multi_peak,two_gable",
+    ):
+        SoleProcessOrchestrator(
+            call_agent=lambda *args: provider_calls.append(args),
+            workspace=tmp_path / "run",
+            run_id="trun_capability_missing",
+            project_id="blockwise",
+            emit=lambda *_args: None,
+        ).run(
+            source=str(source), brief=brief, placements=["feed", "story"],
+            routes=_quality_routes(),
+        )
+
+    assert provider_calls == []
+
+
+def test_required_logo_capability_reaches_provider_when_allowlisted(tmp_path, monkeypatch):
+    catalog = (
+        Path(process.__file__).resolve().parents[1]
+        / "assets" / "ad-template-generator" / "catalog"
+    )
+    monkeypatch.setenv("AD_TEMPLATE_ASSET_CATALOG_DIR", str(catalog))
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    provider_calls = []
+    brief = (
+        "Emblem must be the source-free transparent multi-peak/two-gable silhouette; "
+        "generic single-roof or baked cream backdrop fails."
+    )
+
+    def provider_reached(*args):
+        provider_calls.append(args)
+        raise RuntimeError("provider reached")
+
+    with pytest.raises(RuntimeError, match="provider reached"):
+        SoleProcessOrchestrator(
+            call_agent=provider_reached,
+            workspace=tmp_path / "run",
+            run_id="trun_capability_present",
+            project_id="blockwise",
+            emit=lambda *_args: None,
+        ).run(
+            source=str(source), brief=brief, placements=["feed", "story"],
+            routes=_quality_routes(),
+        )
+
+    assert provider_calls and provider_calls[0][0] == "builder-1"
 
 
 def test_builder_contract_is_strict_and_prompts_require_quality_scores():

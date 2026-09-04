@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="800" viewBox="0 0 1600 800">
+  <defs>
+    <linearGradient id="mountain" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4f7690"/>
+      <stop offset="1" stop-color="#315a73"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#244d59"/>
+      <stop offset="1" stop-color="#17333c"/>
+    </linearGradient>
+  </defs>
+  <path d="M130 390 360 118 510 286 710 58 1010 390Z" fill="url(#mountain)"/>
+  <path d="M566 390 820 130 1040 340 1168 202 1430 390Z" fill="#416b84"/>
+  <path d="M180 468 500 244 804 468" fill="none" stroke="url(#mark)" stroke-width="66" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M292 444v238h416V444L500 300Z" fill="#ffffff" stroke="#17333c" stroke-width="46" stroke-linejoin="round"/>
+  <path d="M664 482 974 274 1418 482" fill="none" stroke="url(#mark)" stroke-width="66" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M774 456v226h534V456L974 330Z" fill="#ffffff" stroke="#17333c" stroke-width="46" stroke-linejoin="round"/>
+  <rect x="408" y="482" width="84" height="82" rx="10" fill="#c98a4a"/>
+  <rect x="538" y="482" width="84" height="82" rx="10" fill="#c98a4a"/>
+  <rect x="886" y="494" width="92" height="82" rx="10" fill="#c98a4a"/>
+  <rect x="1034" y="494" width="92" height="82" rx="10" fill="#c98a4a"/>
+  <rect x="1178" y="492" width="72" height="190" rx="14" fill="#c98a4a"/>
+  <circle cx="1195" cy="586" r="7" fill="#ffffff"/>
+</svg>

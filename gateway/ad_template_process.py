@@ -66,6 +66,37 @@ def _runtime_safe_asset_catalog() -> SafeAssetCatalog:
     except (CatalogIntegrityError, FileNotFoundError, OSError) as exc:
         raise AdTemplateProcessError(f"safe asset catalog is invalid: {exc}") from exc
 
+
+_BRIEF_LOGO_CAPABILITY_PATTERNS = {
+    "multi_peak": re.compile(r"\bmulti[-_\s]?peak\b", re.IGNORECASE),
+    "two_gable": re.compile(r"\b(?:two|dual)[-_\s]?(?:gable|roof)\b", re.IGNORECASE),
+}
+
+
+def _validate_brief_asset_capabilities(
+    brief: str, catalog: SafeAssetCatalog | None = None,
+) -> None:
+    """Fail before provider work when a required logo has no allowlisted implementation."""
+    if not re.search(r"\b(?:emblem|logo|silhouette)\b", brief, re.IGNORECASE):
+        return
+    required_roles = {
+        role for role, pattern in _BRIEF_LOGO_CAPABILITY_PATTERNS.items()
+        if pattern.search(brief)
+    }
+    if not required_roles:
+        return
+    safe_catalog = catalog or _runtime_safe_asset_catalog()
+    for asset in safe_catalog.assets.values():
+        roles = set(asset.roles)
+        if {"brand_mark", "logo", *required_roles} <= roles:
+            return
+    requirements = ",".join(sorted(required_roles))
+    raise AdTemplateProcessError(
+        "safe asset catalog cannot satisfy immutable brief logo silhouette requirements: "
+        f"add one source-free allowlisted brand/logo asset with roles={requirements} "
+        "before starting a provider iteration"
+    )
+
 class ReviewEvidenceError(AdTemplateProcessError):
     """A safely classifiable mandatory review-evidence schema failure."""
 
@@ -2815,6 +2846,7 @@ class SoleProcessOrchestrator:
 
     def run(self, *, source: str, brief: str, placements: Any, routes: List[Dict[str, str]], review_round: int = 0, total_iterations: int = 0, feedback: str = "", history: List[Dict[str, Any]] | None = None, revision_candidate: Mapping[str, Any] | None = None, selected_builder_route: Mapping[str, str] | None = None, builder_escalated: bool = False, previous_score: float | None = None, low_gain_streak: int = 0, require_quality_route: bool = False, resume_final_check: bool = False, best_iteration: int | None = None, best_quality_score: float | None = None) -> Dict[str, Any]:
         if len(routes) < 4: raise AdTemplateProcessError("builder, comparator, and two final reviewers require four configured roles")
+        _validate_brief_asset_capabilities(brief)
         quality_route = routes[4] if len(routes) > 4 else None
         if require_quality_route and quality_route is None:
             raise AdTemplateProcessError("automatic builder quality escalation requires a configured quality route")

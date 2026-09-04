@@ -38,9 +38,14 @@ def test_committed_catalog_covers_required_roles_and_resolves_exact_bytes() -> N
         "lounge",
         "coastal_home",
         "sunset_exterior",
+        "multi_peak",
+        "two_gable",
     } <= roles
-    assert len(catalog.assets) == 17
-    assert len(catalog.prompt_lines()) == 17
+    assert len(catalog.prompt_lines()) == len(catalog.assets)
+    assert any(
+        {"brand_mark", "logo", "multi_peak", "two_gable"} <= set(asset.roles)
+        for asset in catalog.assets.values()
+    )
 
     resolved = resolve_declared_assets(
         catalog,
@@ -54,6 +59,19 @@ def test_committed_catalog_covers_required_roles_and_resolves_exact_bytes() -> N
     )
     assert resolved[0]["assetKey"] == "kitchen-default"
     assert resolved[0]["bytesBase64"]
+
+    logo = resolve_declared_assets(
+        catalog,
+        (
+            {
+                "assetKey": "multi-gable-logo",
+                "fileName": "brand/neutral-multi-gable.png",
+                "mimeType": "image/png",
+            },
+        ),
+    )
+    assert logo[0]["assetKey"] == "multi-gable-logo"
+    assert logo[0]["bytesBase64"].startswith("iVBOR")
 
 
 def test_catalog_rejects_tampered_asset_bytes(tmp_path: Path) -> None:

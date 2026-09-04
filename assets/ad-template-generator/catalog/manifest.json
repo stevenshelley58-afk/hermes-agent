@@ -1,7 +1,25 @@
 {
   "schema": "blockwise.ad-template-safe-asset-catalog",
-  "version": "2026-09-04.1",
+  "version": "2026-09-05.1-multi-gable",
   "assets": [
+    {
+      "fileName": "brand/neutral-multi-gable.png",
+      "mimeType": "image/png",
+      "sha256": "c3325f0d76ccfdbcb843f0008aa2355c06e3e8d17bbd7eb95f9af4ef3aa33032",
+      "byteSize": 22128,
+      "width": 1600,
+      "height": 800,
+      "roles": ["brand_mark", "logo", "multi_peak", "two_gable"],
+      "visualFamilies": ["neutral-brand-multi-gable"],
+      "usage": "neutral-placeholder",
+      "provenance": {
+        "kind": "procedural-svg",
+        "sourceFile": "assets/ad-template-generator/sources/neutral-multi-gable.svg",
+        "sourceSha256": "9b6eed97d278436dec6de3d80dca40fe934fed9ec33b19ceea95637ba33f5ab5",
+        "renderer": "sharp 0.35.4",
+        "license": "project-owned-original"
+      }
+    },
     {
       "fileName": "brand/neutral-real-estate.png",
       "mimeType": "image/png",
