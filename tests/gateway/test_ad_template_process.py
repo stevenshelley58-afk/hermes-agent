@@ -1,9 +1,10 @@
+import base64
+import io
 import json
-import os
-import shlex
 import sys
 from pathlib import Path
 import pytest
+from PIL import Image
 import gateway.ad_template_process as process
 from gateway.ad_template_process import (
     AdTemplateProcessError, deterministic_documents, import_template,
@@ -11,8 +12,46 @@ from gateway.ad_template_process import (
 )
 from gateway.tool_run_api import ToolRunAPIMixin
 
-def evidence(score=9.4, reason="Improve spacing"):
-    return {"rubric": {field: score for field in process.RUBRIC_FIELDS}, "reason": reason}
+def evidence(score=9.4, reason="Improve spacing", *, best_available=False, axes=None, changes=None):
+    axis_states = axes or {
+        "macro_topology": {"decision": "pass", "reason": "The macro composition is coherent"},
+        "micro_typography_legibility": {"decision": "pass", "reason": "The typography is legible"},
+    }
+    return {
+        "rubric": {field: score for field in process.RUBRIC_FIELDS},
+        "reason": reason,
+        "hard_failures": [],
+        "visual_evidence": {
+            "regions": {
+                placement: [{
+                    "bbox": {"x": 0.05, "y": 0.05, "width": 0.9, "height": 0.7},
+                    "kind": "photo",
+                    "semantic_role": "property hero",
+                    "ocr_text": "",
+                    "content_state": "meaningful",
+                }]
+                for placement in ("source", "feed", "story")
+            },
+            "axes": axis_states,
+            "best_so_far": {
+                "available": best_available,
+                "macro_topology": "equivalent" if best_available else "not_applicable",
+                "micro_typography_legibility": "equivalent" if best_available else "not_applicable",
+                "preferred": "current",
+            },
+            "changes": changes or [],
+            "rendered_checks": {
+                "judged_rendered_pixels": True,
+                "identity_treatment": "meaningful_editable_identity",
+                "story_space": "functional_composition",
+            },
+        },
+        "rendered_pixel_checks": {
+            "judged_rendered_pixels": True,
+            "identity_treatment": "meaningful_editable_identity",
+            "story_space": "functional_composition",
+        },
+    }
 
 def iteration(score=9.4, number=1):
     return {"iteration": number, "comparison": evidence(score), "decision": "accepted" if score >= 9.5 else "revise"}
@@ -56,8 +95,8 @@ def fake_render(candidate, workspace, calls):
     workspace.mkdir(parents=True, exist_ok=True)
     feed = workspace / "feed.png"
     story = workspace / "story.png"
-    feed.write_bytes(b"feed")
-    story.write_bytes(b"story")
+    Image.new("RGB", (1080, 1350), "white").save(feed, format="PNG")
+    Image.new("RGB", (1080, 1920), "white").save(story, format="PNG")
     return {
         "template": candidate["template"], "assets": candidate["assets"],
         "previews": [
@@ -88,6 +127,238 @@ def test_quality_gate_rejects_one_weak_dimension_even_when_mean_passes():
         {"id": "reviewer-b", "route": "b/m", **evidence(9.8, "Strong")},
     ]
     assert validate_final_review({"reviewers": reviewers}, accepted=True)["decision"] == "revise"
+
+
+def test_final_review_pixel_checks_fail_empty_logo_and_dead_story_band():
+    empty_logo = evidence(9.9, "The rendered pixels contain an empty logo frame")
+    empty_logo["rendered_pixel_checks"]["identity_treatment"] = "empty_visible_placeholder"
+    clean = evidence(9.9, "Rendered logo and Story composition are complete")
+    result = validate_final_review(
+        {"reviewers": [
+            {"id": "reviewer-a", "route": "a/m", **empty_logo},
+            {"id": "reviewer-b", "route": "b/m", **clean},
+        ]},
+        accepted=True,
+        require_rendered_pixel_checks=True,
+    )
+    assert result["decision"] == "revise"
+    assert result["reviewers"][0]["score"] == 0.0
+    assert "empty visible identity, logo, or mask placeholder" in result["reviewers"][0]["hard_failures"][0].lower()
+
+    dead_story = evidence(10.0, "The Story ends in a large decorative blank band")
+    dead_story["rendered_pixel_checks"]["story_space"] = "large_nonfunctional_dead_band"
+    result = validate_final_review(
+        {"reviewers": [
+            {"id": "reviewer-a", "route": "a/m", **dead_story},
+            {"id": "reviewer-b", "route": "b/m", **clean},
+        ]},
+        accepted=True,
+        require_rendered_pixel_checks=True,
+    )
+    assert result["decision"] == "revise"
+    assert result["reviewers"][0]["rubric"]["native_story"] == 9.1
+    assert result["reviewers"][0]["minimum_score"] == 9.1
+
+
+def test_final_review_pixel_checks_are_required_for_current_policy():
+    missing = evidence(9.9, "Looks complete")
+    missing.pop("rendered_pixel_checks")
+    with pytest.raises(AdTemplateProcessError, match="rendered_pixel_checks"):
+        validate_final_review(
+            {"reviewers": [
+                {"id": "reviewer-a", "route": "a/m", **missing},
+                {"id": "reviewer-b", "route": "b/m", **evidence(9.9, "Complete")},
+            ]},
+            accepted=True,
+            require_rendered_pixel_checks=True,
+        )
+
+
+def test_comparator_visual_evidence_is_normalized_and_placement_scoped():
+    candidate = valid_candidate("placement-scoped")
+    comparison = evidence(9.9, "Feed headline needs stronger hierarchy")
+    comparison["visual_evidence"]["axes"]["macro_topology"] = {
+        "decision": "revise",
+        "reason": "The Feed headline has no dominant relationship to the hero",
+    }
+    comparison["visual_evidence"]["changes"] = [{
+        "placement": "feed",
+        "level": "macro",
+        "target_layer_ids": ["feed-bg"],
+        "instruction": "Rebalance the Feed hero and headline region",
+    }]
+    assessed = process._assessment(
+        comparison,
+        "comparator",
+        require_visual_evidence=True,
+        candidate=candidate,
+        best_available=False,
+    )
+    assert assessed["visual_evidence"]["regions"]["feed"][0]["bbox"] == {
+        "x": 0.05, "y": 0.05, "width": 0.9, "height": 0.7,
+    }
+    assert assessed["minimum_score"] == 9.1
+
+    wrong_placement = json.loads(json.dumps(comparison))
+    wrong_placement["visual_evidence"]["changes"][0]["target_layer_ids"] = ["story-bg"]
+    with pytest.raises(AdTemplateProcessError, match="must name only feed layers"):
+        process._assessment(
+            wrong_placement,
+            "comparator",
+            require_visual_evidence=True,
+            candidate=candidate,
+            best_available=False,
+        )
+
+    invalid_bbox = json.loads(json.dumps(comparison))
+    invalid_bbox["visual_evidence"]["regions"]["feed"][0]["bbox"]["width"] = 1.1
+    with pytest.raises(AdTemplateProcessError, match="normalized image bounds"):
+        process._assessment(
+            invalid_bbox,
+            "comparator",
+            require_visual_evidence=True,
+            candidate=candidate,
+            best_available=False,
+        )
+
+
+def test_comparator_preserves_best_on_either_macro_or_micro_regression():
+    candidate = valid_candidate("regression")
+    comparison = evidence(9.9, "Current typography regressed", best_available=True)
+    comparison["visual_evidence"]["best_so_far"].update(
+        macro_topology="improved",
+        micro_typography_legibility="regressed",
+        preferred="best",
+    )
+    assessed = process._assessment(
+        comparison,
+        "comparator",
+        require_visual_evidence=True,
+        candidate=candidate,
+        best_available=True,
+    )
+    assert assessed["minimum_score"] == 9.1
+    assert process._passes_quality_gate(assessed) is False
+
+    false_preference = json.loads(json.dumps(comparison))
+    false_preference["visual_evidence"]["best_so_far"]["preferred"] = "current"
+    with pytest.raises(AdTemplateProcessError, match="preserve the immutable best"):
+        process._assessment(
+            false_preference,
+            "comparator",
+            require_visual_evidence=True,
+            candidate=candidate,
+            best_available=True,
+        )
+
+
+def test_comparator_hard_fails_empty_identity_copied_contact_and_duplicate_facts():
+    candidate = valid_candidate("identity")
+    comparison = evidence(9.9, "Rendered identity and facts are not acceptable")
+    comparison["visual_evidence"]["regions"]["source"].append({
+        "bbox": {"x": 0.1, "y": 0.8, "width": 0.3, "height": 0.05},
+        "kind": "contact",
+        "semantic_role": "source agency email",
+        "ocr_text": "hello@reallygreatsite.com",
+        "content_state": "meaningful",
+    })
+    comparison["visual_evidence"]["regions"]["feed"].extend([
+        {
+            "bbox": {"x": 0.1, "y": 0.8, "width": 0.3, "height": 0.05},
+            "kind": "contact",
+            "semantic_role": "contact",
+            "ocr_text": "hello@reallygreatsite.com",
+            "content_state": "meaningful",
+        },
+        {
+            "bbox": {"x": 0.1, "y": 0.7, "width": 0.15, "height": 0.04},
+            "kind": "fact",
+            "semantic_role": "bedrooms",
+            "ocr_text": "2 bedrooms",
+            "content_state": "meaningful",
+        },
+        {
+            "bbox": {"x": 0.3, "y": 0.7, "width": 0.15, "height": 0.04},
+            "kind": "fact",
+            "semantic_role": "repeated bedrooms",
+            "ocr_text": "2 bedrooms",
+            "content_state": "meaningful",
+        },
+        {
+            "bbox": {"x": 0.75, "y": 0.05, "width": 0.2, "height": 0.1},
+            "kind": "mask",
+            "semantic_role": "brand placeholder",
+            "ocr_text": "",
+            "content_state": "empty_placeholder",
+        },
+    ])
+    assessed = process._assessment(
+        comparison,
+        "comparator",
+        require_visual_evidence=True,
+        candidate=candidate,
+        best_available=False,
+    )
+    assert assessed["score"] == 0.0
+    failures = " ".join(assessed["hard_failures"]).lower()
+    assert "copies source advertiser identity or contact text" in failures
+    assert "repeats a factual bullet" in failures
+    assert "empty visible identity, logo, or mask rectangle" in failures
+
+
+def test_story_safe_zone_applies_only_to_essential_layers():
+    candidate = valid_candidate("story-safe")
+    story = candidate["template"]["storyLayout"]
+    story["safeZones"] = [{"x": 72, "y": 240, "width": 936, "height": 1380}]
+    story["layers"].extend([
+        {
+            "type": "image_slot", "layerId": "story-full-bleed-photo", "inputKey": "hero",
+            "geometry": {"x": 0, "y": 0, "width": 1080, "height": 1920}, "mask": "none",
+            "minSourceWidth": 1080, "minSourceHeight": 1920,
+            "defaultCrop": {"x": 0, "y": 0, "width": 1, "height": 1},
+            "allowedPlacementOverrides": ["crop", "position"],
+        },
+        {
+            "type": "text", "layerId": "story-headline", "inputKey": "headline",
+            "font": {"file": "manrope-700.woff2"}, "fontSize": 72, "lineHeight": 1.1,
+            "tracking": 20, "alignment": "left", "maxCharacters": 80, "maxLines": 2,
+            "colourRole": "inverseText", "overflowBehaviour": "refuse",
+            "geometry": {"x": 72, "y": 260, "width": 700, "height": 180},
+        },
+    ])
+    candidate["template"]["imageInputs"] = [{
+        "key": "hero", "label": "Hero", "acceptedTypes": ["image/jpeg"],
+    }]
+    candidate["template"]["textInputs"] = [{
+        "key": "headline", "label": "Headline", "placeholder": "A better way home", "maxLength": 80,
+    }]
+    candidate["template"]["fonts"] = [{"file": "manrope-700.woff2"}]
+    assert process.validate_template_artifact(candidate["template"]) is candidate["template"]
+
+    candidate["template"]["storyLayout"]["layers"][-1]["geometry"]["y"] = 80
+    with pytest.raises(AdTemplateProcessError, match="essential text content"):
+        process.validate_template_artifact(candidate["template"])
+
+
+def test_final_review_is_bound_to_comparator_completion_iteration():
+    reviewers = [
+        {"id": "reviewer-a", "route": "a/m", **evidence(9.8, "Complete")},
+        {"id": "reviewer-b", "route": "b/m", **evidence(9.8, "Complete")},
+    ]
+    result = validate_final_review(
+        {"reviewers": reviewers, "completion_iteration": 3},
+        accepted=True,
+        require_rendered_pixel_checks=True,
+        completion_iteration=3,
+    )
+    assert result["completion_iteration"] == 3
+    with pytest.raises(AdTemplateProcessError, match="completion candidate"):
+        validate_final_review(
+            {"reviewers": reviewers, "completion_iteration": 2},
+            accepted=True,
+            require_rendered_pixel_checks=True,
+            completion_iteration=3,
+        )
 
 def test_bare_model_scores_are_rejected():
     with pytest.raises(AdTemplateProcessError):
@@ -120,15 +391,15 @@ def test_layered_documents_are_stable():
 
 def test_catalog_asset_resolution_rejects_unknown_and_traversal(tmp_path, monkeypatch):
     (tmp_path / "home").mkdir()
-    (tmp_path / "home" / "property-photo.webp").write_bytes(b"catalog-photo")
-    template = {"schema": "blockwise.ad-template", "assets": {"property-photo": {"fileName": "home/property-photo.webp", "mimeType": "image/webp"}}}
+    (tmp_path / "home" / "property-photo.png").write_bytes(b"catalog-photo")
+    template = {"schema": "blockwise.ad-template", "assets": {"property-photo": {"fileName": "home/property-photo.png", "mimeType": "image/png"}}}
     monkeypatch.setenv("AD_TEMPLATE_ASSET_CATALOG_DIR", str(tmp_path))
-    resolved = process.resolve_catalog_assets(template, [{"assetKey": "property-photo", "fileName": "home/property-photo.webp", "mimeType": "image/webp"}])
+    resolved = process.resolve_catalog_assets(template, [{"assetKey": "property-photo", "fileName": "home/property-photo.png", "mimeType": "image/png"}])
     assert resolved[0]["bytesBase64"] == "Y2F0YWxvZy1waG90bw=="
-    with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets(template, [{"assetKey": "missing", "fileName": "home/property-photo.webp", "mimeType": "image/webp"}])
-    with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets({"schema": "blockwise.ad-template", "assets": {"x": {"fileName": "../property-photo.webp", "mimeType": "image/webp"}}}, [{"assetKey": "x", "fileName": "../property-photo.webp", "mimeType": "image/webp"}])
-    with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets(template, [{"assetKey": "property-photo", "fileName": "home/property-photo.webp", "mimeType": "image/png"}])
-    with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets(template, [{"assetKey": "property-photo", "fileName": "home/property-photo.webp", "mimeType": "image/webp", "bytesBase64": ""}])
+    with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets(template, [{"assetKey": "missing", "fileName": "home/property-photo.png", "mimeType": "image/png"}])
+    with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets({"schema": "blockwise.ad-template", "assets": {"x": {"fileName": "../property-photo.png", "mimeType": "image/png"}}}, [{"assetKey": "x", "fileName": "../property-photo.png", "mimeType": "image/png"}])
+    with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets(template, [{"assetKey": "property-photo", "fileName": "home/property-photo.png", "mimeType": "image/jpeg"}])
+    with pytest.raises(AdTemplateProcessError): process.resolve_catalog_assets(template, [{"assetKey": "property-photo", "fileName": "home/property-photo.png", "mimeType": "image/png", "bytesBase64": ""}])
 
 
 def test_builder_contract_is_strict_and_prompts_require_quality_scores():
@@ -160,6 +431,18 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
         assert '"assetKey":"hero"' in prompt
         assert "privateNote" not in prompt
         assert "bytesBase64" not in prompt
+        if final:
+            assert "rendered_pixel_checks" in prompt
+            assert "identity_treatment" in prompt
+            assert "empty_visible_placeholder" in prompt
+            assert "large_nonfunctional_dead_band" in prompt
+            assert "Never infer" in prompt
+        else:
+            assert "rendered_pixel_checks" not in prompt
+            assert "visual_evidence" in prompt
+            assert "macro_topology" in prompt
+            assert "micro_typography_legibility" in prompt
+            assert "target_layer_ids" in prompt
     builder = process.generator_prompt(run_id="run", project_id="blockwise", brief="", placements=["feed", "story"], source="source.png")
     for key in process.METADATA_FIELDS:
         assert key in builder
@@ -175,11 +458,17 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
     assert 'fonts must always be a JSON list such as [{"file":"manrope-400.woff2"}' in builder
     assert "shape must be exactly one of rect, rounded, circle, line, pill, notched, wave, or ring" in builder
     assert "lineHeight is a unitless multiplier between 0.8 and 2.5" in builder
+    assert "tracking is additional letter spacing measured in native canvas pixels between -128 and 256" in builder
+    assert "preserve wider source-inspired display tracking" in builder
+    assert "never an em multiplier" in builder
+    assert "Never render an empty logo box" in builder
     assert "Every icon layer must use exactly arrow, check, phone, mail, globe, or pin" in builder
     assert "Every image_slot inputKey must be declared exactly once in imageInputs" in builder
     assert "real logo layer" in builder
     assert "one dominant idea" in builder
     assert "brochure density" in builder
+    assert "Never reintroduce a source identifier" in builder
+    assert "full-bleed photography" in builder
     assert "specialAdCategory must be HOUSING" in builder
     assert "Every text layer inputKey must be declared exactly once in textInputs" in builder
     assert 'Each realAssetRefs entry must contain exactly {"inputKey":"declaredKey"' in builder
@@ -253,6 +542,18 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
     invalid_line_height["feedLayout"]["layers"][1]["lineHeight"] = 29
     with pytest.raises(AdTemplateProcessError, match=r"feedLayout\.layers\[1\]\.lineHeight=29 must be a unitless multiplier between 0\.8 and 2\.5"):
         process.validate_template_artifact(invalid_line_height)
+
+    invalid_tracking = json.loads(json.dumps(invalid_text))
+    invalid_tracking["feedLayout"]["layers"][1]["overflowBehaviour"] = "truncate"
+    invalid_tracking["feedLayout"]["layers"][1]["tracking"] = 400
+    with pytest.raises(AdTemplateProcessError, match=r"tracking=400 must be sane native canvas pixels between -128 and 256, never an em multiplier"):
+        process.validate_template_artifact(invalid_tracking)
+    wide_tracking = json.loads(json.dumps(invalid_text))
+    wide_tracking["feedLayout"]["layers"][1]["overflowBehaviour"] = "truncate"
+    wide_tracking["feedLayout"]["layers"][1]["tracking"] = 36
+    wide_tracking["textInputs"] = [{"key": "headline", "label": "Headline", "placeholder": "NEW", "maxLength": 80}]
+    wide_tracking["fonts"] = [{"file": "manrope-700.woff2"}]
+    assert process.validate_template_artifact(wide_tracking) is wide_tracking
     invalid_vector = json.loads(json.dumps(template))
     invalid_vector["feedLayout"]["layers"].append({
         "type": "vector", "layerId": "feed-rule",
@@ -303,10 +604,8 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
 def test_orchestrator_calls_real_roles_and_persists_receipts(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
-    renderer_command = os.environ.get("AD_TEMPLATE_GENERATOR_CMD") or (
-        f"/usr/bin/node {shlex.quote(str(Path('/projects/only-process-blockwise/packages/ad-template-renderer/dist/cli.js')))}"
-    )
-    monkeypatch.setenv("AD_TEMPLATE_GENERATOR_CMD", renderer_command)
+    renders = []
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
     monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: {"template_id": "tpl_real", "status": "imported"})
     calls = []
     events = []
@@ -353,6 +652,19 @@ def test_orchestrator_calls_real_roles_and_persists_receipts(tmp_path, monkeypat
 def test_vision_roles_reject_filename_only_inputs(tmp_path):
     with pytest.raises(AdTemplateProcessError):
         vision_message("inspect this", [str(tmp_path / "filename-only.png")])
+
+
+def test_bounded_vision_payload_preserves_useful_resolution_and_caps_bytes(tmp_path):
+    source = tmp_path / "large.png"
+    Image.effect_noise((2400, 2400), 100).convert("RGB").save(source, format="PNG")
+    message = vision_message("compare", [str(source)], bounded=True)
+    header, encoded = message[1]["image_url"]["url"].split(",", 1)
+    payload = base64.b64decode(encoded)
+    assert header == "data:image/jpeg;base64"
+    assert len(payload) <= process.VISION_MAX_SERIALIZED_IMAGE_BYTES
+    with Image.open(io.BytesIO(payload)) as rendered:
+        assert max(rendered.size) <= process.VISION_MAX_LONG_EDGE
+        assert min(rendered.size) >= 960
 
 
 def test_blockwise_import_contract_uses_bearer_and_camel_case_receipt(monkeypatch, tmp_path):
@@ -686,7 +998,7 @@ def test_visual_revision_prompt_carries_prior_valid_candidate(tmp_path, monkeypa
         if instance == "builder-2":
             return second
         if instance == "comparator-2":
-            return evidence(9.6, "Revision matches")
+            return evidence(9.6, "Revision matches", best_available=True)
         return evidence(9.7, "Independent final pass")
 
     def render_with_private_runtime_fields(candidate, workspace):
@@ -753,7 +1065,7 @@ def test_final_review_revision_prompt_carries_accepted_candidate(tmp_path, monke
         if instance == "builder-2":
             return second
         if instance.startswith("comparator-"):
-            return evidence(9.6, "Comparator pass")
+            return evidence(9.6, "Comparator pass", best_available=instance != "comparator-1")
         final_calls["count"] += 1
         if final_calls["count"] == 1:
             return evidence(9.0, "Final spacing needs revision")
@@ -872,7 +1184,7 @@ def test_builder_quality_escalation_ignores_steady_material_improvement(tmp_path
             builder_calls.append((instance, route, prompt[0]["text"]))
             return valid_candidate(f"steady-{len(builder_calls)}")
         if instance.startswith("comparator-"):
-            return evidence(next(scores), "Material improvement")
+            return evidence(next(scores), "Material improvement", best_available=instance != "comparator-1")
         return evidence(9.7, "Independent final pass")
 
     monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
@@ -904,7 +1216,7 @@ def test_builder_quality_escalates_on_regression_or_two_low_gains(tmp_path, monk
             builder_calls.append((instance, route, prompt[0]["text"]))
             return valid_candidate(f"candidate-{instance}")
         if instance.startswith("comparator-"):
-            return evidence(next(score_iter), f"comparison {instance}")
+            return evidence(next(score_iter), f"comparison {instance}", best_available=instance != "comparator-1")
         return evidence(9.7, "Independent final pass")
 
     monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
@@ -934,14 +1246,22 @@ def test_regressed_candidate_is_traced_but_next_revision_uses_best_candidate(tmp
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
     scores = iter([8.6, 8.1, 9.6])
-    calls, renders = [], []
+    calls, renders, prompt_lengths = [], [], {}
 
     def call_agent(instance, prompt, route):
         calls.append((instance, route, prompt[0]["text"]))
+        prompt_lengths[instance] = len(prompt)
         if instance.startswith("builder-"):
             return valid_candidate(f"candidate-{instance}")
         if instance.startswith("comparator-"):
-            return evidence(next(scores), f"comparison {instance}")
+            score = next(scores)
+            result = evidence(score, f"comparison {instance}", best_available=instance != "comparator-1")
+            if score < 8.6:
+                result["visual_evidence"]["best_so_far"].update(
+                    macro_topology="regressed",
+                    preferred="best",
+                )
+            return result
         return evidence(9.7, "Independent final pass")
 
     monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
@@ -964,6 +1284,11 @@ def test_regressed_candidate_is_traced_but_next_revision_uses_best_candidate(tmp
         "candidate-builder-1", "candidate-builder-2", "candidate-builder-3",
     ]
     assert [item["comparison"]["score"] for item in result["iterations"]] == [8.6, 8.1, 9.6]
+    assert prompt_lengths["comparator-1"] == 4
+    assert prompt_lengths["comparator-2"] == 6
+    assert prompt_lengths["comparator-3"] == 6
+    final_prompt_lengths = [length for instance, length in prompt_lengths.items() if instance.startswith("final-reviewer-")]
+    assert final_prompt_lengths == [4, 4]
     assert [instance.split("-")[0] for instance, _, _ in calls] == [
         "builder", "comparator", "builder", "comparator", "builder", "comparator", "final", "final",
     ]
@@ -981,7 +1306,14 @@ def test_final_review_revision_keeps_best_candidate_when_next_score_regresses(tm
         if instance.startswith("builder-"):
             return valid_candidate(f"candidate-{instance}")
         if instance.startswith("comparator-"):
-            return evidence(next(scores), f"comparison {instance}")
+            score = next(scores)
+            result = evidence(score, f"comparison {instance}", best_available=instance != "comparator-1")
+            if score < 9.5 and instance != "comparator-1":
+                result["visual_evidence"]["best_so_far"].update(
+                    micro_typography_legibility="regressed",
+                    preferred="best",
+                )
+            return result
         score = next(final_scores)
         return evidence(score, "Revise spacing" if score < 9.5 else "Independent final pass")
 
@@ -1024,7 +1356,14 @@ def test_builder_quality_escalation_is_sticky_through_repairs_and_final_review_r
                 return invalid_quality
             return valid_candidate(f"candidate-{instance}")
         if instance.startswith("comparator-"):
-            return evidence(next(scores), f"comparison {instance}")
+            score = next(scores)
+            result = evidence(score, f"comparison {instance}", best_available=instance != "comparator-1")
+            if score < 8.0 and instance != "comparator-1":
+                result["visual_evidence"]["best_so_far"].update(
+                    macro_topology="regressed",
+                    preferred="best",
+                )
+            return result
         final_calls["count"] += 1
         if final_calls["count"] == 1:
             return evidence(9.0, "Final spacing needs revision")

@@ -1,9 +1,11 @@
 """Executable orchestration for the sole ad-template process."""
 from __future__ import annotations
-import base64, json, math, mimetypes, os, re, shlex, shutil, subprocess, sys, urllib.error, urllib.request, uuid
+import base64, copy, io, json, math, mimetypes, os, re, shlex, shutil, subprocess, sys, urllib.error, urllib.request, uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping
+
+from PIL import Image, UnidentifiedImageError
 
 THRESHOLD = 9.5
 MIN_RUBRIC_SCORE = 9.2
@@ -12,6 +14,8 @@ MAX_CHEAP_STRUCTURED_OUTPUT_RETRIES = 1
 STAGES = ("source", "build", "render", "compare", "final-check", "live")
 MAX_CANDIDATE_CONTEXT_CHARS = 100_000
 MIN_MATERIAL_SCORE_GAIN = 0.5
+VISION_MAX_SERIALIZED_IMAGE_BYTES = 900_000
+VISION_MAX_LONG_EDGE = 1920
 
 class AdTemplateProcessError(ValueError):
     pass
@@ -38,7 +42,216 @@ RUBRIC_FIELDS = (
     "native_story",
 )
 
-def _assessment(value: Any, role: str) -> Dict[str, Any]:
+RENDERED_IDENTITY_STATES = {
+    "meaningful_editable_identity",
+    "no_visible_identity_frame",
+    "empty_visible_placeholder",
+}
+RENDERED_STORY_SPACE_STATES = {
+    "functional_composition",
+    "large_nonfunctional_dead_band",
+}
+VISUAL_REGION_KINDS = {
+    "text", "photo", "logo", "identity", "contact", "fact", "cta", "mask", "other",
+}
+VISUAL_REGION_STATES = {"meaningful", "empty_placeholder", "decorative"}
+BEST_AXIS_STATES = {"improved", "equivalent", "regressed", "not_applicable"}
+
+
+def _normalized_bbox(value: Any, *, path: str) -> Dict[str, float]:
+    if not isinstance(value, dict) or set(value) != {"x", "y", "width", "height"}:
+        raise AdTemplateProcessError(f"{path} must contain exactly normalized x, y, width, and height")
+    result: Dict[str, float] = {}
+    for key in ("x", "y", "width", "height"):
+        if not _number_value(value.get(key)):
+            raise AdTemplateProcessError(f"{path}.{key} must be a finite normalized number")
+        result[key] = float(value[key])
+    if result["x"] < 0 or result["y"] < 0 or result["width"] <= 0 or result["height"] <= 0:
+        raise AdTemplateProcessError(f"{path} must be a positive normalized rectangle")
+    if result["x"] + result["width"] > 1.000001 or result["y"] + result["height"] > 1.000001:
+        raise AdTemplateProcessError(f"{path} must remain within normalized image bounds 0..1")
+    return result
+
+
+def _normalized_ocr(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def _candidate_layer_map(candidate: Any) -> Dict[str, Dict[str, str]]:
+    template = candidate.get("template") if isinstance(candidate, Mapping) else None
+    if not isinstance(template, Mapping):
+        raise AdTemplateProcessError("comparator candidate must contain a template")
+    result: Dict[str, Dict[str, str]] = {"feed": {}, "story": {}}
+    for placement in ("feed", "story"):
+        layout = template.get(f"{placement}Layout")
+        layers = layout.get("layers") if isinstance(layout, Mapping) else None
+        if not isinstance(layers, list):
+            raise AdTemplateProcessError(f"comparator candidate is missing {placement} layers")
+        for layer in layers:
+            if isinstance(layer, Mapping) and _nonempty(layer.get("layerId")):
+                result[placement][str(layer["layerId"])] = str(layer.get("type") or "")
+    return result
+
+
+def _validate_visual_comparison(
+    value: Any,
+    *,
+    candidate: Any,
+    best_available: bool,
+) -> Dict[str, Any]:
+    expected = {"regions", "axes", "best_so_far", "changes", "rendered_checks"}
+    if not isinstance(value, dict) or set(value) != expected:
+        raise AdTemplateProcessError("comparator visual_evidence must contain exactly regions, axes, best_so_far, changes, and rendered_checks")
+    layer_map = _candidate_layer_map(candidate)
+    regions = value["regions"]
+    if not isinstance(regions, dict) or set(regions) != {"source", "feed", "story"}:
+        raise AdTemplateProcessError("comparator regions must contain exactly source, feed, and story")
+    normalized_regions: Dict[str, List[Dict[str, Any]]] = {}
+    source_identity_ocr: set[str] = set()
+    candidate_ocr: Dict[str, List[tuple[str, str]]] = {"feed": [], "story": []}
+    hard_failures: List[str] = []
+    for placement in ("source", "feed", "story"):
+        records = regions[placement]
+        if not isinstance(records, list) or not 1 <= len(records) <= 128:
+            raise AdTemplateProcessError(f"comparator {placement} regions must contain 1 to 128 visible regions")
+        normalized_records: List[Dict[str, Any]] = []
+        photo_seen = False
+        for index, raw in enumerate(records):
+            path = f"visual_evidence.regions.{placement}[{index}]"
+            if not isinstance(raw, dict) or not {"bbox", "kind", "semantic_role", "ocr_text", "content_state"}.issubset(raw) or not set(raw).issubset({"bbox", "kind", "semantic_role", "ocr_text", "content_state", "layer_id"}):
+                raise AdTemplateProcessError(f"{path} has an invalid region shape")
+            kind = raw.get("kind")
+            semantic_role = raw.get("semantic_role")
+            ocr_text = raw.get("ocr_text")
+            content_state = raw.get("content_state")
+            if kind not in VISUAL_REGION_KINDS or not _nonempty(semantic_role) or not isinstance(ocr_text, str) or content_state not in VISUAL_REGION_STATES:
+                raise AdTemplateProcessError(f"{path} has invalid kind, semantic_role, ocr_text, or content_state")
+            normalized = {
+                "bbox": _normalized_bbox(raw["bbox"], path=f"{path}.bbox"),
+                "kind": kind,
+                "semantic_role": str(semantic_role).strip()[:160],
+                "ocr_text": ocr_text[:500],
+                "content_state": content_state,
+            }
+            layer_id = raw.get("layer_id")
+            if placement == "source" and layer_id is not None:
+                raise AdTemplateProcessError(f"{path}.layer_id is invalid for the source image")
+            if placement in layer_map and layer_id is not None:
+                if not _nonempty(layer_id) or layer_id not in layer_map[placement]:
+                    raise AdTemplateProcessError(f"{path}.layer_id must name a {placement} layer")
+                normalized["layer_id"] = layer_id
+            if kind == "photo":
+                photo_seen = True
+            ocr = _normalized_ocr(ocr_text)
+            if placement == "source" and kind in {"identity", "logo", "contact"} and len(ocr) >= 4:
+                source_identity_ocr.add(ocr)
+            elif placement in candidate_ocr and ocr:
+                candidate_ocr[placement].append((kind, ocr))
+            if placement in {"feed", "story"} and kind in {"identity", "logo", "mask"} and content_state == "empty_placeholder":
+                hard_failures.append(f"Rendered {placement.title()} contains an empty visible identity, logo, or mask rectangle")
+            normalized_records.append(normalized)
+        if not photo_seen:
+            raise AdTemplateProcessError(f"comparator {placement} regions must identify at least one semantic photo role")
+        normalized_regions[placement] = normalized_records
+
+    for placement, records in candidate_ocr.items():
+        for _, candidate_text in records:
+            if len(candidate_text) >= 4 and any(
+                source_text in candidate_text or candidate_text in source_text
+                for source_text in source_identity_ocr
+            ):
+                hard_failures.append(f"Rendered {placement.title()} copies source advertiser identity or contact text")
+                break
+        facts = [ocr for kind, ocr in records if kind == "fact" and len(ocr) >= 3]
+        if len(facts) != len(set(facts)):
+            hard_failures.append(f"Rendered {placement.title()} repeats a factual bullet")
+
+    axes = value["axes"]
+    if not isinstance(axes, dict) or set(axes) != {"macro_topology", "micro_typography_legibility"}:
+        raise AdTemplateProcessError("comparator axes must contain macro_topology and micro_typography_legibility")
+    normalized_axes: Dict[str, Dict[str, str]] = {}
+    for axis, raw in axes.items():
+        if not isinstance(raw, dict) or set(raw) != {"decision", "reason"} or raw.get("decision") not in {"pass", "revise"} or not _nonempty(raw.get("reason")):
+            raise AdTemplateProcessError(f"comparator {axis} must contain a pass/revise decision and reason")
+        normalized_axes[axis] = {"decision": raw["decision"], "reason": str(raw["reason"]).strip()[:1000]}
+
+    best = value["best_so_far"]
+    if not isinstance(best, dict) or set(best) != {"available", "macro_topology", "micro_typography_legibility", "preferred"}:
+        raise AdTemplateProcessError("comparator best_so_far has an invalid shape")
+    if best.get("available") is not best_available:
+        raise AdTemplateProcessError("comparator best_so_far availability does not match the attached immutable best candidate")
+    best_axes = (best.get("macro_topology"), best.get("micro_typography_legibility"))
+    if any(item not in BEST_AXIS_STATES for item in best_axes) or best.get("preferred") not in {"current", "best"}:
+        raise AdTemplateProcessError("comparator best_so_far comparison is invalid")
+    if not best_available:
+        if best_axes != ("not_applicable", "not_applicable") or best["preferred"] != "current":
+            raise AdTemplateProcessError("the first comparator must mark best_so_far axes not_applicable and prefer current")
+    else:
+        if "not_applicable" in best_axes:
+            raise AdTemplateProcessError("later comparators must assess both axes against the attached best candidate")
+        regressed = "regressed" in best_axes
+        if (regressed and best["preferred"] != "best") or (not regressed and best["preferred"] != "current"):
+            raise AdTemplateProcessError("comparator must preserve the immutable best candidate when either quality axis regresses")
+
+    changes = value["changes"]
+    if not isinstance(changes, list) or len(changes) > 32:
+        raise AdTemplateProcessError("comparator changes must be a list with at most 32 items")
+    normalized_changes: List[Dict[str, Any]] = []
+    changes_by_level = {"macro": 0, "micro": 0}
+    for index, raw in enumerate(changes):
+        path = f"visual_evidence.changes[{index}]"
+        if not isinstance(raw, dict) or set(raw) != {"placement", "level", "target_layer_ids", "instruction"}:
+            raise AdTemplateProcessError(f"{path} has an invalid shape")
+        placement = raw.get("placement")
+        level = raw.get("level")
+        targets = raw.get("target_layer_ids")
+        instruction = raw.get("instruction")
+        if placement not in {"feed", "story"} or level not in {"macro", "micro"} or not isinstance(targets, list) or not targets or not _nonempty(instruction):
+            raise AdTemplateProcessError(f"{path} must identify placement, level, target layers, and an instruction")
+        if len(targets) != len(set(targets)) or any(not _nonempty(item) or item not in layer_map[placement] for item in targets):
+            raise AdTemplateProcessError(f"{path}.target_layer_ids must name only {placement} layers")
+        instruction_text = str(instruction).strip()[:1000]
+        normalized_instruction = _normalized_ocr(instruction_text)
+        if any(source_text in normalized_instruction for source_text in source_identity_ocr):
+            raise AdTemplateProcessError(f"{path}.instruction must not request copied source advertiser identity or contact text")
+        changes_by_level[level] += 1
+        normalized_changes.append({
+            "placement": placement,
+            "level": level,
+            "target_layer_ids": list(targets),
+            "instruction": instruction_text,
+        })
+    for axis, level in (("macro_topology", "macro"), ("micro_typography_legibility", "micro")):
+        expected_changes = normalized_axes[axis]["decision"] == "revise"
+        if expected_changes != bool(changes_by_level[level]):
+            raise AdTemplateProcessError(f"comparator {axis} decision must agree with its placement-scoped {level} changes")
+
+    checks = value["rendered_checks"]
+    if not isinstance(checks, dict) or set(checks) != {"judged_rendered_pixels", "identity_treatment", "story_space"}:
+        raise AdTemplateProcessError("comparator rendered_checks has an invalid shape")
+    if checks.get("judged_rendered_pixels") is not True or checks.get("identity_treatment") not in RENDERED_IDENTITY_STATES or checks.get("story_space") not in RENDERED_STORY_SPACE_STATES:
+        raise AdTemplateProcessError("comparator rendered_checks must judge the supplied pixels and classify identity and Story space")
+    if checks["identity_treatment"] == "empty_visible_placeholder":
+        hard_failures.append("Rendered Feed or Story contains an empty visible identity, logo, or mask placeholder")
+
+    return {
+        "regions": normalized_regions,
+        "axes": normalized_axes,
+        "best_so_far": dict(best),
+        "changes": normalized_changes,
+        "rendered_checks": dict(checks),
+        "hard_failures": list(dict.fromkeys(hard_failures)),
+    }
+
+def _assessment(
+    value: Any,
+    role: str,
+    *,
+    require_rendered_pixel_checks: bool = False,
+    require_visual_evidence: bool = False,
+    candidate: Any = None,
+    best_available: bool = False,
+) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise AdTemplateProcessError(f"{role} returned invalid evidence")
     rubric = value.get("rubric")
@@ -50,6 +263,48 @@ def _assessment(value: Any, role: str) -> Dict[str, Any]:
     hard_failures = value.get("hard_failures") or value.get("hard_fail") or []
     if isinstance(hard_failures, str): hard_failures = [hard_failures]
     if not isinstance(hard_failures, list): raise AdTemplateProcessError(f"{role} hard_failures must be a list")
+    hard_failures = [str(item)[:240] for item in hard_failures]
+    visual_evidence = None
+    if require_visual_evidence:
+        visual_evidence = _validate_visual_comparison(
+            value.get("visual_evidence"),
+            candidate=candidate,
+            best_available=best_available,
+        )
+        hard_failures.extend(visual_evidence["hard_failures"])
+        if visual_evidence["axes"]["macro_topology"]["decision"] == "revise":
+            scores["source_inspired_direction"] = min(scores["source_inspired_direction"], MIN_RUBRIC_SCORE - 0.1)
+        if visual_evidence["axes"]["micro_typography_legibility"]["decision"] == "revise":
+            scores["hierarchy_typography"] = min(scores["hierarchy_typography"], MIN_RUBRIC_SCORE - 0.1)
+        if visual_evidence["best_so_far"]["preferred"] == "best":
+            scores["source_inspired_direction"] = min(scores["source_inspired_direction"], MIN_RUBRIC_SCORE - 0.1)
+        if visual_evidence["rendered_checks"]["story_space"] == "large_nonfunctional_dead_band":
+            scores["native_story"] = min(scores["native_story"], MIN_RUBRIC_SCORE - 0.1)
+
+    rendered_pixel_checks = value.get("rendered_pixel_checks")
+    if require_rendered_pixel_checks:
+        expected_checks = {"judged_rendered_pixels", "identity_treatment", "story_space"}
+        if not isinstance(rendered_pixel_checks, dict) or set(rendered_pixel_checks) != expected_checks:
+            raise AdTemplateProcessError(
+                f"{role} must provide exact rendered_pixel_checks for the delivered Feed and Story pixels"
+            )
+        if rendered_pixel_checks.get("judged_rendered_pixels") is not True:
+            raise AdTemplateProcessError(f"{role} must judge the rendered pixels, not infer visibility from candidate JSON")
+        identity_treatment = rendered_pixel_checks.get("identity_treatment")
+        story_space = rendered_pixel_checks.get("story_space")
+        if identity_treatment not in RENDERED_IDENTITY_STATES:
+            raise AdTemplateProcessError(f"{role} rendered identity treatment is invalid")
+        if story_space not in RENDERED_STORY_SPACE_STATES:
+            raise AdTemplateProcessError(f"{role} rendered Story space assessment is invalid")
+        if identity_treatment == "empty_visible_placeholder":
+            failure = "Rendered Feed or Story contains an empty visible identity, logo, or mask placeholder"
+            if failure not in hard_failures:
+                hard_failures.append(failure)
+        if story_space == "large_nonfunctional_dead_band":
+            # A protected UI zone can continue a composition, but a large blank
+            # or decorative band is not a native Story treatment. Force the
+            # subscore below the gate even if a reviewer over-scores it.
+            scores["native_story"] = min(scores["native_story"], MIN_RUBRIC_SCORE - 0.1)
     reason = str(value.get("reason") or value.get("mismatches") or "").strip()
     if len(reason) < 3: raise AdTemplateProcessError(f"{role} must explain its decision")
     score = round(sum(scores.values()) / len(scores), 2)
@@ -59,7 +314,9 @@ def _assessment(value: Any, role: str) -> Dict[str, Any]:
         "minimum_score": min(scores.values()),
         "reason": reason,
         "rubric": scores,
-        "hard_failures": [str(item)[:240] for item in hard_failures],
+        "hard_failures": hard_failures,
+        **({"visual_evidence": visual_evidence} if require_visual_evidence else {}),
+        **({"rendered_pixel_checks": dict(rendered_pixel_checks)} if require_rendered_pixel_checks else {}),
     }
 
 def _passes_quality_gate(evidence: Mapping[str, Any]) -> bool:
@@ -69,7 +326,7 @@ def _passes_quality_gate(evidence: Mapping[str, Any]) -> bool:
         and _number(evidence.get("minimum_score")) >= MIN_RUBRIC_SCORE
     )
 
-def validate_iterations(value: Any) -> List[Dict[str, Any]]:
+def validate_iterations(value: Any, *, require_visual_evidence: bool = False) -> List[Dict[str, Any]]:
     if not isinstance(value, list) or not value or len(value) > 30: raise AdTemplateProcessError("iterations must contain 1 to 30 records")
     result, accepted, retry_after_review = [], False, False
     for index, raw in enumerate(value, 1):
@@ -77,7 +334,13 @@ def validate_iterations(value: Any) -> List[Dict[str, Any]]:
         comparison = raw.get("comparison")
         if not isinstance(comparison, dict): raise AdTemplateProcessError("each iteration requires one comparator")
         if any(key in raw or key in comparison for key in ("reviewers", "reviewer", "primary", "strict")): raise AdTemplateProcessError("final reviewers are only allowed after the comparator passes")
-        evidence = _assessment(comparison, "comparator")
+        evidence = _assessment(
+            comparison,
+            "comparator",
+            require_visual_evidence=require_visual_evidence,
+            candidate=raw.get("candidate"),
+            best_available=index > 1,
+        )
         score = evidence["score"]
         passes = _passes_quality_gate(evidence)
         decision = str(raw.get("decision") or ("accepted" if passes else "revise"))
@@ -91,17 +354,29 @@ def validate_iterations(value: Any) -> List[Dict[str, Any]]:
         item = dict(raw); item.update(iteration=index, comparison=evidence, decision=decision); result.append(item)
     return result
 
-def validate_final_review(value: Any, *, accepted: bool) -> Dict[str, Any]:
+def validate_final_review(
+    value: Any,
+    *,
+    accepted: bool,
+    require_rendered_pixel_checks: bool = False,
+    completion_iteration: int | None = None,
+) -> Dict[str, Any]:
     if not accepted:
         if value not in (None, {}, []): raise AdTemplateProcessError("final reviewers cannot run before a passing comparator")
         return {}
     if not isinstance(value, dict) or not isinstance(value.get("reviewers"), list) or len(value["reviewers"]) != 2: raise AdTemplateProcessError("exactly two final reviewers are required")
+    if completion_iteration is not None and value.get("completion_iteration") != completion_iteration:
+        raise AdTemplateProcessError("final reviewers must be bound to the comparator completion candidate")
     normalized = []
     for item in value["reviewers"]:
         if not isinstance(item, dict): raise AdTemplateProcessError("reviewer record must be an object")
         identity = str(item.get("id") or item.get("name") or "").strip()
         if not identity: raise AdTemplateProcessError("reviewer identity is required")
-        evidence = _assessment(item, "final reviewer")
+        evidence = _assessment(
+            item,
+            "final reviewer",
+            require_rendered_pixel_checks=require_rendered_pixel_checks,
+        )
         score, reason = evidence["score"], evidence["reason"]
         route = str(item.get("route") or "").strip()
         if not route: raise AdTemplateProcessError("reviewer route is required")
@@ -109,7 +384,12 @@ def validate_final_review(value: Any, *, accepted: bool) -> Dict[str, Any]:
     if normalized[0]["id"] == normalized[1]["id"] or normalized[0]["route"] == normalized[1]["route"]: raise AdTemplateProcessError("final reviewers must use independent instances and routes")
     passed = all(_passes_quality_gate(item) for item in normalized); decision = "accepted" if passed else "revise"
     if str(value.get("decision") or decision) != decision: raise AdTemplateProcessError("final review decision does not match scores")
-    return {"reviewers": normalized, "decision": decision, "threshold": THRESHOLD}
+    return {
+        "reviewers": normalized,
+        "decision": decision,
+        "threshold": THRESHOLD,
+        **({"completion_iteration": completion_iteration} if completion_iteration is not None else {}),
+    }
 
 def deterministic_documents(template: Any) -> Dict[str, str]:
     if not isinstance(template, dict) or template.get("schema") != "blockwise.ad-template": raise AdTemplateProcessError("template must use the exact Blockwise schema")
@@ -157,6 +437,8 @@ COLOUR_ROLES = {"background", "primary", "secondary", "accent", "mainText", "inv
 VECTOR_SHAPES = ("rect", "rounded", "circle", "line", "pill", "notched", "wave", "ring")
 LINE_HEIGHT_MIN = 0.8
 LINE_HEIGHT_MAX = 2.5
+TRACKING_MIN_PX = -128
+TRACKING_MAX_PX = 256
 SUPPORTED_ICONS = ("arrow", "check", "phone", "mail", "globe", "pin")
 LAYER_FIELDS = {
     "plate": ({"type", "layerId", "colourRole", "geometry", "protected"}, {"assetKey"}),
@@ -249,8 +531,8 @@ def _validate_layout(layout: Any, *, placement: str, width: int, height: int) ->
     safe_zones = layout.get("safeZones")
     if not isinstance(layers, list) or not 1 <= len(layers) <= 256:
         raise AdTemplateProcessError(f"{layout_path}.layers must be a list with 1 to 256 layers")
-    if not isinstance(safe_zones, list) or len(safe_zones) > 32:
-        raise AdTemplateProcessError(f"{layout_path}.safeZones must be a list with at most 32 rectangles")
+    if not isinstance(safe_zones, list) or not 1 <= len(safe_zones) <= 32:
+        raise AdTemplateProcessError(f"{layout_path}.safeZones must be a list with 1 to 32 rectangles")
     for zone_index, zone in enumerate(safe_zones):
         _validate_rect(zone, path=f"{layout_path}.safeZones[{zone_index}]", bounds=(width, height))
     ids = set()
@@ -268,6 +550,19 @@ def _validate_layout(layout: Any, *, placement: str, width: int, height: int) ->
         _validate_rect(layer.get("geometry"), path=f"{layer_path}.geometry", bounds=(width, height))
         ids.add(layer["layerId"])
         layer_type = layer["type"]
+        if layer_type in {"text", "logo", "icon"}:
+            geometry = layer["geometry"]
+            contained = any(
+                geometry["x"] >= zone["x"]
+                and geometry["y"] >= zone["y"]
+                and geometry["x"] + geometry["width"] <= zone["x"] + zone["width"]
+                and geometry["y"] + geometry["height"] <= zone["y"] + zone["height"]
+                for zone in safe_zones
+            )
+            if not contained:
+                raise AdTemplateProcessError(
+                    f"{layer_path} is essential {layer_type} content and must remain inside a declared content-safe zone"
+                )
         for key in ("inputKey", "colourRole", "icon", "assetKey"):
             if key in layer and not _nonempty(layer[key]):
                 raise AdTemplateProcessError(f"{layer_path}.{key} must be a non-empty string")
@@ -295,6 +590,11 @@ def _validate_layout(layout: Any, *, placement: str, width: int, height: int) ->
         if layer_type == "text":
             if not _font(layer["font"]) or not _number_value(layer["fontSize"], positive=True) or not _number_value(layer["tracking"]) or not _positive_int(layer["maxCharacters"]) or not _positive_int(layer["maxLines"]):
                 raise AdTemplateProcessError("text layer sizing is invalid")
+            if not TRACKING_MIN_PX <= layer["tracking"] <= TRACKING_MAX_PX:
+                offending = json.dumps(layer["tracking"], ensure_ascii=True)[:160]
+                raise AdTemplateProcessError(
+                    f"{layer_path}.tracking={offending} must be sane native canvas pixels between {TRACKING_MIN_PX} and {TRACKING_MAX_PX}, never an em multiplier"
+                )
             line_height = layer["lineHeight"]
             if not _number_value(line_height) or not LINE_HEIGHT_MIN <= line_height <= LINE_HEIGHT_MAX:
                 offending = json.dumps(line_height, ensure_ascii=True)[:160]
@@ -717,12 +1017,15 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
         'must be a JSON list containing only crop and/or position (not feed/story). For every text layer, alignment '
         'must be exactly left, center, or right and overflowBehaviour must be exactly refuse, truncate, or scale_down (never ellipsis). '
         'lineHeight is a unitless multiplier between 0.8 and 2.5, normally 1.1 to 1.6; never supply lineHeight in pixels. '
+        f'tracking is additional letter spacing measured in native canvas pixels between {TRACKING_MIN_PX} and {TRACKING_MAX_PX}; '
+        'preserve wider source-inspired display tracking when it remains readable; tracking is never an em multiplier. '
         ' For every vector layer, shape must be exactly one of rect, rounded, circle, line, pill, notched, wave, or ring; '
         'never use aliases such as rectangle or rounded_rect_stroke. Every icon layer must use exactly arrow, check, phone, mail, globe, or pin; '
         'other icon names render as empty circles and are invalid. Every image_slot inputKey must be declared exactly once '
         'in imageInputs. A visible brand role must use a real logo layer bound to an optional imageInput; a logo input may omit '
-        'defaultAssetKey so the editor shows its neutral replaceable placeholder until a Brand Pack or customer logo is supplied. '
-        'Never fake a logo with a baked plate. Every text layer inputKey must be declared exactly once in textInputs. '
+        'defaultAssetKey, but the rendered template must then either omit the visible logo frame entirely or show an editable neutral '
+        'fallback wordmark from a textInput. Never render an empty logo box, badge, silhouette, or placeholder, and never fake a logo '
+        'with a baked plate. Every text layer inputKey must be declared exactly once in textInputs. '
         'imageInputs and textInputs keys must be unique across both lists. Every text-layer font file must appear exactly once in fonts. '
         'Every layer assetKey, image defaultAssetKey, gallery sample assetKey, and replacementAssets assetKey must resolve '
         'to template.assets. Every replacementAssets inputKey must resolve to imageInputs. Every realAssetRefs inputKey may '
@@ -753,9 +1056,9 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
             "input, asset, font, metadata field, and cross-reference, and return the complete revised {template,assets} object."
         )
 
-    return f"""Run the sole ad-template process as the builder agent. Inspect the attached source pixels, remove advertiser identity (names, logos, phones, URLs, portraits), and return JSON with exactly {{template, assets}}. Treat the source as structural inspiration, not a quality ceiling: explicitly avoid inheriting brochure density, tiny copy, weak hierarchy, duplicated contact details, incoherent photography, or a Feed layout stretched into Story. Build a conversion-focused Meta ad around one dominant idea: a strong hook, one coherent hero treatment, only essential proof or facts, and one clear CTA. Dense descriptions and contact lists belong in Meta primary text or the destination, not inside the image. At native pixels use type large enough to remain legible inside a 500px, 390px and 320px-wide Meta shell; do not rely on scale-down or truncation to rescue excess copy. Feed must use a deliberate 72px horizontal and 96px vertical protected content margin. Story must be independently composed with its top 240px and bottom 300px protected from platform UI. Use true editable text, image, logo, CTA, patch and icon roles. Use one coherent property/photo subject across default slots; never mix unrelated properties. For a property listing, publishRequirements.specialAdCategory must be HOUSING. template must contain exactly schema='blockwise.ad-template', templateId, createdAt (ISO datetime), feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata. semanticColours must contain exactly background, primary, secondary, accent, mainText, inverseText; every layer colourRole is one of those six. Each layout contains exactly placement, layers, safeZones; Feed is placement feed within 1080x1350 and Story is placement story within 1080x1920, including safeZones. Geometry and every safe-zone rectangle contain exactly {{x,y,width,height}}: x,y are the top-left coordinates from canvas origin (0,0); width,height are positive sizes, not right/bottom coordinates; x + width must stay within canvas width and y + height within canvas height. Exact safe areas are Feed safeZones=[{{"x":72,"y":96,"width":936,"height":1158}}] within 1080x1350 and Story safeZones=[{{"x":72,"y":240,"width":936,"height":1380}}] within 1080x1920. Layer shapes are exact: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. imageInputs are {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs are {{key,label,placeholder,maxLength}}. fonts are {{file}} and every text-layer font must be declared; allowed bundled font files are {', '.join(sorted(ALLOWED_FONT_FILES))}. metadata is exact: title:string; description:string; gallerySamples={{feed?:{{assetKey?,placement,purpose}},story?:{{assetKey?,placement,purpose}}}}; metaCopyDefaults={{primaryText:string[],headlines:string[],descriptions:string[],cta:string}}; aiWritingGuidance={{summary:string,fields:record<string,string>}}; publishRequirements={{objective:string,specialAdCategory:string|null,instantForm:{{required:boolean,dependency:string|null,defaults?:record<string,string>}},destination:{{required:boolean,kind:'website'|'instant_form'|'none',dependency:string|null}},requiredCtaTypes?:string[]}}; replacementAssets={{inputKey,assetKey,purpose?}}[]; realAssetRefs={{inputKey,kind,required}}[]. Every layer/input/font/colour/asset metadata reference must resolve inside the same template. Declare source-free replacement assets in template.assets as assetKey -> {{fileName,mimeType}} and in top-level assets only as {{assetKey,fileName,mimeType}} with an exact match. Hermes resolves bytes from the fixed safe catalog; never emit bytesBase64 anywhere and never guess filenames. Allowed normalized relative catalog paths are home/open-home-living.webp, home/home-dusk.webp, home/mt-lawley-federation.webp, home/home-pool.webp, home/interior-styled.webp, home/subiaco-townhouse.webp, and adstudio-samples/photos/int-bedroom.png. Never include the source composite, source_path, hashes, signatures, private fields, or a full-source plate. Keep geometry inside canvas and Story native. Hermes renders, compares once per iteration, then runs two fresh final reviewers only after the comparator clears both the {THRESHOLD} mean and {MIN_RUBRIC_SCORE} subscore floor; never self-score or invent review evidence. Run {run_id}; project {project_id}; fixed placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback[:3000]}.{repair_clause}"""
+    return f"""Run the sole ad-template process as the builder agent. Inspect the attached source pixels, remove advertiser identity (names, logos, phones, URLs, portraits), and return JSON with exactly {{template, assets}}. Treat the source as structural inspiration, not a quality ceiling: explicitly avoid inheriting brochure density, tiny copy, weak hierarchy, duplicated facts or contact details, incoherent photography, or a Feed layout stretched into Story. Preserve the source's useful topology, hierarchy, and type character without copying literal advertiser/contact strings such as agency names, email addresses, phone numbers, or URLs; replace those roles with neutral editable content. Never reintroduce a source identifier merely because comparator feedback quotes it. Build a conversion-focused Meta ad around one dominant idea: a strong hook, one coherent hero treatment, only essential proof or facts, and one clear CTA. Dense descriptions and contact lists belong in Meta primary text or the destination, not inside the image. At native pixels use type large enough to remain legible inside a 500px, 390px and 320px-wide Meta shell; do not rely on scale-down or truncation to rescue excess copy. Feed must use a deliberate 72px horizontal and 96px vertical protected content margin. Story must be independently composed with its top 240px and bottom 300px protected from platform UI: essential text, logos, and icons stay inside the declared safe zone, while backgrounds, full-bleed photography, and nonessential media may extend through the UI zones. Use true editable text, image, logo, CTA, patch and icon roles. Use one coherent property/photo subject across default slots; never mix unrelated properties. For a property listing, publishRequirements.specialAdCategory must be HOUSING. template must contain exactly schema='blockwise.ad-template', templateId, createdAt (ISO datetime), feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata. semanticColours must contain exactly background, primary, secondary, accent, mainText, inverseText; every layer colourRole is one of those six. Each layout contains exactly placement, layers, safeZones; Feed is placement feed within 1080x1350 and Story is placement story within 1080x1920, including safeZones. Geometry and every safe-zone rectangle contain exactly {{x,y,width,height}}: x,y are the top-left coordinates from canvas origin (0,0); width,height are positive sizes, not right/bottom coordinates; x + width must stay within canvas width and y + height within canvas height. Exact safe areas are Feed safeZones=[{{"x":72,"y":96,"width":936,"height":1158}}] within 1080x1350 and Story safeZones=[{{"x":72,"y":240,"width":936,"height":1380}}] within 1080x1920. Layer shapes are exact: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. imageInputs are {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs are {{key,label,placeholder,maxLength}}. fonts are {{file}} and every text-layer font must be declared; allowed bundled font files are {', '.join(sorted(ALLOWED_FONT_FILES))}. metadata is exact: title:string; description:string; gallerySamples={{feed?:{{assetKey?,placement,purpose}},story?:{{assetKey?,placement,purpose}}}}; metaCopyDefaults={{primaryText:string[],headlines:string[],descriptions:string[],cta:string}}; aiWritingGuidance={{summary:string,fields:record<string,string>}}; publishRequirements={{objective:string,specialAdCategory:string|null,instantForm:{{required:boolean,dependency:string|null,defaults?:record<string,string>}},destination:{{required:boolean,kind:'website'|'instant_form'|'none',dependency:string|null}},requiredCtaTypes?:string[]}}; replacementAssets={{inputKey,assetKey,purpose?}}[]; realAssetRefs={{inputKey,kind,required}}[]. Every layer/input/font/colour/asset metadata reference must resolve inside the same template. Declare source-free replacement assets in template.assets as assetKey -> {{fileName,mimeType}} and in top-level assets only as {{assetKey,fileName,mimeType}} with an exact match. Hermes resolves bytes from the fixed safe catalog; never emit bytesBase64 anywhere and never guess filenames. Allowed normalized relative catalog paths are home/open-home-living.webp, home/home-dusk.webp, home/mt-lawley-federation.webp, home/home-pool.webp, home/interior-styled.webp, home/subiaco-townhouse.webp, and adstudio-samples/photos/int-bedroom.png. Never include the source composite, source_path, hashes, signatures, private fields, or a full-source plate. Keep geometry inside canvas and Story native. Hermes renders, compares once per iteration, then runs two fresh final reviewers only after the comparator clears both the {THRESHOLD} mean and {MIN_RUBRIC_SCORE} subscore floor; never self-score or invent review evidence. Run {run_id}; project {project_id}; fixed placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback[:3000]}.{repair_clause}"""
 
-def review_prompt(*, final: bool, candidate: Any = None) -> str:
+def review_prompt(*, final: bool, candidate: Any = None, best_available: bool = False, completion_iteration: int | None = None) -> str:
     role = "fresh independent final reviewer" if final else "iteration comparator"
     role += (
         ". Treat the source only as a structural reference whose defects must not be inherited. Mandatory removal of source advertiser identities, "
@@ -766,19 +1069,82 @@ def review_prompt(*, final: bool, candidate: Any = None) -> str:
         "source identity or pixels, or a missing editable role, is not"
     )
     candidate_context = _safe_candidate_prompt_json(candidate)
-    return f"""Act as the {role}. Compare the attached source image with the attached rendered Feed and native Story previews. Evaluate the renders as they will appear inside real Meta shells at 500px, 390px and 320px wide, not only at full-resolution zoom. Return JSON only with exactly reason, hard_failures, and rubric. rubric must contain exactly these eight numeric 0-10 fields: source_inspired_direction (retains useful structural intent while improving source defects), ad_effectiveness (one clear hook, persuasive hierarchy, essential proof and CTA without brochure clutter), hierarchy_typography (strong type hierarchy, intentional wrapping and delivered-screen readability), real_shell_legibility (all essential content remains clear in Meta Feed and Story shells at the stated sizes), colour_art_direction (cohesive palette, contrast, photographic tone and finish), editable_decomposition (the supplied candidate JSON has genuine editable text, logo, CTA, patches, icons and media roles), replacement_robustness (slot geometry, masks, logo treatment and copy bounds plausibly survive realistic replacement content), native_story (a deliberate 1080x1920 composition, not a stretched, cropped, padded or letterboxed Feed). Explain concrete visible mismatches in reason. hard_failures must be a JSON list. Add a hard failure if any source advertiser name, logo, phone, URL, portrait, contact identity, or source composite pixel is reused; if Feed or Story is missing, clipped, distorted, unreadable at delivered size, outside its canvas or protected zones; if the design is a dense brochure rather than a Meta ad; if default photographs visibly represent unrelated subjects; if critical text, logo, CTA, patch, icon or media is flattened/non-editable; if Story is a Feed crop, stretch, letterbox, or has essential content in the top 240px or bottom 300px platform UI zones; or if an asset is missing/unknown. Any hard failure makes the score zero. Do not reuse or infer another reviewer's score. Passing requires a mean of at least {THRESHOLD}, every subscore at least {MIN_RUBRIC_SCORE}, and no hard failures. Candidate contract JSON: {candidate_context}"""
+    final_contract = (
+        f' This is comparator completion candidate iteration {completion_iteration}; review exactly these attached candidate pixels. '
+        'For a final review, return JSON with exactly reason, hard_failures, rubric, and rendered_pixel_checks. '
+        'rendered_pixel_checks must be exactly {"judged_rendered_pixels":true,"identity_treatment":"meaningful_editable_identity"|"no_visible_identity_frame"|"empty_visible_placeholder","story_space":"functional_composition"|"large_nonfunctional_dead_band"}. '
+        'Set these checks only from the delivered Feed and Story pixels. Never infer that fallback text, a logo, a CTA, or any other role is visible merely because candidate JSON declares a layer. '
+        'An empty visible logo box, frame, badge, silhouette, or placeholder is a hard failure even when the logo input is optional; an optional logo may instead have no visible frame. '
+        'A large blank or purely decorative Story footer/band, including one used only to fill the 300px UI-safe zone, is large_nonfunctional_dead_band and cannot receive a passing native_story score. Background can extend through protected zones, but the overall Story must remain intentionally composed rather than ending early.'
+        if final else
+        ' Return JSON with exactly reason, hard_failures, rubric, and visual_evidence. '
+        'visual_evidence must contain exactly regions, axes, best_so_far, changes, and rendered_checks. '
+        'regions must contain exactly source, feed, and story; each is a non-empty list of visible regions with '
+        '{"bbox":{"x":0..1,"y":0..1,"width":0..1,"height":0..1},"kind":"text"|"photo"|"logo"|"identity"|"contact"|"fact"|"cta"|"mask"|"other","semantic_role":"non-empty role","ocr_text":"visible text or empty string","content_state":"meaningful"|"empty_placeholder"|"decorative","layer_id":"candidate layer ID when one exact layer is referenced"}. '
+        'Every image must identify at least one photo region and its semantic role. Source regions never have layer_id. Feed region layer_id values must name Feed layers; Story values must name Story layers. '
+        'axes must be exactly {"macro_topology":{"decision":"pass"|"revise","reason":"..."},"micro_typography_legibility":{"decision":"pass"|"revise","reason":"..."}}. Assess both axes on every iteration, so a good small fix cannot hide an obvious high-level regression and a sound composition cannot hide broken type. '
+        f'best_so_far must be exactly {{"available":{str(best_available).lower()},"macro_topology":"improved"|"equivalent"|"regressed"|"not_applicable","micro_typography_legibility":"improved"|"equivalent"|"regressed"|"not_applicable","preferred":"current"|"best"}}. '
+        'When a best candidate is attached, compare current against its pixels on both axes and prefer best if either regressed; when none is attached, both statuses are not_applicable and current is preferred. '
+        'changes is an array of {"placement":"feed"|"story","level":"macro"|"micro","target_layer_ids":["exact current candidate layer IDs"],"instruction":"specific correction"}; each revise axis needs at least one matching-level change, each pass axis needs none, and IDs may only name layers from that placement. '
+        'rendered_checks must be exactly {"judged_rendered_pixels":true,"identity_treatment":"meaningful_editable_identity"|"no_visible_identity_frame"|"empty_visible_placeholder","story_space":"functional_composition"|"large_nonfunctional_dead_band"}. '
+        'Never request copied source advertiser names, logo text, phones, emails, URLs, portraits, or contact strings. Score their neutral editable replacements by visual role and geometry, not literal OCR equality. Treat repeated factual bullets as a defect.'
+    )
+    attachments = (
+        "Attachment order is source, immutable best Feed, immutable best Story, current Feed, current Story."
+        if not final and best_available else
+        "Attachment order is source, current Feed, current Story."
+    )
+    return f"""Act as the {role}. {attachments} Compare the attached source image with the attached rendered Feed and native Story previews. Vision images may use bounded transport compression; the candidate JSON's native canvas geometry and the visible OCR at delivered shell sizes remain authoritative. Evaluate the renders as they will appear inside real Meta shells at 500px, 390px and 320px wide, not only at full-resolution zoom.{final_contract} rubric must contain exactly these eight numeric 0-10 fields: source_inspired_direction (retains useful structural intent while improving source defects), ad_effectiveness (one clear hook, persuasive hierarchy, essential proof and CTA without brochure clutter), hierarchy_typography (strong type hierarchy, intentional wrapping and delivered-screen readability), real_shell_legibility (all essential content remains clear in Meta Feed and Story shells at the stated sizes), colour_art_direction (cohesive palette, contrast, photographic tone and finish), editable_decomposition (the supplied candidate JSON has genuine editable text, logo, CTA, patches, icons and media roles), replacement_robustness (slot geometry, masks, logo treatment and copy bounds plausibly survive realistic replacement content), native_story (a deliberate 1080x1920 composition, not a stretched, cropped, padded or letterboxed Feed). Explain concrete visible mismatches in reason. hard_failures must be a JSON list. Add a hard failure if any source advertiser name, logo, phone, URL, portrait, contact identity, or source composite pixel is reused; if Feed or Story is missing, clipped, distorted, unreadable at delivered size, outside its canvas; if essential text, logos, or icons enter Story's top 240px or bottom 300px platform UI zones (full-bleed backgrounds, photography, and nonessential media may extend there); if the design is a dense brochure rather than a Meta ad; if default photographs visibly represent unrelated subjects; if critical text, logo, CTA, patch, icon or media is flattened/non-editable; if Story is a Feed crop, stretch, letterbox, or ends in a large nonfunctional dead band; or if an asset is missing/unknown. Do not penalize a correct neutral editable replacement for not reproducing source identity or contact text. Any hard failure makes the score zero. Do not reuse or infer another reviewer's score. Passing requires a mean of at least {THRESHOLD}, every subscore at least {MIN_RUBRIC_SCORE}, and no hard failures. Candidate contract JSON: {candidate_context}"""
 
-def vision_message(text: str, paths: List[str]) -> List[Dict[str, Any]]:
+def _bounded_vision_image(path: Path) -> tuple[bytes, str]:
+    raw = path.read_bytes()
+    try:
+        with Image.open(io.BytesIO(raw)) as opened:
+            opened.load()
+            image = opened.convert("RGB")
+    except (OSError, UnidentifiedImageError):
+        return raw, mimetypes.guess_type(path.name)[0] or "image/png"
+    if max(image.size) > VISION_MAX_LONG_EDGE:
+        image.thumbnail((VISION_MAX_LONG_EDGE, VISION_MAX_LONG_EDGE), Image.Resampling.LANCZOS)
+    for quality in (88, 78, 68, 58):
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=quality, optimize=True, progressive=True)
+        encoded = output.getvalue()
+        if len(encoded) <= VISION_MAX_SERIALIZED_IMAGE_BYTES:
+            return encoded, "image/jpeg"
+    while len(encoded) > VISION_MAX_SERIALIZED_IMAGE_BYTES and max(image.size) > 960:
+        next_size = tuple(max(1, int(value * 0.8)) for value in image.size)
+        image = image.resize(next_size, Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=58, optimize=True, progressive=True)
+        encoded = output.getvalue()
+    return encoded, "image/jpeg"
+
+
+def vision_message(text: str, paths: List[str], *, bounded: bool = False) -> List[Dict[str, Any]]:
     parts: List[Dict[str, Any]] = [{"type": "text", "text": text}]
     for raw in paths:
         path = Path(str(raw)).expanduser().resolve()
         if not path.is_file():
             raise AdTemplateProcessError("vision input image is missing")
-        mime = mimetypes.guess_type(path.name)[0] or "image/png"
-        parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"}})
+        payload, mime = _bounded_vision_image(path) if bounded else (path.read_bytes(), mimetypes.guess_type(path.name)[0] or "image/png")
+        parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"}})
     if len(parts) == 1:
         raise AdTemplateProcessError("vision role requires attached image pixels")
     return parts
+
+
+def _comparison_feedback(evidence: Mapping[str, Any]) -> str:
+    visual = evidence.get("visual_evidence") if isinstance(evidence, Mapping) else None
+    if not isinstance(visual, Mapping):
+        return str(evidence.get("reason") or "")[:3000]
+    feedback = {
+        "summary": str(evidence.get("reason") or "")[:1000],
+        "axes": visual.get("axes"),
+        "changes": visual.get("changes"),
+        "best_so_far": visual.get("best_so_far"),
+    }
+    return json.dumps(feedback, ensure_ascii=False, sort_keys=True, separators=(",", ":"))[:3000]
 
 class SoleProcessOrchestrator:
     """Runs builder, comparator, final reviewers, renderer, and importer as separate roles."""
@@ -805,7 +1171,7 @@ class SoleProcessOrchestrator:
         history = list(history or [])
         iterations = []
         candidate: Dict[str, Any] = {}
-        best_candidate: Mapping[str, Any] | None = revision_candidate
+        best_candidate: Mapping[str, Any] | None = copy.deepcopy(revision_candidate) if revision_candidate is not None else None
         best_score = previous_score if revision_candidate is not None else None
 
         def builder_route_identity(route: Mapping[str, str]) -> str:
@@ -937,9 +1303,33 @@ class SoleProcessOrchestrator:
             self.emit("iteration.rendered", "render", {"iteration": index, "previews": [{"name": str(x.get("name") or ""), "placement": str(x.get("placement") or "")} for x in public_previews]})
             candidate = {**candidate, **rendered}
             self._check_stop()
-            comparison = self.call_agent("comparator-%d" % index, vision_message(review_prompt(final=False, candidate=candidate), [source, str((rendered.get("render") or {}).get("feed") or ""), str((rendered.get("render") or {}).get("story") or "")]), f"{routes[1].get('provider')}/{routes[1].get('model')}")
+            comparison_paths = [source]
+            if iteration_prior is not None:
+                prior_render = iteration_prior.get("render") if isinstance(iteration_prior, Mapping) else None
+                if not isinstance(prior_render, Mapping):
+                    raise AdTemplateProcessError("immutable best candidate is missing rendered Feed and Story pixels")
+                comparison_paths.extend([str(prior_render.get("feed") or ""), str(prior_render.get("story") or "")])
+            comparison_paths.extend([
+                str((rendered.get("render") or {}).get("feed") or ""),
+                str((rendered.get("render") or {}).get("story") or ""),
+            ])
+            comparison = self.call_agent(
+                "comparator-%d" % index,
+                vision_message(
+                    review_prompt(final=False, candidate=candidate, best_available=iteration_prior is not None),
+                    comparison_paths,
+                    bounded=True,
+                ),
+                f"{routes[1].get('provider')}/{routes[1].get('model')}",
+            )
             self._check_stop()
-            evidence = _assessment(comparison, "comparator")
+            evidence = _assessment(
+                comparison,
+                "comparator",
+                require_visual_evidence=True,
+                candidate=candidate,
+                best_available=iteration_prior is not None,
+            )
             score, reason = evidence["score"], evidence["reason"]
             decision = "accepted" if _passes_quality_gate(evidence) else "revise"
             record = {
@@ -951,9 +1341,19 @@ class SoleProcessOrchestrator:
                 "builder_escalated": builder_escalated,
             }
             iterations.append(record)
-            self.emit("iteration.compared", "compare", {"iteration": index, "score": score, "reason": reason, "decision": decision, "preview_names": [str(x.get("name")) for x in candidate.get("previews", []) if isinstance(x, dict)]})
-            if best_score is None or score >= best_score:
-                best_candidate = candidate
+            self.emit("iteration.compared", "compare", {
+                "iteration": index,
+                "score": score,
+                "reason": reason,
+                "decision": decision,
+                "axes": evidence["visual_evidence"]["axes"],
+                "changes": evidence["visual_evidence"]["changes"],
+                "best_so_far": evidence["visual_evidence"]["best_so_far"],
+                "preview_names": [str(x.get("name")) for x in candidate.get("previews", []) if isinstance(x, dict)],
+            })
+            preferred = evidence["visual_evidence"]["best_so_far"]["preferred"]
+            if best_score is None or (preferred == "current" and score > best_score):
+                best_candidate = copy.deepcopy(candidate)
                 best_score = score
             if _passes_quality_gate(evidence):
                 previous_score = score
@@ -981,7 +1381,7 @@ class SoleProcessOrchestrator:
                     "reason": escalation_reason, "previous_score": previous_score, "score": score,
                 })
             previous_score = score
-            feedback = reason
+            feedback = _comparison_feedback(evidence)
         if not iterations or iterations[-1]["decision"] != "accepted": raise AdTemplateProcessError("comparator never reached threshold")
         reviewers = []
         for n, route in enumerate(routes[2:4], 1):
@@ -990,12 +1390,29 @@ class SoleProcessOrchestrator:
             route_identity = provider_route
             self.emit("final-review.started", "final-check", {"reviewer": identity, "route": route_identity})
             self._check_stop()
-            review = self.call_agent(identity, vision_message(review_prompt(final=True, candidate=candidate), [source, str((candidate.get("render") or {}).get("feed") or ""), str((candidate.get("render") or {}).get("story") or "")]), provider_route)
+            review = self.call_agent(
+                identity,
+                vision_message(
+                    review_prompt(final=True, candidate=candidate, completion_iteration=index),
+                    [source, str((candidate.get("render") or {}).get("feed") or ""), str((candidate.get("render") or {}).get("story") or "")],
+                    bounded=True,
+                ),
+                provider_route,
+            )
             self._check_stop()
             if not isinstance(review, dict): raise AdTemplateProcessError("final reviewer returned invalid result")
-            evidence = _assessment(review, "final reviewer")
+            evidence = _assessment(
+                review,
+                "final reviewer",
+                require_rendered_pixel_checks=True,
+            )
             reviewers.append({"id": identity, "route": route_identity, **evidence})
-        final_review = validate_final_review({"reviewers": reviewers}, accepted=True)
+        final_review = validate_final_review(
+            {"reviewers": reviewers, "completion_iteration": index},
+            accepted=True,
+            require_rendered_pixel_checks=True,
+            completion_iteration=index,
+        )
         if final_review["decision"] != "accepted":
             self.emit("final-review.completed", "final-check", {"decision": "revise", "reviewers": final_review["reviewers"]})
             if review_round >= 5 or total_iterations + len(iterations) >= 30:

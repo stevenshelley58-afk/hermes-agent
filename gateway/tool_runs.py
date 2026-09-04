@@ -40,7 +40,7 @@ _MASKED_EDIT_MODELS = frozenset({
     "gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2",
 })
 _KNOWN_IMAGE_ONLY = frozenset({"gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2"})
-_AD_TEMPLATE_POLICY_SEED_REVISION = 7
+_AD_TEMPLATE_POLICY_SEED_REVISION = 8
 AD_TEMPLATE_ROUTE_ORDER = (
     "analyse",
     "compare",

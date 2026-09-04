@@ -91,6 +91,37 @@ def _valid_template() -> dict:
     }
 
 
+def _visual_evidence() -> dict:
+    return {
+        "regions": {
+            placement: [{
+                "bbox": {"x": 0.05, "y": 0.05, "width": 0.9, "height": 0.7},
+                "kind": "photo",
+                "semantic_role": "property hero",
+                "ocr_text": "",
+                "content_state": "meaningful",
+            }]
+            for placement in ("source", "feed", "story")
+        },
+        "axes": {
+            "macro_topology": {"decision": "pass", "reason": "Composition is coherent"},
+            "micro_typography_legibility": {"decision": "pass", "reason": "Type is legible"},
+        },
+        "best_so_far": {
+            "available": False,
+            "macro_topology": "not_applicable",
+            "micro_typography_legibility": "not_applicable",
+            "preferred": "current",
+        },
+        "changes": [],
+        "rendered_checks": {
+            "judged_rendered_pixels": True,
+            "identity_treatment": "meaningful_editable_identity",
+            "story_space": "functional_composition",
+        },
+    }
+
+
 class _PreviewAgent:
     def __init__(self, callback, store, run_id, observed):
         self._callback = callback
@@ -166,6 +197,12 @@ class _StructuredRoleAgent:
                 "reason": "All visible requirements pass",
                 "hard_failures": [],
                 "rubric": {field: 9.7 for field in process.RUBRIC_FIELDS},
+                "visual_evidence": _visual_evidence(),
+                "rendered_pixel_checks": {
+                    "judged_rendered_pixels": True,
+                    "identity_treatment": "meaningful_editable_identity",
+                    "story_space": "functional_composition",
+                },
             }
         return {"final_response": json.dumps(payload)}
 
@@ -512,6 +549,12 @@ async def test_initial_builder_format_recovery_persists_events_and_all_role_cost
                     "hard_failures": [],
                     "rubric": {
                         field: 9.7 for field in process.RUBRIC_FIELDS
+                    },
+                    "visual_evidence": _visual_evidence(),
+                    "rendered_pixel_checks": {
+                        "judged_rendered_pixels": True,
+                        "identity_treatment": "meaningful_editable_identity",
+                        "story_space": "functional_composition",
                     },
                 }
             return {"final_response": json.dumps(payload)}

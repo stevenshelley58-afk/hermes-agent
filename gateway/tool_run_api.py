@@ -238,8 +238,18 @@ class ToolRunAPIMixin:
         missing = sorted(key for key in required if key not in output)
         if missing:
             raise RuntimeError(f"Generator result is incomplete: {', '.join(missing)}")
-        iterations = validate_iterations(output.get("iterations"))
-        final_review = validate_final_review(output.get("final_review"), accepted=iterations[-1]["decision"] == "accepted")
+        policy_revision = int(output.get("model_policy_revision") or 0)
+        current_contract = policy_revision >= 8
+        iterations = validate_iterations(
+            output.get("iterations"),
+            require_visual_evidence=current_contract,
+        )
+        final_review = validate_final_review(
+            output.get("final_review"),
+            accepted=iterations[-1]["decision"] == "accepted",
+            require_rendered_pixel_checks=current_contract,
+            completion_iteration=iterations[-1]["iteration"] if current_contract else None,
+        )
         if final_review.get("decision") != "accepted":
             raise RuntimeError("final reviewers did not pass")
         docs = deterministic_documents(output.get("template"))
@@ -261,8 +271,18 @@ class ToolRunAPIMixin:
     def _validated_generation_gate(output: Any) -> Dict[str, Any]:
         if not isinstance(output, dict):
             raise ToolRunError("generator output is required")
-        iterations = validate_iterations(output.get("iterations"))
-        return validate_final_review(output.get("final_review"), accepted=iterations[-1]["decision"] == "accepted")
+        policy_revision = int(output.get("model_policy_revision") or 0)
+        current_contract = policy_revision >= 8
+        iterations = validate_iterations(
+            output.get("iterations"),
+            require_visual_evidence=current_contract,
+        )
+        return validate_final_review(
+            output.get("final_review"),
+            accepted=iterations[-1]["decision"] == "accepted",
+            require_rendered_pixel_checks=current_contract,
+            completion_iteration=iterations[-1]["iteration"] if current_contract else None,
+        )
 
     def _project_generation_events(self, run_id: str, records: List[Dict[str, Any]]) -> None:
         # The executable orchestrator persists each real comparator and reviewer
