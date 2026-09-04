@@ -1,4 +1,5 @@
 import asyncio
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -30,6 +31,49 @@ def _hierarchical_comparison(score: float, required_changes: list[str]) -> dict:
         "regressions": [],
         "ranked_changes": required_changes,
         "declared_decision": "accept" if score >= 9.5 else "revise",
+    }
+
+
+def _source_inventory(required_changes: list[str]) -> dict:
+    differences = ["Visible mismatch"] if required_changes else []
+    treatment = {
+        "brand_silhouette_features": ["roof"],
+        "phone_badge": {"shape": "circle", "fillTreatment": "filled"},
+        "mail_badge": {"shape": "circle", "fillTreatment": "filled"},
+        "web_badge": {"shape": "circle", "fillTreatment": "filled"},
+        "location_badge": {"shape": "absent", "fillTreatment": "absent"},
+        "cta_badge": {"shape": "absent", "fillTreatment": "absent"},
+    }
+    return {
+        "macro_regions": [
+            {
+                "region": region,
+                "source_components": [region],
+                "feed_components": [region],
+                "story_components": [region],
+                "source_count": 1,
+                "feed_count": 1,
+                "story_count": 1,
+                "status": "match",
+                "material": False,
+                "findings": [],
+                "required_change_refs": [],
+            }
+            for region in process.COMPARATOR_MACRO_INVENTORY_REGIONS
+        ],
+        "micro_checks": [
+            {
+                "check": check,
+                "source_observation": treatment if check == "mark_badge_treatment" else f"source {check}",
+                "feed_observation": treatment if check == "mark_badge_treatment" else f"feed {check}",
+                "story_observation": treatment if check == "mark_badge_treatment" else f"story {check}",
+                "status": "mismatch" if differences and check == "typography_spacing" else "match",
+                "material": bool(differences and check == "typography_spacing"),
+                "findings": differences if differences and check == "typography_spacing" else [],
+                "required_change_refs": [1] if differences and check == "typography_spacing" else [],
+            }
+            for check in process.COMPARATOR_MICRO_INVENTORY_CHECKS
+        ],
     }
 
 
@@ -166,6 +210,75 @@ class _ToolRunHarness(ToolRunAPIMixin):
 
     def _check_auth(self, _request):
         return None
+
+
+class _JsonRetryRequest:
+    can_read_body = True
+    content_length = 2
+
+    def __init__(self, run_id: str, body: dict):
+        self.match_info = {"run_id": run_id}
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+
+def _write_build_retry_checkpoint(
+    workspace: Path, *, iterations: int = 2, accepted_last: bool = True,
+) -> None:
+    (workspace / "previews").mkdir(parents=True)
+    for iteration in range(1, iterations + 1):
+        root = workspace / "iterations" / f"{iteration:02d}"
+        root.mkdir(parents=True)
+        template = _valid_template()
+        template["templateId"] = f"retry-seed-{iteration}"
+        (root / "artifact.json").write_text(
+            json.dumps({"template": template, "assets": []}), encoding="utf-8"
+        )
+        for placement in ("feed", "story"):
+            (workspace / "previews" / f"iteration-{iteration:02d}-{placement}.png").write_bytes(
+                f"{placement}-{iteration}".encode()
+            )
+        accepted = accepted_last and iteration == iterations
+        score = 9.7 if accepted else 9.0
+        changes = [] if accepted else [
+            "placement=story; layers=story-background; "
+            "current={x:0,y:0,width:1080,height:1920}; "
+            "target={x:0,y:0,width:1080,height:1920}; change=Continue matching"
+        ]
+        comparison = {
+            "rubric": {field: score for field in process.RUBRIC_FIELDS},
+            "reason": "Accepted comparator pixels" if accepted else "Continue matching",
+            "hard_failures": [],
+            "visible_strings": _visible_strings(),
+            "differences": [] if accepted else ["Visible mismatch"],
+            "required_changes": changes,
+            "source_inventory": _source_inventory(changes),
+            **_hierarchical_comparison(score, changes),
+        }
+        record = {
+            "iteration": iteration,
+            "candidate": {"template": template, "assets": [], "previews": []},
+            "comparison": comparison,
+            "decision": "accepted" if accepted else "revise",
+        }
+        process.persist_iteration_checkpoint(
+            workspace,
+            iteration=iteration,
+            record=record,
+            best_iteration=iteration,
+            builder_route={"provider": "openai-codex", "model": "gpt-5.6-sol"},
+            builder_escalated=True,
+            previous_score=score,
+            best_quality_score=score,
+            low_gain_streak=0,
+            feedback=json.dumps({
+                "reason": comparison["reason"],
+                "required_changes": changes,
+                "source_invariants": {"feature_bullet_count": 6},
+            }),
+        )
 
 
 def test_main_chat_model_never_controls_ad_template_role_selection(tmp_path):
@@ -815,6 +928,209 @@ async def test_retry_reuses_persisted_source_after_staging_cleanup(tmp_path, mon
     assert "command.queued" in {
         event["kind"] for event in store.events(run["run_id"])
     }
+
+
+@pytest.mark.asyncio
+async def test_terminal_final_failure_build_from_best_is_restart_safe_and_repairs_renderer(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / "hermes-home"
+    source = tmp_path / "source.png"
+    source.write_bytes(b"exact-source-pixels")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    command = _command(str(source), idempotency_key="build-from-best")
+    command["payload"]["sources"][0]["size"] = source.stat().st_size
+    command["payload"]["brief"] = "Immutable full brief tail sentinel ADDRESS_BOUNDS_ONLY"
+    store = ToolRunStore(str(tmp_path / "build-from-best.db"))
+    run, _ = store.create_run(command)
+    workspace = home / "tool_runs" / "ad-template-generator" / run["run_id"]
+    _write_build_retry_checkpoint(workspace)
+    (workspace / "previews" / "source.png").write_bytes(source.read_bytes())
+    store.append_event(
+        run["run_id"], "final-review.retried", status="running", node_id="final-check",
+        data={
+            "reviewer": "final-reviewer-b",
+            "attempt": 3,
+            "reason": "final-review-b returned no structured JSON",
+        },
+    )
+    store.update_run(
+        run["run_id"], status="failed", stage="final-check",
+        error="final-review-b exhausted invalid structured JSON retries",
+    )
+    renderer_reason = (
+        "story text layer story-address painted bounds exceed geometry by 4px on right"
+    )
+    monkeypatch.setattr(
+        tool_run_api,
+        "run_generator_cli",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            process.AdTemplateRendererRejection(renderer_reason)
+        ),
+    )
+    api = _ToolRunHarness(store)
+    started = []
+    monkeypatch.setattr(
+        api, "_start_tool_task",
+        lambda run_id, finalize=False: started.append((run_id, finalize)),
+    )
+
+    response = await api._handle_retry_tool_run(
+        _JsonRetryRequest(run["run_id"], {"mode": "build-from-best"})
+    )
+
+    assert response.status == 202
+    assert started == [(run["run_id"], False)]
+    queued = store.get_run(run["run_id"])
+    assert queued["status"] == "queued"
+    assert queued["stage"] == "build"
+    assert queued["payload"] == run["payload"]
+    assert queued["model_policy_revision"] == run["model_policy_revision"]
+    events = store.events(run["run_id"])
+    intent = [event for event in events if event["kind"] == "command.queued"][-1]
+    assert intent["data"]["retry_mode"] == "build-from-best"
+    assert intent["data"]["seed_iteration"] == 2
+    assert intent["data"]["history_length"] == 2
+    assert intent["data"]["iteration_budget_extension"] == 1
+    assert intent["data"]["renderer_reasons"] == [renderer_reason]
+    assert "final-review-b exhausted invalid structured JSON retries" in intent["data"]["seed_feedback"]
+    assert renderer_reason in intent["data"]["seed_feedback"]
+
+    observed = {}
+
+    class _ResumeFromBest:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run(self, **kwargs):
+            observed.update(kwargs)
+            return {
+                "template": {}, "iterations": [], "final_review": {},
+                "previews": [], "documents": {},
+                "import": {"template_id": "tpl-after-repair", "status": "imported"},
+                "process": "only-ad-template-process",
+            }
+
+    restarted_api = _ToolRunHarness(store)
+    monkeypatch.setattr(tool_run_api, "SoleProcessOrchestrator", _ResumeFromBest)
+    monkeypatch.setattr(
+        restarted_api, "_prepare_candidate_output", lambda _run_id, output: output,
+    )
+    await restarted_api._execute_tool_run(run["run_id"])
+
+    assert observed["resume_final_check"] is False
+    assert observed["total_iterations"] == 2
+    assert observed["best_iteration"] == 2
+    assert observed["revision_candidate"]["template"]["templateId"] == "retry-seed-2"
+    assert observed["iteration_budget_extension"] == 1
+    assert renderer_reason in observed["feedback"]
+    assert "final-review-b exhausted invalid structured JSON retries" in observed["feedback"]
+
+
+@pytest.mark.asyncio
+async def test_build_from_best_concurrent_requests_queue_once_atomically(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    store = ToolRunStore(str(tmp_path / "concurrent-retry.db"))
+    run, _ = store.create_run(_command(str(source), idempotency_key="concurrent-retry"))
+    store.update_run(run["run_id"], status="failed", stage="final-check", error="failed")
+    api = _ToolRunHarness(store)
+    started = []
+    monkeypatch.setattr(api, "_start_tool_task", lambda *args, **kwargs: started.append(args))
+    monkeypatch.setattr(
+        api,
+        "_validate_build_from_best_retry",
+        lambda _run: ({}, {
+            "retry_mode": "build-from-best",
+            "seed_iteration": 2,
+            "history_length": 2,
+            "iteration_budget_extension": 1,
+            "seed_feedback": "{}",
+        }),
+    )
+
+    responses = await asyncio.gather(*[
+        api._handle_retry_tool_run(
+            _JsonRetryRequest(run["run_id"], {"mode": "build-from-best"})
+        )
+        for _ in range(2)
+    ])
+
+    assert sorted(response.status for response in responses) == [202, 400]
+    queued = [
+        event for event in store.events(run["run_id"])
+        if event["kind"] == "command.queued"
+    ]
+    assert len(queued) == 1
+    assert queued[0]["data"]["retry_mode"] == "build-from-best"
+    assert len(started) == 1
+
+
+@pytest.mark.asyncio
+async def test_build_from_best_rejects_completed_import_without_mutation(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    store = ToolRunStore(str(tmp_path / "completed-retry.db"))
+    run, _ = store.create_run(_command(str(source), idempotency_key="completed-retry"))
+    store.update_run(
+        run["run_id"], status="completed", stage="live",
+        output={"import": {"template_id": "already-imported"}},
+    )
+    api = _ToolRunHarness(store)
+    before = store.get_run(run["run_id"])
+    before_events = store.events(run["run_id"])
+    monkeypatch.setattr(
+        api, "_validate_build_from_best_retry",
+        lambda _run: pytest.fail("completed runs must fail before validation"),
+    )
+    monkeypatch.setattr(
+        api, "_start_tool_task",
+        lambda *_args, **_kwargs: pytest.fail("completed run must not start"),
+    )
+
+    response = await api._handle_retry_tool_run(
+        _JsonRetryRequest(run["run_id"], {"mode": "build-from-best"})
+    )
+
+    assert response.status == 400
+    assert store.get_run(run["run_id"]) == before
+    assert store.events(run["run_id"]) == before_events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["source", "best-preview"])
+async def test_build_from_best_fails_closed_when_persisted_seed_is_incomplete(
+    tmp_path, monkeypatch, missing,
+):
+    home = tmp_path / "hermes-home"
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = ToolRunStore(str(tmp_path / f"missing-{missing}.db"))
+    run, _ = store.create_run(_command(str(source), idempotency_key=f"missing-{missing}"))
+    workspace = home / "tool_runs" / "ad-template-generator" / run["run_id"]
+    _write_build_retry_checkpoint(workspace)
+    (workspace / "previews" / "source.png").write_bytes(source.read_bytes())
+    if missing == "source":
+        source.unlink()
+        (workspace / "previews" / "source.png").unlink()
+    else:
+        (workspace / "previews" / "iteration-02-feed.png").unlink()
+    store.update_run(run["run_id"], status="failed", stage="final-check", error="failed")
+    api = _ToolRunHarness(store)
+    before_events = store.events(run["run_id"])
+    monkeypatch.setattr(
+        tool_run_api, "run_generator_cli",
+        lambda *_args, **_kwargs: pytest.fail("incomplete seed must fail before renderer"),
+    )
+
+    response = await api._handle_retry_tool_run(
+        _JsonRetryRequest(run["run_id"], {"mode": "build-from-best"})
+    )
+
+    assert response.status == 400
+    assert store.get_run(run["run_id"])["status"] == "failed"
+    assert store.events(run["run_id"]) == before_events
 
 
 @pytest.mark.asyncio

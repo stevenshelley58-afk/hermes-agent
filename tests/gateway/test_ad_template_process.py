@@ -3491,3 +3491,113 @@ def test_required_quality_route_fails_before_any_builder_call(tmp_path):
             routes=_quality_routes()[:4], require_quality_route=True,
         )
     assert calls == []
+
+
+def test_build_from_best_budget_appends_iteration_after_normal_max(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    workspace = tmp_path / "run"
+    old_checkpoint = workspace / "iterations" / "02" / "checkpoint.json"
+    old_checkpoint.parent.mkdir(parents=True)
+    old_checkpoint.write_text("historical-boundary", encoding="utf-8")
+    (workspace / "previews").mkdir(parents=True)
+    for placement in ("feed", "story"):
+        (workspace / "previews" / f"iteration-02-{placement}.png").write_bytes(
+            f"historical-{placement}".encode()
+        )
+    seed = valid_candidate("persisted-best")
+    seed["render"] = {
+        placement: str(workspace / "previews" / f"iteration-02-{placement}.png")
+        for placement in ("feed", "story")
+    }
+    history = []
+    for iteration in (1, 2):
+        comparison = evidence(9.0, f"historical comparison {iteration}")
+        history.append({
+            "iteration": iteration,
+            "candidate": process._candidate_trace_projection(seed),
+            "comparison": comparison,
+            "decision": "revise",
+        })
+    calls, renders = [], []
+
+    def call_agent(instance, prompt, route):
+        calls.append((instance, route, prompt))
+        if instance.startswith("builder-"):
+            return valid_candidate("appended-iteration")
+        if instance.startswith("comparator-"):
+            return evidence(9.7, "Appended candidate passes")
+        return evidence(9.7, "Independent final passes")
+
+    monkeypatch.setattr(process, "MAX_ITERATIONS", 2)
+    monkeypatch.setattr(
+        process, "run_generator_cli",
+        lambda candidate, iteration_workspace: fake_render(
+            candidate, iteration_workspace, renders,
+        ),
+    )
+    monkeypatch.setattr(
+        process, "import_template",
+        lambda output, run_id, project_id: {
+            "template_id": "tpl-appended", "status": "imported",
+        },
+    )
+
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=workspace, run_id="trun_append_after_max",
+        project_id="blockwise", emit=lambda *_args: None,
+    ).run(
+        source=str(source), brief="", placements=["feed", "story"],
+        routes=_quality_routes(), require_quality_route=True,
+        total_iterations=2, history=history, revision_candidate=seed,
+        selected_builder_route={"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        best_iteration=2, best_quality_score=9.0,
+        iteration_budget_extension=1,
+    )
+
+    assert [item[0] for item in calls[:2]] == ["builder-3", "comparator-3"]
+    assert len(calls) == 4
+    assert all(item[0].startswith("final-reviewer-") for item in calls[2:])
+    assert result["iterations"][-1]["iteration"] == 3
+    assert (workspace / "iterations" / "03" / "checkpoint.json").is_file()
+    assert old_checkpoint.read_text(encoding="utf-8") == "historical-boundary"
+
+
+def test_terminal_final_rejection_persists_feedback_before_bounded_failure(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    workspace = tmp_path / "run"
+
+    def call_agent(instance, _prompt, _route):
+        if instance.startswith("builder-"):
+            return valid_candidate("terminal-final")
+        if instance.startswith("comparator-"):
+            return evidence(9.7, "Comparator accepts actual pixels")
+        return evidence(9.0, "Final reviewer requires address correction")
+
+    monkeypatch.setattr(process, "MAX_FINAL_REVIEW_ROUNDS", 0)
+    monkeypatch.setattr(
+        process, "run_generator_cli",
+        lambda candidate, iteration_workspace: fake_render(
+            candidate, iteration_workspace, [],
+        ),
+    )
+    with pytest.raises(
+        process.AdTemplateProcessError,
+        match="final reviewers failed after the bounded automatic revision loop",
+    ):
+        SoleProcessOrchestrator(
+            call_agent=call_agent, workspace=workspace, run_id="trun_terminal_final",
+            project_id="blockwise", emit=lambda *_args: None,
+        ).run(
+            source=str(source), brief="", placements=["feed", "story"],
+            routes=_quality_routes(), require_quality_route=True,
+        )
+
+    checkpoint = json.loads(
+        (workspace / "iterations" / "01" / "checkpoint.json").read_text("utf-8")
+    )
+    assert checkpoint["record"]["final_review_failed"] is True
+    assert "Final reviewer requires address correction" in checkpoint["feedback"]

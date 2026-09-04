@@ -803,27 +803,79 @@ class ToolRunStore:
             )
         return self.get_run(run_id)
 
-    def requeue(self, run_id: str, *, stage: Optional[str] = None) -> Dict[str, Any]:
-        run = self.get_run(run_id)
-        next_stage = _clean_id(stage or run.get("stage") or "source", "stage")
+    def requeue(
+        self,
+        run_id: str,
+        *,
+        stage: Optional[str] = None,
+        expected_statuses: Optional[Iterable[str]] = None,
+        event_data: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Atomically transition a run to queued and append its durable intent."""
+        _clean_id(run_id, "run_id")
+        allowed_statuses = (
+            frozenset(str(item) for item in expected_statuses)
+            if expected_statuses is not None else None
+        )
+        if allowed_statuses is not None and (
+            not allowed_statuses or not allowed_statuses.issubset(_RUN_STATUSES)
+        ):
+            raise ToolRunError("expected retry statuses are invalid")
+        extra_event_data = dict(event_data or {})
+        if "resume_from" in extra_event_data:
+            raise ToolRunError("retry event data cannot override resume_from")
+        _json(extra_event_data, "event.data")
+        now = _now()
         updates = {
             "status": "queued",
-            "stage": next_stage,
             "cancel_requested": 0,
             "attention": 0,
             "error": None,
             "completed_at": None,
-            "updated_at": _now(),
+            "updated_at": now,
         }
         with self._lock:
+            row = self._conn.execute(
+                "SELECT status,stage,trace_id FROM tool_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Tool run not found: {run_id}")
+            if allowed_statuses is not None and row["status"] not in allowed_statuses:
+                raise ToolRunError("Tool run is no longer eligible for retry")
+            next_stage = _clean_id(stage or row["stage"] or "source", "stage")
+            updates["stage"] = next_stage
             columns = ",".join(f"{key}=?" for key in updates)
-            self._conn.execute(f"UPDATE tool_runs SET {columns} WHERE run_id=?", (*updates.values(), run_id))
-            self._conn.commit()
-        event_data: Dict[str, Any] = {"resume_from": next_stage}
-        self.append_event(
-            run_id, "command.queued", status="queued", node_id=next_stage,
-            data=event_data,
-        )
+            event_payload: Dict[str, Any] = {"resume_from": next_stage, **extra_event_data}
+            data_json = _json(event_payload, "event.data")
+            try:
+                params: List[Any] = [*updates.values(), run_id]
+                where = "run_id=?"
+                if allowed_statuses is not None:
+                    placeholders = ",".join("?" for _ in allowed_statuses)
+                    where += f" AND status IN ({placeholders})"
+                    params.extend(sorted(allowed_statuses))
+                cursor = self._conn.execute(
+                    f"UPDATE tool_runs SET {columns} WHERE {where}", tuple(params)
+                )
+                if cursor.rowcount != 1:
+                    raise ToolRunError("Tool run is no longer eligible for retry")
+                sequence = int(self._conn.execute(
+                    "SELECT COALESCE(MAX(sequence),-1)+1 FROM tool_run_events WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()[0])
+                self._conn.execute(
+                    """INSERT INTO tool_run_events(
+                        run_id,sequence,schema,kind,status,timestamp,node_id,trace_id,span_id,data_json
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        run_id, sequence, TOOL_RUN_EVENT_SCHEMA, "command.queued", "queued",
+                        now, next_stage, row["trace_id"], None, data_json,
+                    ),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
         return self.get_run(run_id)
 
     def replace_remaining_policy(self, run_id: str, policy: Dict[str, Any]) -> Dict[str, Any]:

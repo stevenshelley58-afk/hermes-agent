@@ -2931,8 +2931,11 @@ class SoleProcessOrchestrator:
         if self.should_stop():
             raise AdTemplateProcessError("sole ad-template process was cancelled")
 
-    def run(self, *, source: str, brief: str, placements: Any, routes: List[Dict[str, str]], review_round: int = 0, total_iterations: int = 0, feedback: str = "", history: List[Dict[str, Any]] | None = None, revision_candidate: Mapping[str, Any] | None = None, selected_builder_route: Mapping[str, str] | None = None, builder_escalated: bool = False, previous_score: float | None = None, low_gain_streak: int = 0, require_quality_route: bool = False, resume_final_check: bool = False, best_iteration: int | None = None, best_quality_score: float | None = None) -> Dict[str, Any]:
+    def run(self, *, source: str, brief: str, placements: Any, routes: List[Dict[str, str]], review_round: int = 0, total_iterations: int = 0, feedback: str = "", history: List[Dict[str, Any]] | None = None, revision_candidate: Mapping[str, Any] | None = None, selected_builder_route: Mapping[str, str] | None = None, builder_escalated: bool = False, previous_score: float | None = None, low_gain_streak: int = 0, require_quality_route: bool = False, resume_final_check: bool = False, best_iteration: int | None = None, best_quality_score: float | None = None, iteration_budget_extension: int = 0) -> Dict[str, Any]:
         if len(routes) < 4: raise AdTemplateProcessError("builder, comparator, and two final reviewers require four configured roles")
+        if isinstance(iteration_budget_extension, bool) or iteration_budget_extension not in (0, 1):
+            raise AdTemplateProcessError("iteration budget extension must be zero or one")
+        iteration_limit = MAX_ITERATIONS + iteration_budget_extension
         _validate_brief_asset_capabilities(brief)
         quality_route = routes[4] if len(routes) > 4 else None
         if require_quality_route and quality_route is None:
@@ -2962,7 +2965,7 @@ class SoleProcessOrchestrator:
 
         def builder_route_identity(route: Mapping[str, str]) -> str:
             return f"{route.get('provider')}/{route.get('model')}"
-        iteration_offsets = () if resume_final_check else range(MAX_ITERATIONS - total_iterations)
+        iteration_offsets = () if resume_final_check else range(iteration_limit - total_iterations)
         for offset in iteration_offsets:
             index = total_iterations + offset + 1
             source_invariants = _source_invariants_from_feedback(feedback)
@@ -3576,8 +3579,6 @@ class SoleProcessOrchestrator:
         final_review = validate_final_review({"reviewers": reviewers}, accepted=True)
         if final_review["decision"] != "accepted":
             self.emit("final-review.completed", "final-check", {"decision": "revise", "reviewers": final_review["reviewers"]})
-            if review_round >= MAX_FINAL_REVIEW_ROUNDS or total_iterations + len(iterations) >= MAX_ITERATIONS:
-                raise AdTemplateProcessError("final reviewers failed after the bounded automatic revision loop")
             accepted_records[-1]["final_review_failed"] = True
             reasons = json.dumps([
                 {
@@ -3608,6 +3609,8 @@ class SoleProcessOrchestrator:
                 feedback=reasons,
                 best_quality_score=best_score,
             )
+            if review_round >= MAX_FINAL_REVIEW_ROUNDS or total_iterations + len(iterations) >= iteration_limit:
+                raise AdTemplateProcessError("final reviewers failed after the bounded automatic revision loop")
             return self.run(
                 source=source, brief=brief, placements=placements, routes=routes,
                 review_round=review_round + 1, total_iterations=len(history + iterations),
@@ -3617,6 +3620,7 @@ class SoleProcessOrchestrator:
                 require_quality_route=require_quality_route,
                 best_iteration=best_iteration,
                 best_quality_score=best_score,
+                iteration_budget_extension=iteration_budget_extension,
             )
         self.emit("final-review.completed", "final-check", {"decision": "accepted", "reviewers": final_review["reviewers"]})
         generated = candidate

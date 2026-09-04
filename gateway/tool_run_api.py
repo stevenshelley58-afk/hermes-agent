@@ -14,6 +14,7 @@ import os
 import re
 import uuid
 import shutil
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -23,7 +24,7 @@ from aiohttp import web
 
 from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
-from gateway.ad_template_process import AdTemplateProcessError, AdTemplateStructuredOutputError, AdTemplateTransportError, SoleProcessOrchestrator, _compact_revision_feedback, _quality_ranking_score, validate_artifacts, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
+from gateway.ad_template_process import AdTemplateProcessError, AdTemplateRendererRejection, AdTemplateStructuredOutputError, AdTemplateTransportError, SoleProcessOrchestrator, _compact_revision_feedback, _quality_ranking_score, _renderer_rejection_instructions, validate_artifacts, validate_builder_candidate, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, run_generator_cli, THRESHOLD as AD_TEMPLATE_THRESHOLD
 from gateway.tool_runs import (
     AD_TEMPLATE_ROUTE_ORDER,
     AD_TEMPLATE_OPTIONAL_ROUTE,
@@ -403,7 +404,9 @@ class ToolRunAPIMixin:
         candidate = self._load_ad_template_iteration_candidate(workspace, best_iteration)
         last = history[-1]
         resume_final_check = (
-            last["decision"] == "accepted" and not last.get("final_review_failed")
+            current_stage == "final-check"
+            and last["decision"] == "accepted"
+            and not last.get("final_review_failed")
         )
         selected_route = state.get("builder_route")
         if not isinstance(selected_route, dict):
@@ -427,6 +430,16 @@ class ToolRunAPIMixin:
                 "best_review": history[best_iteration - 1]["comparison"],
                 "current_review": last["comparison"],
             }
+        retry_intent = self._build_from_best_retry_intent(run_id, current_stage)
+        if retry_intent is not None:
+            if (
+                retry_intent.get("seed_iteration") != best_iteration
+                or retry_intent.get("history_length") != len(history)
+            ):
+                raise RuntimeError("build-from-best retry seed no longer matches its checkpoint")
+            decoded_feedback = retry_intent.get("seed_feedback")
+            if not isinstance(decoded_feedback, str) or not decoded_feedback:
+                raise RuntimeError("build-from-best retry has no persisted terminal feedback")
         return {
             "candidate": candidate,
             "history": history,
@@ -438,6 +451,197 @@ class ToolRunAPIMixin:
             "builder_escalated": bool(state.get("builder_escalated")),
             "low_gain_streak": int(state.get("low_gain_streak") or 0),
             "feedback": _compact_revision_feedback(decoded_feedback),
+            "iteration_budget_extension": (
+                int(retry_intent.get("iteration_budget_extension") or 0)
+                if retry_intent is not None else 0
+            ),
+        }
+
+    def _build_from_best_retry_intent(
+        self, run_id: str, current_stage: str
+    ) -> Dict[str, Any] | None:
+        if current_stage != "build":
+            return None
+        for event in reversed(self._tool_run_store.events(run_id, limit=5000)):
+            if event.get("kind") != "command.queued":
+                continue
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            return data if data.get("retry_mode") == "build-from-best" else None
+        return None
+
+    def _terminal_failure_seed_feedback(
+        self,
+        run: Dict[str, Any],
+        checkpoint: Dict[str, Any],
+        renderer_instruction: str,
+    ) -> str:
+        raw_feedback = checkpoint.get("feedback")
+        try:
+            base = json.loads(raw_feedback) if isinstance(raw_feedback, str) else {}
+        except json.JSONDecodeError:
+            base = {}
+        if not isinstance(base, dict):
+            base = {}
+        terminal_reasons: List[str] = []
+        final_hard_failures: List[str] = []
+        final_required_changes: List[str] = []
+        final_events: List[Dict[str, Any]] = []
+        for event in self._tool_run_store.events(str(run["run_id"]), limit=5000):
+            if event.get("kind") == "iteration.compared":
+                final_events = []
+                continue
+            if str(event.get("kind") or "").startswith("final-review."):
+                final_events.append(event)
+        for event in final_events[-16:]:
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            reason = data.get("reason")
+            if reason:
+                terminal_reasons.append(redact_sensitive_text(str(reason), force=True)[:600])
+            reviewers = data.get("reviewers") if isinstance(data.get("reviewers"), list) else []
+            for reviewer in reviewers[:2]:
+                if not isinstance(reviewer, dict):
+                    continue
+                final_hard_failures.extend(
+                    str(item)[:600] for item in (reviewer.get("hard_failures") or [])[:6]
+                )
+                final_required_changes.extend(
+                    str(item)[:1200] for item in (reviewer.get("required_changes") or [])[:6]
+                )
+                if reviewer.get("reason"):
+                    terminal_reasons.append(str(reviewer["reason"])[:600])
+        if run.get("error"):
+            terminal_reasons.append(
+                redact_sensitive_text(str(run["error"]), force=True)[:600]
+            )
+        terminal_reason = "; ".join(dict.fromkeys(terminal_reasons))[:1200]
+        current_review = dict(base)
+        current_review["hard_failures"] = list(dict.fromkeys([
+            *final_hard_failures,
+            *list(base.get("hard_failures") or []),
+            *([f"Terminal final review did not pass: {terminal_reason}"] if terminal_reason else []),
+            renderer_instruction,
+        ]))
+        current_review["required_changes"] = list(dict.fromkeys([
+            renderer_instruction,
+            *final_required_changes,
+            *list(base.get("required_changes") or []),
+        ]))
+        current_review["reason"] = terminal_reason or str(base.get("reason") or "")
+        return _compact_revision_feedback({
+            "instruction": (
+                "Resume at build from the validated immutable best after terminal final-review "
+                "failure; preserve every source invariant and apply the current renderer fix."
+            ),
+            "best_quality_score": checkpoint.get("best_quality_score"),
+            "best_review": current_review,
+            "current_review": current_review,
+            "source_invariants": base.get("source_invariants"),
+        })
+
+    @staticmethod
+    def _checkpoint_builder_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
+        """Project a rendered checkpoint back to the exact builder contract."""
+        raw_assets = candidate.get("assets")
+        if not isinstance(raw_assets, list):
+            raise ToolRunError("persisted best artifact has invalid assets")
+        assets = []
+        for item in raw_assets:
+            if not isinstance(item, dict):
+                raise ToolRunError("persisted best artifact has invalid assets")
+            assets.append({
+                key: item.get(key)
+                for key in ("assetKey", "fileName", "mimeType")
+            })
+        projected = {"template": candidate.get("template"), "assets": assets}
+        try:
+            return validate_builder_candidate(projected)
+        except AdTemplateProcessError as exc:
+            raise ToolRunError("persisted best artifact does not match the current builder contract") from exc
+
+    def _validate_build_from_best_retry(
+        self, run: Dict[str, Any]
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Fail closed before requeuing a terminal run at its persisted best."""
+        if (
+            run.get("tool_id") != "ad-template-generator"
+            or run.get("action") != "build-template"
+        ):
+            raise ToolRunError("build-from-best retry is only supported for ad-template builds")
+        payload = run.get("payload") if isinstance(run.get("payload"), dict) else {}
+        if payload.get("placements") != ["feed", "story"]:
+            raise ToolRunError("build-from-best retry requires the original Feed and Story contract")
+        sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
+        if len(sources) != 1 or not isinstance(sources[0], dict):
+            raise ToolRunError("build-from-best retry requires exactly one persisted source")
+        brief = payload.get("brief")
+        if not isinstance(brief, str) or not brief.strip():
+            raise ToolRunError("build-from-best retry requires the original immutable brief")
+
+        try:
+            from hermes_constants import get_hermes_home
+            workspace = (
+                get_hermes_home()
+                / "tool_runs"
+                / "ad-template-generator"
+                / str(run["run_id"])
+            ).resolve()
+            source = self._durable_tool_source(workspace, str(sources[0].get("path") or ""))
+        except (KeyError, OSError, RuntimeError, ValueError) as exc:
+            raise ToolRunError("persisted source contract is unavailable") from exc
+        expected_size = sources[0].get("size")
+        if isinstance(expected_size, int) and expected_size >= 0 and source.stat().st_size != expected_size:
+            raise ToolRunError("persisted source contract does not match the submitted source")
+        try:
+            checkpoint = self._ad_template_iteration_checkpoint(
+                str(run["run_id"]), workspace, "build"
+            )
+        except (AdTemplateProcessError, OSError, RuntimeError, ValueError) as exc:
+            raise ToolRunError("validated best checkpoint is unavailable") from exc
+        if (
+            not isinstance(checkpoint, dict)
+            or not isinstance(checkpoint.get("candidate"), dict)
+            or not isinstance(checkpoint.get("history"), list)
+            or not checkpoint.get("history")
+            or not isinstance(checkpoint.get("best_iteration"), int)
+        ):
+            raise ToolRunError("validated best checkpoint is unavailable")
+        candidate = self._checkpoint_builder_candidate(checkpoint["candidate"])
+
+        renderer_outcome = "renderable"
+        renderer_reasons: List[str] = []
+        try:
+            with tempfile.TemporaryDirectory(prefix="retry-renderer-preflight-") as scratch:
+                run_generator_cli(candidate, Path(scratch))
+        except AdTemplateRendererRejection as exc:
+            # A bounded deterministic rejection is a compatible current renderer
+            # contract. The resumed builder receives it through the normal repair
+            # path; no canonical run artifact is changed by this preflight.
+            renderer_outcome = "deterministic-rejection"
+            renderer_reasons = list(exc.reasons)
+        except (AdTemplateProcessError, OSError, RuntimeError, ValueError) as exc:
+            raise ToolRunError("current renderer contract cannot validate the persisted best artifact") from exc
+
+        renderer_instruction = "Preserve the validated immutable best exactly."
+        if renderer_reasons:
+            try:
+                renderer_instruction = _renderer_rejection_instructions(
+                    candidate, renderer_reasons
+                )[0]
+            except AdTemplateProcessError as exc:
+                raise ToolRunError("current renderer rejection cannot seed a bounded repair") from exc
+        seed_feedback = self._terminal_failure_seed_feedback(
+            run, checkpoint, renderer_instruction
+        )
+
+        return checkpoint, {
+            "retry_mode": "build-from-best",
+            "seed_iteration": checkpoint["best_iteration"],
+            "history_length": len(checkpoint["history"]),
+            "iteration_budget_extension": 1,
+            "seed_feedback": seed_feedback,
+            "source_verified": True,
+            "renderer_validation": renderer_outcome,
+            "renderer_reasons": renderer_reasons,
         }
 
     @staticmethod
@@ -869,6 +1073,9 @@ class ToolRunAPIMixin:
                     builder_escalated=bool((checkpoint or {}).get("builder_escalated")),
                     low_gain_streak=int((checkpoint or {}).get("low_gain_streak") or 0),
                     feedback=str((checkpoint or {}).get("feedback") or ""),
+                    iteration_budget_extension=int(
+                        (checkpoint or {}).get("iteration_budget_extension") or 0
+                    ),
                 )
                 return result, usage
 
@@ -1240,10 +1447,59 @@ class ToolRunAPIMixin:
             return auth_err
         run_id = request.match_info["run_id"]
         try:
+            body: Dict[str, Any] = {}
+            if callable(getattr(request, "json", None)) and bool(
+                getattr(request, "can_read_body", False)
+            ):
+                try:
+                    parsed = await request.json()
+                except (json.JSONDecodeError, TypeError, ValueError, web.HTTPException) as exc:
+                    if getattr(request, "content_length", None) not in (None, 0):
+                        raise ToolRunError("retry body must be valid JSON") from exc
+                    parsed = {}
+                if not isinstance(parsed, dict):
+                    raise ToolRunError("retry body must be an object")
+                body = parsed
+            unknown = set(body) - {"mode"}
+            if unknown:
+                raise ToolRunError("retry body contains unsupported fields")
+            mode = body.get("mode")
+            if mode not in (None, "build-from-best"):
+                raise ToolRunError("unsupported Tool retry mode")
             run = self._tool_run_store.get_run(run_id)
             if run["status"] not in {"failed", "cancelled", "blocked"}:
                 raise ToolRunError("only failed, cancelled, or blocked Tool runs can be retried")
-            run = self._tool_run_store.requeue(run_id)
+            if mode == "build-from-best":
+                if run["status"] not in {"failed", "cancelled"}:
+                    raise ToolRunError(
+                        "build-from-best retry requires a failed or cancelled terminal Tool run"
+                    )
+                identity = {
+                    key: run.get(key)
+                    for key in (
+                        "run_id", "tool_id", "action", "scope", "payload",
+                        "model_policy_revision", "model_policy",
+                    )
+                }
+                _checkpoint, evidence = await asyncio.to_thread(
+                    self._validate_build_from_best_retry, run
+                )
+                current = self._tool_run_store.get_run(run_id)
+                if current["status"] not in {"failed", "cancelled", "blocked"} or any(
+                    current.get(key) != value for key, value in identity.items()
+                ):
+                    raise ToolRunError("Tool run changed while validating build-from-best retry")
+                run = self._tool_run_store.requeue(
+                    run_id,
+                    stage="build",
+                    expected_statuses={"failed", "cancelled"},
+                    event_data=evidence,
+                )
+            else:
+                run = self._tool_run_store.requeue(
+                    run_id,
+                    expected_statuses={"failed", "cancelled", "blocked"},
+                )
             self._start_tool_task(run_id, finalize=run.get("stage") == "release")
             return web.json_response(run, status=202)
         except KeyError as exc:
