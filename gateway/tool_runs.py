@@ -40,7 +40,7 @@ _MASKED_EDIT_MODELS = frozenset({
     "gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2",
 })
 _KNOWN_IMAGE_ONLY = frozenset({"gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2"})
-_AD_TEMPLATE_POLICY_SEED_REVISION = 10
+_AD_TEMPLATE_POLICY_SEED_REVISION = 11
 AD_TEMPLATE_ROUTE_ORDER = (
     "analyse",
     "compare",
@@ -176,7 +176,7 @@ def default_ad_template_policy() -> Dict[str, Any]:
             "analyse": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-sol"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
             "compare": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-luna"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
             "final-review-a": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-luna"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
-            "final-review-b": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-sol"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
+            "final-review-b": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("deepseek", "deepseek-v4-flash-vision-exp"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
             "quality-escalation": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-sol"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
         },
         "deterministic_stages": ["qa", "import"],
