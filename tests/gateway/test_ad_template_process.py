@@ -2405,7 +2405,11 @@ def test_renderer_layout_rejections_enrich_bounds_and_overlap_targets():
         '"placeholder":"123 Example Street,\\nSample City, ST 12345"',
         '"paintedOverflowPx":4',
         '"overflowEdge":"right"',
-        "clearing at least 4px on right",
+        '"alignment":"right"',
+        '"tracking":0',
+        '"requiredInternalPaddingPx":12',
+        "reserve at least 12px of internal right padding",
+        "Changing only geometry.x or geometry.width while keeping the same edge alignment",
         '"layerId":"story-about-copy"',
         '"layerId":"story-features-heading"',
         '"overlapPx":106',
@@ -2430,7 +2434,13 @@ def test_renderer_layout_rejections_enrich_bounds_and_overlap_targets():
     _third, _third_signatures, third_unchanged = process._renderer_rejection_instructions(
         candidate, reasons, previous_target_signatures=second_signatures,
     )
-    assert third_unchanged == []
+    assert third_unchanged == ["story:story-address"]
+
+    candidate["template"]["storyLayout"]["layers"][-3]["alignment"] = "left"
+    _fourth, _fourth_signatures, fourth_unchanged = process._renderer_rejection_instructions(
+        candidate, reasons, previous_target_signatures=_third_signatures,
+    )
+    assert fourth_unchanged == []
 
 
 def test_initial_non_json_builder_output_retries_cheap_then_escalates_without_extra_reviews(tmp_path, monkeypatch):

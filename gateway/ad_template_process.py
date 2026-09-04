@@ -2456,6 +2456,8 @@ def _renderer_rejection_instruction(
             "font": _prompt_object(layer.get("font"), ("file",)),
             "fontSize": _prompt_value(layer.get("fontSize")),
             "lineHeight": _prompt_value(layer.get("lineHeight")),
+            "alignment": str(layer.get("alignment") or "")[:40],
+            "tracking": _prompt_value(layer.get("tracking")),
             "maxCharacters": _prompt_value(layer.get("maxCharacters")),
             "maxLines": _prompt_value(layer.get("maxLines")),
             "fit": str(layer.get("overflowBehaviour") or "")[:80],
@@ -2515,8 +2517,31 @@ def _renderer_rejection_instruction(
             int(overflow_px) if overflow_px.is_integer() else overflow_px
         )
         target["overflowEdge"] = bounds_match.group("edge").lower()
+        target["requiredInternalPaddingPx"] = math.ceil(overflow_px) + 8
+    signature_target = target
+    anchored_overflow = bool(
+        bounds_match is not None
+        and (
+            (
+                bounds_match.group("edge").lower() == "right"
+                and str(layer.get("alignment") or "").lower() == "right"
+            )
+            or (
+                bounds_match.group("edge").lower() == "left"
+                and str(layer.get("alignment") or "").lower() == "left"
+            )
+        )
+    )
+    if anchored_overflow:
+        # Moving or widening an edge-aligned box moves its painted edge with it,
+        # leaving the same glyph-bearing overflow. Track only the properties
+        # capable of fixing that failure so blind geometry churn is a no-op.
+        signature_target = {
+            key: value for key, value in target.items()
+            if key not in {"geometry", "paintedOverflowPx"}
+        }
     signature = json.dumps(
-        target, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        signature_target, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
     unchanged = bool(previous_target_signature and signature == previous_target_signature)
     no_op_warning = (
@@ -2531,12 +2556,25 @@ def _renderer_rejection_instruction(
             "preserve its distinct stacked lines, maxLines contract, and readability floor."
         )
     elif bounds_match is not None:
-        allowed_fix = (
-            "Allowed fix: expand or shift this named text geometry enough to contain all "
-            f"painted bounds, clearing at least {bounds_match.group('overflow')}px on "
-            f"{bounds_match.group('edge').lower()}; preserve exact visible text, font, "
-            "alignment, punctuation, line structure, and every source-derived invariant."
-        )
+        internal_padding = math.ceil(float(bounds_match.group("overflow"))) + 8
+        if anchored_overflow:
+            allowed_fix = (
+                f"Allowed fix: reserve at least {internal_padding}px of internal "
+                f"{bounds_match.group('edge').lower()} padding. Changing only geometry.x or "
+                "geometry.width while keeping the same edge alignment cannot clear a glyph "
+                "overhang and is an unchanged target. Switch this layer to left/center alignment "
+                "and reposition/resize its geometry to preserve the current painted footprint, "
+                "or choose another allowed bundled font whose painted bounds fit at the "
+                "readability floor. Preserve exact visible text, punctuation, line structure, "
+                "visual anchor, and every source-derived invariant."
+            )
+        else:
+            allowed_fix = (
+                "Allowed fix: expand or shift this named text geometry enough to contain all "
+                f"painted bounds, clearing at least {bounds_match.group('overflow')}px on "
+                f"{bounds_match.group('edge').lower()}; preserve exact visible text, font, "
+                "alignment, punctuation, line structure, and every source-derived invariant."
+            )
     else:
         allowed_fix = (
             f"Allowed fix: raise geometry.height to at least {minimum_height}px, widen the text "
