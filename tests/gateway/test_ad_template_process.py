@@ -218,6 +218,48 @@ def test_source_inventory_drives_exact_pre_render_invariants():
     )
 
 
+def test_feature_list_normalization_splits_literal_and_inline_bullets():
+    candidate = source_invariant_candidate()
+    candidate["template"]["textInputs"][1]["placeholder"] = (
+        "• One  • Two\\n• Three  • Four  • Five  • Six"
+    )
+    for layout_name in ("feedLayout", "storyLayout"):
+        candidate["template"][layout_name]["layers"][2]["maxLines"] = 2
+    invariants = {"feature_bullet_count": 6}
+
+    normalized = process.normalize_list_placeholders(candidate, invariants)
+
+    assert candidate["template"]["storyLayout"]["layers"][2]["maxLines"] == 2
+    assert normalized["template"]["textInputs"][1]["placeholder"] == (
+        "• One\n• Two\n• Three\n• Four\n• Five\n• Six"
+    )
+    for layout_name in ("feedLayout", "storyLayout"):
+        assert normalized["template"][layout_name]["layers"][2]["maxLines"] == 6
+    process.validate_builder_candidate(normalized, source_invariants=invariants)
+
+
+def test_repair_prompt_repeats_all_source_invariants():
+    invariants = {
+        "brand_text_required": True,
+        "divider_required": True,
+        "feature_bullet_count": 6,
+        "price_strings": ["$1.599.999"],
+        "semantic_glyph_roles": ["phone", "mail", "web"],
+    }
+    prompt = process.generator_prompt(
+        run_id="run", project_id="blockwise", brief="", placements=["feed", "story"],
+        source="source.png", feedback=json.dumps({"source_invariants": invariants}),
+        validation_feedback="story feature inventory has 2 stacked bullets",
+        repair_attempt=2, rejected_candidate=source_invariant_candidate(),
+    )
+
+    assert "MANDATORY SOURCE-DERIVED INVARIANTS FOR EVERY REPAIR" in prompt
+    assert '"feature_bullet_count":6' in prompt
+    assert '"price_strings":["$1.599.999"]' in prompt
+    assert '"semantic_glyph_roles":["phone","mail","web"]' in prompt
+    assert "one real newline-delimited bullet per item" in prompt
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -1805,6 +1847,53 @@ def test_renderer_rejection_revises_without_advancing_checkpoint_or_importing(tm
     assert len(imports) == 1
 
 
+def test_renderer_repair_fails_early_on_identical_candidate_and_error(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    candidate = valid_candidate("renderer-repeat")
+    reason = "feed text layer feed-email cannot fit at the 24px readability floor"
+    calls, imports, events = [], [], []
+
+    def call_agent(instance, prompt, route):
+        calls.append(instance)
+        return json.loads(json.dumps(candidate))
+
+    def render(value, workspace):
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / "artifact.json").write_text(
+            json.dumps(value, sort_keys=True), encoding="utf-8",
+        )
+        raise process.AdTemplateRendererRejection(reason)
+
+    monkeypatch.setattr(process, "run_generator_cli", render)
+    monkeypatch.setattr(
+        process, "import_template",
+        lambda output, run_id, project_id: imports.append(output),
+    )
+    orchestrator = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_renderer_repeat",
+        project_id="blockwise", emit=lambda kind, node, data: events.append((kind, data)),
+    )
+
+    with pytest.raises(
+        AdTemplateProcessError,
+        match="repeated an identical renderer-rejected candidate/error",
+    ):
+        orchestrator.run(source=str(source), brief="", placements=["feed", "story"], routes=[
+            {"provider": "builder", "model": "vision"},
+            {"provider": "compare", "model": "vision"},
+            {"provider": "review-a", "model": "vision"},
+            {"provider": "review-b", "model": "vision"},
+        ])
+
+    assert calls == ["builder-1", "builder-1-repair-1"]
+    assert imports == []
+    revised = [data for kind, data in events if kind == "iteration.revised"]
+    assert len(revised) == 2
+    assert revised[0].get("repeated") is None
+    assert revised[1]["repeated"] is True
+
+
 def test_renderer_rejection_reason_is_allowlisted_and_path_free():
     stderr = (
         "file:///opt/releases/private/renderer.js:222\n"
@@ -1862,9 +1951,11 @@ def test_renderer_rejection_feedback_targets_layer_and_detects_unchanged_retry()
         '"font":{"file":"manrope-600.woff2"}',
         '"fontSize":34',
         '"maxLines":1',
+        '"minimumHeight":27',
         '"fit":"scale_down"',
         '"placeholder":"REAL ESTATE"',
-        "widen or raise the text box",
+        "raise geometry.height to at least 27px",
+        "widen the text box",
         "shorten the neutral placeholder/input contract",
         "keep the rendered font at or above the readability floor",
     ):
@@ -1904,6 +1995,14 @@ def test_multiline_renderer_rejection_is_allowlisted_and_targets_line_height():
     assert '"lineHeight":0.8' in instruction
     assert '"maxLines":6' in instruction
     assert "set this named multiline layer lineHeight to at least 1.0" in instruction
+
+    candidate["template"]["storyLayout"]["layers"][-1]["lineHeight"] = 1.15
+    fit_reason = "story text layer story-features cannot fit at the 32px readability floor"
+    fit_instruction, _, _ = process._renderer_rejection_instruction(
+        candidate, fit_reason,
+    )
+    assert '"minimumHeight":221' in fit_instruction
+    assert "raise geometry.height to at least 221px" in fit_instruction
 
 
 def test_renderer_aggregated_rejection_targets_every_layer_and_tracks_each_noop():
@@ -2581,7 +2680,9 @@ def test_schema_repair_is_bounded_and_invalid_candidates_have_no_visual_side_eff
 
     def call_agent(instance, prompt, route):
         calls.append(instance)
-        return json.loads(json.dumps(bad))
+        candidate = json.loads(json.dumps(bad))
+        candidate["template"]["templateId"] = f"always-bad-{len(calls)}"
+        return candidate
 
     monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: renders.append(candidate))
     monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: imports.append(output))
@@ -2589,7 +2690,7 @@ def test_schema_repair_is_bounded_and_invalid_candidates_have_no_visual_side_eff
         call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_bounded",
         project_id="blockwise", emit=lambda kind, node, data: events.append((kind, data)),
     )
-    with pytest.raises(AdTemplateProcessError, match="schema-invalid after 3 repairs"):
+    with pytest.raises(AdTemplateProcessError, match="schema-invalid after 6 repairs"):
         orchestrator.run(source=str(source), brief="", placements=["feed", "story"], routes=[
             {"provider": "builder", "model": "vision"},
             {"provider": "compare", "model": "vision"},
@@ -2597,11 +2698,54 @@ def test_schema_repair_is_bounded_and_invalid_candidates_have_no_visual_side_eff
             {"provider": "review-b", "model": "vision"},
         ])
 
-    assert calls == ["builder-1", "builder-1-repair-1", "builder-1-repair-2", "builder-1-repair-3"]
+    assert calls == [
+        "builder-1", "builder-1-repair-1", "builder-1-repair-2",
+        "builder-1-repair-3", "builder-1-repair-4", "builder-1-repair-5",
+        "builder-1-repair-6",
+    ]
     assert renders == [] and imports == []
-    assert [item[0] for item in events].count("candidate.rejected") == 4
+    assert [item[0] for item in events].count("candidate.rejected") == 7
     assert not any(item[0] in {"iteration.started", "iteration.rendered", "iteration.compared", "final-review.started"} for item in events)
-    assert len(list((tmp_path / "run" / "iterations" / "01").glob("rejected-candidate-*.json"))) == 4
+    assert len(list((tmp_path / "run" / "iterations" / "01").glob("rejected-candidate-*.json"))) == 7
+
+
+def test_schema_repair_fails_early_on_identical_candidate_and_error(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    bad = valid_candidate("identical-bad")
+    bad["template"]["storyLayout"]["safeZones"] = [
+        {"x": 0, "y": 0, "width": 1080, "height": 1921}
+    ]
+    calls, renders, imports, events = [], [], [], []
+
+    def call_agent(instance, prompt, route):
+        calls.append(instance)
+        return json.loads(json.dumps(bad))
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: renders.append(candidate))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: imports.append(output))
+    orchestrator = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_repeat",
+        project_id="blockwise", emit=lambda kind, node, data: events.append((kind, data)),
+    )
+
+    with pytest.raises(
+        AdTemplateProcessError,
+        match="repeated an identical schema-invalid candidate/error",
+    ):
+        orchestrator.run(source=str(source), brief="", placements=["feed", "story"], routes=[
+            {"provider": "builder", "model": "vision"},
+            {"provider": "compare", "model": "vision"},
+            {"provider": "review-a", "model": "vision"},
+            {"provider": "review-b", "model": "vision"},
+        ])
+
+    assert calls == ["builder-1", "builder-1-repair-1"]
+    assert renders == [] and imports == []
+    rejected = [data for kind, data in events if kind == "candidate.rejected"]
+    assert len(rejected) == 2
+    assert rejected[0].get("repeated") is None
+    assert rejected[1]["repeated"] is True
 
 
 def test_stop_during_schema_repair_prevents_render_import_and_rejection_write(tmp_path, monkeypatch):

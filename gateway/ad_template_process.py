@@ -18,7 +18,7 @@ THRESHOLD = 9.5
 MIN_RUBRIC_SCORE = 9.2
 MAX_ITERATIONS = 60
 MAX_FINAL_REVIEW_ROUNDS = 10
-MAX_SCHEMA_REPAIRS_PER_ITERATION = 3
+MAX_SCHEMA_REPAIRS_PER_ITERATION = 6
 MAX_CHEAP_STRUCTURED_OUTPUT_RETRIES = 1
 MAX_RENDERER_REJECTIONS_PER_ATTEMPT = 32
 STAGES = ("source", "build", "render", "compare", "final-check", "live")
@@ -1241,6 +1241,98 @@ def normalize_asset_declarations(value: Any) -> Any:
     return value
 
 
+def normalize_list_placeholders(
+    value: Any, source_invariants: Mapping[str, Any] | None = None,
+) -> Any:
+    """Normalize model-authored feature lists before enforcing source invariants."""
+    if not isinstance(value, Mapping):
+        return value
+    template = value.get("template")
+    if not isinstance(template, Mapping) or not isinstance(template.get("textInputs"), list):
+        return value
+    feature_keys = set()
+    for layout_name in ("feedLayout", "storyLayout"):
+        layout = template.get(layout_name)
+        layers = layout.get("layers") if isinstance(layout, Mapping) else []
+        for layer in layers or []:
+            if not isinstance(layer, Mapping) or layer.get("type") != "text":
+                continue
+            token = (
+                str(layer.get("layerId") or "").lower()
+                + " "
+                + str(layer.get("inputKey") or "").lower()
+            )
+            if "feature" in token or "bullet" in token:
+                feature_keys.add(str(layer.get("inputKey") or ""))
+    if not feature_keys:
+        return value
+
+    normalized_placeholders: Dict[str, str] = {}
+    for item in template["textInputs"]:
+        if not isinstance(item, Mapping) or str(item.get("key") or "") not in feature_keys:
+            continue
+        placeholder = item.get("placeholder")
+        if not isinstance(placeholder, str):
+            continue
+        normalized = (
+            placeholder.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+        )
+        if normalized.lstrip().startswith("•") and normalized.count("•") > 1:
+            bullet_items = [
+                part.strip() for part in re.split(r"\s*•\s*", normalized) if part.strip()
+            ]
+            normalized = "\n".join(f"• {part}" for part in bullet_items)
+        if normalized != placeholder:
+            normalized_placeholders[str(item.get("key") or "")] = normalized
+    expected_bullets = int(
+        _normalized_source_invariants(source_invariants).get("feature_bullet_count") or 0
+    )
+    original_placeholders = {
+        str(item.get("key") or ""): str(item.get("placeholder") or "")
+        for item in template["textInputs"] if isinstance(item, Mapping)
+    }
+    needs_max_lines_update = False
+    if expected_bullets:
+        for layout_name in ("feedLayout", "storyLayout"):
+            layout = template.get(layout_name)
+            layers = layout.get("layers") if isinstance(layout, Mapping) else []
+            for layer in layers or []:
+                if not isinstance(layer, Mapping):
+                    continue
+                key = str(layer.get("inputKey") or "")
+                placeholder = normalized_placeholders.get(key, original_placeholders.get(key, ""))
+                if (
+                    placeholder.count("•") == expected_bullets
+                    and layer.get("maxLines") != expected_bullets
+                ):
+                    needs_max_lines_update = True
+                    break
+            if needs_max_lines_update:
+                break
+    if not normalized_placeholders and not needs_max_lines_update:
+        return value
+
+    result = copy.deepcopy(value)
+    result_template = result["template"]
+    for item in result_template["textInputs"]:
+        key = str(item.get("key") or "") if isinstance(item, Mapping) else ""
+        if key in normalized_placeholders:
+            item["placeholder"] = normalized_placeholders[key]
+
+    if expected_bullets:
+        for layout_name in ("feedLayout", "storyLayout"):
+            layout = result_template.get(layout_name)
+            layers = layout.get("layers") if isinstance(layout, Mapping) else []
+            for layer in layers or []:
+                if not isinstance(layer, Mapping):
+                    continue
+                key = str(layer.get("inputKey") or "")
+                placeholder = normalized_placeholders.get(key, original_placeholders.get(key, ""))
+                if placeholder and placeholder.count("•") == expected_bullets:
+                    layer["maxLines"] = expected_bullets
+    return result
+
+
 def _validate_pre_render_source_invariants(
     template: Mapping[str, Any], source_invariants: Mapping[str, Any] | None,
 ) -> None:
@@ -1572,6 +1664,22 @@ def _safe_candidate_prompt_json(value: Any) -> str:
     if len(encoded) > MAX_CANDIDATE_CONTEXT_CHARS:
         raise AdTemplateProcessError(f"safe candidate context exceeds {MAX_CANDIDATE_CONTEXT_CHARS} characters")
     return encoded
+
+
+def _candidate_rejection_signature(candidate: Any, category: str, reasons: Any) -> str:
+    """Hash an exact safe candidate/error pair for bounded repair progress checks."""
+    raw_reasons = [reasons] if isinstance(reasons, str) else list(reasons or [])
+    payload = {
+        "candidate": _candidate_contract_projection(candidate),
+        "category": str(category or "")[:80],
+        "reasons": [str(item)[:320] for item in raw_reasons][
+            :MAX_RENDERER_REJECTIONS_PER_ATTEMPT
+        ],
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _source_invariants_from_reviews(*reviews: Any) -> Dict[str, Any]:
@@ -2032,7 +2140,7 @@ _DETERMINISTIC_RENDERER_REJECTIONS = (
 
 _TEXT_RENDERER_REJECTION = re.compile(
     r"(?P<placement>feed|story) text layer (?P<layer_id>[A-Za-z0-9._:-]{1,160}) "
-    r"(?:is below|cannot fit at) the \d+(?:\.\d+)?px readability floor",
+    r"(?:is below|cannot fit at) the (?P<floor>\d+(?:\.\d+)?)px readability floor",
     re.IGNORECASE,
 )
 _MULTILINE_RENDERER_REJECTION = re.compile(
@@ -2071,9 +2179,9 @@ def _renderer_rejection_instruction(
 ) -> tuple[str, str | None, bool]:
     """Describe the exact rejected text contract and detect a no-op retry."""
     reason_text = str(reason or "").strip()
-    match = _TEXT_RENDERER_REJECTION.fullmatch(reason_text)
+    fit_match = _TEXT_RENDERER_REJECTION.fullmatch(reason_text)
     multiline_match = _MULTILINE_RENDERER_REJECTION.fullmatch(reason_text)
-    match = match or multiline_match
+    match = fit_match or multiline_match
     template = candidate.get("template") if isinstance(candidate, Mapping) else None
     if match is None or not isinstance(template, Mapping):
         return reason, None, False
@@ -2114,6 +2222,18 @@ def _renderer_rejection_instruction(
         "fit": str(layer.get("overflowBehaviour") or "")[:80],
         "placeholder": str(text_input.get("placeholder") or "")[:320],
     }
+    minimum_height = None
+    if fit_match is not None:
+        try:
+            minimum_height = math.ceil(
+                float(fit_match.group("floor"))
+                * float(layer.get("lineHeight") or 1)
+                * int(layer.get("maxLines") or 1)
+            )
+        except (TypeError, ValueError, OverflowError):
+            minimum_height = None
+        if minimum_height is not None:
+            target["minimumHeight"] = minimum_height
     signature = json.dumps(
         target, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
@@ -2131,8 +2251,13 @@ def _renderer_rejection_instruction(
         )
     else:
         allowed_fix = (
-            "Allowed fix: widen or raise the text box, or shorten the neutral placeholder/input "
-            "contract; keep the rendered font at or above the readability floor."
+            f"Allowed fix: raise geometry.height to at least {minimum_height}px, widen the text "
+            "box, or shorten the neutral placeholder/input contract; preserve every source-derived "
+            "invariant and keep the rendered font at or above the readability floor."
+            if minimum_height is not None
+            else "Allowed fix: widen or raise the text box, or shorten the neutral placeholder/input "
+            "contract; preserve every source-derived invariant and keep the rendered font at or "
+            "above the readability floor."
         )
     instruction = f"{reason}. TARGETED TEXT CONTRACT: {signature}.{no_op_warning} {allowed_fix}"
     return instruction, signature, unchanged
@@ -2339,6 +2464,17 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
             f"{renderer_feedback}. Correct the named layer, geometry, typography, asset, or canvas defect so the candidate "
             "renders without lowering the 24px readability floor. Return a complete corrected template-and-assets JSON object, not a patch."
         )
+    if validation_feedback or renderer_feedback:
+        source_invariants = _source_invariants_from_feedback(feedback)
+        if source_invariants:
+            repair_clause += (
+                " MANDATORY SOURCE-DERIVED INVARIANTS FOR EVERY REPAIR: preserve these exact "
+                "facts while fixing the named error; never repair one constraint by regressing "
+                "another: "
+                f"{json.dumps(source_invariants, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}. "
+                "Feature placeholders must use one real newline-delimited bullet per item, with "
+                "exactly the guarded count and distinct coherent editable content."
+            )
     rejected_json = _safe_candidate_prompt_json(rejected_candidate)
     prior_json = _safe_candidate_prompt_json(prior_candidate)
     if rejected_json:
@@ -2569,6 +2705,7 @@ class SoleProcessOrchestrator:
             output_retry_pending = False
             rendered: Dict[str, Any] | None = None
             renderer_target_signatures: Dict[str, str] = {}
+            seen_candidate_rejections = set()
             for repair_attempt in range(MAX_SCHEMA_REPAIRS_PER_ITERATION + 1):
                 self._check_stop()
                 while True:
@@ -2627,6 +2764,7 @@ class SoleProcessOrchestrator:
                 self._check_stop()
                 try:
                     candidate = normalize_asset_declarations(candidate)
+                    candidate = normalize_list_placeholders(candidate, source_invariants)
                     validate_builder_candidate(
                         candidate, source_invariants=source_invariants,
                     )
@@ -2635,16 +2773,25 @@ class SoleProcessOrchestrator:
                     renderer_feedback = ""
                     self._check_stop()
                     rejected_candidate = candidate
+                    rejection_signature = _candidate_rejection_signature(
+                        candidate, "schema", validation_feedback,
+                    )
+                    repeated_rejection = rejection_signature in seen_candidate_rejections
+                    seen_candidate_rejections.add(rejection_signature)
                     persist_rejected_candidate(
                         candidate, iteration_workspace, iteration=index,
                         attempt=repair_attempt + 1, reason=validation_feedback,
                     )
                     self._check_stop()
-                    self.emit("candidate.rejected", "build", {
+                    rejection_event = {
                         "iteration": index, "attempt": repair_attempt + 1,
                         "reason": validation_feedback, "decision": "repair",
-                    })
+                    }
+                    if repeated_rejection:
+                        rejection_event["repeated"] = True
+                    self.emit("candidate.rejected", "build", rejection_event)
                     self._check_stop()
+                    escalated_this_attempt = False
                     if (
                         repair_attempt >= MAX_CHEAP_STRUCTURED_OUTPUT_RETRIES
                         and quality_route is not None
@@ -2653,6 +2800,7 @@ class SoleProcessOrchestrator:
                         prior_route = builder_route
                         builder_route = dict(quality_route)
                         builder_escalated = True
+                        escalated_this_attempt = True
                         self.emit("builder.escalated", "build", {
                             "iteration": index,
                             "from_provider": prior_route["provider"],
@@ -2661,6 +2809,11 @@ class SoleProcessOrchestrator:
                             "to_model": builder_route["model"],
                             "reason": "candidate_contract_invalid",
                         })
+                    if repeated_rejection and not escalated_this_attempt:
+                        raise AdTemplateProcessError(
+                            "builder repeated an identical schema-invalid candidate/error before "
+                            f"the bounded repair limit: {validation_feedback}"
+                        ) from None
                     if repair_attempt >= MAX_SCHEMA_REPAIRS_PER_ITERATION:
                         raise AdTemplateProcessError(
                             f"builder candidate remained schema-invalid after {MAX_SCHEMA_REPAIRS_PER_ITERATION} repairs: {validation_feedback}"
@@ -2678,6 +2831,11 @@ class SoleProcessOrchestrator:
                     validation_feedback = ""
                     reasons = list(exc.reasons)
                     reason_summary = "; ".join(reasons)
+                    rejection_signature = _candidate_rejection_signature(
+                        candidate, "renderer", reasons,
+                    )
+                    repeated_rejection = rejection_signature in seen_candidate_rejections
+                    seen_candidate_rejections.add(rejection_signature)
                     renderer_feedback, renderer_target_signatures, unchanged_targets = (
                         _renderer_rejection_instructions(
                             candidate,
@@ -2699,7 +2857,7 @@ class SoleProcessOrchestrator:
                         unchanged_targets=unchanged_targets,
                     )
                     self._check_stop()
-                    self.emit("iteration.revised", "build", {
+                    rejection_event = {
                         "iteration": index,
                         "attempt": repair_attempt + 1,
                         "reason": reason_summary,
@@ -2710,7 +2868,11 @@ class SoleProcessOrchestrator:
                         "revision_instruction": renderer_feedback,
                         "target_unchanged": target_unchanged,
                         "unchanged_targets": unchanged_targets,
-                    })
+                    }
+                    if repeated_rejection:
+                        rejection_event["repeated"] = True
+                    self.emit("iteration.revised", "build", rejection_event)
+                    escalated_this_attempt = False
                     if (
                         repair_attempt >= MAX_CHEAP_STRUCTURED_OUTPUT_RETRIES
                         and quality_route is not None
@@ -2719,6 +2881,7 @@ class SoleProcessOrchestrator:
                         prior_route = builder_route
                         builder_route = dict(quality_route)
                         builder_escalated = True
+                        escalated_this_attempt = True
                         self.emit("builder.escalated", "build", {
                             "iteration": index,
                             "from_provider": prior_route["provider"],
@@ -2727,6 +2890,11 @@ class SoleProcessOrchestrator:
                             "to_model": builder_route["model"],
                             "reason": "renderer_rejection",
                         })
+                    if repeated_rejection and not escalated_this_attempt:
+                        raise AdTemplateProcessError(
+                            "builder repeated an identical renderer-rejected candidate/error before "
+                            f"the bounded repair limit: {reason_summary}"
+                        ) from None
                     if repair_attempt >= MAX_SCHEMA_REPAIRS_PER_ITERATION:
                         raise AdTemplateProcessError(
                             f"builder candidate remained renderer-rejected after {MAX_SCHEMA_REPAIRS_PER_ITERATION} repairs: {exc}"
