@@ -23,7 +23,7 @@ from aiohttp import web
 
 from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
-from gateway.ad_template_process import AdTemplateProcessError, AdTemplateStructuredOutputError, AdTemplateTransportError, SoleProcessOrchestrator, validate_artifacts, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
+from gateway.ad_template_process import AdTemplateProcessError, AdTemplateStructuredOutputError, AdTemplateTransportError, SoleProcessOrchestrator, _compact_revision_feedback, validate_artifacts, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
 from gateway.tool_runs import (
     AD_TEMPLATE_ROUTE_ORDER,
     AD_TEMPLATE_OPTIONAL_ROUTE,
@@ -390,6 +390,15 @@ class ToolRunAPIMixin:
         selected_route = state.get("builder_route")
         if not isinstance(selected_route, dict):
             raise RuntimeError("persisted builder route is invalid")
+        raw_feedback = str(state.get("feedback") or "")
+        try:
+            decoded_feedback = json.loads(raw_feedback) if raw_feedback else {}
+        except json.JSONDecodeError:
+            decoded_feedback = {
+                "instruction": "Revise the immutable best-so-far candidate; do not continue from a regressing render.",
+                "best_score": state.get("previous_score"),
+                "current_review": last["comparison"],
+            }
         return {
             "candidate": candidate,
             "history": history,
@@ -399,7 +408,7 @@ class ToolRunAPIMixin:
             "selected_builder_route": selected_route,
             "builder_escalated": bool(state.get("builder_escalated")),
             "low_gain_streak": int(state.get("low_gain_streak") or 0),
-            "feedback": str(state.get("feedback") or "")[:3000],
+            "feedback": _compact_revision_feedback(decoded_feedback),
         }
 
     @staticmethod

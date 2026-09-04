@@ -624,6 +624,7 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
     assert "Every text layer inputKey must be declared exactly once in textInputs" in builder
     assert 'Each realAssetRefs entry must contain exactly {"inputKey":"declaredKey"' in builder
     assert "Every layer assetKey, image defaultAssetKey, gallery sample assetKey" in builder
+    assert "Story must not retain the Feed's horizontal split" in builder
     feedback = json.dumps({
         "rubric": {field: 8.7 for field in process.RUBRIC_FIELDS},
         "minimum_score": 8.7,
@@ -639,9 +640,10 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
         run_id="run", project_id="blockwise", brief="", placements=["feed", "story"],
         source="source.png", feedback=feedback,
     )
-    for key in ("rubric", "minimum_score", "hard_failures", "differences", "required_changes", "reason"):
+    for key in ("rubric", "minimum_score", "hard_failures", "required_changes", "reason"):
         assert f'"{key}"' in feedback_builder
-    assert "UNTRUNCATED-END" in feedback_builder
+    assert '"differences"' not in feedback_builder
+    assert "UNTRUNCATED-END" not in feedback_builder
     repair_builder = process.generator_prompt(
         run_id="run", project_id="blockwise", brief="", placements=["feed", "story"], source="source.png",
         validation_feedback="template is invalid", repair_attempt=1,
@@ -1042,6 +1044,88 @@ def test_five_image_comparator_transport_is_bounded_below_one_megabyte(tmp_path)
     for item in message[1:]:
         encoded = item["image_url"]["url"].split(",", 1)[1]
         assert len(base64.b64decode(encoded)) <= process.VISION_MAX_SERIALIZED_IMAGE_BYTES
+
+
+def test_revision_builder_request_keeps_exact_candidate_but_stays_below_transport_budget(tmp_path):
+    source = tmp_path / "large-source.png"
+    Image.effect_noise((2600, 2600), 100).convert("RGB").save(source, format="PNG")
+    prior = valid_candidate("exact-prior-candidate")
+    feedback = json.dumps({
+        "instruction": "Revise the immutable best-so-far candidate",
+        "best_score": 9.1,
+        "current_review": {
+            "rubric": {field: 9.1 for field in process.RUBRIC_FIELDS},
+            "macro": {field: 9.2 for field in process.MACRO_FIELDS},
+            "minimum_score": 9.1,
+            "hard_failures": [],
+            "differences": ["x" * 4000 for _ in range(4)],
+            "required_changes": [
+                "placement=story; layers=story-hero; current={x:72,y:350,width:620,height:470}; "
+                "target={x:72,y:350,width:936,height:620}; change=stack the price card below a full-width hero"
+            ],
+            "ranked_changes": ["duplicate verbose field" * 200],
+            "critical_regions": [{"region": "story", "status": "pass", "findings": ["x" * 3000]}],
+            "regressions": [],
+            "reason": "r" * 8000,
+        },
+    })
+    prompt = process.generator_prompt(
+        run_id="run", project_id="blockwise", brief="006 listing",
+        placements=["feed", "story"], source=str(source), feedback=feedback,
+        prior_candidate=prior,
+    )
+    message = vision_message(prompt, [str(source)], bounded=True)
+    serialized = json.dumps(message).encode("utf-8")
+
+    assert '"templateId":"exact-prior-candidate"' in prompt
+    assert "PRIOR VALID CANDIDATE" in prompt
+    assert '"differences"' not in prompt
+    assert len(prompt.encode("utf-8")) < 80_000
+    assert len(serialized) < process.VISION_MAX_SERIALIZED_MESSAGE_BYTES
+    encoded = message[1]["image_url"]["url"].split(",", 1)[1]
+    assert len(base64.b64decode(encoded)) <= process.VISION_MAX_SERIALIZED_IMAGE_BYTES
+
+
+def test_live_006_repeated_feed_topology_is_detected_until_story_reflows_vertically():
+    def layer(kind, key, geometry):
+        return {"type": kind, "layerId": f"layer-{key}", "inputKey": key, "geometry": geometry}
+
+    feed = [
+        layer("text", "listingTitle", {"x": 72, "y": 70, "width": 936, "height": 76}),
+        layer("image_slot", "propertyHero", {"x": 86, "y": 183, "width": 545, "height": 389}),
+        layer("logo", "brandLogo", {"x": 680, "y": 207, "width": 224, "height": 104}),
+        layer("image_slot", "livingPhoto", {"x": 86, "y": 582, "width": 281, "height": 227}),
+        layer("image_slot", "kitchenPhoto", {"x": 376, "y": 582, "width": 281, "height": 227}),
+        layer("image_slot", "bathroomPhoto", {"x": 666, "y": 582, "width": 280, "height": 227}),
+        layer("text", "aboutCopy", {"x": 86, "y": 929, "width": 375, "height": 184}),
+        layer("text", "featuresCopy", {"x": 618, "y": 929, "width": 328, "height": 184}),
+    ]
+    story = [
+        layer("text", "listingTitle", {"x": 72, "y": 246, "width": 936, "height": 75}),
+        layer("image_slot", "propertyHero", {"x": 72, "y": 350, "width": 620, "height": 470}),
+        layer("logo", "brandLogo", {"x": 742, "y": 385, "width": 224, "height": 108}),
+        layer("image_slot", "livingPhoto", {"x": 72, "y": 832, "width": 304, "height": 250}),
+        layer("image_slot", "kitchenPhoto", {"x": 384, "y": 832, "width": 304, "height": 250}),
+        layer("image_slot", "bathroomPhoto", {"x": 696, "y": 832, "width": 312, "height": 250}),
+        layer("text", "aboutCopy", {"x": 72, "y": 1195, "width": 430, "height": 184}),
+        layer("text", "featuresCopy", {"x": 600, "y": 1195, "width": 408, "height": 184}),
+    ]
+    candidate = {"template": {
+        "feedLayout": {"layers": feed}, "storyLayout": {"layers": story},
+    }}
+    assert process._story_repeats_feed_topology(candidate) is True
+
+    next(item for item in story if item["inputKey"] == "brandLogo")["geometry"].update(
+        {"x": 72, "y": 840, "width": 300, "height": 108}
+    )
+    next(item for item in story if item["inputKey"] == "aboutCopy")["geometry"].update(
+        {"x": 72, "y": 1120, "width": 936, "height": 184}
+    )
+    next(item for item in story if item["inputKey"] == "featuresCopy")["geometry"].update(
+        {"x": 72, "y": 1320, "width": 936, "height": 184}
+    )
+    assert process._story_repeats_feed_topology(candidate) is False
+    assert "repeats the Feed topology" in process.review_prompt(final=False, candidate=valid_candidate())
 
 
 def test_blockwise_import_contract_uses_hmac_and_camel_case_receipt(monkeypatch, tmp_path):
@@ -1998,6 +2082,53 @@ def test_regressed_candidate_is_traced_but_next_revision_uses_immutable_best(tmp
     assert [instance.split("-")[0] for instance, _, _ in calls] == [
         "builder", "comparator", "builder", "comparator", "builder", "comparator", "final", "final",
     ]
+
+
+def test_blocked_but_improved_candidate_remains_restart_best_by_quality_subscore(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    calls, renders = [], []
+    comparisons = iter([evidence(8.0, "First draft"), evidence(9.1, "Better with one blocker")])
+
+    def call_agent(instance, prompt, route):
+        calls.append((instance, prompt[0]["text"], route))
+        if instance == "builder-3":
+            raise process.AdTemplateTransportError("stop after durable checkpoint")
+        if instance.startswith("builder-"):
+            return valid_candidate(f"candidate-{instance}")
+        if instance.startswith("comparator-"):
+            result = next(comparisons)
+            if instance == "comparator-2":
+                result["critical_regions"] = [{
+                    "region": "logo footprint", "status": "blocker",
+                    "findings": ["One editable logo sizing correction remains"],
+                }]
+            return result
+        return evidence(9.7, "Independent final pass")
+
+    monkeypatch.setattr(
+        process, "run_generator_cli",
+        lambda candidate, workspace: fake_render(candidate, workspace, renders),
+    )
+    with pytest.raises(process.AdTemplateTransportError, match="durable checkpoint"):
+        SoleProcessOrchestrator(
+            call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_quality_best",
+            project_id="blockwise", emit=lambda *_args: None,
+        ).run(
+            source=str(source), brief="", placements=["feed", "story"],
+            routes=_quality_routes(), require_quality_route=True,
+        )
+
+    checkpoint = json.loads(
+        (tmp_path / "run" / "iterations" / "02" / "checkpoint.json").read_text("utf-8")
+    )
+    assert checkpoint["best_iteration"] == 2
+    assert checkpoint["previous_score"] == 9.1
+    assert checkpoint["record"]["comparison"]["score"] == 0.0
+    assert checkpoint["record"]["comparison"]["quality_score"] == 9.1
+    third_prompt = next(prompt for instance, prompt, _route in calls if instance == "builder-3")
+    assert '"templateId":"candidate-builder-2"' in third_prompt
+    assert '"best_quality_score":9.1' in third_prompt
 
 
 def test_final_review_revision_continues_from_the_reviewed_then_current_candidate(tmp_path, monkeypatch):

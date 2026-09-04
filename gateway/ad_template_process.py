@@ -29,6 +29,7 @@ MAX_FINAL_REVIEW_OUTPUT_RETRIES = 3
 MATERIAL_OVERLAP_RATIO = 0.08
 VISION_MAX_SERIALIZED_IMAGE_BYTES = 140_000
 VISION_MAX_LONG_EDGE = 1440
+VISION_MAX_SERIALIZED_MESSAGE_BYTES = 1_000_000
 
 class AdTemplateProcessError(ValueError):
     pass
@@ -416,6 +417,17 @@ def _passes_quality_gate(evidence: Mapping[str, Any]) -> bool:
         and _number(evidence.get("score")) >= THRESHOLD
         and _number(evidence.get("minimum_score")) >= MIN_RUBRIC_SCORE
     )
+
+
+def _quality_ranking_score(evidence: Mapping[str, Any]) -> float:
+    """Rank imperfect candidates without weakening the binary acceptance gate."""
+    rubric = evidence.get("rubric") or {}
+    macro = evidence.get("macro") or {}
+    values = [_number(value) for value in rubric.values()]
+    values.extend(_number(value) for value in macro.values())
+    if not values:
+        return 0.0
+    return round(min(values), 2)
 
 def validate_iterations(value: Any) -> List[Dict[str, Any]]:
     if not isinstance(value, list) or not value or len(value) > MAX_ITERATIONS: raise AdTemplateProcessError(f"iterations must contain 1 to {MAX_ITERATIONS} records")
@@ -1032,6 +1044,123 @@ def _safe_candidate_prompt_json(value: Any) -> str:
         raise AdTemplateProcessError(f"safe candidate context exceeds {MAX_CANDIDATE_CONTEXT_CHARS} characters")
     return encoded
 
+
+def _compact_revision_feedback(value: Any) -> str:
+    """Keep only decision-driving evidence in the next builder request."""
+    if not value:
+        return ""
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return value[:3000]
+    else:
+        decoded = value
+    if not isinstance(decoded, Mapping):
+        return str(value)[:3000]
+    if "best_quality_score" in decoded and "required_changes" in decoded:
+        return json.dumps(
+            decoded, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )[:6000]
+    review = decoded.get("current_review")
+    if not isinstance(review, Mapping):
+        review = decoded
+    regions = review.get("critical_regions")
+    blocking_regions = [
+        {
+            "region": str(item.get("region") or "")[:160],
+            "findings": [str(finding)[:600] for finding in item.get("findings", [])[:4]],
+        }
+        for item in regions or []
+        if isinstance(item, Mapping) and item.get("status") == "blocker"
+    ]
+    projected = {
+        "instruction": str(decoded.get("instruction") or "Apply every required change to the immutable best candidate.")[:300],
+        "best_quality_score": decoded.get("best_score", decoded.get("best_quality_score")),
+        "minimum_score": review.get("minimum_score"),
+        "rubric": review.get("rubric") if isinstance(review.get("rubric"), Mapping) else {},
+        "macro": review.get("macro") if isinstance(review.get("macro"), Mapping) else {},
+        "hard_failures": [str(item)[:600] for item in (review.get("hard_failures") or [])[:6]],
+        "regressions": [str(item)[:600] for item in (review.get("regressions") or [])[:6]],
+        "blocking_regions": blocking_regions[:6],
+        "required_changes": [str(item)[:1200] for item in (review.get("required_changes") or [])[:3]],
+        "reason": str(review.get("reason") or "")[:1200],
+    }
+    return json.dumps(projected, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _horizontal_content_pairs(layout: Any, *, canvas_height: int) -> set[tuple[str, str]]:
+    if not isinstance(layout, Mapping) or not isinstance(layout.get("layers"), list):
+        return set()
+    by_input: Dict[str, Mapping[str, Any]] = {}
+    for layer in layout["layers"]:
+        if not isinstance(layer, Mapping) or layer.get("type") not in {"image_slot", "text", "logo"}:
+            continue
+        key = str(layer.get("inputKey") or "").strip()
+        geometry = layer.get("geometry")
+        if not key or not isinstance(geometry, Mapping):
+            continue
+        area = float(geometry.get("width") or 0) * float(geometry.get("height") or 0)
+        if area < 0.008 * 1080 * canvas_height:
+            continue
+        by_input[key] = layer
+    pairs: set[tuple[str, str]] = set()
+    keys = sorted(by_input)
+    for index, left_key in enumerate(keys):
+        left = by_input[left_key]["geometry"]
+        for right_key in keys[index + 1:]:
+            right = by_input[right_key]["geometry"]
+            overlap_y = max(
+                0.0,
+                min(left["y"] + left["height"], right["y"] + right["height"])
+                - max(left["y"], right["y"]),
+            )
+            if overlap_y < 0.45 * min(left["height"], right["height"]):
+                continue
+            disjoint_x = (
+                left["x"] + left["width"] <= right["x"]
+                or right["x"] + right["width"] <= left["x"]
+            )
+            if disjoint_x:
+                pairs.add((left_key, right_key))
+    return pairs
+
+
+def _story_repeats_feed_topology(candidate: Any) -> bool:
+    """Detect a complex Feed layout copied sideways into the 9:16 Story canvas."""
+    template = candidate.get("template") if isinstance(candidate, Mapping) else None
+    if not isinstance(template, Mapping):
+        return False
+    feed_layers = (template.get("feedLayout") or {}).get("layers")
+    story_layers = (template.get("storyLayout") or {}).get("layers")
+    if not isinstance(feed_layers, list) or not isinstance(story_layers, list):
+        return False
+    feed_keys = {
+        str(layer.get("inputKey")) for layer in feed_layers
+        if isinstance(layer, Mapping) and layer.get("inputKey")
+    }
+    story_keys = {
+        str(layer.get("inputKey")) for layer in story_layers
+        if isinstance(layer, Mapping) and layer.get("inputKey")
+    }
+    if len(feed_keys & story_keys) < 8:
+        return False
+    feed_pairs = _horizontal_content_pairs(template.get("feedLayout"), canvas_height=1350)
+    story_pairs = _horizontal_content_pairs(template.get("storyLayout"), canvas_height=1920)
+    repeated = feed_pairs & story_pairs
+    feed_types = {
+        str(layer.get("inputKey")): str(layer.get("type"))
+        for layer in feed_layers
+        if isinstance(layer, Mapping) and layer.get("inputKey")
+    }
+    repeated_non_media = sum(
+        1 for left, right in repeated
+        if {feed_types.get(left), feed_types.get(right)} != {"image_slot"}
+    )
+    # A retained thumbnail rail is allowed. Repeating it together with the
+    # Feed hero/card or body-column relationships is not a native Story.
+    return len(repeated) >= 4 and repeated_non_media >= 2
+
 def _candidate_trace_projection(value: Any) -> Dict[str, Any]:
     projected = _candidate_contract_projection(value)
     previews = []
@@ -1227,6 +1356,7 @@ def import_template(output: Mapping[str, Any], *, run_id: str, project_id: str) 
 
 def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: Any, source: str, feedback: str = "", validation_feedback: str = "", repair_attempt: int = 0, prior_candidate: Any = None, rejected_candidate: Any = None) -> str:
     catalog_lines = "\n".join(_runtime_safe_asset_catalog().prompt_lines())
+    feedback_text = _compact_revision_feedback(feedback)
     repair_clause = (
         ' Return one JSON object with exactly two top-level keys: {"template": {...}, "assets": []}; '
         'never omit assets even when it is empty, and do not add prose or another wrapper. '
@@ -1273,12 +1403,24 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
             "input, asset, font, metadata field, and cross-reference, and return the complete revised {template,assets} object."
         )
 
+    if prior_json and not rejected_json and not validation_feedback:
+        return f"""Revise the attached-source Blockwise template in place. Return JSON only with exactly {{"template":{{...}},"assets":[]}}. The prior candidate below is the exact editable contract: preserve every correct layer, input, placeholder, asset, font, metadata field, and cross-reference; apply every required change in the compact review evidence; never replace the template with a redesign.
+
+PRIOR VALID CANDIDATE: {prior_json}
+REVIEW EVIDENCE: {feedback_text}
+
+Reinspect the attached source pixels for every requested correction. Keep Feed faithful to the source geometry and information structure. Story must be an intentional 1080x1920 recomposition, not the Feed canvas scaled, contained, or rearranged with the same horizontal split and two-column topology. Reflow at least one major Feed side-by-side group into a vertical 9:16 hierarchy; for a listing like 006 use a full-width hero, the price/brand card below it, then stacked facts and readable contact. UI-unsafe Story bands y=0..239 and y=1620..1919 may contain backgrounds, frames, decoration, or nonessential full-bleed media, but essential text/logo/icon/CTA stays within x=72..1008 and y=240..1620.
+
+Never copy source identity, contact details, portraits, logos, URLs, or pixels. Keep their visual roles as neutral editable inputs. Do not duplicate facts or photographs. tracking remains absolute canvas pixels -4..4; lineHeight remains unitless 0.8..2.5. Preserve the existing exact schema and use only these manifest-backed assets if a requested role must change:
+{catalog_lines}
+Run {run_id}; project {project_id}; placements {json.dumps(placements)}; brief {brief[:2000]}."""
+
     # Source fidelity is the sole visual objective. The source bitmap is never
     # shipped, but its observable design must be reconstructed as editable
     # layers instead of being simplified into a different archetype.
     return f"""Build one layered Blockwise ad template by recreating the attached source image as closely as possible. The rendered Feed must be a near-match to the source at thumbnail and full size: preserve its layout regions, relative geometry, spacing, image-slot count and shapes, crop intent, border and divider treatment, typography scale and style, palette, information hierarchy, and visible content structure. Do not redesign, simplify, modernise, improve, or reinterpret the source. The only acceptable visual substitutions are neutral editable replacements for advertiser identity and source photography. Remove source names, logos, phone numbers, URLs, portraits, contact identity, and source pixels, but keep equivalent editable logo, text, icon, patch, and image-slot roles in the same visual positions. Never flatten the source image into a plate. Every visible text input must have a non-blank placeholder. Every visible non-logo image input must have its own default asset; never bind two distinct visible inputs to the same photograph. Every required brand-logo reference must have a visible logo layer and a non-blank neutral default logo.
 
-The attached source is the authority. For a revision, apply every item in prior reviewer feedback to the prior valid candidate and leave already-matching regions unchanged. Story must be a native 1080x1920 translation of the same design system and hierarchy, with essential content outside the top 240px and bottom 300px platform zones; it is not evidence that Feed may diverge from the source.
+The attached source is the authority. For a revision, apply every item in prior reviewer feedback to the prior valid candidate and leave already-matching regions unchanged. Story must be a native 1080x1920 translation of the same design system and hierarchy, with essential content outside the top 240px and bottom 300px platform zones; it is not evidence that Feed may diverge from the source. Story must not retain the Feed's horizontal split or two-column topology: reflow major Feed groups into a deliberate vertical hierarchy. For a listing like 006 use a full-width hero, price/brand card below, then stacked facts and readable contact.
 
 Return JSON only with exactly {{"template":{{...}},"assets":[]}}. template must use schema "blockwise.ad-template" and contain exactly templateId, createdAt, feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata plus schema. Feed is 1080x1350 with safeZones=[{{"x":72,"y":96,"width":936,"height":1158}}]. Story is 1080x1920 with safeZones=[{{"x":72,"y":240,"width":936,"height":1380}}]. Geometry is always {{x,y,width,height}} from the top-left and must remain inside the canvas. Each layout contains exactly placement, layers, and safeZones. Every layer must match one exact shape: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. Do not omit layerId, opacity, protected, or any other required field. Text uses a declared bundled font, native-canvas fontSize, unitless lineHeight 0.8-2.5, tracking as an absolute canvas-pixel value from -4 to 4 (never em, percent, or a multiplier), alignment left|center|right, maxCharacters, maxLines, colourRole, overflowBehaviour refuse|truncate|scale_down, and geometry. image_slot mask is rounded_rect|circle|none and defaultCrop is normalized {{"x":0,"y":0,"width":1,"height":1}}. imageInputs entries are exactly {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs entries are exactly {{key,label,placeholder,maxLength}}; fonts entries are exactly {{file}}. Every reference must resolve.
 
@@ -1286,7 +1428,7 @@ semanticColours contains exactly background, primary, secondary, accent, mainTex
 {catalog_lines}
 Use one coherent property across slots. When the source contains a logo, declare the neutral brand asset and bind it as the logo imageInput defaultAssetKey so the logo is visible in every rendered iteration.
 
-Hermes will render the candidate, attach the source and render to a vision comparator, and feed its complete comparator or final-review evidence into the next revision. Prior reviewer feedback contains the rubric, minimum_score, hard_failures, differences, required_changes, and reason. Apply every required change exactly and preserve already-correct regions. When a final reviewer returns a negative verdict with required_changes=[], use that reviewer's reason, differences, weak rubric fields, and hard failures as the revision brief instead of ignoring the review. Do not self-score. Run {run_id}; project {project_id}; placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback}.{repair_clause}"""
+Hermes will render the candidate, attach the source and render to a vision comparator, and feed its complete comparator or final-review evidence into the next revision. Prior reviewer feedback contains the rubric, minimum_score, hard_failures, differences, required_changes, and reason. Apply every required change exactly and preserve already-correct regions. When a final reviewer returns a negative verdict with required_changes=[], use that reviewer's reason, differences, weak rubric fields, and hard failures as the revision brief instead of ignoring the review. Do not self-score. Run {run_id}; project {project_id}; placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback_text}.{repair_clause}"""
 
     return f"""Run the sole ad-template process as the builder agent. Inspect the attached source pixels, remove advertiser identity (names, logos, phones, URLs, portraits), and return JSON with exactly {{template, assets}}. Treat the source as structural inspiration, not a quality ceiling: explicitly avoid inheriting brochure density, tiny copy, weak hierarchy, duplicated contact details, incoherent photography, or a Feed layout stretched into Story. Build a conversion-focused Meta ad around one dominant idea: a strong hook, one coherent hero treatment, only essential proof or facts, and one clear CTA. Dense descriptions and contact lists belong in Meta primary text or the destination, not inside the image. At native pixels use type large enough to remain legible inside a 500px, 390px and 320px-wide Meta shell; do not rely on scale-down or truncation to rescue excess copy. Feed must use a deliberate 72px horizontal and 96px vertical protected content margin. Story must be independently composed with its top 240px and bottom 300px protected from platform UI. Use true editable text, image, logo, CTA, patch and icon roles. Use one coherent property/photo subject across default slots; never mix unrelated properties. For a property listing, publishRequirements.specialAdCategory must be HOUSING. template must contain exactly schema='blockwise.ad-template', templateId, createdAt (ISO datetime), feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata. semanticColours must contain exactly background, primary, secondary, accent, mainText, inverseText; every layer colourRole is one of those six. Each layout contains exactly placement, layers, safeZones; Feed is placement feed within 1080x1350 and Story is placement story within 1080x1920, including safeZones. Geometry and every safe-zone rectangle contain exactly {{x,y,width,height}}: x,y are the top-left coordinates from canvas origin (0,0); width,height are positive sizes, not right/bottom coordinates; x + width must stay within canvas width and y + height within canvas height. Exact safe areas are Feed safeZones=[{{"x":72,"y":96,"width":936,"height":1158}}] within 1080x1350 and Story safeZones=[{{"x":72,"y":240,"width":936,"height":1380}}] within 1080x1920. Layer shapes are exact: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. imageInputs are {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs are {{key,label,placeholder,maxLength}}. fonts are {{file}} and every text-layer font must be declared; allowed bundled font files are {', '.join(sorted(ALLOWED_FONT_FILES))}. metadata is exact: title:string; description:string; gallerySamples={{feed?:{{assetKey?,placement,purpose}},story?:{{assetKey?,placement,purpose}}}}; metaCopyDefaults={{primaryText:string[],headlines:string[],descriptions:string[],cta:string}}; aiWritingGuidance={{summary:string,fields:record<string,string>}}; publishRequirements={{objective:string,specialAdCategory:string|null,instantForm:{{required:boolean,dependency:string|null,defaults?:record<string,string>}},destination:{{required:boolean,kind:'website'|'instant_form'|'none',dependency:string|null}},requiredCtaTypes?:string[]}}; replacementAssets={{inputKey,assetKey,purpose?}}[]; realAssetRefs={{inputKey,kind,required}}[]. Every layer/input/font/colour/asset metadata reference must resolve inside the same template. Declare source-free replacement assets in template.assets as assetKey -> {{fileName,mimeType}} and in top-level assets only as {{assetKey,fileName,mimeType}} with an exact match. Hermes resolves bytes from the fixed safe catalog; never emit bytesBase64 anywhere and never guess filenames. Choose only from this exact role-tagged safe catalog; prefer photo-default assets and use neutral-placeholder only when no suitable photo role exists:\n{catalog_lines}\nNever include the source composite, source_path, hashes, signatures, private fields, or a full-source plate. Keep geometry inside canvas and Story native. Hermes renders, compares once per iteration, then runs two fresh final reviewers only after the comparator clears both the {THRESHOLD} mean and {MIN_RUBRIC_SCORE} subscore floor; never self-score or invent review evidence. Run {run_id}; project {project_id}; fixed placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback[:3000]}.{repair_clause}"""
 
@@ -1334,13 +1476,13 @@ def review_prompt(*, final: bool, candidate: Any = None, has_previous_best: bool
     )
     return f"""You are the {role} in a source-matching loop. The attached images are ordered: {image_order}. Inspect the actual pixels together. The primary objective is not generic ad quality; it is faithful reconstruction of the source design as editable layers.
 
-Compare source versus Feed region by region: outer frame and margins; header/title block; image count, grid, aspect ratios and crop intent; logo/price panel; divider lines; body columns; feature list; footer/contact row; typography family/style/weight/scale/line wrapping; palette; alignment; whitespace; borders, corner radii, icons and decorative details. Neutral replacement photography and neutral advertiser identity must not reduce the score when their visual role, size, crop, and position match. Source advertiser names, logo wordmarks, agent names or portraits, phone numbers, email addresses, and URLs are observation-only: never request them in required_changes and never reduce a score because coherent neutral replacements differ. Match their visual footprint and editable role, not their identity. Never request an obvious source typo, clipped string, or duplicated feature; match its typographic density with coherent neutral copy. Source pixels are prohibited, but the replacement set must still be coherent: hard-fail a wrong-subject image, the same non-logo photograph repeated in distinct visible slots, or distinct slots that should show different views but visibly reuse one crop. Any simplification, omitted section, changed information density, different skeleton, moved panel, different image-slot structure, or generic redesign must reduce the score heavily. Story is scored only as a deliberate native 1080x1920 translation of the same visual system; it cannot compensate for a Feed mismatch. Assess Story dead space only inside the content-safe band y=240..1620. The top y=0..239 and bottom y=1620..1919 are UI-unsafe bands, not mandatory blank bands: background, frame, decorative layers, and nonessential full-bleed media may occupy them. Essential text, logos, icons, and CTAs must remain inside x=72..1008 and y=240..1620. Never demand blank padding merely because a nonessential layer enters a UI-unsafe band.
+Compare source versus Feed region by region: outer frame and margins; header/title block; image count, grid, aspect ratios and crop intent; logo/price panel; divider lines; body columns; feature list; footer/contact row; typography family/style/weight/scale/line wrapping; palette; alignment; whitespace; borders, corner radii, icons and decorative details. Neutral replacement photography and neutral advertiser identity must not reduce the score when their visual role, size, crop, and position match. Source advertiser names, logo wordmarks, agent names or portraits, phone numbers, email addresses, and URLs are observation-only: never request them in required_changes and never reduce a score because coherent neutral replacements differ. Match their visual footprint and editable role, not their identity. Never request an obvious source typo, clipped string, or duplicated feature; match its typographic density with coherent neutral copy. Source pixels are prohibited, but the replacement set must still be coherent: hard-fail a wrong-subject image, the same non-logo photograph repeated in distinct visible slots, or distinct slots that should show different views but visibly reuse one crop. Any simplification, omitted section, changed information density, different skeleton, moved panel, different image-slot structure, or generic redesign must reduce the score heavily. Story is scored only as a deliberate native 1080x1920 translation of the same visual system; it cannot compensate for a Feed mismatch. A Story that preserves the Feed's horizontal hero/card split, multi-column body, or other major side-by-side topology by simply scaling or moving it into 9:16 is a hard failure even when every layer fits inside the safe band. A native listing Story such as 006 must recompose into a full-width hero, price/brand card below, then stacked facts and readable contact. Assess Story dead space only inside the content-safe band y=240..1620. The top y=0..239 and bottom y=1620..1919 are UI-unsafe bands, not mandatory blank bands: background, frame, decorative layers, and nonessential full-bleed media may occupy them. Essential text, logos, icons, and CTAs must remain inside x=72..1008 and y=240..1620. Never demand blank padding merely because a nonessential layer enters a UI-unsafe band.
 
 Use this scale strictly: 10.0 means the Feed is visually indistinguishable in structure at thumbnail size except permitted neutral content substitutions; 9.5 means only tiny finishing differences remain; 9.0 still has clearly visible spacing, scale, typography, or geometry differences; 8.0 is recognisably based on the source but materially different; 5.0 is merely the same category; 0 is missing or invalid. Do not award 9.5 to a design that a person can immediately distinguish from the source.
 
 {output_contract} {hierarchical_contract} visible_strings must be exactly an object with source, feed, and story arrays. Transcribe every visibly rendered word, number, currency value, CTA and logo wordmark in reading order; preserve visible splitting, missing glyphs and truncation exactly (for example, a broken HOUSE rendered as H U / O S / E must be transcribed that way, not silently corrected). differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. required_changes is the ordered list of material work the builder should apply next. {change_list_contract} Every required_changes string must use this exact actionable structure: placement=feed|story; layers=comma-separated layerIds; current={{x:...,y:...,width:...,height:...}}; target={{x:...,y:...,width:...,height:...}}; change=specific instruction. Name all affected layer IDs and use their current and intended target geometry. Copy current geometry exactly from Candidate contract JSON, then check every proposed target rectangle against every existing layer before returning it. Never propose a target that newly overlaps an image slot or opaque vector panel with another image slot unless that overlap is visibly present in the source and the change text explicitly identifies and justifies the source-visible overlap. Use a separate required_changes item when affected layers do not share identical current and target geometry. hard_failures is a list. rubric contains exactly these eight 0-10 numbers: feed_source_likeness, layout_geometry, spacing_proportions, typography_likeness, colour_likeness, image_slot_composition, editable_decomposition, native_story_translation. A passing candidate requires feed_source_likeness >= {THRESHOLD}, mean >= {THRESHOLD}, every field{'' if final else ' and every macro field'} >= {MIN_RUBRIC_SCORE}, no critical-region blocker, no regression, no hard failure, and no required change.
 
-Hard-fail source pixels flattened into the output, copied advertiser identity, missing/unreadable renders, any missing/split/clipped/truncated/garbled visible text, a malformed or blank logo, repeated/wrong photographs, canvas/safe-zone violations, non-editable critical roles, unknown assets, or a stretched/cropped/letterboxed Story. The numeric tracking field in Candidate JSON is absolute canvas pixels, never em, percent, or a font-size multiplier. Inspect both native Feed/Story renders and any subsequently attached Meta-shell previews; a shell-only defect is still a defect. Do not infer another reviewer's score. Candidate contract JSON: {candidate_context}"""
+Hard-fail source pixels flattened into the output, copied advertiser identity, missing/unreadable renders, any missing/split/clipped/truncated/garbled visible text, a malformed or blank logo, repeated/wrong photographs, canvas/safe-zone violations, non-editable critical roles, unknown assets, a stretched/cropped/letterboxed Story, or a Story that repeats the Feed topology instead of reflowing major groups for 9:16. The numeric tracking field in Candidate JSON is absolute canvas pixels, never em, percent, or a font-size multiplier. Inspect both native Feed/Story renders and any subsequently attached Meta-shell previews; a shell-only defect is still a defect. Do not infer another reviewer's score. Candidate contract JSON: {candidate_context}"""
 
 def _bounded_vision_image(path: Path) -> tuple[bytes, str]:
     raw = path.read_bytes()
@@ -1386,6 +1528,8 @@ def vision_message(text: str, paths: List[str], *, bounded: bool = False) -> Lis
         parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"}})
     if len(parts) == 1:
         raise AdTemplateProcessError("vision role requires attached image pixels")
+    if bounded and len(json.dumps(parts, ensure_ascii=False).encode("utf-8")) >= VISION_MAX_SERIALIZED_MESSAGE_BYTES:
+        raise AdTemplateProcessError("bounded vision message exceeds transport budget")
     return parts
 
 
@@ -1477,7 +1621,7 @@ class SoleProcessOrchestrator:
                                 repair_attempt=max(repair_attempt, structured_output_failures),
                                 prior_candidate=iteration_prior if repair_attempt == 0 else None,
                                 rejected_candidate=rejected_candidate if repair_attempt > 0 else None,
-                            ), [source]),
+                            ), [source], bounded=True),
                             builder_route_identity(builder_route),
                         )
                         output_retry_pending = False
@@ -1640,6 +1784,22 @@ class SoleProcessOrchestrator:
                         )
                     self._check_stop()
                     evidence = _assessment(comparison, "comparator", require_change_list=True)
+                    if _story_repeats_feed_topology(candidate):
+                        story_failure = any(
+                            "story" in item.lower()
+                            and any(word in item.lower() for word in ("topology", "feed", "reflow", "9:16"))
+                            for item in evidence["hard_failures"]
+                        )
+                        story_change = any(
+                            item.lower().startswith("placement=story;")
+                            and any(word in item.lower() for word in ("topology", "reflow", "stack", "vertical"))
+                            for item in evidence["required_changes"]
+                        )
+                        if not (story_failure and story_change):
+                            raise ComparatorSelfConsistencyError(
+                                "comparator overlooked Story that repeats Feed horizontal topology; "
+                                "record a Story hard failure and an actionable vertical-reflow change"
+                            )
                     if previous_best is None and evidence["regressions"]:
                         raise ComparatorSelfConsistencyError(
                             "first comparison cannot report regressions without a previous-best"
@@ -1674,6 +1834,8 @@ class SoleProcessOrchestrator:
                     continue
                 break
             score, reason = evidence["score"], evidence["reason"]
+            quality_score = _quality_ranking_score(evidence)
+            evidence["quality_score"] = quality_score
             decision = "accepted" if _passes_quality_gate(evidence) else "revise"
             record = {
                 "iteration": index,
@@ -1687,6 +1849,7 @@ class SoleProcessOrchestrator:
             self.emit("iteration.compared", "compare", {
                 "iteration": index,
                 "score": score,
+                "quality_score": quality_score,
                 "minimum_score": evidence["minimum_score"],
                 "reason": reason,
                 "rubric": evidence["rubric"],
@@ -1716,10 +1879,10 @@ class SoleProcessOrchestrator:
             }, ensure_ascii=False)
             if _passes_quality_gate(evidence):
                 best_candidate = copy.deepcopy(candidate)
-                best_score = score
+                best_score = quality_score
                 best_iteration = index
                 working_candidate = best_candidate
-                previous_score = score
+                previous_score = quality_score
                 persist_iteration_checkpoint(
                     self.workspace,
                     iteration=index,
@@ -1735,12 +1898,14 @@ class SoleProcessOrchestrator:
 
             eligible_for_best = not (
                 evidence["hard_failures"]
-                or evidence["critical_blocker"]
                 or evidence["macro_regression"]
             )
-            if best_candidate is None or (eligible_for_best and (best_score is None or score > best_score)):
+            if best_candidate is None or (
+                eligible_for_best
+                and (best_score is None or quality_score > best_score)
+            ):
                 best_candidate = copy.deepcopy(candidate)
-                best_score = score
+                best_score = quality_score
                 best_iteration = index
             working_candidate = best_candidate
             current_feedback = json.dumps({
@@ -1751,8 +1916,8 @@ class SoleProcessOrchestrator:
 
             escalation_reason = ""
             if not builder_escalated and quality_route is not None and previous_score is not None:
-                gain = score - previous_score
-                if score < previous_score:
+                gain = quality_score - previous_score
+                if quality_score < previous_score:
                     escalation_reason = "regression"
                 elif gain < MIN_MATERIAL_SCORE_GAIN:
                     low_gain_streak += 1
@@ -1768,10 +1933,10 @@ class SoleProcessOrchestrator:
                     "iteration": index,
                     "from_provider": prior_route["provider"], "from_model": prior_route["model"],
                     "to_provider": builder_route["provider"], "to_model": builder_route["model"],
-                    "reason": escalation_reason, "previous_score": previous_score, "score": score,
+                    "reason": escalation_reason, "previous_score": previous_score, "score": quality_score,
                 })
-            previous_score = score
-            feedback = current_feedback
+            previous_score = quality_score
+            feedback = _compact_revision_feedback(current_feedback)
             persist_iteration_checkpoint(
                 self.workspace,
                 iteration=index,

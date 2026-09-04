@@ -288,7 +288,10 @@ def test_build_restart_loads_two_iterations_and_best_for_iteration_three(tmp_pat
             builder_escalated=True,
             previous_score=score,
             low_gain_streak=0,
-            feedback=f"iteration {iteration}",
+            feedback=(
+                '{"truncated":"' + "x" * 4000
+                if iteration == 2 else json.dumps({"iteration": iteration})
+            ),
         )
     checkpoint = _ToolRunHarness(store)._ad_template_iteration_checkpoint(
         "trun_checkpoint", workspace, "build"
@@ -299,6 +302,10 @@ def test_build_restart_loads_two_iterations_and_best_for_iteration_three(tmp_pat
     assert checkpoint["candidate"]["template"]["templateId"] == "completion-test"
     assert checkpoint["resume_final_check"] is False
     assert checkpoint["previous_score"] == 9.1
+    recovered_feedback = json.loads(checkpoint["feedback"])
+    assert recovered_feedback["best_quality_score"] == 9.1
+    assert recovered_feedback["minimum_score"] == 9.1
+    assert recovered_feedback["required_changes"] == changes
 
 
 def test_final_check_requeue_rebuilds_after_interrupted_accepted_artifact(tmp_path):
