@@ -23,7 +23,7 @@ from aiohttp import web
 
 from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
-from gateway.ad_template_process import AdTemplateProcessError, AdTemplateStructuredOutputError, SoleProcessOrchestrator, validate_artifacts, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
+from gateway.ad_template_process import AdTemplateProcessError, AdTemplateStructuredOutputError, AdTemplateTransportError, SoleProcessOrchestrator, validate_artifacts, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, THRESHOLD as AD_TEMPLATE_THRESHOLD
 from gateway.tool_runs import (
     AD_TEMPLATE_ROUTE_ORDER,
     AD_TEMPLATE_OPTIONAL_ROUTE,
@@ -332,6 +332,14 @@ class ToolRunAPIMixin:
         elif value is not None:
             text = str(value)
         text = redact_sensitive_text(text, force=True).strip()
+        if re.search(
+            r"(?:API call failed after\s+\d+\s+(?:retries|attempts?)|"
+            r"Codex stream produced no bytes within TTFB cutoff|"
+            r"Operation interrupted during API call|request timed out)",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            raise AdTemplateTransportError("model role transport attempt exhausted")
         if text.startswith("```") and text.endswith("```"):
             text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S).strip()
         try:
@@ -648,6 +656,10 @@ class ToolRunAPIMixin:
                         stream_delta_callback=role_heartbeat,
                         reasoning_callback=role_heartbeat,
                     )
+                    # The durable role policy owns retry/fallback. Disable the
+                    # generic agent's nested three-attempt loop so one stalled
+                    # vision route cannot multiply every orchestrator retry.
+                    agent._api_max_retries = 1
                     active = self._tool_run_agents.setdefault(run_id, {})
                     active[instance_id] = agent
                     try:

@@ -118,6 +118,7 @@ class _PreviewAgent:
 
     def run_conversation(self, **_kwargs):
         self._observed["user_message"] = _kwargs.get("user_message")
+        self._observed["api_max_retries"] = getattr(self, "_api_max_retries", None)
         self._callback(
             "tool.started",
             "terminal",
@@ -456,6 +457,7 @@ async def test_generic_terminal_preview_never_advances_or_emits_stage(tmp_path, 
     assert callable(api.agent_kwargs[0]["stream_delta_callback"])
     assert callable(api.agent_kwargs[0]["reasoning_callback"])
     assert "thinking_callback" not in api.agent_kwargs[0]
+    assert api.observed["api_max_retries"] == 1
     assert api.agent_kwargs[0]["route"] is None
     assert api.preflighted == [
         {"provider": "openai-codex", "model": "gpt-5.6-sol"},
@@ -531,6 +533,13 @@ def test_direct_orchestrator_result_does_not_weaken_generic_agent_parser():
     with pytest.raises(RuntimeError, match="structured JSON"):
         ToolRunAPIMixin._tool_json_output(result)
     assert ToolRunAPIMixin._tool_json_output(result, process_result=True) == result
+
+
+def test_model_transport_exhaustion_is_distinct_from_structured_output_failure():
+    with pytest.raises(process.AdTemplateTransportError, match="transport"):
+        ToolRunAPIMixin._tool_json_output({
+            "final_response": "API call failed after 1 retries: Codex TTFB timeout",
+        })
 
 
 def test_completion_projection_keeps_large_layered_documents_out_of_the_ledger(tmp_path):

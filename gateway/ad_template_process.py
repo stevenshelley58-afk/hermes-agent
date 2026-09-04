@@ -39,6 +39,11 @@ class AdTemplateStructuredOutputError(RuntimeError):
 
     pass
 
+class AdTemplateTransportError(RuntimeError):
+    """A model role exhausted its bounded provider transport attempt."""
+
+    pass
+
 def _number(value: Any) -> float:
     try: result = float(value)
     except (TypeError, ValueError): raise AdTemplateProcessError("score must be numeric") from None
@@ -95,6 +100,42 @@ def _parse_required_change(value: str) -> Dict[str, Any] | None:
 def _required_change_is_actionable(value: str) -> bool:
     """Require placement, layer IDs, and current/target geometry in each change."""
     return _parse_required_change(value) is not None
+
+def _normalize_required_change_placements(
+    evidence: Mapping[str, Any], candidate: Mapping[str, Any]
+) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Repair only an unambiguous Feed/Story label slip from a comparator."""
+    template = candidate.get("template") if isinstance(candidate.get("template"), dict) else {}
+    known: Dict[str, set[str]] = {}
+    for placement in ("feed", "story"):
+        layout = template.get(f"{placement}Layout")
+        layers = layout.get("layers") if isinstance(layout, dict) else []
+        known[placement] = {
+            str(layer.get("layerId")) for layer in layers
+            if isinstance(layer, dict) and layer.get("layerId")
+        }
+    normalized: List[str] = []
+    corrections: List[Dict[str, Any]] = []
+    for raw in evidence.get("required_changes") or []:
+        text = str(raw)
+        parsed = _parse_required_change(text)
+        if parsed is not None:
+            placement = parsed["placement"]
+            opposite = "story" if placement == "feed" else "feed"
+            named = set(parsed["layer_ids"])
+            if named and named.isdisjoint(known[placement]) and named.issubset(known[opposite]):
+                text = re.sub(
+                    r"^(\s*placement\s*=\s*)(?:feed|story)",
+                    rf"\g<1>{opposite}", text, count=1, flags=re.IGNORECASE,
+                )
+                corrections.append({
+                    "from": placement, "to": opposite, "layers": sorted(named),
+                })
+        normalized.append(text)
+    result = dict(evidence)
+    result["required_changes"] = normalized
+    result["ranked_changes"] = list(normalized)
+    return result, corrections
 
 def _rect_matches(left: Mapping[str, Any], right: Mapping[str, Any], tolerance: float = 0.5) -> bool:
     return all(abs(float(left[key]) - float(right[key])) <= tolerance for key in ("x", "y", "width", "height"))
@@ -1236,7 +1277,7 @@ def review_prompt(*, final: bool, candidate: Any = None, has_previous_best: bool
     )
     return f"""You are the {role} in a source-matching loop. The attached images are ordered: {image_order}. Inspect the actual pixels together. The primary objective is not generic ad quality; it is faithful reconstruction of the source design as editable layers.
 
-Compare source versus Feed region by region: outer frame and margins; header/title block; image count, grid, aspect ratios and crop intent; logo/price panel; divider lines; body columns; feature list; footer/contact row; typography family/style/weight/scale/line wrapping; palette; alignment; whitespace; borders, corner radii, icons and decorative details. Neutral replacement photography and neutral advertiser identity must not reduce the score when their visual role, size, crop, and position match. Source pixels are prohibited, but the replacement set must still be coherent: hard-fail a wrong-subject image, the same non-logo photograph repeated in distinct visible slots, or distinct slots that should show different views but visibly reuse one crop. Any simplification, omitted section, changed information density, different skeleton, moved panel, different image-slot structure, or generic redesign must reduce the score heavily. Story is scored only as a deliberate native 1080x1920 translation of the same visual system; it cannot compensate for a Feed mismatch. Assess Story dead space only inside the content-safe band y=240..1620. Empty space in y=0..239 and y=1620..1919 is mandatory platform-UI protection and must never be reported or scored as dead space, a spacing defect, a difference, or a required change.
+Compare source versus Feed region by region: outer frame and margins; header/title block; image count, grid, aspect ratios and crop intent; logo/price panel; divider lines; body columns; feature list; footer/contact row; typography family/style/weight/scale/line wrapping; palette; alignment; whitespace; borders, corner radii, icons and decorative details. Neutral replacement photography and neutral advertiser identity must not reduce the score when their visual role, size, crop, and position match. Source advertiser names, logo wordmarks, agent names or portraits, phone numbers, email addresses, and URLs are observation-only: never request them in required_changes and never reduce a score because coherent neutral replacements differ. Match their visual footprint and editable role, not their identity. Never request an obvious source typo, clipped string, or duplicated feature; match its typographic density with coherent neutral copy. Source pixels are prohibited, but the replacement set must still be coherent: hard-fail a wrong-subject image, the same non-logo photograph repeated in distinct visible slots, or distinct slots that should show different views but visibly reuse one crop. Any simplification, omitted section, changed information density, different skeleton, moved panel, different image-slot structure, or generic redesign must reduce the score heavily. Story is scored only as a deliberate native 1080x1920 translation of the same visual system; it cannot compensate for a Feed mismatch. Assess Story dead space only inside the content-safe band y=240..1620. The top y=0..239 and bottom y=1620..1919 are UI-unsafe bands, not mandatory blank bands: background, frame, decorative layers, and nonessential full-bleed media may occupy them. Essential text, logos, icons, and CTAs must remain inside x=72..1008 and y=240..1620. Never demand blank padding merely because a nonessential layer enters a UI-unsafe band.
 
 Use this scale strictly: 10.0 means the Feed is visually indistinguishable in structure at thumbnail size except permitted neutral content substitutions; 9.5 means only tiny finishing differences remain; 9.0 still has clearly visible spacing, scale, typography, or geometry differences; 8.0 is recognisably based on the source but materially different; 5.0 is merely the same category; 0 is missing or invalid. Do not award 9.5 to a design that a person can immediately distinguish from the source.
 
@@ -1451,6 +1492,8 @@ class SoleProcessOrchestrator:
                 final=False, candidate=candidate, has_previous_best=previous_best is not None,
             )
             comparison_rejection = ""
+            comparison_route = dict(routes[1])
+            comparator_transport_fallback_used = False
             for comparison_attempt in range(MAX_COMPARATOR_SELF_CONSISTENCY_RETRIES + 1):
                 retry_suffix = ""
                 if comparison_rejection:
@@ -1466,14 +1509,41 @@ class SoleProcessOrchestrator:
                         "Return only the corrected JSON object."
                     )
                 try:
-                    comparison = self.call_agent(
-                        "comparator-%d" % index if comparison_attempt == 0 else f"comparator-{index}-retry-{comparison_attempt}",
-                        vision_message(
-                            comparison_prompt + retry_suffix,
-                            review_vision_paths(source, rendered, previous_best),
-                        ),
-                        f"{routes[1].get('provider')}/{routes[1].get('model')}",
+                    instance = "comparator-%d" % index if comparison_attempt == 0 else f"comparator-{index}-retry-{comparison_attempt}"
+                    message = vision_message(
+                        comparison_prompt + retry_suffix,
+                        review_vision_paths(source, rendered, previous_best),
                     )
+                    try:
+                        comparison = self.call_agent(
+                            instance, message,
+                            f"{comparison_route.get('provider')}/{comparison_route.get('model')}",
+                        )
+                    except AdTemplateTransportError as exc:
+                        if (
+                            comparator_transport_fallback_used
+                            or quality_route is None
+                            or builder_route_identity(comparison_route) == builder_route_identity(quality_route)
+                        ):
+                            raise
+                        previous_route = dict(comparison_route)
+                        comparison_route = dict(quality_route)
+                        comparator_transport_fallback_used = True
+                        self.emit(
+                            "comparator.route-escalated", "compare",
+                            {
+                                "iteration": index,
+                                "from_provider": previous_route["provider"],
+                                "from_model": previous_route["model"],
+                                "to_provider": comparison_route["provider"],
+                                "to_model": comparison_route["model"],
+                                "reason": str(exc),
+                            },
+                        )
+                        comparison = self.call_agent(
+                            f"{instance}-transport-fallback", message,
+                            builder_route_identity(comparison_route),
+                        )
                     self._check_stop()
                     evidence = _assessment(comparison, "comparator", require_change_list=True)
                     if previous_best is None and evidence["regressions"]:
@@ -1484,6 +1554,14 @@ class SoleProcessOrchestrator:
                     if evidence["declared_decision"] != expected_comparator_decision:
                         raise ComparatorSelfConsistencyError(
                             "comparator decision does not match hierarchical gates"
+                        )
+                    evidence, placement_corrections = _normalize_required_change_placements(
+                        evidence, candidate,
+                    )
+                    if placement_corrections:
+                        self.emit(
+                            "comparator.normalized", "compare",
+                            {"iteration": index, "corrections": placement_corrections},
                         )
                     _validate_required_change_targets(evidence, candidate)
                 except (AdTemplateProcessError, AdTemplateStructuredOutputError, ComparatorSelfConsistencyError) as exc:

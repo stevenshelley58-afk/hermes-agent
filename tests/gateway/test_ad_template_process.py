@@ -323,6 +323,35 @@ def test_comparator_approximate_current_geometry_uses_actual_document_baseline()
     )
 
 
+def test_comparator_repairs_unambiguous_cross_placement_label():
+    candidate = overlap_candidate("placement-label-slip")
+    candidate["template"]["storyLayout"]["layers"].append({
+        "type": "vector", "layerId": "story-border",
+        "geometry": {"x": 72, "y": 240, "width": 936, "height": 1380},
+        "shape": "rounded", "colourRole": "primary", "opacity": 1,
+    })
+    assessment = evidence(8.9, "Story border needs refinement")
+    assessment["required_changes"] = [
+        "placement=feed; layers=story-border; "
+        "current={x:72,y:240,width:936,height:1380}; "
+        "target={x:72,y:240,width:936,height:1380}; "
+        "change=Reduce the Story border radius without moving it"
+    ]
+    assessment["ranked_changes"] = assessment["required_changes"]
+    parsed = process._assessment(assessment, "comparator", require_change_list=True)
+
+    normalized, corrections = process._normalize_required_change_placements(
+        parsed, candidate,
+    )
+
+    assert normalized["required_changes"][0].startswith("placement=story;")
+    assert normalized["ranked_changes"] == normalized["required_changes"]
+    assert corrections == [{
+        "from": "feed", "to": "story", "layers": ["story-border"],
+    }]
+    process._validate_required_change_targets(normalized, candidate)
+
+
 def test_comparator_retries_self_inconsistent_overlap_and_persists_event(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
@@ -363,6 +392,52 @@ def test_comparator_retries_self_inconsistent_overlap_and_persists_event(tmp_pat
     retry_prompt = next(prompt for name, prompt in calls if name == "comparator-1-retry-1")
     assert "previous response was rejected" in retry_prompt
     assert "feed-hero and feed-thumb-1" in retry_prompt
+    assert result["iterations"][0]["decision"] == "accepted"
+
+
+def test_comparator_transport_timeout_escalates_once_to_quality_route(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    events, calls, renders = [], [], []
+
+    def call_agent(instance, prompt, route):
+        calls.append((instance, route))
+        if instance.startswith("builder-"):
+            return valid_candidate(f"candidate-{instance}")
+        if instance == "comparator-1":
+            raise process.AdTemplateTransportError("model role transport attempt exhausted")
+        return evidence(9.7, "Quality route completed the comparison")
+
+    monkeypatch.setattr(
+        process, "run_generator_cli",
+        lambda candidate, workspace: fake_render(candidate, workspace, renders),
+    )
+    monkeypatch.setattr(
+        process, "import_template",
+        lambda output, run_id, project_id: {
+            "template_id": "tpl-transport-fallback", "status": "imported",
+        },
+    )
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run",
+        run_id="trun_transport_fallback", project_id="blockwise",
+        emit=lambda kind, node, data: events.append((kind, data)),
+    ).run(
+        source=str(source), brief="", placements=["feed", "story"],
+        routes=_quality_routes(), require_quality_route=True,
+    )
+
+    assert ("comparator-1", "openai-codex/gpt-5.6-luna") in calls
+    assert (
+        "comparator-1-transport-fallback", "openai-codex/gpt-5.6-sol"
+    ) in calls
+    escalated = [data for kind, data in events if kind == "comparator.route-escalated"]
+    assert escalated == [{
+        "iteration": 1,
+        "from_provider": "openai-codex", "from_model": "gpt-5.6-luna",
+        "to_provider": "openai-codex", "to_model": "gpt-5.6-sol",
+        "reason": "model role transport attempt exhausted",
+    }]
     assert result["iterations"][0]["decision"] == "accepted"
 
 
@@ -496,7 +571,9 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
         assert "Neutral replacement photography" in prompt
         assert "required_changes" in prompt
         assert "Assess Story dead space only inside the content-safe band y=240..1620" in prompt
-        assert "y=0..239 and y=1620..1919 is mandatory platform-UI protection" in prompt
+        assert "UI-unsafe bands, not mandatory blank bands" in prompt
+        assert "never request them in required_changes" in prompt
+        assert "never request an obvious source typo, clipped string, or duplicated feature" in prompt.lower()
         assert "placement=feed|story; layers=comma-separated layerIds" in prompt
         assert "check every proposed target rectangle against every existing layer" in prompt
         assert "Never propose a target that newly overlaps an image slot or opaque vector panel" in prompt
