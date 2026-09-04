@@ -71,6 +71,41 @@ def test_restart_requeues_interrupted_runs_with_checkpoint(tmp_path):
     assert store.events(run["run_id"])[-1]["kind"] == "run.recovered"
 
 
+def test_executor_interruption_only_cancels_with_durable_operator_intent(tmp_path):
+    store = ToolRunStore(str(tmp_path / "executor-interruption.db"))
+    deploy_run, _ = store.create_run(command(idempotency_key="deploy-interruption"))
+    store.update_run(
+        deploy_run["run_id"], status="running", stage="render", progress=0.5,
+    )
+
+    recovered = store.resolve_executor_interruption(
+        deploy_run["run_id"], reason="gateway-shutdown",
+    )
+
+    assert recovered["status"] == "queued"
+    assert recovered["stage"] == "render"
+    assert recovered["attention"] is True
+    event = store.events(deploy_run["run_id"])[-1]
+    assert event["kind"] == "run.interrupted"
+    assert event["data"] == {
+        "reason": "gateway-shutdown",
+        "will_resume": True,
+        "resume_from": "render",
+    }
+
+    cancelled_run, _ = store.create_run(command(
+        request_id="req-cancelled",
+        idempotency_key="operator-cancelled",
+    ))
+    store.update_run(cancelled_run["run_id"], status="running", stage="build")
+    store.request_cancel(cancelled_run["run_id"])
+
+    cancelled = store.resolve_executor_interruption(cancelled_run["run_id"])
+
+    assert cancelled["status"] == "cancelled"
+    assert store.events(cancelled_run["run_id"])[-1]["kind"] == "run.cancelled"
+
+
 def test_model_policy_revisions_are_immutable_and_run_pinned(tmp_path):
     store = ToolRunStore(str(tmp_path / "policy.db"))
     base = store.get_policy("ad-template-generator")

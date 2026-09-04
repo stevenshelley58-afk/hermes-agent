@@ -746,6 +746,63 @@ class ToolRunStore:
         self.append_event(run_id, "command.cancel-requested", status="running", node_id=run.get("stage"), data={})
         return self.get_run(run_id)
 
+    def resolve_executor_interruption(
+        self, run_id: str, *, reason: str = "executor-interrupted"
+    ) -> Dict[str, Any]:
+        """Classify executor cancellation from durable operator intent.
+
+        Async task cancellation is also how the gateway stops work during a
+        deploy.  It is therefore not evidence that the operator cancelled the
+        run.  Only the durable ``cancel_requested`` bit may make the run
+        terminal; every other interruption is returned to the queue with its
+        stage/checkpoint intact for startup recovery.
+        """
+        _clean_id(run_id, "run_id")
+        clean_reason = _clean_id(reason, "interruption reason")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status,stage,cancel_requested FROM tool_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Tool run not found: {run_id}")
+            if row["status"] in _TERMINAL_STATUSES:
+                return self.get_run(run_id)
+            now = _now()
+            explicitly_cancelled = bool(row["cancel_requested"])
+            if explicitly_cancelled:
+                self._conn.execute(
+                    """UPDATE tool_runs
+                       SET status='cancelled',attention=1,completed_at=?,updated_at=?
+                       WHERE run_id=?""",
+                    (now, now, run_id),
+                )
+            else:
+                self._conn.execute(
+                    """UPDATE tool_runs
+                       SET status='queued',cancel_requested=0,attention=1,
+                           completed_at=NULL,updated_at=?
+                       WHERE run_id=?""",
+                    (now, run_id),
+                )
+            self._conn.commit()
+        if explicitly_cancelled:
+            self.append_event(
+                run_id, "run.cancelled", status="cancelled",
+                node_id=row["stage"], data={},
+            )
+        else:
+            self.append_event(
+                run_id, "run.interrupted", status="blocked",
+                node_id=row["stage"],
+                data={
+                    "reason": clean_reason,
+                    "will_resume": True,
+                    "resume_from": row["stage"],
+                },
+            )
+        return self.get_run(run_id)
+
     def requeue(self, run_id: str, *, stage: Optional[str] = None) -> Dict[str, Any]:
         run = self.get_run(run_id)
         next_stage = _clean_id(stage or run.get("stage") or "source", "stage")

@@ -145,6 +145,10 @@ class _ToolRunHarness(ToolRunAPIMixin):
         self.observed = {}
         self.system_prompts = []
         self.agent_kwargs = []
+        self.preflighted = []
+
+    def _preflight_tool_candidate(self, candidate):
+        self.preflighted.append(dict(candidate))
 
     def _resolve_route(self, _model):
         return {}
@@ -410,6 +414,9 @@ async def test_generic_terminal_preview_never_advances_or_emits_stage(tmp_path, 
     store = ToolRunStore(str(tmp_path / "tool-runs.db"))
     run, _ = store.create_run(_command(str(source), idempotency_key="stage-truth"))
     api = _ToolRunHarness(store)
+    api._resolve_route = lambda _model: pytest.fail(
+        "frozen Tool routes must not consult mutable chat model routes"
+    )
     monkeypatch.setattr(tool_run_api, "SoleProcessOrchestrator", _ExplicitEventOrchestrator)
     monkeypatch.setattr(api, "_prepare_candidate_output", lambda _run_id, output: output)
 
@@ -449,6 +456,42 @@ async def test_generic_terminal_preview_never_advances_or_emits_stage(tmp_path, 
     assert callable(api.agent_kwargs[0]["stream_delta_callback"])
     assert callable(api.agent_kwargs[0]["reasoning_callback"])
     assert "thinking_callback" not in api.agent_kwargs[0]
+    assert api.agent_kwargs[0]["route"] is None
+    assert api.preflighted == [
+        {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unknown_frozen_provider_fails_preflight_before_any_model_work(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source-pixels")
+    store = ToolRunStore(str(tmp_path / "provider-preflight.db"))
+    run, _ = store.create_run(
+        _command(str(source), idempotency_key="provider-preflight")
+    )
+    api = _ToolRunHarness(store)
+
+    def reject_provider(_candidate):
+        raise RuntimeError("Unknown provider 'custom:venice'")
+
+    api._preflight_tool_candidate = reject_provider
+
+    await api._execute_tool_run(run["run_id"])
+
+    failed = store.get_run(run["run_id"])
+    assert failed["status"] == "failed"
+    assert "Unknown provider" in failed["error"]
+    assert api.agent_kwargs == []
+    assert not any(
+        event["kind"] == "stage.started" for event in store.events(run["run_id"])
+    )
 
 
 @pytest.mark.asyncio

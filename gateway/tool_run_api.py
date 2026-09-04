@@ -449,6 +449,49 @@ class ToolRunAPIMixin:
         ]
         return candidates[: int(settings.get("max_attempts") or len(candidates) or 1)], settings
 
+    @staticmethod
+    def _preflight_tool_candidate(candidate: Dict[str, str]) -> None:
+        """Resolve one frozen provider/model pair without consulting chat state."""
+        provider = str(candidate.get("provider") or "").strip()
+        model = str(candidate.get("model") or "").strip()
+        if not provider or not model:
+            raise RuntimeError("Frozen ad-template model route is incomplete")
+        from gateway.platforms.api_server import _resolve_request_runtime_agent_kwargs
+
+        runtime = _resolve_request_runtime_agent_kwargs(provider, target_model=model)
+        resolved_provider = str(runtime.get("provider") or "").strip()
+        if resolved_provider != provider:
+            raise RuntimeError(
+                f"Frozen ad-template provider resolved as {resolved_provider or 'none'}, expected {provider}"
+            )
+
+    def _frozen_tool_route_plan(
+        self, run: Dict[str, Any]
+    ) -> Dict[str, tuple[List[Dict[str, str]], Dict[str, Any]]]:
+        """Snapshot and preflight every route that this run can execute."""
+        roles = list(AD_TEMPLATE_ROUTE_ORDER)
+        stages = (run.get("model_policy") or {}).get("stages") or {}
+        if AD_TEMPLATE_OPTIONAL_ROUTE in stages:
+            roles.append(AD_TEMPLATE_OPTIONAL_ROUTE)
+        plan: Dict[str, tuple[List[Dict[str, str]], Dict[str, Any]]] = {}
+        role_pairs: Dict[tuple[str, str], List[str]] = {}
+        for role in roles:
+            candidates, settings = self._tool_candidates(run, role)
+            if not candidates:
+                raise RuntimeError(f"No route configured for {role}")
+            frozen_candidates = [dict(item) for item in candidates]
+            plan[role] = (frozen_candidates, dict(settings))
+            for candidate in frozen_candidates:
+                pair = (candidate["provider"], candidate["model"])
+                role_pairs.setdefault(pair, []).append(role)
+        for (provider, model), route_roles in role_pairs.items():
+            self._preflight_tool_candidate({"provider": provider, "model": model})
+            self._tool_run_store.append_event(
+                run["run_id"], "provider.preflight", status="ok", node_id="source",
+                data={"provider": provider, "model": model, "roles": route_roles},
+            )
+        return plan
+
     def _tool_prompt(self, run: Dict[str, Any], *, finalize: bool = False) -> str:
         payload = run.get("payload") or {}
         sources = payload.get("sources") or []
@@ -506,6 +549,7 @@ class ToolRunAPIMixin:
             run["model_policy"] = validate_model_policy(
                 run.get("model_policy"), tool_id=str(run.get("tool_id") or ""),
             )
+            route_plan = self._frozen_tool_route_plan(run)
             current_stage = self._canonical_tool_stage(run.get("stage"))
             self._tool_run_store.update_run(
                 run_id, status="running", stage=current_stage,
@@ -516,9 +560,7 @@ class ToolRunAPIMixin:
                 data={"summary": "Starting sole ad-template process"},
             )
             route_stage = "analyse"
-            candidates, route_settings = self._tool_candidates(run, route_stage)
-            if not candidates:
-                raise RuntimeError(f"No compatible model configured for {route_stage}")
+            candidates, route_settings = route_plan[route_stage]
             loop = asyncio.get_running_loop()
             reported_cost = 0.0
             cost_limit = float(route_settings.get("max_cost_usd") or 0)
@@ -595,12 +637,11 @@ class ToolRunAPIMixin:
 
                 def call_agent(instance_id: str, prompt: Any, route_name: str):
                     provider, model = route_name.split("/", 1)
-                    route = self._resolve_route(model)
                     agent = self._create_agent(
                         ephemeral_system_prompt=self._isolated_tool_role_prompt(),
                         session_id=f"{run_id}:{instance_id}:{uuid.uuid4().hex}",
                         tool_progress_callback=progress_callback,
-                        requested_model=model, requested_provider=provider, route=route,
+                        requested_model=model, requested_provider=provider, route=None,
                         confirmed_runtime_lock=True,
                         persistence_disabled=True,
                         enabled_toolsets_override=[],
@@ -622,18 +663,15 @@ class ToolRunAPIMixin:
                         active.pop(instance_id, None)
                         if not active:
                             self._tool_run_agents.pop(run_id, None)
-                routes = []
-                for role in AD_TEMPLATE_ROUTE_ORDER:
-                    stage_candidates, _ = self._tool_candidates(run, role)
-                    if not stage_candidates:
-                        raise RuntimeError(f"No route configured for {role}")
-                    routes.append(stage_candidates[0])
-                fallback_candidates, _ = self._tool_candidates(run, AD_TEMPLATE_OPTIONAL_ROUTE)
-                if AD_TEMPLATE_OPTIONAL_ROUTE in ((run.get("model_policy") or {}).get("stages") or {}):
-                    if not fallback_candidates:
-                        raise RuntimeError(f"No route configured for {AD_TEMPLATE_OPTIONAL_ROUTE}")
-                    routes.append(fallback_candidates[0])
-                route_names = [f"{item['provider']}/{item['model']}" for item in routes]
+                routes = [
+                    dict(route_plan[role][0][0]) for role in AD_TEMPLATE_ROUTE_ORDER
+                ]
+                # A configured analyse fallback must actually replace the
+                # builder route on retry; the previous implementation ignored
+                # ``_candidate`` and silently repeated the failed primary.
+                routes[0] = dict(_candidate)
+                if AD_TEMPLATE_OPTIONAL_ROUTE in route_plan:
+                    routes.append(dict(route_plan[AD_TEMPLATE_OPTIONAL_ROUTE][0][0]))
                 def emit(kind: str, node: str, data: Dict[str, Any]):
                     nonlocal current_stage
                     event_stage = self._tool_stage_from_process_event(kind, node)
@@ -775,14 +813,12 @@ class ToolRunAPIMixin:
             )
         except asyncio.CancelledError:
             try:
-                if getattr(self, "_tool_run_shutdown", False):
-                    self._tool_run_store.append_event(
-                        run_id, "run.interrupted", status="blocked", node_id=current_stage,
-                        data={"reason": "gateway-shutdown", "will_resume": True},
-                    )
-                else:
-                    self._tool_run_store.update_run(run_id, status="cancelled", attention=True)
-                    self._tool_run_store.append_event(run_id, "run.cancelled", status="cancelled", node_id=current_stage, data={})
+                self._tool_run_store.resolve_executor_interruption(
+                    run_id,
+                    reason="gateway-shutdown"
+                    if getattr(self, "_tool_run_shutdown", False)
+                    else "executor-interrupted",
+                )
             except Exception:
                 pass
             raise
