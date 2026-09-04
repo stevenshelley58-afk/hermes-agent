@@ -71,6 +71,41 @@ def test_restart_requeues_interrupted_runs_with_checkpoint(tmp_path):
     assert store.events(run["run_id"])[-1]["kind"] == "run.recovered"
 
 
+def test_restart_recovers_only_recent_cancelled_rows_without_operator_intent(tmp_path):
+    store = ToolRunStore(str(tmp_path / "recover-cancel-race.db"))
+    recent, _ = store.create_run(command(idempotency_key="recent-cancel-race"))
+    old, _ = store.create_run(command(
+        request_id="req-old-cancel-race", idempotency_key="old-cancel-race",
+    ))
+    requested, _ = store.create_run(command(
+        request_id="req-requested-cancel", idempotency_key="requested-cancel",
+    ))
+    now = store.get_run(recent["run_id"])["updated_at"]
+    store._conn.execute(
+        "UPDATE tool_runs SET status='cancelled',completed_at=?,updated_at=? WHERE run_id=?",
+        (now, now, recent["run_id"]),
+    )
+    store._conn.execute(
+        "UPDATE tool_runs SET status='cancelled',completed_at=?,updated_at=? WHERE run_id=?",
+        (now - 600, now - 600, old["run_id"]),
+    )
+    store._conn.execute(
+        """UPDATE tool_runs SET status='cancelled',cancel_requested=1,
+           completed_at=?,updated_at=? WHERE run_id=?""",
+        (now, now, requested["run_id"]),
+    )
+    store._conn.commit()
+
+    recovered = store.recover_incomplete()
+
+    assert [item["run_id"] for item in recovered] == [recent["run_id"]]
+    assert recovered[0]["status"] == "queued"
+    assert recovered[0]["completed_at"] is None
+    assert store.events(recent["run_id"])[-1]["data"]["reason"] == "unrequested-cancellation"
+    assert store.get_run(old["run_id"])["status"] == "cancelled"
+    assert store.get_run(requested["run_id"])["status"] == "cancelled"
+
+
 def test_executor_interruption_only_cancels_with_durable_operator_intent(tmp_path):
     store = ToolRunStore(str(tmp_path / "executor-interruption.db"))
     deploy_run, _ = store.create_run(command(idempotency_key="deploy-interruption"))

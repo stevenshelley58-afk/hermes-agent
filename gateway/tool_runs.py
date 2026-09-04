@@ -866,21 +866,37 @@ class ToolRunStore:
 
     def recover_incomplete(self) -> List[Dict[str, Any]]:
         """Return interrupted runs to the queue without erasing checkpoints."""
+        # During a release from an older runtime, asyncio cancellation could
+        # race its shutdown flag and write terminal ``cancelled`` even though
+        # no operator requested cancellation. Recover only that exact recent
+        # signature; durable operator cancellations retain cancel_requested=1.
+        recent_cutoff = _now() - 300
         with self._lock:
             rows = self._conn.execute(
-                "SELECT run_id,stage FROM tool_runs WHERE status IN ('running','cancelling') ORDER BY created_at"
+                """SELECT run_id,stage,status FROM tool_runs
+                   WHERE status IN ('running','cancelling')
+                      OR (status='cancelled' AND cancel_requested=0 AND updated_at>=?)
+                   ORDER BY created_at""",
+                (recent_cutoff,),
             ).fetchall()
             self._conn.execute(
-                """UPDATE tool_runs SET status='queued',cancel_requested=0,attention=1,updated_at=?
-                   WHERE status IN ('running','cancelling')""",
-                (_now(),),
+                """UPDATE tool_runs
+                   SET status='queued',cancel_requested=0,attention=1,
+                       completed_at=NULL,updated_at=?
+                   WHERE status IN ('running','cancelling')
+                      OR (status='cancelled' AND cancel_requested=0 AND updated_at>=?)""",
+                (_now(), recent_cutoff),
             )
             self._conn.commit()
         recovered: List[Dict[str, Any]] = []
         for row in rows:
             self.append_event(
                 row["run_id"], "run.recovered", status="queued", node_id=row["stage"],
-                data={"reason": "gateway-restart", "resume_from": row["stage"]},
+                data={
+                    "reason": "unrequested-cancellation"
+                    if row["status"] == "cancelled" else "gateway-restart",
+                    "resume_from": row["stage"],
+                },
             )
             recovered.append(self.get_run(row["run_id"]))
         return recovered
