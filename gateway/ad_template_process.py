@@ -130,14 +130,14 @@ FINAL_SEMANTIC_GLYPH_CHECKS = ("phone", "mail", "web", "location", "cta")
 COMPARATOR_BADGE_TREATMENTS = (
     "absent", "none", "circle", "pill", "rounded_rect", "other",
 )
+COMPARATOR_BADGE_FILL_TREATMENTS = (
+    "absent", "none", "filled", "outline", "mixed", "other",
+)
 
 
 def _comparator_mark_badge_observation(value: Any, *, placement: str) -> Dict[str, Any]:
     """Normalize a vision role's bounded brand-silhouette/icon-badge signature."""
-    keys = {
-        "brand_silhouette_features", "phone_badge", "mail_badge", "web_badge",
-        "location_badge", "cta_badge",
-    }
+    keys = {"brand_silhouette_features", *(f"{role}_badge" for role in FINAL_SEMANTIC_GLYPH_CHECKS)}
     if not isinstance(value, dict) or set(value) != keys:
         raise ReviewEvidenceError(
             f"comparator mark_badge_treatment must record an exact structured {placement} observation",
@@ -158,13 +158,34 @@ def _comparator_mark_badge_observation(value: Any, *, placement: str) -> Dict[st
     for role in FINAL_SEMANTIC_GLYPH_CHECKS:
         key = f"{role}_badge"
         treatment = value.get(key)
-        if treatment not in COMPARATOR_BADGE_TREATMENTS:
+        if not isinstance(treatment, dict) or set(treatment) != {"shape", "fillTreatment"}:
             raise ReviewEvidenceError(
-                f"comparator mark_badge_treatment {placement} {key} must be one of "
+                f"comparator mark_badge_treatment {placement} {key} must contain exactly shape and fillTreatment",
+                field="source_inventory.micro_checks",
+            )
+        shape = treatment.get("shape")
+        fill_treatment = treatment.get("fillTreatment")
+        if shape not in COMPARATOR_BADGE_TREATMENTS:
+            raise ReviewEvidenceError(
+                f"comparator mark_badge_treatment {placement} {key}.shape must be one of "
                 f"{', '.join(COMPARATOR_BADGE_TREATMENTS)}",
                 field="source_inventory.micro_checks",
             )
-        normalized[key] = treatment
+        if fill_treatment not in COMPARATOR_BADGE_FILL_TREATMENTS:
+            raise ReviewEvidenceError(
+                f"comparator mark_badge_treatment {placement} {key}.fillTreatment must be one of "
+                f"{', '.join(COMPARATOR_BADGE_FILL_TREATMENTS)}",
+                field="source_inventory.micro_checks",
+            )
+        if (
+            shape in {"absent", "none"} and fill_treatment != shape
+            or shape not in {"absent", "none"} and fill_treatment in {"absent", "none"}
+        ):
+            raise ReviewEvidenceError(
+                f"comparator mark_badge_treatment {placement} {key} has incompatible shape and fillTreatment",
+                field="source_inventory.micro_checks",
+            )
+        normalized[key] = {"shape": shape, "fillTreatment": fill_treatment}
     return normalized
 
 def _parse_required_change(value: str) -> Dict[str, Any] | None:
@@ -517,6 +538,15 @@ def _comparator_source_inventory(
                     "comparator mark_badge_treatment cannot declare match when brand silhouette "
                     "features or semantic icon badge treatments differ from the source"
                 )
+        if check == "mark_badge_treatment" and item.get("status") == "mismatch":
+            source_treatment = normalized_item["source_observation"]
+            if all(
+                normalized_item[f"{placement}_observation"] == source_treatment
+                for placement in ("feed", "story")
+            ):
+                raise ComparatorSelfConsistencyError(
+                    "comparator mark_badge_treatment cannot declare mismatch when structured observations match"
+                )
         micro_checks.append(normalized_item)
     if tuple(seen_checks) != COMPARATOR_MICRO_INVENTORY_CHECKS:
         raise ComparatorSelfConsistencyError(
@@ -588,6 +618,57 @@ def _final_semantic_glyph_inventory(value: Any) -> Dict[str, Any]:
         normalized[check] = normalized_item
     return normalized
 
+
+def _final_mark_badge_treatment(value: Any) -> Dict[str, Any]:
+    """Require finals to independently verify source-specific mark and badge treatment."""
+    exact_keys = {
+        "source_observation", "feed_observation", "story_observation", "status", "findings",
+    }
+    if not isinstance(value, dict) or set(value) != exact_keys:
+        raise ReviewEvidenceError(
+            "final reviewer mark_badge_treatment must use the exact structured observation schema",
+            field="mark_badge_treatment",
+        )
+    normalized: Dict[str, Any] = {}
+    for placement in ("source", "feed", "story"):
+        normalized[f"{placement}_observation"] = _comparator_mark_badge_observation(
+            value.get(f"{placement}_observation"), placement=placement,
+        )
+    status = value.get("status")
+    findings = value.get("findings")
+    if status not in {"match", "mismatch"} or not isinstance(findings, list) or not all(
+        isinstance(finding, str) and finding.strip() for finding in findings
+    ):
+        raise ReviewEvidenceError(
+            "final reviewer mark_badge_treatment requires match|mismatch status and string findings",
+            field="mark_badge_treatment",
+        )
+    if status == "match" and findings:
+        raise ComparatorSelfConsistencyError(
+            "final reviewer mark_badge_treatment declares match with mismatch findings"
+        )
+    source_treatment = normalized["source_observation"]
+    observations_differ = any(
+        normalized[f"{placement}_observation"] != source_treatment
+        for placement in ("feed", "story")
+    )
+    if status == "match" and observations_differ:
+        raise ComparatorSelfConsistencyError(
+            "final reviewer mark_badge_treatment cannot declare match when brand silhouette "
+            "features, badge shapes, or fill treatments differ from the source"
+        )
+    if status == "mismatch" and not findings:
+        raise ComparatorSelfConsistencyError(
+            "final reviewer mark_badge_treatment mismatch requires concrete findings"
+        )
+    if status == "mismatch" and not observations_differ:
+        raise ComparatorSelfConsistencyError(
+            "final reviewer mark_badge_treatment cannot declare mismatch when structured observations match"
+        )
+    normalized["status"] = status
+    normalized["findings"] = [finding.strip() for finding in findings]
+    return normalized
+
 def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ReviewEvidenceError(f"{role} returned invalid evidence", field="evidence")
@@ -641,6 +722,7 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
     ranked_changes: List[str] = []
     source_inventory: Dict[str, Any] = {}
     semantic_glyph_inventory: Dict[str, Any] = {}
+    mark_badge_treatment: Dict[str, Any] = {}
     declared_decision = None
     if role == "comparator":
         raw_macro = value.get("macro")
@@ -690,6 +772,9 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
     elif role == "final reviewer":
         semantic_glyph_inventory = _final_semantic_glyph_inventory(
             value.get("semantic_glyph_inventory")
+        )
+        mark_badge_treatment = _final_mark_badge_treatment(
+            value.get("mark_badge_treatment")
         )
     if require_change_list:
         if not isinstance(differences, list) or not all(isinstance(item, str) and item.strip() for item in differences):
@@ -762,6 +847,8 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
             "semantic_glyph_mismatch": any(
                 item["status"] == "mismatch" for item in semantic_glyph_inventory.values()
             ),
+            "mark_badge_treatment": mark_badge_treatment,
+            "mark_badge_treatment_mismatch": mark_badge_treatment["status"] == "mismatch",
         } if role == "final reviewer" else {}),
         **({"differences": differences, "required_changes": required_changes} if require_change_list else {}),
     }
@@ -773,6 +860,7 @@ def _passes_quality_gate(evidence: Mapping[str, Any]) -> bool:
         and not evidence.get("critical_blocker")
         and not evidence.get("macro_regression")
         and not evidence.get("semantic_glyph_mismatch")
+        and not evidence.get("mark_badge_treatment_mismatch")
         and min((evidence.get("macro") or {"default": 10}).values()) >= MIN_RUBRIC_SCORE
         and _number((evidence.get("rubric") or {}).get("feed_source_likeness")) >= THRESHOLD
         and _number(evidence.get("score")) >= THRESHOLD
@@ -2601,7 +2689,7 @@ def review_prompt(
         "genuinely clears every gate."
     )
     output_contract = (
-        "Return JSON only with exactly reason, differences, visible_strings, semantic_glyph_inventory, hard_failures, and rubric."
+        "Return JSON only with exactly reason, differences, visible_strings, semantic_glyph_inventory, mark_badge_treatment, hard_failures, and rubric."
         if final
         else
         "Return JSON only with exactly reason, differences, required_changes, ranked_changes, visible_strings, "
@@ -2638,9 +2726,9 @@ Use this scale strictly: 10.0 means the Feed is visually indistinguishable in st
 
 {output_contract} {hierarchical_contract} visible_strings must be exactly an object with source, feed, and story arrays. Transcribe every visibly rendered word, number, currency value, CTA and logo wordmark in reading order; preserve visible splitting, missing glyphs and truncation exactly (for example, a broken HOUSE rendered as H U / O S / E must be transcribed that way, not silently corrected). differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. Every differences string must also appear verbatim in one source_inventory findings array. required_changes is the ordered list of all material work the builder should apply next. {change_list_contract} Every required_changes string must use this exact actionable structure: placement=feed|story; layers=comma-separated layerIds; current={{x:...,y:...,width:...,height:...}}; target={{x:...,y:...,width:...,height:...}}; change=specific instruction. Name all affected layer IDs and use their current and intended target geometry. Copy current geometry exactly from Candidate contract JSON, then check every proposed target rectangle against every existing layer before returning it. Never propose a target that newly overlaps an image slot or opaque vector panel with another image slot unless that overlap is visibly present in the source and the change text explicitly identifies and justifies the source-visible overlap. Use a separate required_changes item when affected layers do not share identical current and target geometry.
 
-For the comparator only, source_inventory must contain exactly macro_regions and micro_checks. macro_regions must contain these entries exactly once and in this order: frame_header, hero_offer_panel, image_gallery, about_features, contact_footer, story_recomposition. Each entry has exactly region, source_components, feed_components, story_components, source_count, feed_count, story_count, status, material, findings, required_change_refs. The component fields are arrays of visible component descriptions; each count is a non-negative integer exactly equal to its array length. micro_checks must contain these entries exactly once and in this order: brand_text, mark_badge_treatment, dividers, bullet_count_stacking, typography_spacing, overlap, punctuation, semantic_glyphs. Each entry has exactly check, source_observation, feed_observation, story_observation, status, material, findings, required_change_refs. status is match or mismatch; material is boolean. A match has findings=[] and required_change_refs=[]. A mismatch has concrete findings. Every material mismatch has one or more 1-based required_change_refs pointing into required_changes; a non-material mismatch has none. Every required_change must be referenced. Inspect brand_text for a source-visible wordmark or brand-role text footprint and require a coherent neutral editable replacement when identity substitution is permitted; an icon alone does not replace source-visible brand text. mark_badge_treatment source/feed/story observations must each be an exact object with keys brand_silhouette_features, phone_badge, mail_badge, web_badge, location_badge, cta_badge. brand_silhouette_features is a list of short lowercase visible primitives such as mountain, single-roof, two-roof, window, door; reuse the same exact token for the same primitive across images and use [] only when no brand mark is visible. Every *_badge is exactly absent, none, circle, pill, rounded_rect, or other: absent means the semantic role is not visible, while none means its glyph is visible without an enclosing badge. mark_badge_treatment may be match only when the normalized Feed and Story objects exactly equal the source object. A source multi-part brand silhouette simplified to a generic mark, or a source circular/pill badge rendered as a bare glyph, is a material mismatch with required_changes. Count divider rules and state their orientation/position. Count bullet glyphs and separately count stacked visible bullet lines; run-on bullets are not stacked. A candidate that repeats a source's obviously duplicated feature content is still a material mismatch: preserve the exact source count and stacked structure while requiring distinct coherent neutral editable examples. Compare type family/style/weight/scale/tracking/line height and region spacing. Report every visible overlap, including text crowding even when pixel bounds pass. Compare punctuation character-for-character for otherwise corresponding visible strings, including price separators. semantic_glyphs must inventory the source-visible phone, mail, web/globe, location/pin, and CTA/arrow/check roles and compare their Feed/Story pixels. Hollow rings, blank circles, and generic placeholder marks are mismatches when the source shows distinct semantic symbols; map each material mismatch to required_changes. Do not mark any micro check match without recording what is visibly present in source, Feed, and Story.
+For the comparator only, source_inventory must contain exactly macro_regions and micro_checks. macro_regions must contain these entries exactly once and in this order: frame_header, hero_offer_panel, image_gallery, about_features, contact_footer, story_recomposition. Each entry has exactly region, source_components, feed_components, story_components, source_count, feed_count, story_count, status, material, findings, required_change_refs. The component fields are arrays of visible component descriptions; each count is a non-negative integer exactly equal to its array length. micro_checks must contain these entries exactly once and in this order: brand_text, mark_badge_treatment, dividers, bullet_count_stacking, typography_spacing, overlap, punctuation, semantic_glyphs. Each entry has exactly check, source_observation, feed_observation, story_observation, status, material, findings, required_change_refs. status is match or mismatch; material is boolean. A match has findings=[] and required_change_refs=[]. A mismatch has concrete findings. Every material mismatch has one or more 1-based required_change_refs pointing into required_changes; a non-material mismatch has none. Every required_change must be referenced. Inspect brand_text for a source-visible wordmark or brand-role text footprint and require a coherent neutral editable replacement when identity substitution is permitted; an icon alone does not replace source-visible brand text. mark_badge_treatment source/feed/story observations must each be an exact object with keys brand_silhouette_features, phone_badge, mail_badge, web_badge, location_badge, cta_badge. brand_silhouette_features is a list of short lowercase visible primitives such as mountain, single-roof, two-roof, window, door; reuse the same exact token for the same primitive across images and use [] only when no brand mark is visible. Every *_badge is exactly an object with shape and fillTreatment. shape is absent, none, circle, pill, rounded_rect, or other: absent means the semantic role is not visible, while none means its glyph is visible without an enclosing badge. fillTreatment is absent, none, filled, outline, mixed, or other and must describe whether the enclosing badge is visibly solid or hollow. mark_badge_treatment may be match only when the normalized Feed and Story objects exactly equal the source object, including fillTreatment. A source multi-part brand silhouette simplified to a generic mark, or a source filled circular/pill badge rendered as a hollow outline or bare glyph, is a material mismatch with required_changes. Count divider rules and state their orientation/position. Count bullet glyphs and separately count stacked visible bullet lines; run-on bullets are not stacked. A candidate that repeats a source's obviously duplicated feature content is still a material mismatch: preserve the exact source count and stacked structure while requiring distinct coherent neutral editable examples. Compare type family/style/weight/scale/tracking/line height and region spacing. Report every visible overlap, including text crowding even when pixel bounds pass. Compare punctuation character-for-character for otherwise corresponding visible strings, including price separators. semantic_glyphs must inventory the source-visible phone, mail, web/globe, location/pin, and CTA/arrow/check roles and compare their Feed/Story pixels. Hollow rings, blank circles, and generic placeholder marks are mismatches when the source shows distinct semantic symbols; map each material mismatch to required_changes. Do not mark any micro check match without recording what is visibly present in source, Feed, and Story.
 
-For final reviewers only, semantic_glyph_inventory must contain exactly phone, mail, web, location, and cta in that order. Each value has exactly source_observation, feed_observation, story_observation, status, findings. Record absent roles explicitly. status is match or mismatch; match requires findings=[] and mismatch requires concrete findings. Hollow rings, blank circles, or generic placeholder marks cannot match a distinct source-visible semantic symbol. Any semantic glyph mismatch prevents final acceptance even when numeric scores otherwise pass.
+For final reviewers only, semantic_glyph_inventory must contain exactly phone, mail, web, location, and cta in that order. Each value has exactly source_observation, feed_observation, story_observation, status, findings. Record absent roles explicitly. status is match or mismatch; match requires findings=[] and mismatch requires concrete findings. Hollow rings, blank circles, or generic placeholder marks cannot match a distinct source-visible semantic symbol. mark_badge_treatment is also mandatory and has exactly source_observation, feed_observation, story_observation, status, findings. Its three observations use the same exact structured brand_silhouette_features plus per-role badge objects defined for the comparator. It may be match only when Feed and Story exactly equal source, including filled versus outline treatment. Any semantic glyph or mark/badge treatment mismatch prevents final acceptance even when numeric scores otherwise pass.
 
 hard_failures is a list. rubric contains exactly these eight 0-10 numbers: feed_source_likeness, layout_geometry, spacing_proportions, typography_likeness, colour_likeness, image_slot_composition, editable_decomposition, native_story_translation. A passing candidate requires feed_source_likeness >= {THRESHOLD}, mean >= {THRESHOLD}, every field{'' if final else ' and every macro field'} >= {MIN_RUBRIC_SCORE}, no critical-region blocker, no regression, no hard failure, and no required change.
 
@@ -3256,8 +3344,9 @@ class SoleProcessOrchestrator:
                     retry_suffix = (
                         "\n\nYour previous final-review response was rejected by the strict evidence schema: "
                         f"{rejection}. Return the complete corrected JSON object with exactly reason, differences, "
-                        "visible_strings, semantic_glyph_inventory, hard_failures, and the eight-field rubric. "
+                        "visible_strings, semantic_glyph_inventory, mark_badge_treatment, hard_failures, and the eight-field rubric. "
                         "semantic_glyph_inventory must cover phone, mail, web, location, and CTA from actual pixels. "
+                        "mark_badge_treatment must independently record the structured source, Feed, and Story treatment observations. "
                         "Do not return required_changes. Do not lower "
                         "scores to avoid the schema. Return only the corrected JSON object."
                     )
@@ -3337,6 +3426,7 @@ class SoleProcessOrchestrator:
                     "hard_failures": item["hard_failures"],
                     "differences": item["differences"],
                     "semantic_glyph_inventory": item["semantic_glyph_inventory"],
+                    "mark_badge_treatment": item["mark_badge_treatment"],
                     "required_changes": item["required_changes"],
                     "reason": item["reason"],
                 }

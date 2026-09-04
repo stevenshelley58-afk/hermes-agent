@@ -14,6 +14,18 @@ from gateway.ad_template_process import (
 )
 from gateway.tool_run_api import ToolRunAPIMixin
 
+
+def treatment_observation():
+    return {
+        "brand_silhouette_features": ["roof"],
+        "phone_badge": {"shape": "circle", "fillTreatment": "filled"},
+        "mail_badge": {"shape": "circle", "fillTreatment": "filled"},
+        "web_badge": {"shape": "circle", "fillTreatment": "filled"},
+        "location_badge": {"shape": "absent", "fillTreatment": "absent"},
+        "cta_badge": {"shape": "absent", "fillTreatment": "absent"},
+    }
+
+
 def evidence(score=9.4, reason="Improve spacing"):
     actionable_change = (
         "placement=feed; layers=feed-bg; "
@@ -44,30 +56,15 @@ def evidence(score=9.4, reason="Improve spacing"):
             {
                 "check": check,
                 "source_observation": (
-                    {
-                        "brand_silhouette_features": ["roof"],
-                        "phone_badge": "circle", "mail_badge": "circle",
-                        "web_badge": "circle", "location_badge": "absent",
-                        "cta_badge": "absent",
-                    }
+                    treatment_observation()
                     if check == "mark_badge_treatment" else f"source {check}"
                 ),
                 "feed_observation": (
-                    {
-                        "brand_silhouette_features": ["roof"],
-                        "phone_badge": "circle", "mail_badge": "circle",
-                        "web_badge": "circle", "location_badge": "absent",
-                        "cta_badge": "absent",
-                    }
+                    treatment_observation()
                     if check == "mark_badge_treatment" else f"feed {check}"
                 ),
                 "story_observation": (
-                    {
-                        "brand_silhouette_features": ["roof"],
-                        "phone_badge": "circle", "mail_badge": "circle",
-                        "web_badge": "circle", "location_badge": "absent",
-                        "cta_badge": "absent",
-                    }
+                    treatment_observation()
                     if check == "mark_badge_treatment" else f"story {check}"
                 ),
                 "status": "mismatch" if differences and check == "typography_spacing" else "match",
@@ -102,6 +99,13 @@ def evidence(score=9.4, reason="Improve spacing"):
                 "findings": [],
             }
             for check in process.FINAL_SEMANTIC_GLYPH_CHECKS
+        },
+        "mark_badge_treatment": {
+            "source_observation": treatment_observation(),
+            "feed_observation": treatment_observation(),
+            "story_observation": treatment_observation(),
+            "status": "match",
+            "findings": [],
         },
     }
 
@@ -491,6 +495,39 @@ def test_final_review_rejects_placeholder_semantic_glyphs_despite_passing_scores
 
     assert final["decision"] == "revise"
     assert final["reviewers"][0]["semantic_glyph_mismatch"] is True
+
+
+@pytest.mark.parametrize(
+    ("placement", "mutate"),
+    [
+        (
+            "feed",
+            lambda observation: observation["phone_badge"].update(fillTreatment="outline"),
+        ),
+        (
+            "story",
+            lambda observation: observation.update(
+                brand_silhouette_features=["single-roof"],
+            ),
+        ),
+    ],
+)
+def test_final_review_cannot_match_changed_fill_treatment_or_brand_silhouette(
+    placement, mutate,
+):
+    weak = evidence(9.8, "Numeric pass")
+    mutate(weak["mark_badge_treatment"][f"{placement}_observation"])
+
+    with pytest.raises(
+        process.ComparatorSelfConsistencyError,
+        match="cannot declare match when brand silhouette features, badge shapes, or fill treatments differ",
+    ):
+        validate_final_review({
+            "reviewers": [
+                {"id": "reviewer-a", "route": "a/vision", **weak},
+                {"id": "reviewer-b", "route": "b/vision", **evidence(9.8, "Independent pass")},
+            ],
+        }, accepted=True)
 
 
 @pytest.mark.parametrize("raw_value", (..., None, "move it", {"change": "move it"}, 1))
@@ -932,7 +969,8 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
         if final:
             assert "do not return required_changes" in prompt
             assert "Hermes derives the next builder brief" in prompt
-            assert "Return JSON only with exactly reason, differences, visible_strings, semantic_glyph_inventory, hard_failures, and rubric" in prompt
+            assert "Return JSON only with exactly reason, differences, visible_strings, semantic_glyph_inventory, mark_badge_treatment, hard_failures, and rubric" in prompt
+            assert "filled versus outline treatment" in prompt
         else:
             assert "required_changes must contain at least one actionable item" in prompt
             assert "mark_badge_treatment" in prompt
@@ -1433,7 +1471,7 @@ def test_comparator_inventory_requires_all_explicit_micro_checks_and_change_cove
     ("placement", "field", "value"),
     [
         ("feed", "brand_silhouette_features", ["door", "single-roof"]),
-        ("story", "phone_badge", "none"),
+        ("story", "phone_badge", {"shape": "none", "fillTreatment": "none"}),
     ],
 )
 def test_comparator_cannot_match_changed_brand_silhouette_or_icon_badge(
@@ -2763,7 +2801,7 @@ def test_final_review_schema_recovery_survives_three_invalid_outputs(tmp_path, m
     final_calls = [item for item in calls if item[0].startswith("final-reviewer-")]
     assert len(final_calls) == 5
     assert "-retry-3" in final_calls[3][0]
-    assert "exactly reason, differences, visible_strings, semantic_glyph_inventory, hard_failures, and the eight-field rubric" in final_calls[3][1]
+    assert "exactly reason, differences, visible_strings, semantic_glyph_inventory, mark_badge_treatment, hard_failures, and the eight-field rubric" in final_calls[3][1]
     assert "Do not return required_changes" in final_calls[3][1]
     retried = [data for kind, data in events if kind == "final-review.retried"]
     assert len(retried) == 3
