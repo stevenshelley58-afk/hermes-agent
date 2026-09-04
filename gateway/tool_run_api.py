@@ -309,6 +309,100 @@ class ToolRunAPIMixin:
         }
 
     @staticmethod
+    def _load_ad_template_iteration_candidate(
+        workspace: Path, iteration: int
+    ) -> Dict[str, Any]:
+        workspace_root = workspace.resolve()
+        artifact_path = (
+            workspace / "iterations" / f"{iteration:02d}" / "artifact.json"
+        ).resolve()
+        try:
+            artifact_path.relative_to(workspace_root)
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("persisted iteration artifact is unavailable") from exc
+        if not isinstance(artifact, dict) or set(artifact) != {"template", "assets"}:
+            raise RuntimeError("persisted iteration artifact is invalid")
+        previews = []
+        render = {}
+        for placement in ("feed", "story"):
+            preview = (
+                workspace / "previews" / f"iteration-{iteration:02d}-{placement}.png"
+            ).resolve()
+            try:
+                preview.relative_to(workspace_root)
+            except ValueError as exc:
+                raise RuntimeError("persisted iteration preview escapes run workspace") from exc
+            render[placement] = str(preview)
+            previews.append({
+                "name": preview.name,
+                "path": str(preview),
+                "placement": placement,
+            })
+        candidate = {
+            **artifact,
+            "previews": previews,
+            "render": render,
+            "template_path": str(artifact_path),
+        }
+        try:
+            validate_artifacts(candidate, workspace)
+        except (AdTemplateProcessError, OSError, ValueError) as exc:
+            raise RuntimeError("persisted iteration candidate is unavailable") from exc
+        return candidate
+
+    def _ad_template_iteration_checkpoint(
+        self, run_id: str, workspace: Path, current_stage: str
+    ) -> Dict[str, Any] | None:
+        """Load the last complete append-only boundary for restart continuation."""
+        records: List[Dict[str, Any]] = []
+        state: Dict[str, Any] | None = None
+        for iteration in range(1, 61):
+            path = workspace / "iterations" / f"{iteration:02d}" / "checkpoint.json"
+            if not path.is_file():
+                break
+            try:
+                checkpoint = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError("persisted iteration checkpoint is unreadable") from exc
+            if (
+                not isinstance(checkpoint, dict)
+                or checkpoint.get("schema") != "hermes.ad-template-iteration-checkpoint.v1"
+                or checkpoint.get("iteration") != iteration
+                or not isinstance(checkpoint.get("record"), dict)
+            ):
+                raise RuntimeError("persisted iteration checkpoint is invalid")
+            records.append(checkpoint["record"])
+            state = checkpoint
+        if not records or state is None:
+            if current_stage == "final-check":
+                return self._final_check_checkpoint(run_id, workspace)
+            return None
+        history = validate_iterations(records)
+        best_iteration = int(state.get("best_iteration") or 0)
+        if not 1 <= best_iteration <= len(history):
+            raise RuntimeError("persisted best iteration is invalid")
+        candidate = self._load_ad_template_iteration_candidate(workspace, best_iteration)
+        last = history[-1]
+        resume_final_check = (
+            last["decision"] == "accepted" and not last.get("final_review_failed")
+        )
+        selected_route = state.get("builder_route")
+        if not isinstance(selected_route, dict):
+            raise RuntimeError("persisted builder route is invalid")
+        return {
+            "candidate": candidate,
+            "history": history,
+            "previous_score": state.get("previous_score"),
+            "resume_final_check": resume_final_check,
+            "best_iteration": best_iteration,
+            "selected_builder_route": selected_route,
+            "builder_escalated": bool(state.get("builder_escalated")),
+            "low_gain_streak": int(state.get("low_gain_streak") or 0),
+            "feedback": str(state.get("feedback") or "")[:3000],
+        }
+
+    @staticmethod
     def _tool_json_output(value: Any, *, process_result: bool = False) -> Dict[str, Any]:
         if process_result:
             required = {
@@ -706,7 +800,9 @@ class ToolRunAPIMixin:
                 if not source:
                     raise RuntimeError("source image is missing")
                 source = str(self._durable_tool_source(workspace, source))
-                checkpoint = self._final_check_checkpoint(run_id, workspace) if current_stage == "final-check" else None
+                checkpoint = self._ad_template_iteration_checkpoint(
+                    run_id, workspace, current_stage
+                )
                 result = SoleProcessOrchestrator(
                     call_agent=call_agent, workspace=workspace, run_id=run_id,
                     project_id=str((run.get("scope") or {}).get("project_id") or ""), emit=emit,
@@ -720,6 +816,11 @@ class ToolRunAPIMixin:
                     history=(checkpoint or {}).get("history"),
                     total_iterations=len((checkpoint or {}).get("history") or []),
                     previous_score=(checkpoint or {}).get("previous_score"),
+                    best_iteration=(checkpoint or {}).get("best_iteration"),
+                    selected_builder_route=(checkpoint or {}).get("selected_builder_route"),
+                    builder_escalated=bool((checkpoint or {}).get("builder_escalated")),
+                    low_gain_streak=int((checkpoint or {}).get("low_gain_streak") or 0),
+                    feedback=str((checkpoint or {}).get("feedback") or ""),
                 )
                 return result, usage
 
@@ -798,7 +899,10 @@ class ToolRunAPIMixin:
                             data={"attempt": attempt, "from_model": candidate["model"], "to_model": next_candidate["model"], "reason": failure},
                         )
             if result is None:
-                raise RuntimeError(f"All configured {route_stage} model attempts failed: {'; '.join(failures)}")
+                raise RuntimeError(
+                    f"Sole ad-template process failed during {current_stage}: "
+                    f"{'; '.join(failures)}"
+                )
             refreshed = self._tool_run_store.get_run(run_id)
             if refreshed.get("cancel_requested"):
                 self._tool_run_store.update_run(run_id, status="cancelled", attention=True)

@@ -1,9 +1,11 @@
 """Executable orchestration for the sole ad-template process."""
 from __future__ import annotations
-import base64, copy, hashlib, hmac, json, math, mimetypes, os, re, shlex, shutil, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, uuid
+import base64, copy, hashlib, hmac, io, json, math, mimetypes, os, re, shlex, shutil, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping
+
+from PIL import Image, UnidentifiedImageError
 
 THRESHOLD = 9.5
 MIN_RUBRIC_SCORE = 9.2
@@ -18,6 +20,8 @@ STORY_CONTENT_SAFE_ZONE = {"x": 72, "y": 240, "width": 936, "height": 1380}
 MAX_COMPARATOR_SELF_CONSISTENCY_RETRIES = 3
 MAX_FINAL_REVIEW_OUTPUT_RETRIES = 3
 MATERIAL_OVERLAP_RATIO = 0.08
+VISION_MAX_SERIALIZED_IMAGE_BYTES = 140_000
+VISION_MAX_LONG_EDGE = 1440
 
 class AdTemplateProcessError(ValueError):
     pass
@@ -1030,6 +1034,44 @@ def persist_rejected_candidate(candidate: Any, iteration_workspace: Path, *, ite
     os.replace(temporary, path)
     return path
 
+
+def persist_iteration_checkpoint(
+    workspace: Path,
+    *,
+    iteration: int,
+    record: Mapping[str, Any],
+    best_iteration: int,
+    builder_route: Mapping[str, str],
+    builder_escalated: bool,
+    previous_score: float | None,
+    low_gain_streak: int,
+    feedback: str,
+) -> Path:
+    """Persist an append-only iteration boundary for restart-safe continuation."""
+    root = workspace / "iterations" / f"{iteration:02d}"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / "checkpoint.json"
+    payload = {
+        "schema": "hermes.ad-template-iteration-checkpoint.v1",
+        "iteration": iteration,
+        "record": dict(record),
+        "best_iteration": best_iteration,
+        "builder_route": {
+            "provider": str(builder_route.get("provider") or ""),
+            "model": str(builder_route.get("model") or ""),
+        },
+        "builder_escalated": bool(builder_escalated),
+        "previous_score": previous_score,
+        "low_gain_streak": int(low_gain_streak),
+        "feedback": str(feedback)[:3000],
+    }
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+    )
+    os.replace(temporary, path)
+    return path
+
 def resolve_catalog_assets(template: Mapping[str, Any], assets: Any) -> List[Dict[str, Any]]:
     if not isinstance(assets, list): raise AdTemplateProcessError("builder assets must be a list")
     declarations = template.get("assets") if isinstance(template.get("assets"), dict) else {}
@@ -1285,14 +1327,48 @@ Use this scale strictly: 10.0 means the Feed is visually indistinguishable in st
 
 Hard-fail source pixels flattened into the output, copied advertiser identity, missing/unreadable renders, any missing/split/clipped/truncated/garbled visible text, a malformed or blank logo, repeated/wrong photographs, canvas/safe-zone violations, non-editable critical roles, unknown assets, or a stretched/cropped/letterboxed Story. The numeric tracking field in Candidate JSON is absolute canvas pixels, never em, percent, or a font-size multiplier. Inspect both native Feed/Story renders and any subsequently attached Meta-shell previews; a shell-only defect is still a defect. Do not infer another reviewer's score. Candidate contract JSON: {candidate_context}"""
 
-def vision_message(text: str, paths: List[str]) -> List[Dict[str, Any]]:
+def _bounded_vision_image(path: Path) -> tuple[bytes, str]:
+    raw = path.read_bytes()
+    try:
+        with Image.open(io.BytesIO(raw)) as opened:
+            opened.load()
+            image = opened.convert("RGB")
+    except (OSError, UnidentifiedImageError):
+        return raw, mimetypes.guess_type(path.name)[0] or "image/png"
+    if max(image.size) > VISION_MAX_LONG_EDGE:
+        image.thumbnail((VISION_MAX_LONG_EDGE, VISION_MAX_LONG_EDGE), Image.Resampling.LANCZOS)
+    encoded = b""
+    for quality in (82, 70, 58):
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=quality, optimize=True, progressive=True)
+        encoded = output.getvalue()
+        if len(encoded) <= VISION_MAX_SERIALIZED_IMAGE_BYTES:
+            return encoded, "image/jpeg"
+    while len(encoded) > VISION_MAX_SERIALIZED_IMAGE_BYTES and max(image.size) > 480:
+        image = image.resize(
+            tuple(max(1, int(value * 0.8)) for value in image.size),
+            Image.Resampling.LANCZOS,
+        )
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=58, optimize=True, progressive=True)
+        encoded = output.getvalue()
+    if len(encoded) > VISION_MAX_SERIALIZED_IMAGE_BYTES:
+        raise AdTemplateProcessError("bounded vision image exceeds transport budget")
+    return encoded, "image/jpeg"
+
+
+def vision_message(text: str, paths: List[str], *, bounded: bool = False) -> List[Dict[str, Any]]:
     parts: List[Dict[str, Any]] = [{"type": "text", "text": text}]
     for raw in paths:
         path = Path(str(raw)).expanduser().resolve()
         if not path.is_file():
             raise AdTemplateProcessError("vision input image is missing")
-        mime = mimetypes.guess_type(path.name)[0] or "image/png"
-        parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"}})
+        payload, mime = (
+            _bounded_vision_image(path)
+            if bounded
+            else (path.read_bytes(), mimetypes.guess_type(path.name)[0] or "image/png")
+        )
+        parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"}})
     if len(parts) == 1:
         raise AdTemplateProcessError("vision role requires attached image pixels")
     return parts
@@ -1328,7 +1404,7 @@ class SoleProcessOrchestrator:
         if self.should_stop():
             raise AdTemplateProcessError("sole ad-template process was cancelled")
 
-    def run(self, *, source: str, brief: str, placements: Any, routes: List[Dict[str, str]], review_round: int = 0, total_iterations: int = 0, feedback: str = "", history: List[Dict[str, Any]] | None = None, revision_candidate: Mapping[str, Any] | None = None, selected_builder_route: Mapping[str, str] | None = None, builder_escalated: bool = False, previous_score: float | None = None, low_gain_streak: int = 0, require_quality_route: bool = False, resume_final_check: bool = False) -> Dict[str, Any]:
+    def run(self, *, source: str, brief: str, placements: Any, routes: List[Dict[str, str]], review_round: int = 0, total_iterations: int = 0, feedback: str = "", history: List[Dict[str, Any]] | None = None, revision_candidate: Mapping[str, Any] | None = None, selected_builder_route: Mapping[str, str] | None = None, builder_escalated: bool = False, previous_score: float | None = None, low_gain_streak: int = 0, require_quality_route: bool = False, resume_final_check: bool = False, best_iteration: int | None = None) -> Dict[str, Any]:
         if len(routes) < 4: raise AdTemplateProcessError("builder, comparator, and two final reviewers require four configured roles")
         quality_route = routes[4] if len(routes) > 4 else None
         if require_quality_route and quality_route is None:
@@ -1346,6 +1422,8 @@ class SoleProcessOrchestrator:
         working_candidate: Mapping[str, Any] | None = revision_candidate
         best_candidate: Mapping[str, Any] | None = copy.deepcopy(revision_candidate) if revision_candidate else None
         best_score = previous_score if revision_candidate else None
+        if best_iteration is None and best_candidate is not None:
+            best_iteration = total_iterations
         if resume_final_check:
             validated_history = validate_iterations(history)
             if not candidate or validated_history[-1]["decision"] != "accepted":
@@ -1513,6 +1591,7 @@ class SoleProcessOrchestrator:
                     message = vision_message(
                         comparison_prompt + retry_suffix,
                         review_vision_paths(source, rendered, previous_best),
+                        bounded=True,
                     )
                     try:
                         comparison = self.call_agent(
@@ -1623,8 +1702,20 @@ class SoleProcessOrchestrator:
             if _passes_quality_gate(evidence):
                 best_candidate = copy.deepcopy(candidate)
                 best_score = score
+                best_iteration = index
                 working_candidate = best_candidate
                 previous_score = score
+                persist_iteration_checkpoint(
+                    self.workspace,
+                    iteration=index,
+                    record=record,
+                    best_iteration=index,
+                    builder_route=builder_route,
+                    builder_escalated=builder_escalated,
+                    previous_score=previous_score,
+                    low_gain_streak=low_gain_streak,
+                    feedback=feedback,
+                )
                 break
 
             eligible_for_best = not (
@@ -1635,6 +1726,7 @@ class SoleProcessOrchestrator:
             if best_candidate is None or (eligible_for_best and (best_score is None or score > best_score)):
                 best_candidate = copy.deepcopy(candidate)
                 best_score = score
+                best_iteration = index
             working_candidate = best_candidate
             current_feedback = json.dumps({
                 "instruction": "Revise the immutable best-so-far candidate; do not continue from a regressing render.",
@@ -1665,6 +1757,17 @@ class SoleProcessOrchestrator:
                 })
             previous_score = score
             feedback = current_feedback
+            persist_iteration_checkpoint(
+                self.workspace,
+                iteration=index,
+                record=record,
+                best_iteration=int(best_iteration or index),
+                builder_route=builder_route,
+                builder_escalated=builder_escalated,
+                previous_score=previous_score,
+                low_gain_streak=low_gain_streak,
+                feedback=feedback,
+            )
         accepted_records = history if resume_final_check else iterations
         if not accepted_records or accepted_records[-1]["decision"] != "accepted": raise AdTemplateProcessError(f"quality loop exhausted {MAX_ITERATIONS} iterations without a final-review-ready candidate")
         accepted_score = _number((accepted_records[-1].get("comparison") or {}).get("score"))
@@ -1695,6 +1798,7 @@ class SoleProcessOrchestrator:
                         vision_message(
                             final_prompt + retry_suffix,
                             review_vision_paths(source, candidate),
+                            bounded=True,
                         ),
                         provider_route,
                     )
@@ -1759,6 +1863,17 @@ class SoleProcessOrchestrator:
                 }
                 for item in final_review["reviewers"]
             ], ensure_ascii=False)
+            persist_iteration_checkpoint(
+                self.workspace,
+                iteration=int(accepted_records[-1]["iteration"]),
+                record=accepted_records[-1],
+                best_iteration=int(best_iteration or accepted_records[-1]["iteration"]),
+                builder_route=builder_route,
+                builder_escalated=builder_escalated,
+                previous_score=accepted_score,
+                low_gain_streak=low_gain_streak,
+                feedback=reasons,
+            )
             return self.run(
                 source=source, brief=brief, placements=placements, routes=routes,
                 review_round=review_round + 1, total_iterations=len(history + iterations),
@@ -1766,6 +1881,7 @@ class SoleProcessOrchestrator:
                 selected_builder_route=builder_route, builder_escalated=builder_escalated,
                 previous_score=accepted_score, low_gain_streak=low_gain_streak,
                 require_quality_route=require_quality_route,
+                best_iteration=best_iteration,
             )
         self.emit("final-review.completed", "final-check", {"decision": "accepted", "reviewers": final_review["reviewers"]})
         generated = candidate

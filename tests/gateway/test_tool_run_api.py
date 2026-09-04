@@ -245,6 +245,62 @@ def test_final_check_requeue_loads_accepted_iteration_and_existing_artifacts(tmp
     assert checkpoint["resume_final_check"] is True
 
 
+def test_build_restart_loads_two_iterations_and_best_for_iteration_three(tmp_path):
+    store = ToolRunStore(str(tmp_path / "checkpoint.db"))
+    workspace = tmp_path / "run"
+    (workspace / "previews").mkdir(parents=True)
+    for iteration, score in ((1, 8.4), (2, 9.1)):
+        root = workspace / "iterations" / f"{iteration:02d}"
+        root.mkdir(parents=True)
+        (root / "artifact.json").write_text(json.dumps({
+            "template": _valid_template(), "assets": [],
+        }), encoding="utf-8")
+        for placement in ("feed", "story"):
+            (workspace / "previews" / f"iteration-{iteration:02d}-{placement}.png").write_bytes(
+                placement.encode()
+            )
+        changes = [
+            "placement=feed; layers=feed-background; "
+            "current={x:0,y:0,width:1080,height:1350}; "
+            "target={x:0,y:0,width:1080,height:1350}; change=Continue matching"
+        ]
+        comparison = {
+            "rubric": {field: score for field in process.RUBRIC_FIELDS},
+            "reason": "Continue matching the source",
+            "hard_failures": [],
+            "visible_strings": _visible_strings(),
+            "differences": ["Visible mismatch"],
+            "required_changes": changes,
+            **_hierarchical_comparison(score, changes),
+        }
+        record = {
+            "iteration": iteration,
+            "candidate": {"template": _valid_template(), "assets": [], "previews": []},
+            "comparison": comparison,
+            "decision": "revise",
+        }
+        process.persist_iteration_checkpoint(
+            workspace,
+            iteration=iteration,
+            record=record,
+            best_iteration=iteration,
+            builder_route={"provider": "openai-codex", "model": "gpt-5.6-sol"},
+            builder_escalated=True,
+            previous_score=score,
+            low_gain_streak=0,
+            feedback=f"iteration {iteration}",
+        )
+    checkpoint = _ToolRunHarness(store)._ad_template_iteration_checkpoint(
+        "trun_checkpoint", workspace, "build"
+    )
+    assert checkpoint is not None
+    assert len(checkpoint["history"]) == 2
+    assert checkpoint["best_iteration"] == 2
+    assert checkpoint["candidate"]["template"]["templateId"] == "completion-test"
+    assert checkpoint["resume_final_check"] is False
+    assert checkpoint["previous_score"] == 9.1
+
+
 def test_final_check_requeue_rebuilds_after_interrupted_accepted_artifact(tmp_path):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")

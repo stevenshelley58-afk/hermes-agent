@@ -201,7 +201,7 @@ def test_builtin_policy_uses_only_audited_native_vision_roles():
         "final-review-b": ("openai-codex", "gpt-5.6-sol"),
         "quality-escalation": ("openai-codex", "gpt-5.6-sol"),
     }
-    assert policy["seed_revision"] == 9
+    assert policy["seed_revision"] == 10
     assert AD_TEMPLATE_ROUTE_ORDER == tuple(expected)[:-1]
     assert AD_TEMPLATE_OPTIONAL_ROUTE == "quality-escalation"
     for stage_id, route in expected.items():
@@ -261,26 +261,26 @@ def test_text_only_deepseek_routes_fail_closed_even_when_self_declared(model):
         validate_model_policy(policy)
 
 
-def test_stale_sole_revisions_one_to_eight_are_preserved_and_revision_nine_selected(tmp_path):
-    path = tmp_path / "seed-v9.db"
+def test_stale_sole_revisions_one_to_nine_are_preserved_and_revision_ten_selected(tmp_path):
+    path = tmp_path / "seed-v10.db"
     store = ToolRunStore(str(path))
     stale = default_ad_template_policy()
-    stale["seed_revision"] = 8
+    stale["seed_revision"] = 9
     stale["stages"]["analyse"]["primary"]["model"] = "gpt-5.6-luna"
     stale_json = json.dumps(stale, separators=(",", ":"), sort_keys=True)
     store._conn.execute(
         "UPDATE tool_model_policies SET is_default=0,policy_json=? WHERE tool_id=? AND revision=1",
         (stale_json, "ad-template-generator"),
     )
-    for revision in (2, 3, 4, 5, 6, 7, 8):
+    for revision in (2, 3, 4, 5, 6, 7, 8, 9):
         store._conn.execute(
             "INSERT INTO tool_model_policies(tool_id,revision,project_id,created_at,is_default,policy_json) VALUES(?,?,?,?,?,?)",
-            ("ad-template-generator", revision, "", float(revision), int(revision == 8), stale_json),
+            ("ad-template-generator", revision, "", float(revision), int(revision == 9), stale_json),
         )
     store._conn.commit()
     historical = store._conn.execute(
         "SELECT revision,project_id,created_at,policy_json FROM tool_model_policies "
-        "WHERE tool_id=? AND revision<=8 ORDER BY revision",
+        "WHERE tool_id=? AND revision<=9 ORDER BY revision",
         ("ad-template-generator",),
     ).fetchall()
     historical = [tuple(row) for row in historical]
@@ -289,23 +289,23 @@ def test_stale_sole_revisions_one_to_eight_are_preserved_and_revision_nine_selec
     migrated = ToolRunStore(str(path))
     preserved = migrated._conn.execute(
         "SELECT revision,project_id,created_at,policy_json FROM tool_model_policies "
-        "WHERE tool_id=? AND revision<=8 ORDER BY revision",
+        "WHERE tool_id=? AND revision<=9 ORDER BY revision",
         ("ad-template-generator",),
     ).fetchall()
     assert [tuple(row) for row in preserved] == historical
-    assert migrated.get_policy("ad-template-generator", 8)["is_default"] is False
-    assert migrated.get_policy("ad-template-generator", 8)["policy"] == stale
+    assert migrated.get_policy("ad-template-generator", 9)["is_default"] is False
+    assert migrated.get_policy("ad-template-generator", 9)["policy"] == stale
     current = migrated.get_policy("ad-template-generator")
-    assert current["revision"] == 9
-    assert current["policy"]["seed_revision"] == 9
+    assert current["revision"] == 10
+    assert current["policy"]["seed_revision"] == 10
     assert current["policy"]["stages"]["analyse"]["primary"]["model"] == "gpt-5.6-sol"
     assert current["policy"]["stages"]["quality-escalation"]["primary"]["model"] == "gpt-5.6-sol"
     pinned, _ = migrated.create_run(command(
         request_id="req-stale",
         idempotency_key="stale-policy-pin",
-        model_policy_revision=8,
+        model_policy_revision=9,
     ))
-    assert pinned["model_policy_revision"] == 8
+    assert pinned["model_policy_revision"] == 9
     assert pinned["model_policy"] == stale
 
 

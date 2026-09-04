@@ -1,9 +1,11 @@
+import base64
 import json
 import os
 import shlex
 import sys
 from pathlib import Path
 import pytest
+from PIL import Image
 import gateway.ad_template_process as process
 from gateway.ad_template_process import (
     AdTemplateProcessError, deterministic_documents, import_template,
@@ -1029,6 +1031,16 @@ def test_vision_roles_reject_filename_only_inputs(tmp_path):
         vision_message("inspect this", [str(tmp_path / "filename-only.png")])
 
 
+def test_five_image_comparator_transport_is_bounded_below_one_megabyte(tmp_path):
+    source = tmp_path / "large.png"
+    Image.effect_noise((2400, 2400), 100).convert("RGB").save(source, format="PNG")
+    message = vision_message("compare", [str(source)] * 5, bounded=True)
+    assert len(json.dumps(message).encode("utf-8")) < 1_000_000
+    for item in message[1:]:
+        encoded = item["image_url"]["url"].split(",", 1)[1]
+        assert len(base64.b64decode(encoded)) <= process.VISION_MAX_SERIALIZED_IMAGE_BYTES
+
+
 def test_blockwise_import_contract_uses_hmac_and_camel_case_receipt(monkeypatch, tmp_path):
     seen = {}
     class Response:
@@ -1518,6 +1530,58 @@ def test_final_check_resume_reuses_checkpoint_score_when_reviewers_request_revis
     assert result["iterations"][0]["final_review_failed"] is True
     assert result["iterations"][1]["decision"] == "accepted"
     assert result["import"]["template_id"] == "tpl-resumed"
+
+
+def test_build_restart_continues_at_iteration_three_from_persisted_best(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    best = valid_candidate("persisted-best")
+    best_feed = tmp_path / "best-feed.png"
+    best_story = tmp_path / "best-story.png"
+    best_feed.write_bytes(b"feed")
+    best_story.write_bytes(b"story")
+    best["render"] = {"feed": str(best_feed), "story": str(best_story)}
+    calls, renders = [], []
+
+    def call_agent(instance, _prompt, _route):
+        calls.append(instance)
+        if instance.startswith("builder-"):
+            return valid_candidate("resumed-third")
+        return evidence(9.7, "Completion pass")
+
+    monkeypatch.setattr(
+        process, "run_generator_cli",
+        lambda candidate, workspace: fake_render(candidate, workspace, renders),
+    )
+    monkeypatch.setattr(
+        process, "import_template",
+        lambda *_args, **_kwargs: {"template_id": "tpl-third", "status": "imported"},
+    )
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent,
+        workspace=tmp_path / "run",
+        run_id="trun_resume_build",
+        project_id="blockwise",
+        emit=lambda *_args: None,
+    ).run(
+        source=str(source),
+        brief="",
+        placements=["feed", "story"],
+        routes=[
+            {"provider": "builder", "model": "vision"},
+            {"provider": "compare", "model": "vision"},
+            {"provider": "review-a", "model": "vision-a"},
+            {"provider": "review-b", "model": "vision-b"},
+        ],
+        history=[iteration(8.4, 1), iteration(9.1, 2)],
+        revision_candidate=best,
+        total_iterations=2,
+        previous_score=9.1,
+        best_iteration=2,
+    )
+    assert calls[0] == "builder-3"
+    assert result["iterations"][-1]["iteration"] == 3
+    assert (tmp_path / "run" / "iterations" / "03" / "checkpoint.json").is_file()
 
 
 def test_negative_final_review_without_geometry_changes_revises_after_both_reviewers(tmp_path, monkeypatch):
