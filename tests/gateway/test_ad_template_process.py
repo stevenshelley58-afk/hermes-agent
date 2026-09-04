@@ -1473,6 +1473,8 @@ def test_renderer_rejection_revises_without_advancing_checkpoint_or_importing(tm
         "decision": "revise",
         "category": "renderer_rejection",
         "evidence": "iterations/01/renderer-rejection-01.json",
+        "revision_instruction": reason,
+        "target_unchanged": False,
     }
     evidence_path = tmp_path / "run" / revised["evidence"]
     rejection_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
@@ -1497,6 +1499,60 @@ def test_renderer_rejection_reason_is_allowlisted_and_path_free():
     assert process._deterministic_renderer_rejection(
         "Error: Cannot find module /secret/path/renderer.js"
     ) is None
+
+
+def test_renderer_rejection_feedback_targets_layer_and_detects_unchanged_retry():
+    candidate = valid_candidate("renderer-target")
+    candidate["template"]["feedLayout"]["layers"].append({
+        "type": "text",
+        "layerId": "feed-brand-name",
+        "inputKey": "brandName",
+        "font": {"file": "manrope-600.woff2"},
+        "fontSize": 34,
+        "lineHeight": 1.1,
+        "tracking": 1,
+        "alignment": "center",
+        "maxCharacters": 18,
+        "maxLines": 1,
+        "colourRole": "mainText",
+        "overflowBehaviour": "scale_down",
+        "geometry": {"x": 682, "y": 316, "width": 300, "height": 42},
+    })
+    candidate["template"]["textInputs"].append({
+        "key": "brandName",
+        "label": "Real estate brand name",
+        "placeholder": "REAL ESTATE",
+        "maxLength": 18,
+    })
+    reason = "feed text layer feed-brand-name cannot fit at the 24px readability floor"
+
+    first, signature, first_unchanged = process._renderer_rejection_instruction(
+        candidate, reason
+    )
+    second, second_signature, second_unchanged = process._renderer_rejection_instruction(
+        candidate, reason, previous_target_signature=signature
+    )
+
+    assert first_unchanged is False
+    assert second_unchanged is True
+    assert second_signature == signature
+    for expected in (
+        '"placement":"feed"',
+        '"layerId":"feed-brand-name"',
+        '"inputKey":"brandName"',
+        '"geometry":{"height":42,"width":300,"x":682,"y":316}',
+        '"font":{"file":"manrope-600.woff2"}',
+        '"fontSize":34',
+        '"maxLines":1',
+        '"fit":"scale_down"',
+        '"placeholder":"REAL ESTATE"',
+        "widen or raise the text box",
+        "shorten the neutral placeholder/input contract",
+        "keep the rendered font at or above the readability floor",
+    ):
+        assert expected in first
+    assert "UNCHANGED NAMED LAYER DETECTED" not in first
+    assert "UNCHANGED NAMED LAYER DETECTED" in second
 
 
 def test_initial_non_json_builder_output_retries_cheap_then_escalates_without_extra_reviews(tmp_path, monkeypatch):

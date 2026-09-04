@@ -1261,6 +1261,8 @@ def persist_renderer_rejection(
     iteration: int,
     attempt: int,
     reason: str,
+    revision_instruction: str = "",
+    target_unchanged: bool = False,
 ) -> Path:
     """Preserve the exact renderer input plus path-free rejection evidence."""
     iteration_workspace.mkdir(parents=True, exist_ok=True)
@@ -1278,6 +1280,8 @@ def persist_renderer_rejection(
         "iteration": iteration,
         "attempt": attempt,
         "reason": reason,
+        "revision_instruction": revision_instruction or reason,
+        "target_unchanged": bool(target_unchanged),
         "artifact": preserved_artifact.name,
         "candidate": _candidate_contract_projection(candidate),
     }
@@ -1368,6 +1372,12 @@ _DETERMINISTIC_RENDERER_REJECTIONS = (
     re.compile(r"ring vector [A-Za-z0-9._:-]{1,160} must use square geometry", re.IGNORECASE),
 )
 
+_TEXT_RENDERER_REJECTION = re.compile(
+    r"(?P<placement>feed|story) text layer (?P<layer_id>[A-Za-z0-9._:-]{1,160}) "
+    r"(?:is below|cannot fit at) the \d+(?:\.\d+)?px readability floor",
+    re.IGNORECASE,
+)
+
 
 def _deterministic_renderer_rejection(stderr: str, stdout: str = "") -> str | None:
     """Extract only an allowlisted, path-free candidate rejection reason."""
@@ -1377,6 +1387,71 @@ def _deterministic_renderer_rejection(stderr: str, stdout: str = "") -> str | No
         if match:
             return match.group(0)[:320]
     return None
+
+
+def _renderer_rejection_instruction(
+    candidate: Any,
+    reason: str,
+    *,
+    previous_target_signature: str | None = None,
+) -> tuple[str, str | None, bool]:
+    """Describe the exact rejected text contract and detect a no-op retry."""
+    match = _TEXT_RENDERER_REJECTION.fullmatch(str(reason or "").strip())
+    template = candidate.get("template") if isinstance(candidate, Mapping) else None
+    if match is None or not isinstance(template, Mapping):
+        return reason, None, False
+    placement = match.group("placement").lower()
+    layout = template.get(f"{placement}Layout")
+    layers = layout.get("layers") if isinstance(layout, Mapping) else None
+    layer_id = match.group("layer_id")
+    layer = next(
+        (
+            item
+            for item in layers or []
+            if isinstance(item, Mapping) and str(item.get("layerId") or "") == layer_id
+        ),
+        None,
+    )
+    if not isinstance(layer, Mapping):
+        return reason, None, False
+    input_key = str(layer.get("inputKey") or "")[:160]
+    text_inputs = template.get("textInputs")
+    text_input = next(
+        (
+            item
+            for item in text_inputs or []
+            if isinstance(item, Mapping) and str(item.get("key") or "") == input_key
+        ),
+        {},
+    )
+    target = {
+        "placement": placement,
+        "layerId": layer_id,
+        "inputKey": input_key,
+        "geometry": _prompt_rect(layer.get("geometry")),
+        "font": _prompt_object(layer.get("font"), ("file",)),
+        "fontSize": _prompt_value(layer.get("fontSize")),
+        "maxCharacters": _prompt_value(layer.get("maxCharacters")),
+        "maxLines": _prompt_value(layer.get("maxLines")),
+        "fit": str(layer.get("overflowBehaviour") or "")[:80],
+        "placeholder": str(text_input.get("placeholder") or "")[:320],
+    }
+    signature = json.dumps(
+        target, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    unchanged = bool(previous_target_signature and signature == previous_target_signature)
+    no_op_warning = (
+        " UNCHANGED NAMED LAYER DETECTED: the prior retry returned this exact failing "
+        "target contract; change the named layer or its neutral input now."
+        if unchanged
+        else ""
+    )
+    instruction = (
+        f"{reason}. TARGETED TEXT CONTRACT: {signature}.{no_op_warning} "
+        "Allowed fix: widen or raise the text box, or shorten the neutral placeholder/input "
+        "contract; keep the rendered font at or above the readability floor."
+    )
+    return instruction, signature, unchanged
 
 def run_generator_cli(candidate: Mapping[str, Any], workspace: Path) -> Dict[str, Any]:
     command = os.environ.get("AD_TEMPLATE_GENERATOR_CMD", "").strip()
@@ -1752,6 +1827,7 @@ class SoleProcessOrchestrator:
             structured_output_failures = 0
             output_retry_pending = False
             rendered: Dict[str, Any] | None = None
+            renderer_target_signature: str | None = None
             for repair_attempt in range(MAX_SCHEMA_REPAIRS_PER_ITERATION + 1):
                 self._check_stop()
                 while True:
@@ -1857,7 +1933,13 @@ class SoleProcessOrchestrator:
                     rendered = run_generator_cli(candidate, iteration_workspace)
                 except AdTemplateRendererRejection as exc:
                     validation_feedback = ""
-                    renderer_feedback = str(exc)
+                    renderer_feedback, renderer_target_signature, target_unchanged = (
+                        _renderer_rejection_instruction(
+                            candidate,
+                            str(exc),
+                            previous_target_signature=renderer_target_signature,
+                        )
+                    )
                     rejected_candidate = candidate
                     evidence_path = persist_renderer_rejection(
                         candidate,
@@ -1865,6 +1947,8 @@ class SoleProcessOrchestrator:
                         iteration=index,
                         attempt=repair_attempt + 1,
                         reason=str(exc),
+                        revision_instruction=renderer_feedback,
+                        target_unchanged=target_unchanged,
                     )
                     self._check_stop()
                     self.emit("iteration.revised", "build", {
@@ -1874,6 +1958,8 @@ class SoleProcessOrchestrator:
                         "decision": "revise",
                         "category": "renderer_rejection",
                         "evidence": evidence_path.relative_to(self.workspace).as_posix(),
+                        "revision_instruction": renderer_feedback,
+                        "target_unchanged": target_unchanged,
                     })
                     if (
                         repair_attempt >= MAX_CHEAP_STRUCTURED_OUTPUT_RETRIES
