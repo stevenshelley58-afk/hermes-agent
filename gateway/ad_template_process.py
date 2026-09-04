@@ -3365,10 +3365,17 @@ class SoleProcessOrchestrator:
             identity = f"final-reviewer-{self.run_id}-{n}-{uuid.uuid4().hex[:8]}"
             provider_route = f"{route.get('provider')}/{route.get('model')}"
             route_identity = provider_route
-            quality_review_route = builder_route_identity(quality_route) if n == 1 and quality_route else ""
+            quality_review_route = builder_route_identity(quality_route) if quality_route else ""
+            first_review_fallback_route = quality_review_route if n == 1 else ""
+            final_b_protocol_fallback_route = (
+                quality_review_route
+                if n == 2 and str(route.get("provider") or "").strip().lower() == "deepseek"
+                else ""
+            )
             quality_route_used = False
             self.emit("final-review.started", "final-check", {"reviewer": identity, "route": route_identity})
             final_prompt = review_prompt(final=True, candidate=candidate, brief=brief)
+            final_review_paths = review_vision_paths(source, candidate)
             rejection = ""
             for output_attempt in range(MAX_FINAL_REVIEW_OUTPUT_RETRIES + 1):
                 retry_suffix = ""
@@ -3389,7 +3396,7 @@ class SoleProcessOrchestrator:
                         attempt_identity,
                         vision_message(
                             final_prompt + retry_suffix,
-                            review_vision_paths(source, candidate),
+                            final_review_paths,
                             bounded=True,
                         ),
                         provider_route,
@@ -3415,14 +3422,14 @@ class SoleProcessOrchestrator:
                             exc,
                             (AdTemplateStructuredOutputError, AdTemplateTransportError),
                         )
-                        and quality_review_route
-                        and quality_review_route != route_identity
-                        and quality_review_route != builder_route_identity(routes[3])
+                        and first_review_fallback_route
+                        and first_review_fallback_route != route_identity
+                        and first_review_fallback_route != builder_route_identity(routes[3])
                         and not quality_route_used
                     ):
                         previous_route = route_identity
-                        provider_route = quality_review_route
-                        route_identity = quality_review_route
+                        provider_route = first_review_fallback_route
+                        route_identity = first_review_fallback_route
                         quality_route_used = True
                         identity = f"final-reviewer-{self.run_id}-{n}-quality-{uuid.uuid4().hex[:8]}"
                         self.emit("final-review.route-escalated", "final-check", {
@@ -3431,6 +3438,44 @@ class SoleProcessOrchestrator:
                         })
                         continue
                     if output_attempt >= MAX_FINAL_REVIEW_OUTPUT_RETRIES:
+                        if (
+                            isinstance(exc, (AdTemplateStructuredOutputError, ReviewEvidenceError))
+                            and final_b_protocol_fallback_route
+                            and final_b_protocol_fallback_route != route_identity
+                            and not quality_route_used
+                        ):
+                            previous_route = route_identity
+                            route_identity = final_b_protocol_fallback_route
+                            quality_route_used = True
+                            fallback_identity = (
+                                f"final-reviewer-{self.run_id}-{n}-protocol-fallback-"
+                                f"{uuid.uuid4().hex[:8]}"
+                            )
+                            self.emit("final-review.route-escalated", "final-check", {
+                                "reviewer": fallback_identity,
+                                "from_route": previous_route,
+                                "to_route": route_identity,
+                                "reason": rejection,
+                                "category": "protocol-fallback",
+                            })
+                            self._check_stop()
+                            fallback_review = self.call_agent(
+                                fallback_identity,
+                                vision_message(final_prompt, final_review_paths, bounded=True),
+                                route_identity,
+                            )
+                            self._check_stop()
+                            fallback_evidence = _assessment(
+                                fallback_review,
+                                "final reviewer",
+                                require_change_list=True,
+                            )
+                            reviewers.append({
+                                "id": fallback_identity,
+                                "route": route_identity,
+                                **fallback_evidence,
+                            })
+                            break
                         raise
                     self.emit("final-review.retried", "final-check", {
                         "reviewer": identity,

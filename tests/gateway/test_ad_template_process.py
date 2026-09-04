@@ -2779,6 +2779,99 @@ def test_non_json_first_final_reviewer_escalates_to_quality_route_without_rebuil
     assert len(renders) == 1 and len(imports) == 1
 
 
+def test_exhausted_non_json_final_b_falls_back_once_to_independent_quality_route(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    calls, events, renders, imports = [], [], [], []
+
+    def call_agent(instance, prompt, route):
+        calls.append((instance, prompt, route))
+        if instance.startswith("builder-"):
+            return valid_candidate("final-b-protocol-fallback")
+        if instance.startswith("comparator-"):
+            return evidence(9.7, "Comparator pass")
+        if route == "deepseek/deepseek-v4-flash-vision-exp":
+            raise process.AdTemplateStructuredOutputError(
+                "Builder did not return one structured JSON result"
+            )
+        return evidence(9.7, "Independent final pass")
+
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: imports.append(output) or {"template_id": "tpl-final-b-protocol-fallback", "status": "imported"})
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent, workspace=tmp_path / "run",
+        run_id="trun_final_b_protocol_fallback", project_id="blockwise",
+        emit=lambda kind, node, data: events.append((kind, data)),
+    ).run(source=str(source), brief="IMMUTABLE_BRIEF_TAIL", placements=["feed", "story"], routes=[
+        {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+        {"provider": "deepseek", "model": "deepseek-v4-flash-vision-exp"},
+        {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+    ], require_quality_route=True)
+
+    final_calls = [item for item in calls if item[0].startswith("final-reviewer-")]
+    deepseek_calls = [item for item in final_calls if item[2].startswith("deepseek/")]
+    fallback_calls = [item for item in final_calls if "-protocol-fallback-" in item[0]]
+    assert len(deepseek_calls) == process.MAX_FINAL_REVIEW_OUTPUT_RETRIES + 1
+    assert len(fallback_calls) == 1
+    assert fallback_calls[0][2] == "openai-codex/gpt-5.6-sol"
+    assert fallback_calls[0][1] == deepseek_calls[0][1]
+    assert "IMMUTABLE_BRIEF_TAIL" in fallback_calls[0][1][0]["text"]
+    assert [item["route"] for item in result["final_review"]["reviewers"]] == [
+        "openai-codex/gpt-5.6-luna", "openai-codex/gpt-5.6-sol",
+    ]
+    escalations = [data for kind, data in events if kind == "final-review.route-escalated"]
+    assert len(escalations) == 1
+    assert escalations[0]["category"] == "protocol-fallback"
+    assert escalations[0]["from_route"] == "deepseek/deepseek-v4-flash-vision-exp"
+    assert escalations[0]["to_route"] == "openai-codex/gpt-5.6-sol"
+    assert len(renders) == 1 and len(imports) == 1
+
+
+def test_valid_low_score_final_b_does_not_use_protocol_fallback(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    calls, events, renders, imports = [], [], [], []
+
+    def call_agent(instance, prompt, route):
+        calls.append((instance, route))
+        if instance.startswith("builder-"):
+            return valid_candidate("final-b-valid-low-score")
+        if instance.startswith("comparator-"):
+            return evidence(9.7, "Comparator pass")
+        if route == "deepseek/deepseek-v4-flash-vision-exp":
+            return evidence(9.2, "Genuine final rejection")
+        return evidence(9.7, "Independent final pass")
+
+    monkeypatch.setattr(process, "MAX_FINAL_REVIEW_ROUNDS", 0)
+    monkeypatch.setattr(process, "run_generator_cli", lambda candidate, workspace: fake_render(candidate, workspace, renders))
+    monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: imports.append(output) or {"template_id": "unexpected", "status": "imported"})
+    with pytest.raises(
+        process.AdTemplateProcessError,
+        match="final reviewers failed after the bounded automatic revision loop",
+    ):
+        SoleProcessOrchestrator(
+            call_agent=call_agent, workspace=tmp_path / "run",
+            run_id="trun_final_b_valid_low_score", project_id="blockwise",
+            emit=lambda kind, node, data: events.append((kind, data)),
+        ).run(source=str(source), brief="", placements=["feed", "story"], routes=[
+            {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+            {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+            {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+            {"provider": "deepseek", "model": "deepseek-v4-flash-vision-exp"},
+            {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        ], require_quality_route=True)
+
+    final_calls = [item for item in calls if item[0].startswith("final-reviewer-")]
+    assert [route for _instance, route in final_calls] == [
+        "openai-codex/gpt-5.6-luna",
+        "deepseek/deepseek-v4-flash-vision-exp",
+    ]
+    assert not any(kind == "final-review.route-escalated" for kind, _data in events)
+    assert len(renders) == 1 and imports == []
+
+
 def test_first_final_reviewer_transport_timeout_escalates_once_to_distinct_quality_route(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
