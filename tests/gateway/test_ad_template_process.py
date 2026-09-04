@@ -222,6 +222,7 @@ def test_source_inventory_drives_exact_pre_render_invariants():
     ("mutation", "message"),
     [
         ("features", "source inventory requires exactly 6 distinct stacked bullets"),
+        ("duplicate-features", "feature inventory repeats bullet content"),
         ("brand", "must preserve the source-visible brand lockup"),
         ("phone", "semantic phone role requires a real phone icon layer"),
         ("divider", "must preserve the source-visible divider"),
@@ -239,6 +240,10 @@ def test_pre_render_source_invariants_reject_material_regressions(mutation, mess
     }
     if mutation == "features":
         candidate["template"]["textInputs"][1]["placeholder"] = "• One\n• Two\n• Three\n• Four"
+    elif mutation == "duplicate-features":
+        candidate["template"]["textInputs"][1]["placeholder"] = (
+            "• One\n• Two\n• Three\n• One\n• Two\n• Three"
+        )
     elif mutation == "brand":
         candidate["template"]["feedLayout"]["layers"] = [
             layer for layer in candidate["template"]["feedLayout"]["layers"]
@@ -258,6 +263,36 @@ def test_pre_render_source_invariants_reject_material_regressions(mutation, mess
         candidate["template"]["textInputs"][2]["placeholder"] = "$1,599,999"
     with pytest.raises(AdTemplateProcessError, match=re.escape(message)):
         process.validate_builder_candidate(candidate, source_invariants=invariants)
+
+
+def test_pre_render_rejects_center_compressed_story_but_allows_ui_bands():
+    candidate = source_invariant_candidate()
+    for index, layer in enumerate(candidate["template"]["storyLayout"]["layers"][1:]):
+        layer["geometry"]["y"] = 650 + index * 20
+    with pytest.raises(AdTemplateProcessError, match="center-compressed or letterboxed"):
+        process.validate_builder_candidate(candidate)
+
+    candidate = source_invariant_candidate()
+    assert process.validate_builder_candidate(candidate) is candidate
+
+
+def test_comparator_price_transcription_must_match_guarded_rendered_placeholder():
+    candidate = source_invariant_candidate()
+    review = process._assessment(evidence(9.6, "Pass"), "comparator", require_change_list=True)
+    invariants = {"price_strings": ["$1.599.999"]}
+    with pytest.raises(
+        process.ComparatorSelfConsistencyError,
+        match="price transcription contradicts the guarded rendered placeholder",
+    ):
+        process._validate_comparator_source_invariant_observations(
+            review, candidate, invariants,
+        )
+
+    review["visible_strings"]["feed"] = ["$1.599.999"]
+    review["visible_strings"]["story"] = ["$1.599.999"]
+    process._validate_comparator_source_invariant_observations(
+        review, candidate, invariants,
+    )
 
 def fake_render(candidate, workspace, calls):
     calls.append(candidate)

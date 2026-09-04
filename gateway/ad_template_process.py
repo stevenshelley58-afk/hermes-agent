@@ -1355,21 +1355,24 @@ def _validate_pre_render_source_invariants(
                     )
                 ):
                     feature_layers.append(layer)
-            observed = sum(
-                max(
-                    len([
-                        line for line in text_inputs.get(
-                            str(layer.get("inputKey") or ""), ""
-                        ).splitlines() if line.strip()
-                    ]),
-                    text_inputs.get(str(layer.get("inputKey") or ""), "").count("•"),
-                )
+            feature_items = [
+                re.sub(r"^[\s•*\-–—]+", "", line).strip().lower()
                 for layer in feature_layers
-            )
+                for line in text_inputs.get(
+                    str(layer.get("inputKey") or ""), ""
+                ).splitlines()
+                if line.strip()
+            ]
+            observed = len(feature_items)
             if observed != expected_bullets:
                 raise AdTemplateProcessError(
                     f"{layout_name} {placement} feature inventory has {observed} stacked bullets; "
                     f"source inventory requires exactly {expected_bullets} distinct stacked bullets"
+                )
+            if len(set(feature_items)) != expected_bullets:
+                raise AdTemplateProcessError(
+                    f"{layout_name} {placement} feature inventory repeats bullet content; replace the "
+                    f"source defect with exactly {expected_bullets} distinct coherent editable examples"
                 )
 
         if expected_prices:
@@ -1386,6 +1389,35 @@ def _validate_pre_render_source_invariants(
                     f"{layout_name} {placement} price punctuation must exactly preserve one source-visible "
                     f"price string: {json.dumps(expected_prices, ensure_ascii=True)}"
                 )
+
+        if placement == "story":
+            meaningful = []
+            for layer in layers:
+                if not isinstance(layer, Mapping) or layer.get("type") == "plate":
+                    continue
+                geometry = layer.get("geometry")
+                if not isinstance(geometry, Mapping):
+                    continue
+                width = float(geometry.get("width") or 0)
+                height = float(geometry.get("height") or 0)
+                token = str(layer.get("layerId") or "").lower()
+                if (
+                    layer.get("type") == "vector"
+                    and width >= 900 and height >= 1400
+                    and any(term in token for term in ("frame", "border", "background"))
+                ):
+                    continue
+                meaningful.append((float(geometry.get("y") or 0), height))
+            if len(meaningful) >= 6:
+                top = min(y for y, _height in meaningful)
+                bottom = max(y + height for y, height in meaningful)
+                if top > 420 or bottom < 1440 or bottom - top < 1050:
+                    raise AdTemplateProcessError(
+                        "storyLayout is center-compressed or letterboxed: meaningful visual layers "
+                        f"span only y={top:g}..{bottom:g}; distribute the Story hierarchy across at "
+                        "least y<=420 through y>=1440, keep essential text/logo/icon content inside "
+                        "y=240..1620, and allow nonessential media or decoration into UI bands"
+                    )
 
 
 def validate_builder_candidate(
@@ -1653,6 +1685,44 @@ def _source_invariants_from_feedback(feedback: Any) -> Dict[str, Any]:
     if not isinstance(feedback, Mapping):
         return {}
     return _normalized_source_invariants(feedback.get("source_invariants"))
+
+
+def _validate_comparator_source_invariant_observations(
+    evidence: Mapping[str, Any], candidate: Mapping[str, Any], source_invariants: Any,
+) -> None:
+    """Reject comparator transcriptions that contradict guarded rendered text."""
+    invariants = _normalized_source_invariants(source_invariants)
+    expected_prices = invariants.get("price_strings") or []
+    if not expected_prices:
+        return
+    template = candidate.get("template") if isinstance(candidate, Mapping) else None
+    if not isinstance(template, Mapping):
+        return
+    inputs = {
+        str(item.get("key") or ""): str(item.get("placeholder") or "")
+        for item in template.get("textInputs") or [] if isinstance(item, Mapping)
+    }
+    visible = evidence.get("visible_strings")
+    for placement in ("feed", "story"):
+        layout = template.get(f"{placement}Layout")
+        layers = layout.get("layers") if isinstance(layout, Mapping) else []
+        rendered_prices = [
+            inputs.get(str(layer.get("inputKey") or ""), "")
+            for layer in layers if isinstance(layer, Mapping) and layer.get("type") == "text"
+            and "price" in (
+                str(layer.get("layerId") or "").lower()
+                + " " + str(layer.get("inputKey") or "").lower()
+            )
+        ]
+        expected = next((price for price in expected_prices if price in rendered_prices), None)
+        if expected is None:
+            continue
+        observed = visible.get(placement) if isinstance(visible, Mapping) else []
+        if not isinstance(observed, list) or not any(expected in str(item) for item in observed):
+            raise ComparatorSelfConsistencyError(
+                f"comparator {placement} price transcription contradicts the guarded rendered "
+                f"placeholder {json.dumps(expected, ensure_ascii=True)}; reinspect punctuation"
+            )
 
 
 def _compact_revision_feedback(value: Any) -> str:
@@ -2367,7 +2437,7 @@ Use this scale strictly: 10.0 means the Feed is visually indistinguishable in st
 
 {output_contract} {hierarchical_contract} visible_strings must be exactly an object with source, feed, and story arrays. Transcribe every visibly rendered word, number, currency value, CTA and logo wordmark in reading order; preserve visible splitting, missing glyphs and truncation exactly (for example, a broken HOUSE rendered as H U / O S / E must be transcribed that way, not silently corrected). differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. Every differences string must also appear verbatim in one source_inventory findings array. required_changes is the ordered list of all material work the builder should apply next. {change_list_contract} Every required_changes string must use this exact actionable structure: placement=feed|story; layers=comma-separated layerIds; current={{x:...,y:...,width:...,height:...}}; target={{x:...,y:...,width:...,height:...}}; change=specific instruction. Name all affected layer IDs and use their current and intended target geometry. Copy current geometry exactly from Candidate contract JSON, then check every proposed target rectangle against every existing layer before returning it. Never propose a target that newly overlaps an image slot or opaque vector panel with another image slot unless that overlap is visibly present in the source and the change text explicitly identifies and justifies the source-visible overlap. Use a separate required_changes item when affected layers do not share identical current and target geometry.
 
-For the comparator only, source_inventory must contain exactly macro_regions and micro_checks. macro_regions must contain these entries exactly once and in this order: frame_header, hero_offer_panel, image_gallery, about_features, contact_footer, story_recomposition. Each entry has exactly region, source_components, feed_components, story_components, source_count, feed_count, story_count, status, material, findings, required_change_refs. The component fields are arrays of visible component descriptions; each count is a non-negative integer exactly equal to its array length. micro_checks must contain these entries exactly once and in this order: brand_text, dividers, bullet_count_stacking, typography_spacing, overlap, punctuation, semantic_glyphs. Each entry has exactly check, source_observation, feed_observation, story_observation, status, material, findings, required_change_refs. status is match or mismatch; material is boolean. A match has findings=[] and required_change_refs=[]. A mismatch has concrete findings. Every material mismatch has one or more 1-based required_change_refs pointing into required_changes; a non-material mismatch has none. Every required_change must be referenced. Inspect brand_text for a source-visible wordmark or brand-role text footprint and require a coherent neutral editable replacement when identity substitution is permitted; an icon alone does not replace source-visible brand text. Count divider rules and state their orientation/position. Count bullet glyphs and separately count stacked visible bullet lines; run-on bullets are not stacked. Compare type family/style/weight/scale/tracking/line height and region spacing. Report every visible overlap, including text crowding even when pixel bounds pass. Compare punctuation character-for-character for otherwise corresponding visible strings, including price separators. semantic_glyphs must inventory the source-visible phone, mail, web/globe, location/pin, and CTA/arrow/check roles and compare their Feed/Story pixels. Hollow rings, blank circles, and generic placeholder marks are mismatches when the source shows distinct semantic symbols; map each material mismatch to required_changes. Do not mark any micro check match without recording what is visibly present in source, Feed, and Story.
+For the comparator only, source_inventory must contain exactly macro_regions and micro_checks. macro_regions must contain these entries exactly once and in this order: frame_header, hero_offer_panel, image_gallery, about_features, contact_footer, story_recomposition. Each entry has exactly region, source_components, feed_components, story_components, source_count, feed_count, story_count, status, material, findings, required_change_refs. The component fields are arrays of visible component descriptions; each count is a non-negative integer exactly equal to its array length. micro_checks must contain these entries exactly once and in this order: brand_text, dividers, bullet_count_stacking, typography_spacing, overlap, punctuation, semantic_glyphs. Each entry has exactly check, source_observation, feed_observation, story_observation, status, material, findings, required_change_refs. status is match or mismatch; material is boolean. A match has findings=[] and required_change_refs=[]. A mismatch has concrete findings. Every material mismatch has one or more 1-based required_change_refs pointing into required_changes; a non-material mismatch has none. Every required_change must be referenced. Inspect brand_text for a source-visible wordmark or brand-role text footprint and require a coherent neutral editable replacement when identity substitution is permitted; an icon alone does not replace source-visible brand text. Count divider rules and state their orientation/position. Count bullet glyphs and separately count stacked visible bullet lines; run-on bullets are not stacked. A candidate that repeats a source's obviously duplicated feature content is still a material mismatch: preserve the exact source count and stacked structure while requiring distinct coherent neutral editable examples. Compare type family/style/weight/scale/tracking/line height and region spacing. Report every visible overlap, including text crowding even when pixel bounds pass. Compare punctuation character-for-character for otherwise corresponding visible strings, including price separators. semantic_glyphs must inventory the source-visible phone, mail, web/globe, location/pin, and CTA/arrow/check roles and compare their Feed/Story pixels. Hollow rings, blank circles, and generic placeholder marks are mismatches when the source shows distinct semantic symbols; map each material mismatch to required_changes. Do not mark any micro check match without recording what is visibly present in source, Feed, and Story.
 
 For final reviewers only, semantic_glyph_inventory must contain exactly phone, mail, web, location, and cta in that order. Each value has exactly source_observation, feed_observation, story_observation, status, findings. Record absent roles explicitly. status is match or mismatch; match requires findings=[] and mismatch requires concrete findings. Hollow rings, blank circles, or generic placeholder marks cannot match a distinct source-visible semantic symbol. Any semantic glyph mismatch prevents final acceptance even when numeric scores otherwise pass.
 
@@ -2751,6 +2821,9 @@ class SoleProcessOrchestrator:
                         )
                     self._check_stop()
                     evidence = _assessment(comparison, "comparator", require_change_list=True)
+                    _validate_comparator_source_invariant_observations(
+                        evidence, candidate, source_invariants,
+                    )
                     if _story_repeats_feed_topology(candidate):
                         story_failure = any(
                             "story" in item.lower()
