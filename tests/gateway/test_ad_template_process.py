@@ -1470,15 +1470,23 @@ def test_renderer_rejection_revises_without_advancing_checkpoint_or_importing(tm
         "iteration": 1,
         "attempt": 1,
         "reason": reason,
+        "reasons": [reason],
         "decision": "revise",
         "category": "renderer_rejection",
         "evidence": "iterations/01/renderer-rejection-01.json",
-        "revision_instruction": reason,
+        "revision_instruction": (
+            "Resolve ALL 1 deterministic renderer rejections before returning the next "
+            "complete candidate. Every numbered target is mandatory; changing only the first "
+            f"target is insufficient. TARGET 1: {reason}"
+        ),
         "target_unchanged": False,
+        "unchanged_targets": [],
     }
     evidence_path = tmp_path / "run" / revised["evidence"]
     rejection_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     assert rejection_evidence["reason"] == reason
+    assert rejection_evidence["reasons"] == [reason]
+    assert rejection_evidence["unchanged_targets"] == []
     assert rejection_evidence["artifact"] == "renderer-rejected-artifact-01.json"
     assert rejection_evidence["candidate"]["template"]["templateId"] == "renderer-rejected"
     assert (evidence_path.parent / rejection_evidence["artifact"]).is_file()
@@ -1553,6 +1561,104 @@ def test_renderer_rejection_feedback_targets_layer_and_detects_unchanged_retry()
         assert expected in first
     assert "UNCHANGED NAMED LAYER DETECTED" not in first
     assert "UNCHANGED NAMED LAYER DETECTED" in second
+
+
+def test_renderer_aggregated_rejection_targets_every_layer_and_tracks_each_noop():
+    candidate = valid_candidate("renderer-aggregate")
+    candidate["template"]["feedLayout"]["layers"].append({
+        "type": "text",
+        "layerId": "feed-email-text",
+        "inputKey": "emailAddress",
+        "font": {"file": "manrope-500.woff2"},
+        "fontSize": 24,
+        "lineHeight": 1,
+        "tracking": 0,
+        "alignment": "left",
+        "maxCharacters": 42,
+        "maxLines": 1,
+        "colourRole": "mainText",
+        "overflowBehaviour": "scale_down",
+        "geometry": {"x": 392, "y": 1208, "width": 278, "height": 30},
+    })
+    candidate["template"]["storyLayout"]["layers"].append({
+        "type": "text",
+        "layerId": "story-address",
+        "inputKey": "propertyAddress",
+        "font": {"file": "manrope-500.woff2"},
+        "fontSize": 32,
+        "lineHeight": 1.1,
+        "tracking": 0,
+        "alignment": "left",
+        "maxCharacters": 80,
+        "maxLines": 2,
+        "colourRole": "mainText",
+        "overflowBehaviour": "scale_down",
+        "geometry": {"x": 382, "y": 928, "width": 570, "height": 58},
+    })
+    candidate["template"]["textInputs"].extend([
+        {
+            "key": "emailAddress",
+            "label": "Email",
+            "placeholder": "hello@exampleproperty.com",
+            "maxLength": 42,
+        },
+        {
+            "key": "propertyAddress",
+            "label": "Address",
+            "placeholder": "123 Example Street, Sample City, ST 12345",
+            "maxLength": 80,
+        },
+    ])
+    reasons = [
+        "feed text layer feed-email-text cannot fit at the 24px readability floor",
+        "story text layer story-address cannot fit at the 32px readability floor",
+    ]
+    stderr = "AD_TEMPLATE_TEXT_PREFLIGHT_FAILED " + json.dumps({
+        "code": "AD_TEMPLATE_TEXT_PREFLIGHT_FAILED",
+        "violations": [
+            {
+                "placement": "feed",
+                "layerId": "feed-email-text",
+                "kind": "cannot_fit",
+                "readabilityFloorPx": 24,
+                "reason": reasons[0],
+            },
+            {
+                "placement": "story",
+                "layerId": "story-address",
+                "kind": "cannot_fit",
+                "readabilityFloorPx": 32,
+                "reason": reasons[1],
+            },
+        ],
+    })
+    assert process._deterministic_renderer_rejections(stderr) == reasons
+
+    first, signatures, unchanged = process._renderer_rejection_instructions(
+        candidate, reasons
+    )
+    second, second_signatures, second_unchanged = (
+        process._renderer_rejection_instructions(
+            candidate, reasons, previous_target_signatures=signatures
+        )
+    )
+
+    assert "Resolve ALL 2 deterministic renderer rejections" in first
+    assert "TARGET 1:" in first and "TARGET 2:" in first
+    assert first.index("feed-email-text") < first.index("story-address")
+    assert '"placeholder":"hello@exampleproperty.com"' in first
+    assert '"placeholder":"123 Example Street, Sample City, ST 12345"' in first
+    assert unchanged == []
+    assert second_signatures == signatures
+    assert second_unchanged == ["feed:feed-email-text", "story:story-address"]
+    assert second.count("UNCHANGED NAMED LAYER DETECTED") == 2
+
+    candidate["template"]["feedLayout"]["layers"][-1]["geometry"]["width"] = 420
+    third, _third_signatures, third_unchanged = process._renderer_rejection_instructions(
+        candidate, reasons, previous_target_signatures=second_signatures
+    )
+    assert third_unchanged == ["story:story-address"]
+    assert third.count("UNCHANGED NAMED LAYER DETECTED") == 1
 
 
 def test_initial_non_json_builder_output_retries_cheap_then_escalates_without_extra_reviews(tmp_path, monkeypatch):

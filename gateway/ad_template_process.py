@@ -20,6 +20,7 @@ MAX_ITERATIONS = 60
 MAX_FINAL_REVIEW_ROUNDS = 10
 MAX_SCHEMA_REPAIRS_PER_ITERATION = 3
 MAX_CHEAP_STRUCTURED_OUTPUT_RETRIES = 1
+MAX_RENDERER_REJECTIONS_PER_ATTEMPT = 32
 STAGES = ("source", "build", "render", "compare", "final-check", "live")
 MAX_CANDIDATE_CONTEXT_CHARS = 100_000
 MIN_MATERIAL_SCORE_GAIN = 0.5
@@ -38,7 +39,15 @@ class AdTemplateProcessError(ValueError):
 class AdTemplateRendererRejection(AdTemplateProcessError):
     """A deterministic candidate refusal returned by the shared renderer."""
 
-    pass
+    def __init__(self, reasons: Any):
+        raw = [reasons] if isinstance(reasons, str) else list(reasons or [])
+        bounded = tuple(str(item).strip()[:320] for item in raw if str(item).strip())[
+            :MAX_RENDERER_REJECTIONS_PER_ATTEMPT
+        ]
+        if not bounded:
+            raise ValueError("renderer rejection requires at least one reason")
+        self.reasons = bounded
+        super().__init__("; ".join(bounded))
 
 
 def _runtime_safe_asset_catalog() -> SafeAssetCatalog:
@@ -1261,8 +1270,10 @@ def persist_renderer_rejection(
     iteration: int,
     attempt: int,
     reason: str,
+    reasons: Any = None,
     revision_instruction: str = "",
     target_unchanged: bool = False,
+    unchanged_targets: Any = None,
 ) -> Path:
     """Preserve the exact renderer input plus path-free rejection evidence."""
     iteration_workspace.mkdir(parents=True, exist_ok=True)
@@ -1280,8 +1291,14 @@ def persist_renderer_rejection(
         "iteration": iteration,
         "attempt": attempt,
         "reason": reason,
+        "reasons": [str(item)[:320] for item in (reasons or [reason])][
+            :MAX_RENDERER_REJECTIONS_PER_ATTEMPT
+        ],
         "revision_instruction": revision_instruction or reason,
         "target_unchanged": bool(target_unchanged),
+        "unchanged_targets": [str(item)[:320] for item in (unchanged_targets or [])][
+            :MAX_RENDERER_REJECTIONS_PER_ATTEMPT
+        ],
         "artifact": preserved_artifact.name,
         "candidate": _candidate_contract_projection(candidate),
     }
@@ -1379,14 +1396,25 @@ _TEXT_RENDERER_REJECTION = re.compile(
 )
 
 
-def _deterministic_renderer_rejection(stderr: str, stdout: str = "") -> str | None:
-    """Extract only an allowlisted, path-free candidate rejection reason."""
+def _deterministic_renderer_rejections(stderr: str, stdout: str = "") -> List[str]:
+    """Extract bounded, de-duplicated, path-free candidate rejection reasons."""
     text = "\n".join((str(stderr or ""), str(stdout or "")))
+    matches = []
     for pattern in _DETERMINISTIC_RENDERER_REJECTIONS:
-        match = pattern.search(text)
-        if match:
-            return match.group(0)[:320]
-    return None
+        matches.extend((match.start(), match.group(0)[:320]) for match in pattern.finditer(text))
+    reasons: List[str] = []
+    for _offset, reason in sorted(matches):
+        if reason not in reasons:
+            reasons.append(reason)
+        if len(reasons) >= MAX_RENDERER_REJECTIONS_PER_ATTEMPT:
+            break
+    return reasons
+
+
+def _deterministic_renderer_rejection(stderr: str, stdout: str = "") -> str | None:
+    """Compatibility accessor for the first allowlisted renderer refusal."""
+    reasons = _deterministic_renderer_rejections(stderr, stdout)
+    return reasons[0] if reasons else None
 
 
 def _renderer_rejection_instruction(
@@ -1453,6 +1481,53 @@ def _renderer_rejection_instruction(
     )
     return instruction, signature, unchanged
 
+
+def _renderer_rejection_target_key(reason: str) -> str:
+    match = _TEXT_RENDERER_REJECTION.fullmatch(str(reason or "").strip())
+    if match is None:
+        return str(reason)[:320]
+    return f"{match.group('placement').lower()}:{match.group('layer_id')}"
+
+
+def _renderer_rejection_instructions(
+    candidate: Any,
+    reasons: Any,
+    *,
+    previous_target_signatures: Mapping[str, str] | None = None,
+) -> tuple[str, Dict[str, str], List[str]]:
+    """Enrich every renderer refusal and track unchanged targets per layer."""
+    bounded_reasons = [str(item)[:320] for item in (reasons or [])][
+        :MAX_RENDERER_REJECTIONS_PER_ATTEMPT
+    ]
+    if not bounded_reasons:
+        raise AdTemplateProcessError("renderer rejection contained no safe reasons")
+    prior = dict(previous_target_signatures or {})
+    next_signatures = dict(prior)
+    instructions: List[str] = []
+    unchanged_targets: List[str] = []
+    for reason in bounded_reasons:
+        target_key = _renderer_rejection_target_key(reason)
+        instruction, signature, unchanged = _renderer_rejection_instruction(
+            candidate,
+            reason,
+            previous_target_signature=prior.get(target_key),
+        )
+        instructions.append(instruction)
+        if signature is not None:
+            next_signatures[target_key] = signature
+        if unchanged:
+            unchanged_targets.append(target_key)
+    numbered = " ".join(
+        f"TARGET {index}: {instruction}"
+        for index, instruction in enumerate(instructions, start=1)
+    )
+    aggregate = (
+        f"Resolve ALL {len(instructions)} deterministic renderer rejections before returning "
+        "the next complete candidate. Every numbered target is mandatory; changing only the "
+        f"first target is insufficient. {numbered}"
+    )
+    return aggregate, next_signatures, unchanged_targets
+
 def run_generator_cli(candidate: Mapping[str, Any], workspace: Path) -> Dict[str, Any]:
     command = os.environ.get("AD_TEMPLATE_GENERATOR_CMD", "").strip()
     if not command: raise AdTemplateProcessError("AD_TEMPLATE_GENERATOR_CMD must point to the shared Blockwise renderer CLI")
@@ -1473,9 +1548,9 @@ def run_generator_cli(candidate: Mapping[str, Any], workspace: Path) -> Dict[str
     argv = shlex.split(command) + ["--input", str(artifact_path), "--assets-dir", str(workspace), "--out-dir", str(out_dir)]
     proc = subprocess.run(argv, text=True, capture_output=True, timeout=600, check=False)
     if proc.returncode:
-        reason = _deterministic_renderer_rejection(proc.stderr, proc.stdout)
-        if reason:
-            raise AdTemplateRendererRejection(reason)
+        reasons = _deterministic_renderer_rejections(proc.stderr, proc.stdout)
+        if reasons:
+            raise AdTemplateRendererRejection(reasons)
         raise AdTemplateProcessError(f"shared Blockwise renderer failed ({proc.returncode})")
     receipt_path = out_dir / "receipt.json"
     try: receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -1827,7 +1902,7 @@ class SoleProcessOrchestrator:
             structured_output_failures = 0
             output_retry_pending = False
             rendered: Dict[str, Any] | None = None
-            renderer_target_signature: str | None = None
+            renderer_target_signatures: Dict[str, str] = {}
             for repair_attempt in range(MAX_SCHEMA_REPAIRS_PER_ITERATION + 1):
                 self._check_stop()
                 while True:
@@ -1933,33 +2008,40 @@ class SoleProcessOrchestrator:
                     rendered = run_generator_cli(candidate, iteration_workspace)
                 except AdTemplateRendererRejection as exc:
                     validation_feedback = ""
-                    renderer_feedback, renderer_target_signature, target_unchanged = (
-                        _renderer_rejection_instruction(
+                    reasons = list(exc.reasons)
+                    reason_summary = "; ".join(reasons)
+                    renderer_feedback, renderer_target_signatures, unchanged_targets = (
+                        _renderer_rejection_instructions(
                             candidate,
-                            str(exc),
-                            previous_target_signature=renderer_target_signature,
+                            reasons,
+                            previous_target_signatures=renderer_target_signatures,
                         )
                     )
+                    target_unchanged = bool(unchanged_targets)
                     rejected_candidate = candidate
                     evidence_path = persist_renderer_rejection(
                         candidate,
                         iteration_workspace,
                         iteration=index,
                         attempt=repair_attempt + 1,
-                        reason=str(exc),
+                        reason=reason_summary,
+                        reasons=reasons,
                         revision_instruction=renderer_feedback,
                         target_unchanged=target_unchanged,
+                        unchanged_targets=unchanged_targets,
                     )
                     self._check_stop()
                     self.emit("iteration.revised", "build", {
                         "iteration": index,
                         "attempt": repair_attempt + 1,
-                        "reason": str(exc),
+                        "reason": reason_summary,
+                        "reasons": reasons,
                         "decision": "revise",
                         "category": "renderer_rejection",
                         "evidence": evidence_path.relative_to(self.workspace).as_posix(),
                         "revision_instruction": renderer_feedback,
                         "target_unchanged": target_unchanged,
+                        "unchanged_targets": unchanged_targets,
                     })
                     if (
                         repair_attempt >= MAX_CHEAP_STRUCTURED_OUTPUT_RETRIES
