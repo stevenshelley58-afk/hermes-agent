@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" viewBox="0 0 1600 1200">
+  <defs>
+    <linearGradient id="land" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#4d7049"/><stop offset="1" stop-color="#223f36"/></linearGradient>
+    <linearGradient id="water" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#8cc5ce"/><stop offset="1" stop-color="#467f92"/></linearGradient>
+    <linearGradient id="roof" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#c8b395"/><stop offset="1" stop-color="#806a52"/></linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="170%" height="170%"><feDropShadow dx="16" dy="24" stdDeviation="16" flood-color="#0b1b1c" flood-opacity=".35"/></filter>
+  </defs>
+  <rect width="1600" height="1200" fill="url(#land)"/>
+  <path d="M-80 990C300 785 510 1025 820 910c312-115 475-420 860-340v650H-80Z" fill="url(#water)"/>
+  <path d="M-80 940C300 735 500 975 812 860c308-114 483-420 868-340" fill="none" stroke="#dfd7c9" stroke-width="72"/>
+  <path d="M-80 940C300 735 500 975 812 860c308-114 483-420 868-340" fill="none" stroke="#f5f0e8" stroke-width="4" stroke-dasharray="26 24" opacity=".75"/>
+  <g filter="url(#shadow)">
+    <path d="m512 238 390-98 318 162-42 386-386 116-330-174Z" fill="#e6ddce"/>
+    <path d="m554 290 334-84 270 132-34 296-334 100-278-144Z" fill="#d5c8b6"/>
+    <path d="m620 350 232-58 182 90-28 196-226 70-190-100Z" fill="url(#roof)"/>
+    <path d="m654 400 194-48 130 64-18 124-188 56-136-76Z" fill="#2b3432"/>
+    <path d="m700 460 126-32 86 42-12 74-122 38-90-48Z" fill="#91c8d0"/>
+  </g>
+  <g fill="#2f5940" stroke="#89a26d" stroke-width="8">
+    <circle cx="420" cy="220" r="66"/><circle cx="1210" cy="230" r="74"/><circle cx="1320" cy="416" r="58"/>
+    <circle cx="352" cy="520" r="72"/><circle cx="1270" cy="746" r="84"/><circle cx="282" cy="760" r="62"/>
+  </g>
+  <g fill="#d9d2c7">
+    <rect x="466" y="660" width="176" height="82" rx="16" transform="rotate(-21 466 660)"/>
+    <rect x="1116" y="470" width="188" height="86" rx="16" transform="rotate(8 1116 470)"/>
+  </g>
+  <path d="M90 1040c230-96 424-40 594-2 294 65 470-116 796-210" fill="none" stroke="#bce0e4" stroke-width="10" opacity=".55"/>
+</svg>

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" viewBox="0 0 1600 1200">
+  <defs>
+    <linearGradient id="ground" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e9ece5"/>
+      <stop offset="1" stop-color="#d6ded2"/>
+    </linearGradient>
+    <linearGradient id="parcel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9fc791"/>
+      <stop offset="1" stop-color="#6f9f67"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="22" stdDeviation="18" flood-color="#1d2d31" flood-opacity=".2"/>
+    </filter>
+    <pattern id="lots" width="84" height="72" patternUnits="userSpaceOnUse" patternTransform="rotate(-7)">
+      <path d="M0 0H84V72H0Z" fill="none" stroke="#b9c5b5" stroke-width="3"/>
+    </pattern>
+  </defs>
+  <rect width="1600" height="1200" fill="url(#ground)"/>
+  <rect width="1600" height="1200" fill="url(#lots)" opacity=".5"/>
+  <path d="M-40 260C250 350 420 185 690 245s410 250 950 120" fill="none" stroke="#fff" stroke-width="94"/>
+  <path d="M-40 260C250 350 420 185 690 245s410 250 950 120" fill="none" stroke="#c9d0d1" stroke-width="4" stroke-dasharray="26 30"/>
+  <path d="M280-50c80 290-10 410 60 670 58 215 220 316 236 620" fill="none" stroke="#fff" stroke-width="72"/>
+  <path d="M280-50c80 290-10 410 60 670 58 215 220 316 236 620" fill="none" stroke="#c9d0d1" stroke-width="4" stroke-dasharray="24 28"/>
+  <path d="M1010-40c-30 250 130 370 112 610-18 252-198 344-176 670" fill="none" stroke="#fff" stroke-width="64"/>
+  <path d="M1010-40c-30 250 130 370 112 610-18 252-198 344-176 670" fill="none" stroke="#c9d0d1" stroke-width="4" stroke-dasharray="20 26"/>
+  <path d="m602 436 414-72 184 214-88 354-394 104-222-246Z" fill="url(#parcel)" stroke="#315b42" stroke-width="18" filter="url(#shadow)"/>
+  <path d="m662 492 298-54 158 168-68 266-286 82-176-200Z" fill="#b9d6a8" opacity=".6"/>
+  <g fill="#54785b">
+    <circle cx="710" cy="560" r="26"/><circle cx="970" cy="520" r="34"/><circle cx="1060" cy="690" r="25"/>
+    <circle cx="760" cy="870" r="31"/><circle cx="892" cy="920" r="24"/><circle cx="640" cy="744" r="22"/>
+  </g>
+  <path d="M854 540c-78 0-140 62-140 140 0 113 140 274 140 274s140-161 140-274c0-78-62-140-140-140Z" fill="#d0603a" filter="url(#shadow)"/>
+  <circle cx="854" cy="680" r="54" fill="#fff4e5"/>
+</svg>
