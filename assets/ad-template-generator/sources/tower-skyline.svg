@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1600" viewBox="0 0 1200 1600">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#b6cfdf"/><stop offset=".52" stop-color="#e8ded0"/><stop offset="1" stop-color="#c98762"/></linearGradient>
+    <linearGradient id="tower" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#e8e5df"/><stop offset=".5" stop-color="#bdb8ae"/><stop offset="1" stop-color="#777b7c"/></linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#31586b"/><stop offset="1" stop-color="#152e3a"/></linearGradient>
+    <filter id="shadow" x="-40%" y="-20%" width="180%" height="150%"><feDropShadow dx="24" dy="28" stdDeviation="24" flood-color="#1b2b33" flood-opacity=".3"/></filter>
+  </defs>
+  <rect width="1200" height="1600" fill="url(#sky)"/>
+  <circle cx="982" cy="240" r="92" fill="#f7d4a4" opacity=".82"/>
+  <g opacity=".32" fill="#4a6572"><rect x="18" y="980" width="198" height="420"/><rect x="930" y="890" width="248" height="510"/><rect x="782" y="1080" width="152" height="320"/></g>
+  <g filter="url(#shadow)">
+    <path d="m318 220 444-74 190 184v1070H280V330Z" fill="url(#tower)"/>
+    <path d="m318 220 444-74v1254H318Z" fill="#eeeae3"/>
+    <path d="M428 282h228v1118H428Z" fill="url(#glass)"/>
+    <path d="m762 146 190 184v1070H762Z" fill="#8e8e87"/>
+    <path d="M348 360h388M348 486h388M348 612h388M348 738h388M348 864h388M348 990h388M348 1116h388M348 1242h388" stroke="#a29d93" stroke-width="22"/>
+    <path d="M786 360h142M786 504h142M786 648h142M786 792h142M786 936h142M786 1080h142M786 1224h142" stroke="#686d6d" stroke-width="18"/>
+    <path d="M318 220 260 356h58Zm444-74 84 154-84 30Z" fill="#d6d2ca"/>
+  </g>
+  <path d="M0 1396c220-92 344-56 510-4 214 68 410 8 690-72v280H0Z" fill="#294840"/>
+  <g fill="#4f7058"><circle cx="122" cy="1374" r="92"/><circle cx="1084" cy="1338" r="116"/><circle cx="876" cy="1422" r="84"/></g>
+</svg>

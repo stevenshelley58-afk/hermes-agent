@@ -1,0 +1,323 @@
+{
+  "schema": "blockwise.ad-template-safe-asset-catalog",
+  "version": "2026-09-04.1",
+  "assets": [
+    {
+      "fileName": "brand/neutral-real-estate.png",
+      "mimeType": "image/png",
+      "sha256": "abe66a1b533386f00b0021558fbf02e84031aced200bfbb72a81e2096325a93b",
+      "byteSize": 97914,
+      "width": 1600,
+      "height": 1600,
+      "roles": ["brand_mark", "logo"],
+      "visualFamilies": ["neutral-brand"],
+      "usage": "neutral-placeholder",
+      "provenance": {
+        "kind": "procedural-svg",
+        "sourceFile": "assets/ad-template-generator/sources/neutral-real-estate.svg",
+        "sourceSha256": "9f1b4956ab4b967d598669bb770c35f48f2ad1df2f737ba8a30d251ece600bd7",
+        "renderer": "sharp 0.35.4",
+        "license": "project-owned-original"
+      }
+    },
+    {
+      "fileName": "exterior/apartment-garden.webp",
+      "mimeType": "image/webp",
+      "sha256": "a310f7891c9b9daa39a20f2a4ff20bd24e30794872dbf9345ad91d14b33d7d0f",
+      "byteSize": 250876,
+      "width": 1024,
+      "height": 1024,
+      "roles": ["apartment", "development", "mid_rise", "garden_exterior"],
+      "visualFamilies": ["fictional-neutral-modern", "fictional-apartment"],
+      "usage": "photo-default",
+      "provenance": {
+        "kind": "committed-fictional-fixture",
+        "repository": "stevenshelley58-afk/blockwise",
+        "commit": "fb6d88911fc0bbe748c4dd24e17366345cf9624a",
+        "path": "public/adstudio-samples/photos/prop-development.png",
+        "sourceSha256": "38a357b454795a1d54d374f28deb7df391fdc5e65ee5ca6c834e6910ee024f07",
+        "attestation": "commit message declares the assets safe and fictional"
+      }
+    },
+    {
+      "fileName": "exterior/farmhouse.webp",
+      "mimeType": "image/webp",
+      "sha256": "d70e80e746e07f5563f1f0205be76b19a17961ecf446719642dae7aa83ae39e7",
+      "byteSize": 250032,
+      "width": 1024,
+      "height": 1024,
+      "roles": ["farmhouse", "traditional_exterior", "daylight_exterior"],
+      "visualFamilies": ["fictional-neutral-traditional"],
+      "usage": "photo-default",
+      "provenance": {
+        "kind": "committed-fictional-fixture",
+        "repository": "stevenshelley58-afk/blockwise",
+        "commit": "fb6d88911fc0bbe748c4dd24e17366345cf9624a",
+        "path": "public/adstudio-samples/photos/prop-farmhouse.png",
+        "sourceSha256": "85f65ff33de6e6fd922bd1aa30ba970d275430c6e00cd55f4b2ef54a9db9bd4d",
+        "attestation": "commit message declares the assets safe and fictional"
+      }
+    },
+    {
+      "fileName": "exterior/modern-dusk.webp",
+      "mimeType": "image/webp",
+      "sha256": "5d66a2d8258041bc6c626d1f10cf2663713188e9cf7a5935e2583336b53c81db",
+      "byteSize": 186560,
+      "width": 1024,
+      "height": 1024,
+      "roles": ["modern_home", "dusk_exterior", "sunset_exterior", "night_exterior"],
+      "visualFamilies": ["fictional-neutral-modern", "fictional-modern-dusk"],
+      "usage": "photo-default",
+      "provenance": {
+        "kind": "committed-fictional-fixture",
+        "repository": "stevenshelley58-afk/blockwise",
+        "commit": "fb6d88911fc0bbe748c4dd24e17366345cf9624a",
+        "path": "public/adstudio-samples/photos/prop-dusk.png",
+        "sourceSha256": "a5ba9fd9a7c541bcfdae934da9eec0b3f9865547105fa91a4a44744db6bc3cfd",
+        "attestation": "commit message declares the assets safe and fictional"
+      }
+    },
+    {
+      "fileName": "exterior/pavilion-patio.webp",
+      "mimeType": "image/webp",
+      "sha256": "f1d309b34cb0dd74f1c7fa85053e1a94515ba6cf35a49c95f966c895ef1605dd",
+      "byteSize": 202714,
+      "width": 1024,
+      "height": 1024,
+      "roles": ["modern_home", "pavilion_exterior", "patio", "daylight_exterior"],
+      "visualFamilies": ["fictional-neutral-modern", "fictional-modern-daylight"],
+      "usage": "photo-default",
+      "provenance": {
+        "kind": "committed-fictional-fixture",
+        "repository": "stevenshelley58-afk/blockwise",
+        "commit": "fb6d88911fc0bbe748c4dd24e17366345cf9624a",
+        "path": "public/adstudio-samples/photos/prop-pavilion.png",
+        "sourceSha256": "59180c0189aff26817033f1c0300eae2440cb3edb15c3745a91c303860247c63",
+        "attestation": "commit message declares the assets safe and fictional"
+      }
+    },
+    {
+      "fileName": "exterior/suburban-daylight.webp",
+      "mimeType": "image/webp",
+      "sha256": "d7d5b7bfa0520662c1da7c933d3793fca0524ee71ebaf229e7cf9c78c6eaf264",
+      "byteSize": 250890,
+      "width": 1024,
+      "height": 1024,
+      "roles": ["suburban_home", "daylight_exterior", "family_home"],
+      "visualFamilies": ["fictional-neutral-traditional", "fictional-suburban-daylight"],
+      "usage": "photo-default",
+      "provenance": {
+        "kind": "committed-fictional-fixture",
+        "repository": "stevenshelley58-afk/blockwise",
+        "commit": "fb6d88911fc0bbe748c4dd24e17366345cf9624a",
+        "path": "public/adstudio-samples/photos/prop-sunny.png",
+        "sourceSha256": "accffa058d035dfc7de3f48a381345f1900c3245127a837ca76171a51ea8b7a4",
+        "attestation": "commit message declares the assets safe and fictional"
+      }
+    },
+    {
+      "fileName": "interior/bathroom.webp",
+      "mimeType": "image/webp",
+      "sha256": "dbcc76eb7d37b95efca3593f3df0a0956fe940cc7df023ad7806006bfb7f8df4",
+      "byteSize": 110120,
+      "width": 1024,
+      "height": 1024,
+      "roles": ["bathroom", "interior_detail"],
+      "visualFamilies": ["fictional-neutral-modern"],
+      "usage": "photo-default",
+      "provenance": {
+        "kind": "committed-fictional-fixture",
+        "repository": "stevenshelley58-afk/blockwise",
+        "commit": "fb6d88911fc0bbe748c4dd24e17366345cf9624a",
+        "path": "public/adstudio-samples/photos/int-bathroom.png",
+        "sourceSha256": "dab8466b788f4aedf8fc1724a776719318d4df11193298691298b837aba50534",
+        "attestation": "commit message declares the assets safe and fictional"
+      }
+    },
+    {
+      "fileName": "interior/bedroom.webp",
+      "mimeType": "image/webp",
+      "sha256": "8fec0752c59b2015ae26565445b7dfca57f99db007f103c9ae98aed201c89d55",
+      "byteSize": 177792,
+      "width": 1024,
+      "height": 1024,
+      "roles": ["bedroom", "interior_detail"],
+      "visualFamilies": ["fictional-neutral-modern"],
+      "usage": "photo-default",
+      "provenance": {
+        "kind": "committed-fictional-fixture",
+        "repository": "stevenshelley58-afk/blockwise",
+        "commit": "fb6d88911fc0bbe748c4dd24e17366345cf9624a",
+        "path": "public/adstudio-samples/photos/int-bedroom.png",
+        "sourceSha256": "831c757d7608318fc8ba77f0a40e0dd1ed3179f38ec0e90cbcb1d30a2a7846a8",
+        "attestation": "commit message declares the assets safe and fictional"
+      }
+    },
+    {
+      "fileName": "interior/dining.webp",
+      "mimeType": "image/webp",
+      "sha256": "59f597d03d423ffbc7c0eee1afb53f066752e2ece22271c0850c0ec4263cd961",
+      "byteSize": 166162,
+      "width": 1024,
+      "height": 1024,
+      "roles": ["dining", "interior_detail"],
+      "visualFamilies": ["fictional-neutral-modern"],
+      "usage": "photo-default",
+      "provenance": {
+        "kind": "committed-fictional-fixture",
+        "repository": "stevenshelley58-afk/blockwise",
+        "commit": "fb6d88911fc0bbe748c4dd24e17366345cf9624a",
+        "path": "public/adstudio-samples/photos/int-dining.png",
+        "sourceSha256": "046aac73f9df9b5a97be28b928dc469f4811d700a859b54a56ba4bec006ec610",
+        "attestation": "commit message declares the assets safe and fictional"
+      }
+    },
+    {
+      "fileName": "interior/kitchen.webp",
+      "mimeType": "image/webp",
+      "sha256": "8f392528d88e26d2b83c28868dca9e83d03e6032a7b7c4b041be7cde1a7c4d77",
+      "byteSize": 99866,
+      "width": 1024,
+      "height": 1024,
+      "roles": ["kitchen", "interior_detail"],
+      "visualFamilies": ["fictional-neutral-modern"],
+      "usage": "photo-default",
+      "provenance": {
+        "kind": "committed-fictional-fixture",
+        "repository": "stevenshelley58-afk/blockwise",
+        "commit": "fb6d88911fc0bbe748c4dd24e17366345cf9624a",
+        "path": "public/adstudio-samples/photos/int-kitchen.png",
+        "sourceSha256": "80fe40a4fcdc73ae359866531cdfb78d7c32f137b8eb5310d064df5a09b91036",
+        "attestation": "commit message declares the assets safe and fictional"
+      }
+    },
+    {
+      "fileName": "interior/living-bright.webp",
+      "mimeType": "image/webp",
+      "sha256": "1daf37797e5de80ac00e9aaae860a36b4d200b6cdad2c9561b8856546bf82707",
+      "byteSize": 159726,
+      "width": 1024,
+      "height": 1024,
+      "roles": ["living_room", "lounge", "bright_interior"],
+      "visualFamilies": ["fictional-neutral-modern", "fictional-modern-daylight"],
+      "usage": "photo-default",
+      "provenance": {
+        "kind": "committed-fictional-fixture",
+        "repository": "stevenshelley58-afk/blockwise",
+        "commit": "fb6d88911fc0bbe748c4dd24e17366345cf9624a",
+        "path": "public/adstudio-samples/photos/int-lounge.png",
+        "sourceSha256": "822eb27cef5fda2ac7480316ccf163dbf3a4ed757fd6a2501b73f179b6b4133b",
+        "attestation": "commit message declares the assets safe and fictional"
+      }
+    },
+    {
+      "fileName": "interior/living-warm.webp",
+      "mimeType": "image/webp",
+      "sha256": "68cd7f2003666ac5a4479096243e411b0fc3e3138be3c117530b09ea5bbaa793",
+      "byteSize": 190552,
+      "width": 1024,
+      "height": 1024,
+      "roles": ["living_room", "lounge", "warm_interior", "night_interior"],
+      "visualFamilies": ["fictional-neutral-modern", "fictional-modern-dusk"],
+      "usage": "photo-default",
+      "provenance": {
+        "kind": "committed-fictional-fixture",
+        "repository": "stevenshelley58-afk/blockwise",
+        "commit": "fb6d88911fc0bbe748c4dd24e17366345cf9624a",
+        "path": "public/adstudio-samples/photos/int-living.png",
+        "sourceSha256": "795b5488e848ee0796424ce7ed95e99ab3d6d62a5bc9b5f6f80a36e0f2360899",
+        "attestation": "commit message declares the assets safe and fictional"
+      }
+    },
+    {
+      "fileName": "procedural/aerial-estate.webp",
+      "mimeType": "image/webp",
+      "sha256": "68d83e1cad9c85fe6d4411fd52d3a25f0ddd2c8115e4923bfede18f7a943e2ea",
+      "byteSize": 136972,
+      "width": 3200,
+      "height": 2400,
+      "roles": ["aerial_estate", "estate", "top_down_property"],
+      "visualFamilies": ["procedural-neutral"],
+      "usage": "neutral-placeholder",
+      "provenance": {
+        "kind": "procedural-svg",
+        "sourceFile": "assets/ad-template-generator/sources/aerial-estate.svg",
+        "sourceSha256": "0e86598a560d96436d808d55b931ec958105aef87cbbe485d4cd7689d08a6169",
+        "renderer": "sharp 0.35.4",
+        "license": "project-owned-original"
+      }
+    },
+    {
+      "fileName": "procedural/agent-placeholder.webp",
+      "mimeType": "image/webp",
+      "sha256": "94c5c5204720766fb65780df93d6f2bc2ca24f143cac32684bf74fafc2a87deb",
+      "byteSize": 72700,
+      "width": 2400,
+      "height": 2400,
+      "roles": ["agent_portrait", "portrait_placeholder", "identity_placeholder"],
+      "visualFamilies": ["procedural-neutral"],
+      "usage": "neutral-placeholder",
+      "provenance": {
+        "kind": "procedural-svg",
+        "sourceFile": "assets/ad-template-generator/sources/agent-placeholder.svg",
+        "sourceSha256": "5161bc78bdc0504d4a7c1ecc7c261c3d6061a477a0f02a32899629b43eee513c",
+        "renderer": "sharp 0.35.4",
+        "license": "project-owned-original"
+      }
+    },
+    {
+      "fileName": "procedural/coastal-home.webp",
+      "mimeType": "image/webp",
+      "sha256": "d328e81220cf929597d54fefb02eebcc769488ecf1e92bf231847df45eee2d16",
+      "byteSize": 80200,
+      "width": 3200,
+      "height": 2400,
+      "roles": ["coastal_home", "waterfront_exterior", "coastal_exterior"],
+      "visualFamilies": ["procedural-neutral"],
+      "usage": "neutral-placeholder",
+      "provenance": {
+        "kind": "procedural-svg",
+        "sourceFile": "assets/ad-template-generator/sources/coastal-home.svg",
+        "sourceSha256": "e6dea39dbdc2dda9346d51e05f8af5877be19e7859a24dbab0d0866a353f0954",
+        "renderer": "sharp 0.35.4",
+        "license": "project-owned-original"
+      }
+    },
+    {
+      "fileName": "procedural/land-parcel-map.webp",
+      "mimeType": "image/webp",
+      "sha256": "fecb52b5a615b5c0e36e73f5b6ab27d7d951d76d7a1a9149947b160a261b054d",
+      "byteSize": 182678,
+      "width": 3200,
+      "height": 2400,
+      "roles": ["land_parcel", "map", "location_map"],
+      "visualFamilies": ["procedural-neutral"],
+      "usage": "neutral-placeholder",
+      "provenance": {
+        "kind": "procedural-svg",
+        "sourceFile": "assets/ad-template-generator/sources/land-parcel-map.svg",
+        "sourceSha256": "0f513c4b1d1643f863eb9174f0e1a4afef586f7780af8905e4660bcb204e68dd",
+        "renderer": "sharp 0.35.4",
+        "license": "project-owned-original"
+      }
+    },
+    {
+      "fileName": "procedural/tower-skyline.webp",
+      "mimeType": "image/webp",
+      "sha256": "9a5ef16deff65b94de7dfc87e647252292db1d68890b0ce0e8fdf5e9232bcc2b",
+      "byteSize": 49960,
+      "width": 2400,
+      "height": 3200,
+      "roles": ["high_rise", "tower", "skyline", "apartment"],
+      "visualFamilies": ["procedural-neutral"],
+      "usage": "neutral-placeholder",
+      "provenance": {
+        "kind": "procedural-svg",
+        "sourceFile": "assets/ad-template-generator/sources/tower-skyline.svg",
+        "sourceSha256": "c4283d4a08595939170db26e39dc24fb44aa1d186aeb75d019e0d1cfaf238b30",
+        "renderer": "sharp 0.35.4",
+        "license": "project-owned-original"
+      }
+    }
+  ]
+}
