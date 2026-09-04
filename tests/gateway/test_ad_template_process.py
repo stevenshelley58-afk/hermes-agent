@@ -1398,6 +1398,107 @@ def test_schema_invalid_candidate_repairs_before_one_render_and_comparator(tmp_p
     assert "data:image/png;base64" not in persisted_blob
 
 
+def test_renderer_rejection_revises_without_advancing_checkpoint_or_importing(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    source.write_bytes(b"source")
+    rejected = valid_candidate("renderer-rejected")
+    corrected = valid_candidate("renderer-corrected")
+    calls, renders, imports, events, operations = [], [], [], [], []
+    reason = "feed text layer feed-email cannot fit at the 24px readability floor"
+
+    def call_agent(instance, prompt, route):
+        calls.append((instance, prompt, route))
+        if instance == "builder-1":
+            return rejected
+        if instance == "builder-1-repair-1":
+            operations.append("second-builder")
+            return corrected
+        if instance == "comparator-1":
+            return evidence(9.6, "Corrected render passes")
+        return evidence(9.7, "Independent final pass")
+
+    def render(candidate, workspace):
+        if candidate["template"]["templateId"] == "renderer-rejected":
+            workspace.mkdir(parents=True, exist_ok=True)
+            (workspace / "artifact.json").write_text(
+                json.dumps(candidate, sort_keys=True), encoding="utf-8"
+            )
+            operations.append("renderer-rejected")
+            raise process.AdTemplateRendererRejection(reason)
+        operations.append("renderer-corrected")
+        return fake_render(candidate, workspace, renders)
+
+    monkeypatch.setattr(process, "run_generator_cli", render)
+    monkeypatch.setattr(
+        process,
+        "persist_iteration_checkpoint",
+        lambda *args, **kwargs: operations.append("checkpoint") or tmp_path / "checkpoint.json",
+    )
+    monkeypatch.setattr(
+        process,
+        "import_template",
+        lambda output, run_id, project_id: imports.append(output)
+        or {"template_id": "tpl-renderer-corrected", "status": "imported"},
+    )
+
+    result = SoleProcessOrchestrator(
+        call_agent=call_agent,
+        workspace=tmp_path / "run",
+        run_id="trun_renderer_repair",
+        project_id="blockwise",
+        emit=lambda kind, node, data: events.append((kind, node, data)),
+    ).run(source=str(source), brief="", placements=["feed", "story"], routes=[
+        {"provider": "builder", "model": "cheap"},
+        {"provider": "compare", "model": "vision"},
+        {"provider": "review-a", "model": "vision"},
+        {"provider": "review-b", "model": "independent"},
+        {"provider": "builder", "model": "quality"},
+    ])
+
+    assert [item[0] for item in calls[:3]] == [
+        "builder-1", "builder-1-repair-1", "comparator-1",
+    ]
+    repair_prompt = calls[1][1][0]["text"]
+    assert "DETERMINISTIC RENDERER REPAIR 1" in repair_prompt
+    assert reason in repair_prompt
+    assert '"templateId":"renderer-rejected"' in repair_prompt
+    assert operations.index("renderer-rejected") < operations.index("second-builder")
+    assert operations.index("renderer-corrected") < operations.index("checkpoint")
+    assert operations.count("checkpoint") == 1
+    revised = next(data for kind, _node, data in events if kind == "iteration.revised")
+    assert revised == {
+        "iteration": 1,
+        "attempt": 1,
+        "reason": reason,
+        "decision": "revise",
+        "category": "renderer_rejection",
+        "evidence": "iterations/01/renderer-rejection-01.json",
+    }
+    evidence_path = tmp_path / "run" / revised["evidence"]
+    rejection_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert rejection_evidence["reason"] == reason
+    assert rejection_evidence["artifact"] == "renderer-rejected-artifact-01.json"
+    assert rejection_evidence["candidate"]["template"]["templateId"] == "renderer-rejected"
+    assert (evidence_path.parent / rejection_evidence["artifact"]).is_file()
+    assert len(result["iterations"]) == 1
+    assert result["iterations"][0]["iteration"] == 1
+    assert len(imports) == 1
+
+
+def test_renderer_rejection_reason_is_allowlisted_and_path_free():
+    stderr = (
+        "file:///opt/releases/private/renderer.js:222\n"
+        "Error: feed text layer feed-email cannot fit at the 24px readability floor\n"
+        "    at renderText (/secret/path/renderer.js:222:15)"
+    )
+    assert process._deterministic_renderer_rejection(stderr) == (
+        "feed text layer feed-email cannot fit at the 24px readability floor"
+    )
+    assert process._deterministic_renderer_rejection(
+        "Error: Cannot find module /secret/path/renderer.js"
+    ) is None
+
+
 def test_initial_non_json_builder_output_retries_cheap_then_escalates_without_extra_reviews(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")

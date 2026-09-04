@@ -35,6 +35,12 @@ class AdTemplateProcessError(ValueError):
     pass
 
 
+class AdTemplateRendererRejection(AdTemplateProcessError):
+    """A deterministic candidate refusal returned by the shared renderer."""
+
+    pass
+
+
 def _runtime_safe_asset_catalog() -> SafeAssetCatalog:
     configured = os.environ.get("AD_TEMPLATE_ASSET_CATALOG_DIR", "").strip()
     root = (
@@ -1248,6 +1254,41 @@ def persist_rejected_candidate(candidate: Any, iteration_workspace: Path, *, ite
     return path
 
 
+def persist_renderer_rejection(
+    candidate: Any,
+    iteration_workspace: Path,
+    *,
+    iteration: int,
+    attempt: int,
+    reason: str,
+) -> Path:
+    """Preserve the exact renderer input plus path-free rejection evidence."""
+    iteration_workspace.mkdir(parents=True, exist_ok=True)
+    artifact = iteration_workspace / "artifact.json"
+    if not artifact.is_file():
+        raise AdTemplateProcessError("renderer rejection has no candidate artifact")
+    preserved_artifact = iteration_workspace / f"renderer-rejected-artifact-{attempt:02d}.json"
+    temporary_artifact = preserved_artifact.with_suffix(".json.tmp")
+    shutil.copyfile(artifact, temporary_artifact)
+    os.replace(temporary_artifact, preserved_artifact)
+
+    path = iteration_workspace / f"renderer-rejection-{attempt:02d}.json"
+    evidence = {
+        "schema": "hermes.ad-template-renderer-rejection.v1",
+        "iteration": iteration,
+        "attempt": attempt,
+        "reason": reason,
+        "artifact": preserved_artifact.name,
+        "candidate": _candidate_contract_projection(candidate),
+    }
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(evidence, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+    )
+    os.replace(temporary, path)
+    return path
+
+
 def persist_iteration_checkpoint(
     workspace: Path,
     *,
@@ -1313,6 +1354,30 @@ def resolve_catalog_assets(template: Mapping[str, Any], assets: Any) -> List[Dic
     except CatalogIntegrityError as exc:
         raise AdTemplateProcessError(f"builder asset is not in the safe catalog: {exc}") from exc
 
+
+_DETERMINISTIC_RENDERER_REJECTIONS = (
+    re.compile(r"(?:feed|story) first layer must be a protected full-canvas background plate", re.IGNORECASE),
+    re.compile(r"(?:feed|story) render is not fully opaque at \(-?\d+, -?\d+\)", re.IGNORECASE),
+    re.compile(r"Missing immutable (?:plate|overlay) asset: [A-Za-z0-9._:-]{1,160}", re.IGNORECASE),
+    re.compile(r"Missing declared template font: [A-Za-z0-9._-]{1,160}", re.IGNORECASE),
+    re.compile(
+        r"(?:feed|story) text layer [A-Za-z0-9._:-]{1,160} "
+        r"(?:is below|cannot fit at) the \d+(?:\.\d+)?px readability floor",
+        re.IGNORECASE,
+    ),
+    re.compile(r"ring vector [A-Za-z0-9._:-]{1,160} must use square geometry", re.IGNORECASE),
+)
+
+
+def _deterministic_renderer_rejection(stderr: str, stdout: str = "") -> str | None:
+    """Extract only an allowlisted, path-free candidate rejection reason."""
+    text = "\n".join((str(stderr or ""), str(stdout or "")))
+    for pattern in _DETERMINISTIC_RENDERER_REJECTIONS:
+        match = pattern.search(text)
+        if match:
+            return match.group(0)[:320]
+    return None
+
 def run_generator_cli(candidate: Mapping[str, Any], workspace: Path) -> Dict[str, Any]:
     command = os.environ.get("AD_TEMPLATE_GENERATOR_CMD", "").strip()
     if not command: raise AdTemplateProcessError("AD_TEMPLATE_GENERATOR_CMD must point to the shared Blockwise renderer CLI")
@@ -1332,7 +1397,11 @@ def run_generator_cli(candidate: Mapping[str, Any], workspace: Path) -> Dict[str
     out_dir = workspace / "rendered"
     argv = shlex.split(command) + ["--input", str(artifact_path), "--assets-dir", str(workspace), "--out-dir", str(out_dir)]
     proc = subprocess.run(argv, text=True, capture_output=True, timeout=600, check=False)
-    if proc.returncode: raise AdTemplateProcessError(f"shared Blockwise renderer failed ({proc.returncode})")
+    if proc.returncode:
+        reason = _deterministic_renderer_rejection(proc.stderr, proc.stdout)
+        if reason:
+            raise AdTemplateRendererRejection(reason)
+        raise AdTemplateProcessError(f"shared Blockwise renderer failed ({proc.returncode})")
     receipt_path = out_dir / "receipt.json"
     try: receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError): raise AdTemplateProcessError("shared renderer returned no receipt") from None
@@ -1417,7 +1486,7 @@ def import_template(output: Mapping[str, Any], *, run_id: str, project_id: str) 
     replayed = bool(payload.get("replayed"))
     return {"template_id": str(payload["templateId"]), "status": "replayed" if replayed else "imported", "asset_count": int(payload.get("assetCount") or len(assets)), "replayed": replayed}
 
-def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: Any, source: str, feedback: str = "", validation_feedback: str = "", repair_attempt: int = 0, prior_candidate: Any = None, rejected_candidate: Any = None) -> str:
+def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: Any, source: str, feedback: str = "", validation_feedback: str = "", renderer_feedback: str = "", repair_attempt: int = 0, prior_candidate: Any = None, rejected_candidate: Any = None) -> str:
     catalog_lines = "\n".join(_runtime_safe_asset_catalog().prompt_lines())
     feedback_text = _compact_revision_feedback(feedback)
     repair_clause = (
@@ -1454,6 +1523,13 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
             f" STRICT SCHEMA REPAIR {repair_attempt} of {MAX_SCHEMA_REPAIRS_PER_ITERATION}: "
             f"the previous candidate was rejected before rendering with this exact validation error: {validation_feedback}. "
             "Return a complete corrected template-and-assets JSON object, not a patch."
+        )
+    if renderer_feedback:
+        repair_clause += (
+            f" DETERMINISTIC RENDERER REPAIR {repair_attempt} of {MAX_SCHEMA_REPAIRS_PER_ITERATION}: "
+            "the previous candidate passed the template schema but the shared renderer rejected it with this exact reason: "
+            f"{renderer_feedback}. Correct the named layer, geometry, typography, asset, or canvas defect so the candidate "
+            "renders without lowering the 24px readability floor. Return a complete corrected template-and-assets JSON object, not a patch."
         )
     rejected_json = _safe_candidate_prompt_json(rejected_candidate)
     prior_json = _safe_candidate_prompt_json(prior_candidate)
@@ -1671,9 +1747,11 @@ class SoleProcessOrchestrator:
             self._check_stop()
             self.emit("stage.started", "build", {"iteration": index, "role": "builder"})
             validation_feedback = ""
+            renderer_feedback = ""
             rejected_candidate: Any = None
             structured_output_failures = 0
             output_retry_pending = False
+            rendered: Dict[str, Any] | None = None
             for repair_attempt in range(MAX_SCHEMA_REPAIRS_PER_ITERATION + 1):
                 self._check_stop()
                 while True:
@@ -1688,6 +1766,7 @@ class SoleProcessOrchestrator:
                                 run_id=self.run_id, project_id=self.project_id, brief=brief,
                                 placements=placements, source=source, feedback=feedback,
                                 validation_feedback=validation_feedback,
+                                renderer_feedback=renderer_feedback,
                                 repair_attempt=max(repair_attempt, structured_output_failures),
                                 prior_candidate=iteration_prior if repair_attempt == 0 else None,
                                 rejected_candidate=rejected_candidate if repair_attempt > 0 else None,
@@ -1734,6 +1813,7 @@ class SoleProcessOrchestrator:
                     validate_builder_candidate(candidate)
                 except AdTemplateProcessError as exc:
                     validation_feedback = str(exc)
+                    renderer_feedback = ""
                     self._check_stop()
                     rejected_candidate = candidate
                     persist_rejected_candidate(
@@ -1767,11 +1847,58 @@ class SoleProcessOrchestrator:
                             f"builder candidate remained schema-invalid after {MAX_SCHEMA_REPAIRS_PER_ITERATION} repairs: {validation_feedback}"
                         ) from None
                     continue
+                self.emit("iteration.started", "build", {"iteration": index, "role": "builder"})
+                # A deterministic renderer refusal is candidate feedback, not an
+                # infrastructure failure. Preserve the exact renderer input and
+                # safe evidence, leave the last comparator checkpoint untouched,
+                # and ask the builder for a bounded in-iteration repair.
+                self._check_stop()
+                try:
+                    rendered = run_generator_cli(candidate, iteration_workspace)
+                except AdTemplateRendererRejection as exc:
+                    validation_feedback = ""
+                    renderer_feedback = str(exc)
+                    rejected_candidate = candidate
+                    evidence_path = persist_renderer_rejection(
+                        candidate,
+                        iteration_workspace,
+                        iteration=index,
+                        attempt=repair_attempt + 1,
+                        reason=str(exc),
+                    )
+                    self._check_stop()
+                    self.emit("iteration.revised", "build", {
+                        "iteration": index,
+                        "attempt": repair_attempt + 1,
+                        "reason": str(exc),
+                        "decision": "revise",
+                        "category": "renderer_rejection",
+                        "evidence": evidence_path.relative_to(self.workspace).as_posix(),
+                    })
+                    if (
+                        repair_attempt >= MAX_CHEAP_STRUCTURED_OUTPUT_RETRIES
+                        and quality_route is not None
+                        and builder_route_identity(builder_route) != builder_route_identity(quality_route)
+                    ):
+                        prior_route = builder_route
+                        builder_route = dict(quality_route)
+                        builder_escalated = True
+                        self.emit("builder.escalated", "build", {
+                            "iteration": index,
+                            "from_provider": prior_route["provider"],
+                            "from_model": prior_route["model"],
+                            "to_provider": builder_route["provider"],
+                            "to_model": builder_route["model"],
+                            "reason": "renderer_rejection",
+                        })
+                    if repair_attempt >= MAX_SCHEMA_REPAIRS_PER_ITERATION:
+                        raise AdTemplateProcessError(
+                            f"builder candidate remained renderer-rejected after {MAX_SCHEMA_REPAIRS_PER_ITERATION} repairs: {exc}"
+                        ) from None
+                    continue
                 break
-            self.emit("iteration.started", "build", {"iteration": index, "role": "builder"})
-            # Only a strictly valid candidate becomes a visual iteration.
-            self._check_stop()
-            rendered = run_generator_cli(candidate, iteration_workspace)
+            if rendered is None:
+                raise AdTemplateProcessError("builder produced no renderable candidate")
             self._check_stop()
             preview_receipt = validate_artifacts(rendered, iteration_workspace)
             public_preview_root = self.workspace / "previews"
