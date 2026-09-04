@@ -43,9 +43,33 @@ def evidence(score=9.4, reason="Improve spacing"):
         "micro_checks": [
             {
                 "check": check,
-                "source_observation": f"source {check}",
-                "feed_observation": f"feed {check}",
-                "story_observation": f"story {check}",
+                "source_observation": (
+                    {
+                        "brand_silhouette_features": ["roof"],
+                        "phone_badge": "circle", "mail_badge": "circle",
+                        "web_badge": "circle", "location_badge": "absent",
+                        "cta_badge": "absent",
+                    }
+                    if check == "mark_badge_treatment" else f"source {check}"
+                ),
+                "feed_observation": (
+                    {
+                        "brand_silhouette_features": ["roof"],
+                        "phone_badge": "circle", "mail_badge": "circle",
+                        "web_badge": "circle", "location_badge": "absent",
+                        "cta_badge": "absent",
+                    }
+                    if check == "mark_badge_treatment" else f"feed {check}"
+                ),
+                "story_observation": (
+                    {
+                        "brand_silhouette_features": ["roof"],
+                        "phone_badge": "circle", "mail_badge": "circle",
+                        "web_badge": "circle", "location_badge": "absent",
+                        "cta_badge": "absent",
+                    }
+                    if check == "mark_badge_treatment" else f"story {check}"
+                ),
                 "status": "mismatch" if differences and check == "typography_spacing" else "match",
                 "material": bool(differences and check == "typography_spacing"),
                 "findings": differences if differences and check == "typography_spacing" else [],
@@ -911,6 +935,9 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
             assert "Return JSON only with exactly reason, differences, visible_strings, semantic_glyph_inventory, hard_failures, and rubric" in prompt
         else:
             assert "required_changes must contain at least one actionable item" in prompt
+            assert "mark_badge_treatment" in prompt
+            assert "brand_silhouette_features" in prompt
+            assert "A source multi-part brand silhouette simplified to a generic mark" in prompt
         assert '"templateId":"strict"' in prompt
         assert '"assetKey":"hero"' in prompt
         assert "privateNote" not in prompt
@@ -936,6 +963,10 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
     assert 'defaultCrop must be exactly {"x":0,"y":0,"width":1,"height":1}' in builder
     assert "overflowBehaviour must be exactly refuse, truncate, or scale_down" in builder
     assert 'fonts must always be a JSON list such as [{"file":"manrope-400.woff2"}' in builder
+    assert "The only bundled font filenames allowed" in builder
+    assert "Every other font filename is forbidden" in builder
+    for font_file in process.ALLOWED_FONT_FILES:
+        assert font_file in builder
     assert "shape must be exactly one of rect, rounded, circle, line, pill, notched, wave, or ring" in builder
     assert "Every layout requires one full-canvas background plate" in builder
     assert "ring is circular-only and requires square geometry" in builder
@@ -973,8 +1004,10 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
         assert f'"{key}"' in feedback_builder
     assert '"differences"' not in feedback_builder
     assert "UNTRUNCATED-END" not in feedback_builder
+    brief_tail = "C13_REPAIR_BRIEF_TAIL_SENTINEL"
+    repair_brief = ("repair-brief-" + ("x" * 3000) + brief_tail)
     repair_builder = process.generator_prompt(
-        run_id="run", project_id="blockwise", brief="", placements=["feed", "story"], source="source.png",
+        run_id="run", project_id="blockwise", brief=repair_brief, placements=["feed", "story"], source="source.png",
         validation_feedback="template is invalid", repair_attempt=1,
         rejected_candidate={"template": {"templateId": "broken", "bytesBase64": "forbidden", "privateNote": "secret"}, "assets": []},
     )
@@ -982,7 +1015,11 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
     assert '"templateId":"broken"' in repair_builder
     assert '"bytesBase64":' not in repair_builder
     assert "privateNote" not in repair_builder
-    assert "forbidden" not in repair_builder and "secret" not in repair_builder
+    assert "secret" not in repair_builder
+    assert "The only bundled font filenames allowed" in repair_builder
+    assert brief_tail in repair_builder
+    for font_file in process.ALLOWED_FONT_FILES:
+        assert font_file in repair_builder
     oversized_candidate = {
         "template": {
             "metadata": {
@@ -1367,7 +1404,7 @@ def test_comparator_inventory_requires_all_explicit_micro_checks_and_change_cove
     ]
     with pytest.raises(
         process.ComparatorSelfConsistencyError,
-        match="must cover brand text, dividers, bullet count/stacking",
+        match="must cover brand text, mark/badge treatment, dividers, bullet count/stacking",
     ):
         process._assessment(missing_check, "comparator", require_change_list=True)
 
@@ -1390,6 +1427,30 @@ def test_comparator_inventory_requires_all_explicit_micro_checks_and_change_cove
     assert glyph_check["check"] == "semantic_glyphs"
     assert glyph_check["material"] is True
     assert glyph_check["required_change_refs"] == [1]
+
+
+@pytest.mark.parametrize(
+    ("placement", "field", "value"),
+    [
+        ("feed", "brand_silhouette_features", ["door", "single-roof"]),
+        ("story", "phone_badge", "none"),
+    ],
+)
+def test_comparator_cannot_match_changed_brand_silhouette_or_icon_badge(
+    placement, field, value,
+):
+    review = evidence(9.6, "Source micro treatments match")
+    treatment = next(
+        item for item in review["source_inventory"]["micro_checks"]
+        if item["check"] == "mark_badge_treatment"
+    )
+    treatment[f"{placement}_observation"][field] = value
+
+    with pytest.raises(
+        process.ComparatorSelfConsistencyError,
+        match="cannot declare match when brand silhouette features or semantic icon badge treatments differ",
+    ):
+        process._assessment(review, "comparator", require_change_list=True)
 
 
 def test_comparator_inventory_requires_verbatim_difference_and_every_change_reference():
@@ -1467,10 +1528,12 @@ def test_orchestrator_calls_real_roles_and_persists_receipts(tmp_path, monkeypat
             return evidence(9.6, "Composition is ready")
         return evidence(9.7, "Final review is ready")
 
+    brief_tail = "C13_ALL_REVIEW_ROLES_TAIL_SENTINEL"
+    run_brief = "immutable-brief-" + ("x" * 3000) + brief_tail
     result = SoleProcessOrchestrator(
         call_agent=call_agent, workspace=tmp_path / "run", run_id="trun_test",
         project_id="blockwise", emit=lambda kind, node, data: events.append((kind, data)),
-    ).run(source=str(source), brief="test", placements=["square"], routes=[
+    ).run(source=str(source), brief=run_brief, placements=["square"], routes=[
         {"provider": "builder", "model": "cheap-a"},
         {"provider": "compare", "model": "cheap-b"},
         {"provider": "review-a", "model": "cheap-c"},
@@ -1479,6 +1542,7 @@ def test_orchestrator_calls_real_roles_and_persists_receipts(tmp_path, monkeypat
     assert [item[0].split("-")[0] for item in calls] == ["builder", "comparator", "final", "final"]
     assert all(isinstance(item[1], list) for item in calls)
     assert len(calls[0][1]) == 2 and len(calls[1][1]) == 4 and len(calls[2][1]) == 4 and len(calls[3][1]) == 4
+    assert all(brief_tail in calls[index][1][0]["text"] for index in (0, 1, 2, 3))
     assert all(part["type"] == "image_url" for part in calls[1][1][1:])
     compared = [item for item in events if item[0] == "iteration.compared"]
     assert len(compared) == 1
@@ -1537,8 +1601,10 @@ def test_revision_builder_request_keeps_exact_candidate_but_stays_below_transpor
             "reason": "r" * 8000,
         },
     })
+    brief_tail = "C13_VALID_REVISION_BRIEF_TAIL_SENTINEL"
+    revision_brief = "006 listing " + ("x" * 3000) + brief_tail
     prompt = process.generator_prompt(
-        run_id="run", project_id="blockwise", brief="006 listing",
+        run_id="run", project_id="blockwise", brief=revision_brief,
         placements=["feed", "story"], source=str(source), feedback=feedback,
         prior_candidate=prior,
     )
@@ -1546,6 +1612,7 @@ def test_revision_builder_request_keeps_exact_candidate_but_stays_below_transpor
     serialized = json.dumps(message).encode("utf-8")
 
     assert '"templateId":"exact-prior-candidate"' in prompt
+    assert brief_tail in prompt
     assert "PRIOR VALID CANDIDATE" in prompt
     assert '"differences"' not in prompt
     assert len(prompt.encode("utf-8")) < 80_000

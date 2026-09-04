@@ -118,6 +118,7 @@ COMPARATOR_MACRO_INVENTORY_REGIONS = (
 )
 COMPARATOR_MICRO_INVENTORY_CHECKS = (
     "brand_text",
+    "mark_badge_treatment",
     "dividers",
     "bullet_count_stacking",
     "typography_spacing",
@@ -126,6 +127,45 @@ COMPARATOR_MICRO_INVENTORY_CHECKS = (
     "semantic_glyphs",
 )
 FINAL_SEMANTIC_GLYPH_CHECKS = ("phone", "mail", "web", "location", "cta")
+COMPARATOR_BADGE_TREATMENTS = (
+    "absent", "none", "circle", "pill", "rounded_rect", "other",
+)
+
+
+def _comparator_mark_badge_observation(value: Any, *, placement: str) -> Dict[str, Any]:
+    """Normalize a vision role's bounded brand-silhouette/icon-badge signature."""
+    keys = {
+        "brand_silhouette_features", "phone_badge", "mail_badge", "web_badge",
+        "location_badge", "cta_badge",
+    }
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ReviewEvidenceError(
+            f"comparator mark_badge_treatment must record an exact structured {placement} observation",
+            field="source_inventory.micro_checks",
+        )
+    features = value.get("brand_silhouette_features")
+    if (
+        not isinstance(features, list)
+        or not all(isinstance(item, str) and item.strip() for item in features)
+    ):
+        raise ReviewEvidenceError(
+            f"comparator mark_badge_treatment {placement} brand_silhouette_features must be a string list",
+            field="source_inventory.micro_checks",
+        )
+    normalized: Dict[str, Any] = {
+        "brand_silhouette_features": sorted({item.strip().lower() for item in features}),
+    }
+    for role in FINAL_SEMANTIC_GLYPH_CHECKS:
+        key = f"{role}_badge"
+        treatment = value.get(key)
+        if treatment not in COMPARATOR_BADGE_TREATMENTS:
+            raise ReviewEvidenceError(
+                f"comparator mark_badge_treatment {placement} {key} must be one of "
+                f"{', '.join(COMPARATOR_BADGE_TREATMENTS)}",
+                field="source_inventory.micro_checks",
+            )
+        normalized[key] = treatment
+    return normalized
 
 def _parse_required_change(value: str) -> Dict[str, Any] | None:
     placement = re.search(r"\bplacement\s*=\s*(feed|story)\b", value, re.IGNORECASE)
@@ -441,12 +481,17 @@ def _comparator_source_inventory(
         normalized_item = dict(item)
         for placement in ("source", "feed", "story"):
             observation = item.get(f"{placement}_observation")
-            if not isinstance(observation, str) or not observation.strip():
-                raise ReviewEvidenceError(
-                    f"comparator {check} must record a {placement} observation",
-                    field="source_inventory.micro_checks",
+            if check == "mark_badge_treatment":
+                normalized_item[f"{placement}_observation"] = (
+                    _comparator_mark_badge_observation(observation, placement=placement)
                 )
-            normalized_item[f"{placement}_observation"] = observation.strip()
+            else:
+                if not isinstance(observation, str) or not observation.strip():
+                    raise ReviewEvidenceError(
+                        f"comparator {check} must record a {placement} observation",
+                        field="source_inventory.micro_checks",
+                    )
+                normalized_item[f"{placement}_observation"] = observation.strip()
         if item.get("status") not in {"match", "mismatch"}:
             raise ReviewEvidenceError(
                 f"comparator {check} status must be match or mismatch",
@@ -462,11 +507,22 @@ def _comparator_source_inventory(
             )
         normalized_item["findings"] = [finding.strip() for finding in findings]
         normalized_item["required_change_refs"] = normalized_refs(normalized_item, check)
+        if check == "mark_badge_treatment" and item.get("status") == "match":
+            source_treatment = normalized_item["source_observation"]
+            if any(
+                normalized_item[f"{placement}_observation"] != source_treatment
+                for placement in ("feed", "story")
+            ):
+                raise ComparatorSelfConsistencyError(
+                    "comparator mark_badge_treatment cannot declare match when brand silhouette "
+                    "features or semantic icon badge treatments differ from the source"
+                )
         micro_checks.append(normalized_item)
     if tuple(seen_checks) != COMPARATOR_MICRO_INVENTORY_CHECKS:
         raise ComparatorSelfConsistencyError(
-            "comparator micro inventory must cover brand text, dividers, bullet count/stacking, "
-            "typography/spacing, overlap, punctuation, and semantic glyphs exactly once in contract order"
+            "comparator micro inventory must cover brand text, mark/badge treatment, dividers, "
+            "bullet count/stacking, typography/spacing, overlap, punctuation, and semantic glyphs "
+            "exactly once in contract order"
         )
 
     normalized_differences = [item.strip() for item in differences] if isinstance(differences, list) else []
@@ -2423,6 +2479,7 @@ def import_template(output: Mapping[str, Any], *, run_id: str, project_id: str) 
 def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: Any, source: str, feedback: str = "", validation_feedback: str = "", renderer_feedback: str = "", repair_attempt: int = 0, prior_candidate: Any = None, rejected_candidate: Any = None) -> str:
     catalog_lines = "\n".join(_runtime_safe_asset_catalog().prompt_lines())
     feedback_text = _compact_revision_feedback(feedback)
+    allowed_font_files = ", ".join(sorted(ALLOWED_FONT_FILES))
     repair_clause = (
         ' Return one JSON object with exactly two top-level keys: {"template": {...}, "assets": []}; '
         'never omit assets even when it is empty, and do not add prose or another wrapper. '
@@ -2450,7 +2507,10 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
         'Each realAssetRefs entry must contain exactly {"inputKey":"declaredKey","kind":"non_empty_descriptive_kind","required":true}; '
         'kind is a non-empty descriptive string such as property_photo, interior_photo, brand_logo, property_address, or contact_details.'
         ' fonts must always be a JSON list such as [{"file":"manrope-400.woff2"},{"file":"manrope-700.woff2"}]; '
-        'never return fonts as an object, named map, or record.'
+        'never return fonts as an object, named map, or record. '
+        f'The only bundled font filenames allowed in fonts[] and every text font.file are: {allowed_font_files}. '
+        'Every other font filename is forbidden; during any repair preserve an already-valid bundled filename or replace '
+        'an invalid filename with one exact name from this list.'
     )
     if validation_feedback:
         repair_clause += (
@@ -2502,9 +2562,10 @@ Reinspect the attached source pixels for every requested correction. Keep Feed f
 When a final reviewer returns a negative verdict with no explicit required_changes, treat its reason, differences, hard failures, and weakest rubric fields as required revision guidance.
 
 Never copy source identity, contact details, portraits, logos, URLs, or pixels. Keep their visual roles as neutral editable inputs. Do not duplicate facts or photographs. tracking remains absolute canvas pixels -4..4; lineHeight remains unitless 0.8..2.5, and every multiline text layer with maxLines>1 requires lineHeight>=1.0. fontSize is at least 24 native canvas pixels in Feed and 32 in Story, including body and contact copy. Preserve the existing exact schema and use only these manifest-backed assets if a requested role must change:
+The only bundled font filenames allowed in fonts[] and every text font.file are: {allowed_font_files}. Every other font filename is forbidden; preserve a valid existing filename or replace an invalid filename with one exact name from this list.
 Every layout requires one full-canvas background plate. A plate is only a plain rectangular fill and cannot express corners or an outline. ring is circular-only and requires square geometry. Build a rounded rectangular border with nested inset rounded vectors (outer border colour, inner background colour); never use same-bounds stacked filled plates.
 {catalog_lines}
-Run {run_id}; project {project_id}; placements {json.dumps(placements)}; brief {brief[:2000]}."""
+Run {run_id}; project {project_id}; placements {json.dumps(placements)}; brief {brief[:4000]}."""
 
     # Source fidelity is the sole visual objective. The source bitmap is never
     # shipped, but its observable design must be reconstructed as editable
@@ -2523,7 +2584,10 @@ Hermes will render the candidate, attach the source and render to a vision compa
 
     return f"""Run the sole ad-template process as the builder agent. Inspect the attached source pixels, remove advertiser identity (names, logos, phones, URLs, portraits), and return JSON with exactly {{template, assets}}. Treat the source as structural inspiration, not a quality ceiling: explicitly avoid inheriting brochure density, tiny copy, weak hierarchy, duplicated contact details, incoherent photography, or a Feed layout stretched into Story. Build a conversion-focused Meta ad around one dominant idea: a strong hook, one coherent hero treatment, only essential proof or facts, and one clear CTA. Dense descriptions and contact lists belong in Meta primary text or the destination, not inside the image. At native pixels use type large enough to remain legible inside a 500px, 390px and 320px-wide Meta shell; do not rely on scale-down or truncation to rescue excess copy. Feed must use a deliberate 72px horizontal and 96px vertical protected content margin. Story must be independently composed with its top 240px and bottom 300px protected from platform UI. Use true editable text, image, logo, CTA, patch and icon roles. Use one coherent property/photo subject across default slots; never mix unrelated properties. For a property listing, publishRequirements.specialAdCategory must be HOUSING. template must contain exactly schema='blockwise.ad-template', templateId, createdAt (ISO datetime), feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata. semanticColours must contain exactly background, primary, secondary, accent, mainText, inverseText; every layer colourRole is one of those six. Each layout contains exactly placement, layers, safeZones; Feed is placement feed within 1080x1350 and Story is placement story within 1080x1920, including safeZones. Geometry and every safe-zone rectangle contain exactly {{x,y,width,height}}: x,y are the top-left coordinates from canvas origin (0,0); width,height are positive sizes, not right/bottom coordinates; x + width must stay within canvas width and y + height within canvas height. Exact safe areas are Feed safeZones=[{{"x":72,"y":96,"width":936,"height":1158}}] within 1080x1350 and Story safeZones=[{{"x":72,"y":240,"width":936,"height":1380}}] within 1080x1920. Layer shapes are exact: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. imageInputs are {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs are {{key,label,placeholder,maxLength}}. fonts are {{file}} and every text-layer font must be declared; allowed bundled font files are {', '.join(sorted(ALLOWED_FONT_FILES))}. metadata is exact: title:string; description:string; gallerySamples={{feed?:{{assetKey?,placement,purpose}},story?:{{assetKey?,placement,purpose}}}}; metaCopyDefaults={{primaryText:string[],headlines:string[],descriptions:string[],cta:string}}; aiWritingGuidance={{summary:string,fields:record<string,string>}}; publishRequirements={{objective:string,specialAdCategory:string|null,instantForm:{{required:boolean,dependency:string|null,defaults?:record<string,string>}},destination:{{required:boolean,kind:'website'|'instant_form'|'none',dependency:string|null}},requiredCtaTypes?:string[]}}; replacementAssets={{inputKey,assetKey,purpose?}}[]; realAssetRefs={{inputKey,kind,required}}[]. Every layer/input/font/colour/asset metadata reference must resolve inside the same template. Declare source-free replacement assets in template.assets as assetKey -> {{fileName,mimeType}} and in top-level assets only as {{assetKey,fileName,mimeType}} with an exact match. Hermes resolves bytes from the fixed safe catalog; never emit bytesBase64 anywhere and never guess filenames. Choose only from this exact role-tagged safe catalog; prefer photo-default assets and use neutral-placeholder only when no suitable photo role exists:\n{catalog_lines}\nNever include the source composite, source_path, hashes, signatures, private fields, or a full-source plate. Keep geometry inside canvas and Story native. Hermes renders, compares once per iteration, then runs two fresh final reviewers only after the comparator clears both the {THRESHOLD} mean and {MIN_RUBRIC_SCORE} subscore floor; never self-score or invent review evidence. Run {run_id}; project {project_id}; fixed placements {json.dumps(placements)}; brief {brief[:4000]}; prior reviewer feedback {feedback[:3000]}.{repair_clause}"""
 
-def review_prompt(*, final: bool, candidate: Any = None, has_previous_best: bool = False) -> str:
+def review_prompt(
+    *, final: bool, candidate: Any = None, has_previous_best: bool = False,
+    brief: str = "",
+) -> str:
     role = "fresh independent final reviewer" if final else "iteration comparator"
     candidate_context = _safe_candidate_prompt_json(candidate)
     change_list_contract = (
@@ -2574,13 +2638,13 @@ Use this scale strictly: 10.0 means the Feed is visually indistinguishable in st
 
 {output_contract} {hierarchical_contract} visible_strings must be exactly an object with source, feed, and story arrays. Transcribe every visibly rendered word, number, currency value, CTA and logo wordmark in reading order; preserve visible splitting, missing glyphs and truncation exactly (for example, a broken HOUSE rendered as H U / O S / E must be transcribed that way, not silently corrected). differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. Every differences string must also appear verbatim in one source_inventory findings array. required_changes is the ordered list of all material work the builder should apply next. {change_list_contract} Every required_changes string must use this exact actionable structure: placement=feed|story; layers=comma-separated layerIds; current={{x:...,y:...,width:...,height:...}}; target={{x:...,y:...,width:...,height:...}}; change=specific instruction. Name all affected layer IDs and use their current and intended target geometry. Copy current geometry exactly from Candidate contract JSON, then check every proposed target rectangle against every existing layer before returning it. Never propose a target that newly overlaps an image slot or opaque vector panel with another image slot unless that overlap is visibly present in the source and the change text explicitly identifies and justifies the source-visible overlap. Use a separate required_changes item when affected layers do not share identical current and target geometry.
 
-For the comparator only, source_inventory must contain exactly macro_regions and micro_checks. macro_regions must contain these entries exactly once and in this order: frame_header, hero_offer_panel, image_gallery, about_features, contact_footer, story_recomposition. Each entry has exactly region, source_components, feed_components, story_components, source_count, feed_count, story_count, status, material, findings, required_change_refs. The component fields are arrays of visible component descriptions; each count is a non-negative integer exactly equal to its array length. micro_checks must contain these entries exactly once and in this order: brand_text, dividers, bullet_count_stacking, typography_spacing, overlap, punctuation, semantic_glyphs. Each entry has exactly check, source_observation, feed_observation, story_observation, status, material, findings, required_change_refs. status is match or mismatch; material is boolean. A match has findings=[] and required_change_refs=[]. A mismatch has concrete findings. Every material mismatch has one or more 1-based required_change_refs pointing into required_changes; a non-material mismatch has none. Every required_change must be referenced. Inspect brand_text for a source-visible wordmark or brand-role text footprint and require a coherent neutral editable replacement when identity substitution is permitted; an icon alone does not replace source-visible brand text. Count divider rules and state their orientation/position. Count bullet glyphs and separately count stacked visible bullet lines; run-on bullets are not stacked. A candidate that repeats a source's obviously duplicated feature content is still a material mismatch: preserve the exact source count and stacked structure while requiring distinct coherent neutral editable examples. Compare type family/style/weight/scale/tracking/line height and region spacing. Report every visible overlap, including text crowding even when pixel bounds pass. Compare punctuation character-for-character for otherwise corresponding visible strings, including price separators. semantic_glyphs must inventory the source-visible phone, mail, web/globe, location/pin, and CTA/arrow/check roles and compare their Feed/Story pixels. Hollow rings, blank circles, and generic placeholder marks are mismatches when the source shows distinct semantic symbols; map each material mismatch to required_changes. Do not mark any micro check match without recording what is visibly present in source, Feed, and Story.
+For the comparator only, source_inventory must contain exactly macro_regions and micro_checks. macro_regions must contain these entries exactly once and in this order: frame_header, hero_offer_panel, image_gallery, about_features, contact_footer, story_recomposition. Each entry has exactly region, source_components, feed_components, story_components, source_count, feed_count, story_count, status, material, findings, required_change_refs. The component fields are arrays of visible component descriptions; each count is a non-negative integer exactly equal to its array length. micro_checks must contain these entries exactly once and in this order: brand_text, mark_badge_treatment, dividers, bullet_count_stacking, typography_spacing, overlap, punctuation, semantic_glyphs. Each entry has exactly check, source_observation, feed_observation, story_observation, status, material, findings, required_change_refs. status is match or mismatch; material is boolean. A match has findings=[] and required_change_refs=[]. A mismatch has concrete findings. Every material mismatch has one or more 1-based required_change_refs pointing into required_changes; a non-material mismatch has none. Every required_change must be referenced. Inspect brand_text for a source-visible wordmark or brand-role text footprint and require a coherent neutral editable replacement when identity substitution is permitted; an icon alone does not replace source-visible brand text. mark_badge_treatment source/feed/story observations must each be an exact object with keys brand_silhouette_features, phone_badge, mail_badge, web_badge, location_badge, cta_badge. brand_silhouette_features is a list of short lowercase visible primitives such as mountain, single-roof, two-roof, window, door; reuse the same exact token for the same primitive across images and use [] only when no brand mark is visible. Every *_badge is exactly absent, none, circle, pill, rounded_rect, or other: absent means the semantic role is not visible, while none means its glyph is visible without an enclosing badge. mark_badge_treatment may be match only when the normalized Feed and Story objects exactly equal the source object. A source multi-part brand silhouette simplified to a generic mark, or a source circular/pill badge rendered as a bare glyph, is a material mismatch with required_changes. Count divider rules and state their orientation/position. Count bullet glyphs and separately count stacked visible bullet lines; run-on bullets are not stacked. A candidate that repeats a source's obviously duplicated feature content is still a material mismatch: preserve the exact source count and stacked structure while requiring distinct coherent neutral editable examples. Compare type family/style/weight/scale/tracking/line height and region spacing. Report every visible overlap, including text crowding even when pixel bounds pass. Compare punctuation character-for-character for otherwise corresponding visible strings, including price separators. semantic_glyphs must inventory the source-visible phone, mail, web/globe, location/pin, and CTA/arrow/check roles and compare their Feed/Story pixels. Hollow rings, blank circles, and generic placeholder marks are mismatches when the source shows distinct semantic symbols; map each material mismatch to required_changes. Do not mark any micro check match without recording what is visibly present in source, Feed, and Story.
 
 For final reviewers only, semantic_glyph_inventory must contain exactly phone, mail, web, location, and cta in that order. Each value has exactly source_observation, feed_observation, story_observation, status, findings. Record absent roles explicitly. status is match or mismatch; match requires findings=[] and mismatch requires concrete findings. Hollow rings, blank circles, or generic placeholder marks cannot match a distinct source-visible semantic symbol. Any semantic glyph mismatch prevents final acceptance even when numeric scores otherwise pass.
 
 hard_failures is a list. rubric contains exactly these eight 0-10 numbers: feed_source_likeness, layout_geometry, spacing_proportions, typography_likeness, colour_likeness, image_slot_composition, editable_decomposition, native_story_translation. A passing candidate requires feed_source_likeness >= {THRESHOLD}, mean >= {THRESHOLD}, every field{'' if final else ' and every macro field'} >= {MIN_RUBRIC_SCORE}, no critical-region blocker, no regression, no hard failure, and no required change.
 
-Hard-fail source pixels flattened into the output, copied advertiser identity, missing/unreadable renders, any missing/split/clipped/truncated/garbled visible text, a malformed or blank logo, repeated/wrong photographs, canvas/safe-zone violations, non-editable critical roles, unknown assets, a stretched/cropped/letterboxed Story, or a Story that repeats the Feed topology instead of reflowing major groups for 9:16. The numeric tracking field in Candidate JSON is absolute canvas pixels, never em, percent, or a font-size multiplier. Inspect both native Feed/Story renders and any subsequently attached Meta-shell previews; a shell-only defect is still a defect. Do not infer another reviewer's score. Candidate contract JSON: {candidate_context}"""
+Hard-fail source pixels flattened into the output, copied advertiser identity, missing/unreadable renders, any missing/split/clipped/truncated/garbled visible text, a malformed or blank logo, repeated/wrong photographs, canvas/safe-zone violations, non-editable critical roles, unknown assets, a stretched/cropped/letterboxed Story, or a Story that repeats the Feed topology instead of reflowing major groups for 9:16. The numeric tracking field in Candidate JSON is absolute canvas pixels, never em, percent, or a font-size multiplier. Inspect both native Feed/Story renders and any subsequently attached Meta-shell previews; a shell-only defect is still a defect. Do not infer another reviewer's score. Immutable run brief (observation-only; do not invent omitted facts): {brief[:4000]}. Candidate contract JSON: {candidate_context}"""
 
 def _bounded_vision_image(path: Path) -> tuple[bytes, str]:
     raw = path.read_bytes()
@@ -2929,6 +2993,7 @@ class SoleProcessOrchestrator:
             previous_best = copy.deepcopy(best_candidate) if best_candidate else None
             comparison_prompt = review_prompt(
                 final=False, candidate=candidate, has_previous_best=previous_best is not None,
+                brief=brief,
             )
             comparison_rejection = ""
             comparison_route = dict(routes[1])
@@ -3183,7 +3248,7 @@ class SoleProcessOrchestrator:
             quality_review_route = builder_route_identity(quality_route) if n == 1 and quality_route else ""
             quality_route_used = False
             self.emit("final-review.started", "final-check", {"reviewer": identity, "route": route_identity})
-            final_prompt = review_prompt(final=True, candidate=candidate)
+            final_prompt = review_prompt(final=True, candidate=candidate, brief=brief)
             rejection = ""
             for output_attempt in range(MAX_FINAL_REVIEW_OUTPUT_RETRIES + 1):
                 retry_suffix = ""
