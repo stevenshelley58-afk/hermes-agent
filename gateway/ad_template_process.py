@@ -1359,16 +1359,17 @@ def _validate_pre_render_source_invariants(
         layout = template.get(layout_name)
         layers = layout.get("layers") if isinstance(layout, Mapping) else []
         text_layers = [layer for layer in layers if isinstance(layer, Mapping) and layer.get("type") == "text"]
-        layer_tokens = {
+        semantic_layer_tokens = {
             str(layer.get("layerId") or "").lower()
             + " "
             + str(layer.get("inputKey") or "").lower()
-            for layer in layers if isinstance(layer, Mapping)
+            for layer in layers
+            if isinstance(layer, Mapping) and layer.get("type") in {"icon", "vector"}
         }
 
         for role, aliases in semantic_roles.items():
             referenced = role in expected_icons or any(
-                any(alias in token for alias in aliases) for token in layer_tokens
+                any(alias in token for alias in aliases) for token in semantic_layer_tokens
             )
             if not referenced:
                 continue

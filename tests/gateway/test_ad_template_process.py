@@ -307,6 +307,44 @@ def test_pre_render_source_invariants_reject_material_regressions(mutation, mess
         process.validate_builder_candidate(candidate, source_invariants=invariants)
 
 
+def test_cta_text_does_not_invent_an_icon_but_explicit_graphic_placeholder_does():
+    candidate = source_invariant_candidate()
+    template = candidate["template"]
+    template["textInputs"].append({
+        "key": "contactCta", "label": "Contact CTA",
+        "placeholder": "Connect us for more info", "maxLength": 40,
+    })
+    for placement, font_size in (("feed", 24), ("story", 32)):
+        layout = template[f"{placement}Layout"]
+        layout["layers"] = [
+            layer for layer in layout["layers"]
+            if layer.get("layerId") != f"{placement}-arrow-icon"
+        ]
+        layout["layers"].append({
+            "type": "text", "layerId": f"{placement}-contact-cta",
+            "inputKey": "contactCta", "font": {"file": "manrope-400.woff2"},
+            "fontSize": font_size, "lineHeight": 1.2, "tracking": 0,
+            "alignment": "left", "maxCharacters": 40, "maxLines": 1,
+            "colourRole": "mainText", "overflowBehaviour": "refuse",
+            "geometry": {"x": 500, "y": 1200 if placement == "feed" else 1400,
+                         "width": 400, "height": 60},
+        })
+    invariants = {"semantic_glyph_roles": ["phone", "mail", "web"]}
+
+    process.validate_builder_candidate(candidate, source_invariants=invariants)
+
+    template["feedLayout"]["layers"].append({
+        "type": "vector", "layerId": "feed-cta-icon-placeholder", "shape": "ring",
+        "colourRole": "mainText", "opacity": 1,
+        "geometry": {"x": 920, "y": 1200, "width": 36, "height": 36},
+    })
+    with pytest.raises(
+        AdTemplateProcessError,
+        match="semantic cta role requires a real cta icon layer",
+    ):
+        process.validate_builder_candidate(candidate, source_invariants=invariants)
+
+
 def test_pre_render_rejects_center_compressed_story_but_allows_ui_bands():
     candidate = source_invariant_candidate()
     for index, layer in enumerate(candidate["template"]["storyLayout"]["layers"][1:]):
