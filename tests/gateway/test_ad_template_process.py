@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -68,6 +69,16 @@ def evidence(score=9.4, reason="Improve spacing"):
             "source": ["SOURCE"], "feed": ["FEED"], "story": ["STORY"],
         },
         "source_inventory": source_inventory,
+        "semantic_glyph_inventory": {
+            check: {
+                "source_observation": f"source {check} role",
+                "feed_observation": f"feed {check} role",
+                "story_observation": f"story {check} role",
+                "status": "match",
+                "findings": [],
+            }
+            for check in process.FINAL_SEMANTIC_GLYPH_CHECKS
+        },
     }
 
 def remap_inventory(review, *, check="typography_spacing"):
@@ -123,6 +134,130 @@ def valid_candidate(template_id="candidate"):
     def layout(placement, height):
         return {"placement": placement, "layers": [{"type": "plate", "layerId": f"{placement}-bg", "colourRole": "background", "geometry": {"x": 0, "y": 0, "width": 1080, "height": height}, "protected": False}], "safeZones": [{"x": 0, "y": 0, "width": 1080, "height": height}]}
     return {"template": {"schema": "blockwise.ad-template", "templateId": template_id, "createdAt": "2026-08-30T00:00:00.000Z", "feedLayout": layout("feed", 1350), "storyLayout": layout("story", 1920), "imageInputs": [], "textInputs": [], "semanticColours": semantic_colours(), "assets": {}, "fonts": [], "metadata": metadata()}, "assets": []}
+
+
+def source_invariant_candidate():
+    candidate = valid_candidate("source-invariants")
+    template = candidate["template"]
+    template["fonts"] = [{"file": "manrope-400.woff2"}]
+    template["textInputs"] = [
+        {"key": "brand_name", "label": "Brand", "placeholder": "REAL ESTATE", "maxLength": 20},
+        {
+            "key": "features", "label": "Features",
+            "placeholder": "• One\n• Two\n• Three\n• Four\n• Five\n• Six", "maxLength": 120,
+        },
+        {"key": "price", "label": "Price", "placeholder": "$1.599.999", "maxLength": 20},
+    ]
+    for placement, height, font_size in (("feed", 1350, 24), ("story", 1920, 32)):
+        layout = template[f"{placement}Layout"]
+        for index, (input_key, max_lines) in enumerate((
+            ("brand_name", 1), ("features", 6), ("price", 1),
+        )):
+            layout["layers"].append({
+                "type": "text", "layerId": f"{placement}-{input_key}",
+                "inputKey": input_key, "font": {"file": "manrope-400.woff2"},
+                "fontSize": font_size, "lineHeight": 1.2, "tracking": 0,
+                "alignment": "left", "maxCharacters": 120, "maxLines": max_lines,
+                "colourRole": "mainText", "overflowBehaviour": "refuse",
+                "geometry": {"x": 100, "y": 300 + index * 260, "width": 700, "height": 220},
+            })
+        for index, icon in enumerate(("phone", "mail", "globe", "pin", "arrow")):
+            layout["layers"].append({
+                "type": "icon", "layerId": f"{placement}-{icon}-icon",
+                "icon": icon, "colourRole": "mainText",
+                "geometry": {
+                    "x": 100 + index * 80,
+                    "y": 1500 if placement == "story" else height - 180,
+                    "width": 40, "height": 40,
+                },
+            })
+    template["feedLayout"]["layers"].append({
+        "type": "vector", "layerId": "feed-column-divider", "shape": "line",
+        "colourRole": "mainText", "opacity": 1,
+        "geometry": {"x": 540, "y": 850, "width": 2, "height": 260},
+    })
+    return candidate
+
+
+def test_source_inventory_drives_exact_pre_render_invariants():
+    review = evidence(8.8, "Repair source-visible invariants")
+    review["visible_strings"]["source"] = [
+        "REAL ESTATE", "$1.599.999",
+        "• One\n• Two\n• Three\n• One\n• Two\n• Three",
+    ]
+    checks = {item["check"]: item for item in review["source_inventory"]["micro_checks"]}
+    checks["brand_text"]["source_observation"] = (
+        "A visible REAL ESTATE wordmark sits beneath the roof emblem"
+    )
+    checks["dividers"]["source_observation"] = (
+        "A visible vertical divider separates ABOUT from PROPERTY FEATURES"
+    )
+    contact = next(
+        item for item in review["source_inventory"]["macro_regions"]
+        if item["region"] == "contact_footer"
+    )
+    contact["source_components"] = [
+        "filled circular phone pictogram", "filled circular mail pictogram",
+        "filled circular globe pictogram",
+    ]
+
+    compact = process._compact_revision_feedback({"current_review": review})
+    invariants = json.loads(compact)["source_invariants"]
+    assert invariants == {
+        "brand_text_required": True,
+        "divider_required": True,
+        "feature_bullet_count": 6,
+        "price_strings": ["$1.599.999"],
+        "semantic_glyph_roles": ["phone", "mail", "web"],
+    }
+    assert process._source_invariants_from_feedback(
+        process._compact_revision_feedback(compact)
+    ) == invariants
+    process.validate_builder_candidate(
+        source_invariant_candidate(), source_invariants=invariants,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("features", "source inventory requires exactly 6 distinct stacked bullets"),
+        ("brand", "must preserve the source-visible brand lockup"),
+        ("phone", "semantic phone role requires a real phone icon layer"),
+        ("divider", "must preserve the source-visible divider"),
+        ("price", "price punctuation must exactly preserve"),
+    ],
+)
+def test_pre_render_source_invariants_reject_material_regressions(mutation, message):
+    candidate = source_invariant_candidate()
+    invariants = {
+        "brand_text_required": True,
+        "divider_required": True,
+        "feature_bullet_count": 6,
+        "price_strings": ["$1.599.999"],
+        "semantic_glyph_roles": ["phone", "mail", "web"],
+    }
+    if mutation == "features":
+        candidate["template"]["textInputs"][1]["placeholder"] = "• One\n• Two\n• Three\n• Four"
+    elif mutation == "brand":
+        candidate["template"]["feedLayout"]["layers"] = [
+            layer for layer in candidate["template"]["feedLayout"]["layers"]
+            if layer.get("layerId") != "feed-brand_name"
+        ]
+    elif mutation == "phone":
+        candidate["template"]["feedLayout"]["layers"] = [
+            layer for layer in candidate["template"]["feedLayout"]["layers"]
+            if layer.get("layerId") != "feed-phone-icon"
+        ]
+    elif mutation == "divider":
+        candidate["template"]["feedLayout"]["layers"] = [
+            layer for layer in candidate["template"]["feedLayout"]["layers"]
+            if layer.get("layerId") != "feed-column-divider"
+        ]
+    else:
+        candidate["template"]["textInputs"][2]["placeholder"] = "$1,599,999"
+    with pytest.raises(AdTemplateProcessError, match=re.escape(message)):
+        process.validate_builder_candidate(candidate, source_invariants=invariants)
 
 def fake_render(candidate, workspace, calls):
     calls.append(candidate)
@@ -200,6 +335,23 @@ def test_quality_gate_rejects_one_weak_dimension_even_when_mean_passes():
         {"id": "reviewer-b", "route": "b/m", **evidence(9.8, "Strong")},
     ]
     assert validate_final_review({"reviewers": reviewers}, accepted=True)["decision"] == "revise"
+
+
+def test_final_review_rejects_placeholder_semantic_glyphs_despite_passing_scores():
+    weak = evidence(9.8, "Numeric pass")
+    weak["semantic_glyph_inventory"]["phone"].update(
+        status="mismatch",
+        findings=["Source phone handset became a hollow ring in Feed and Story"],
+    )
+    final = validate_final_review({
+        "reviewers": [
+            {"id": "reviewer-a", "route": "a/vision", **weak},
+            {"id": "reviewer-b", "route": "b/vision", **evidence(9.8, "Independent pass")},
+        ],
+    }, accepted=True)
+
+    assert final["decision"] == "revise"
+    assert final["reviewers"][0]["semantic_glyph_mismatch"] is True
 
 
 @pytest.mark.parametrize("raw_value", (..., None, "move it", {"change": "move it"}, 1))
@@ -641,7 +793,7 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
         if final:
             assert "do not return required_changes" in prompt
             assert "Hermes derives the next builder brief" in prompt
-            assert "Return JSON only with exactly reason, differences, visible_strings, hard_failures, and rubric" in prompt
+            assert "Return JSON only with exactly reason, differences, visible_strings, semantic_glyph_inventory, hard_failures, and rubric" in prompt
         else:
             assert "required_changes must contain at least one actionable item" in prompt
         assert '"templateId":"strict"' in prompt
@@ -675,6 +827,7 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
     assert "A plate is only a plain rectangular fill and cannot express corners" in builder
     assert "never use same-bounds stacked filled plates" in builder
     assert "lineHeight is a unitless multiplier between 0.8 and 2.5" in builder
+    assert "Every multiline text layer with maxLines>1 requires lineHeight>=1.0" in builder
     assert "fontSize must be at least 24 native canvas pixels in Feed and 32 in Story" in builder
     assert "Every icon layer must use exactly arrow, check, phone, mail, globe, or pin" in builder
     assert "Every image_slot inputKey must be declared exactly once in imageInputs" in builder
@@ -771,6 +924,16 @@ def test_builder_contract_is_strict_and_prompts_require_quality_scores():
     invalid_line_height["feedLayout"]["layers"][1]["lineHeight"] = 29
     with pytest.raises(AdTemplateProcessError, match=r"feedLayout\.layers\[1\]\.lineHeight=29 must be a unitless multiplier between 0\.8 and 2\.5"):
         process.validate_template_artifact(invalid_line_height)
+
+    overlapping_multiline = json.loads(json.dumps(invalid_text))
+    overlapping_multiline["feedLayout"]["layers"][1]["overflowBehaviour"] = "truncate"
+    overlapping_multiline["feedLayout"]["layers"][1]["lineHeight"] = 0.8
+    with pytest.raises(
+        AdTemplateProcessError,
+        match=r'feedLayout\.layers\[1\] text layer "feed-headline" in feed has lineHeight=0\.8; '
+        r'multiline maxLines=2 requires lineHeight>=1\.0',
+    ):
+        process.validate_template_artifact(overlapping_multiline)
 
     micro_feed_text = json.loads(json.dumps(invalid_line_height))
     micro_feed_text["feedLayout"]["layers"][1]["lineHeight"] = 1.2
@@ -1104,6 +1267,14 @@ def test_comparator_inventory_requires_all_explicit_micro_checks_and_change_cove
         match="material mismatch must map to a concrete required_change",
     ):
         process._assessment(uncovered, "comparator", require_change_list=True)
+
+    semantic = evidence(9.0, "Hollow rings replace distinct phone, mail, and web glyphs")
+    remap_inventory(semantic, check="semantic_glyphs")
+    parsed = process._assessment(semantic, "comparator", require_change_list=True)
+    glyph_check = parsed["source_inventory"]["micro_checks"][-1]
+    assert glyph_check["check"] == "semantic_glyphs"
+    assert glyph_check["material"] is True
+    assert glyph_check["required_change_refs"] == [1]
 
 
 def test_comparator_inventory_requires_verbatim_difference_and_every_change_reference():
@@ -1665,6 +1836,39 @@ def test_renderer_rejection_feedback_targets_layer_and_detects_unchanged_retry()
         assert expected in first
     assert "UNCHANGED NAMED LAYER DETECTED" not in first
     assert "UNCHANGED NAMED LAYER DETECTED" in second
+
+
+def test_multiline_renderer_rejection_is_allowlisted_and_targets_line_height():
+    candidate = valid_candidate("renderer-multiline")
+    candidate["template"]["storyLayout"]["layers"].append({
+        "type": "text", "layerId": "story-features", "inputKey": "features",
+        "font": {"file": "manrope-400.woff2"}, "fontSize": 32, "lineHeight": 0.8,
+        "tracking": 0, "alignment": "left", "maxCharacters": 160, "maxLines": 6,
+        "colourRole": "mainText", "overflowBehaviour": "scale_down",
+        "geometry": {"x": 72, "y": 1296, "width": 936, "height": 160},
+    })
+    candidate["template"]["textInputs"].append({
+        "key": "features", "label": "Features",
+        "placeholder": "One\nTwo\nThree\nFour\nFive\nSix", "maxLength": 160,
+    })
+    reason = "story text layer story-features with maxLines 6 must use lineHeight at least 1"
+    stderr = "AD_TEMPLATE_TEXT_PREFLIGHT_FAILED " + json.dumps({
+        "code": "AD_TEMPLATE_TEXT_PREFLIGHT_FAILED",
+        "violations": [{
+            "placement": "story", "layerId": "story-features",
+            "kind": "multiline_line_height_below_minimum", "maxLines": 6,
+            "lineHeight": 0.8, "minimumLineHeight": 1, "reason": reason,
+        }],
+    })
+
+    assert process._deterministic_renderer_rejections(stderr) == [reason]
+    instruction, signature, unchanged = process._renderer_rejection_instruction(
+        candidate, reason,
+    )
+    assert signature is not None and unchanged is False
+    assert '"lineHeight":0.8' in instruction
+    assert '"maxLines":6' in instruction
+    assert "set this named multiline layer lineHeight to at least 1.0" in instruction
 
 
 def test_renderer_aggregated_rejection_targets_every_layer_and_tracks_each_noop():
@@ -2320,7 +2524,7 @@ def test_final_review_schema_recovery_survives_three_invalid_outputs(tmp_path, m
     final_calls = [item for item in calls if item[0].startswith("final-reviewer-")]
     assert len(final_calls) == 5
     assert "-retry-3" in final_calls[3][0]
-    assert "exactly reason, differences, visible_strings, hard_failures, and the eight-field rubric" in final_calls[3][1]
+    assert "exactly reason, differences, visible_strings, semantic_glyph_inventory, hard_failures, and the eight-field rubric" in final_calls[3][1]
     assert "Do not return required_changes" in final_calls[3][1]
     retried = [data for kind, data in events if kind == "final-review.retried"]
     assert len(retried) == 3

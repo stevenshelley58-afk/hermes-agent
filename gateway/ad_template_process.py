@@ -123,7 +123,9 @@ COMPARATOR_MICRO_INVENTORY_CHECKS = (
     "typography_spacing",
     "overlap",
     "punctuation",
+    "semantic_glyphs",
 )
+FINAL_SEMANTIC_GLYPH_CHECKS = ("phone", "mail", "web", "location", "cta")
 
 def _parse_required_change(value: str) -> Dict[str, Any] | None:
     placement = re.search(r"\bplacement\s*=\s*(feed|story)\b", value, re.IGNORECASE)
@@ -464,7 +466,7 @@ def _comparator_source_inventory(
     if tuple(seen_checks) != COMPARATOR_MICRO_INVENTORY_CHECKS:
         raise ComparatorSelfConsistencyError(
             "comparator micro inventory must cover brand text, dividers, bullet count/stacking, "
-            "typography/spacing, overlap, and punctuation exactly once in contract order"
+            "typography/spacing, overlap, punctuation, and semantic glyphs exactly once in contract order"
         )
 
     normalized_differences = [item.strip() for item in differences] if isinstance(differences, list) else []
@@ -481,6 +483,54 @@ def _comparator_source_inventory(
             "comparator required_changes must each be referenced by a material source_inventory mismatch"
         )
     return {"macro_regions": macro_regions, "micro_checks": micro_checks}
+
+def _final_semantic_glyph_inventory(value: Any) -> Dict[str, Any]:
+    """Require final reviewers to inspect every semantic action/contact glyph role."""
+    if not isinstance(value, dict) or tuple(value) != FINAL_SEMANTIC_GLYPH_CHECKS:
+        raise ReviewEvidenceError(
+            "final reviewer semantic_glyph_inventory must cover phone, mail, web, location, and CTA in order",
+            field="semantic_glyph_inventory",
+        )
+    normalized: Dict[str, Any] = {}
+    exact_keys = {
+        "source_observation", "feed_observation", "story_observation", "status", "findings",
+    }
+    for check in FINAL_SEMANTIC_GLYPH_CHECKS:
+        item = value.get(check)
+        if not isinstance(item, dict) or set(item) != exact_keys:
+            raise ReviewEvidenceError(
+                f"final reviewer semantic glyph {check} must use the exact observation schema",
+                field="semantic_glyph_inventory",
+            )
+        normalized_item = dict(item)
+        for placement in ("source", "feed", "story"):
+            observation = item.get(f"{placement}_observation")
+            if not isinstance(observation, str) or not observation.strip():
+                raise ReviewEvidenceError(
+                    f"final reviewer semantic glyph {check} must record a {placement} observation",
+                    field="semantic_glyph_inventory",
+                )
+            normalized_item[f"{placement}_observation"] = observation.strip()
+        status = item.get("status")
+        findings = item.get("findings")
+        if status not in {"match", "mismatch"} or not isinstance(findings, list) or not all(
+            isinstance(finding, str) and finding.strip() for finding in findings
+        ):
+            raise ReviewEvidenceError(
+                f"final reviewer semantic glyph {check} requires match|mismatch status and string findings",
+                field="semantic_glyph_inventory",
+            )
+        if status == "match" and findings:
+            raise ComparatorSelfConsistencyError(
+                f"final reviewer semantic glyph {check} declares match with mismatch findings"
+            )
+        if status == "mismatch" and not findings:
+            raise ComparatorSelfConsistencyError(
+                f"final reviewer semantic glyph {check} mismatch requires concrete findings"
+            )
+        normalized_item["findings"] = [finding.strip() for finding in findings]
+        normalized[check] = normalized_item
+    return normalized
 
 def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> Dict[str, Any]:
     if not isinstance(value, dict):
@@ -534,6 +584,7 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
     regressions: List[str] = []
     ranked_changes: List[str] = []
     source_inventory: Dict[str, Any] = {}
+    semantic_glyph_inventory: Dict[str, Any] = {}
     declared_decision = None
     if role == "comparator":
         raw_macro = value.get("macro")
@@ -580,6 +631,10 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
         declared_decision = value.get("decision", value.get("declared_decision"))
         if declared_decision not in {"accept", "revise"}:
             raise ReviewEvidenceError("comparator decision must be accept or revise", field="decision")
+    elif role == "final reviewer":
+        semantic_glyph_inventory = _final_semantic_glyph_inventory(
+            value.get("semantic_glyph_inventory")
+        )
     if require_change_list:
         if not isinstance(differences, list) or not all(isinstance(item, str) and item.strip() for item in differences):
             raise ReviewEvidenceError(
@@ -646,6 +701,12 @@ def _assessment(value: Any, role: str, *, require_change_list: bool = False) -> 
             "declared_decision": declared_decision,
             "critical_blocker": critical_blocker, "macro_regression": macro_regression,
         } if role == "comparator" else {}),
+        **({
+            "semantic_glyph_inventory": semantic_glyph_inventory,
+            "semantic_glyph_mismatch": any(
+                item["status"] == "mismatch" for item in semantic_glyph_inventory.values()
+            ),
+        } if role == "final reviewer" else {}),
         **({"differences": differences, "required_changes": required_changes} if require_change_list else {}),
     }
 
@@ -655,6 +716,7 @@ def _passes_quality_gate(evidence: Mapping[str, Any]) -> bool:
         and not evidence.get("required_changes")
         and not evidence.get("critical_blocker")
         and not evidence.get("macro_regression")
+        and not evidence.get("semantic_glyph_mismatch")
         and min((evidence.get("macro") or {"default": 10}).values()) >= MIN_RUBRIC_SCORE
         and _number((evidence.get("rubric") or {}).get("feed_source_likeness")) >= THRESHOLD
         and _number(evidence.get("score")) >= THRESHOLD
@@ -936,6 +998,13 @@ def _validate_layout(layout: Any, *, placement: str, width: int, height: int) ->
             if not _number_value(line_height) or not LINE_HEIGHT_MIN <= line_height <= LINE_HEIGHT_MAX:
                 offending = json.dumps(line_height, ensure_ascii=True)[:160]
                 raise AdTemplateProcessError(f"{layer_path}.lineHeight={offending} must be a unitless multiplier between 0.8 and 2.5 (normally 1.1 to 1.6), never pixels")
+            if layer["maxLines"] > 1 and line_height < 1.0:
+                offending = json.dumps(line_height, ensure_ascii=True)[:160]
+                raise AdTemplateProcessError(
+                    f"{layer_path} text layer {json.dumps(layer['layerId'])} in {placement} "
+                    f"has lineHeight={offending}; multiline maxLines={layer['maxLines']} requires "
+                    "lineHeight>=1.0 to prevent visible line overlap"
+                )
             if layer["alignment"] not in {"left", "center", "right"}:
                 raise AdTemplateProcessError(f"{layer_path}.alignment must be left, center, or right")
             if layer["overflowBehaviour"] not in {"refuse", "truncate", "scale_down"}:
@@ -1172,7 +1241,156 @@ def normalize_asset_declarations(value: Any) -> Any:
     return value
 
 
-def validate_builder_candidate(value: Any) -> Dict[str, Any]:
+def _validate_pre_render_source_invariants(
+    template: Mapping[str, Any], source_invariants: Mapping[str, Any] | None,
+) -> None:
+    """Reject visually deterministic semantic regressions before renderer I/O."""
+    text_inputs = {
+        str(item.get("key") or ""): str(item.get("placeholder") or "")
+        for item in template.get("textInputs") or [] if isinstance(item, Mapping)
+    }
+    invariants = _normalized_source_invariants(source_invariants)
+    expected_bullets = int(invariants.get("feature_bullet_count") or 0)
+    expected_prices = [
+        str(item) for item in invariants.get("price_strings") or [] if _nonempty(item)
+    ]
+
+    semantic_roles = {
+        "phone": ("phone",),
+        "mail": ("mail", "email"),
+        "web": ("web", "globe"),
+        "location": ("location", "pin"),
+        "cta": ("cta",),
+    }
+    expected_icons = set(invariants.get("semantic_glyph_roles") or [])
+    for layout_name, placement in (("feedLayout", "feed"), ("storyLayout", "story")):
+        layout = template.get(layout_name)
+        layers = layout.get("layers") if isinstance(layout, Mapping) else []
+        text_layers = [layer for layer in layers if isinstance(layer, Mapping) and layer.get("type") == "text"]
+        layer_tokens = {
+            str(layer.get("layerId") or "").lower()
+            + " "
+            + str(layer.get("inputKey") or "").lower()
+            for layer in layers if isinstance(layer, Mapping)
+        }
+
+        for role, aliases in semantic_roles.items():
+            referenced = role in expected_icons or any(
+                any(alias in token for alias in aliases) for token in layer_tokens
+            )
+            if not referenced:
+                continue
+            expected_icon = {"mail": "mail", "web": "globe", "location": "pin"}.get(role, role)
+            if role == "cta":
+                icon_ok = any(
+                    layer.get("type") == "icon" and layer.get("icon") in {"arrow", "check"}
+                    for layer in layers if isinstance(layer, Mapping)
+                )
+            else:
+                icon_ok = any(
+                    layer.get("type") == "icon" and layer.get("icon") == expected_icon
+                    for layer in layers if isinstance(layer, Mapping)
+                )
+            if not icon_ok:
+                raise AdTemplateProcessError(
+                    f"{layout_name} {placement} semantic {role} role requires a real {expected_icon} "
+                    "icon layer; hollow rings, blank circles, and generic vector placeholders are invalid"
+                )
+
+        valid_dividers = []
+        for layer_index, layer in enumerate(layers):
+            if not isinstance(layer, Mapping) or "divider" not in str(layer.get("layerId") or "").lower():
+                continue
+            geometry = layer.get("geometry") if isinstance(layer.get("geometry"), Mapping) else {}
+            width = float(geometry.get("width") or 0)
+            height = float(geometry.get("height") or 0)
+            elongated = max(width, height) >= 3 * max(1.0, min(width, height))
+            if elongated and not (
+                layer.get("type") == "vector" and layer.get("shape") in {"line", "rect"}
+            ):
+                raise AdTemplateProcessError(
+                    f"{layout_name}.layers[{layer_index}] divider {json.dumps(layer.get('layerId'))} "
+                    "has elongated geometry but is not a visible line or rect; circle/ring dividers collapse to dots"
+                )
+            if elongated and layer.get("type") == "vector" and layer.get("shape") in {"line", "rect"}:
+                valid_dividers.append(layer)
+
+        if placement == "feed" and invariants.get("divider_required") and not valid_dividers:
+            raise AdTemplateProcessError(
+                "feedLayout feed must preserve the source-visible divider as an elongated line or rect; "
+                "a missing divider, circle, ring, or dot is invalid"
+            )
+
+        if invariants.get("brand_text_required"):
+            brand_text = [
+                layer for layer in text_layers
+                if "brand" in (
+                    str(layer.get("layerId") or "").lower()
+                    + " " + str(layer.get("inputKey") or "").lower()
+                )
+                and _nonempty(text_inputs.get(str(layer.get("inputKey") or "")))
+            ]
+            if not brand_text:
+                raise AdTemplateProcessError(
+                    f"{layout_name} {placement} must preserve the source-visible brand lockup as "
+                    "neutral editable brand text; an icon-only logo is insufficient"
+                )
+
+        if expected_bullets:
+            feature_layers = []
+            for layer in text_layers:
+                token = (
+                    str(layer.get("layerId") or "").lower()
+                    + " " + str(layer.get("inputKey") or "").lower()
+                )
+                placeholder = text_inputs.get(str(layer.get("inputKey") or ""), "")
+                nonempty_lines = [line for line in placeholder.splitlines() if line.strip()]
+                if (
+                    "bullet" in token
+                    or "feature-item" in token
+                    or "feature_item" in token
+                    or (
+                        "feature" in token
+                        and (placeholder.count("•") > 0 or len(nonempty_lines) > 1)
+                    )
+                ):
+                    feature_layers.append(layer)
+            observed = sum(
+                max(
+                    len([
+                        line for line in text_inputs.get(
+                            str(layer.get("inputKey") or ""), ""
+                        ).splitlines() if line.strip()
+                    ]),
+                    text_inputs.get(str(layer.get("inputKey") or ""), "").count("•"),
+                )
+                for layer in feature_layers
+            )
+            if observed != expected_bullets:
+                raise AdTemplateProcessError(
+                    f"{layout_name} {placement} feature inventory has {observed} stacked bullets; "
+                    f"source inventory requires exactly {expected_bullets} distinct stacked bullets"
+                )
+
+        if expected_prices:
+            price_values = [
+                text_inputs.get(str(layer.get("inputKey") or ""), "")
+                for layer in text_layers
+                if "price" in (
+                    str(layer.get("layerId") or "").lower()
+                    + " " + str(layer.get("inputKey") or "").lower()
+                )
+            ]
+            if not any(price in price_values for price in expected_prices):
+                raise AdTemplateProcessError(
+                    f"{layout_name} {placement} price punctuation must exactly preserve one source-visible "
+                    f"price string: {json.dumps(expected_prices, ensure_ascii=True)}"
+                )
+
+
+def validate_builder_candidate(
+    value: Any, *, source_invariants: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
     _reject_builder_bytes(value)
     if not isinstance(value, dict) or set(value) != {"template", "assets"}:
         raise AdTemplateProcessError("builder must return exactly template and assets")
@@ -1196,6 +1414,7 @@ def validate_builder_candidate(value: Any) -> Dict[str, Any]:
         seen.add(key)
     if set(declarations) != seen:
         raise AdTemplateProcessError("builder assets must supply every template.assets declaration exactly once")
+    _validate_pre_render_source_invariants(template, source_invariants)
     return value
 
 _PRIVATE_EVIDENCE_KEYS = frozenset({
@@ -1323,6 +1542,119 @@ def _safe_candidate_prompt_json(value: Any) -> str:
     return encoded
 
 
+def _source_invariants_from_reviews(*reviews: Any) -> Dict[str, Any]:
+    """Project source-visible facts from comparator evidence into pre-render guards."""
+    bullet_count = 0
+    price_strings: List[str] = []
+    source_components: List[str] = []
+    source_observations: Dict[str, str] = {}
+    for review in reviews:
+        if not isinstance(review, Mapping):
+            continue
+        visible = review.get("visible_strings")
+        source_strings = visible.get("source") if isinstance(visible, Mapping) else []
+        if isinstance(source_strings, list):
+            bullet_count = max(
+                bullet_count,
+                sum(
+                    max(
+                        sum(
+                            line.lstrip().startswith("•")
+                            for line in str(item).splitlines()
+                        ),
+                        str(item).count("•"),
+                    )
+                    for item in source_strings
+                ),
+            )
+            for item in source_strings:
+                match = re.fullmatch(r"\s*[$£€]\s*\d[\d.,]*\s*", str(item))
+                if match and match.group(0).strip() not in price_strings:
+                    price_strings.append(match.group(0).strip())
+        inventory = review.get("source_inventory")
+        if not isinstance(inventory, Mapping):
+            continue
+        for region in inventory.get("macro_regions") or []:
+            if isinstance(region, Mapping) and isinstance(region.get("source_components"), list):
+                source_components.extend(str(item) for item in region["source_components"])
+        for check in inventory.get("micro_checks") or []:
+            if isinstance(check, Mapping) and _nonempty(check.get("check")):
+                source_observations[str(check["check"])] = str(
+                    check.get("source_observation") or ""
+                )
+    component_text = " ".join(source_components).lower()
+    brand_text = source_observations.get("brand_text", "").lower()
+    divider_text = source_observations.get("dividers", "").lower()
+    semantic_roles = []
+    for role, aliases in {
+        "phone": ("phone", "handset"),
+        "mail": ("mail", "envelope"),
+        "web": ("web", "globe"),
+        "location": ("location pin", "map pin"),
+        "cta": ("cta arrow", "cta check"),
+    }.items():
+        if any(alias in component_text for alias in aliases):
+            semantic_roles.append(role)
+    return {
+        "feature_bullet_count": bullet_count,
+        "price_strings": price_strings,
+        "brand_text_required": bool(
+            any(term in brand_text for term in ("wordmark", "brand text", "logo text", "real estate"))
+            and not any(
+                phrase in brand_text for phrase in ("absent", "not visible", "no brand")
+            )
+        ),
+        "divider_required": bool(
+            any(term in divider_text for term in ("vertical", "horizontal", "rule"))
+            and not any(
+                phrase in divider_text for phrase in ("absent", "not visible", "no divider")
+            )
+        ),
+        "semantic_glyph_roles": semantic_roles,
+    }
+
+
+def _normalized_source_invariants(value: Any) -> Dict[str, Any]:
+    """Bound source-derived facts before reuse in later builder iterations."""
+    if not isinstance(value, Mapping):
+        return {}
+    bullet_count = value.get("feature_bullet_count")
+    if isinstance(bullet_count, bool) or not isinstance(bullet_count, int):
+        bullet_count = 0
+    raw_prices = value.get("price_strings")
+    if not isinstance(raw_prices, list):
+        raw_prices = []
+    raw_roles = value.get("semantic_glyph_roles")
+    if not isinstance(raw_roles, list):
+        raw_roles = []
+    return {
+        "feature_bullet_count": max(0, min(bullet_count, 64)),
+        "price_strings": [
+            str(item)[:80] for item in raw_prices[:16]
+            if _nonempty(item)
+        ],
+        "brand_text_required": value.get("brand_text_required") is True,
+        "divider_required": value.get("divider_required") is True,
+        "semantic_glyph_roles": [
+            role for role in FINAL_SEMANTIC_GLYPH_CHECKS
+            if role in set(raw_roles)
+        ],
+    }
+
+
+def _source_invariants_from_feedback(feedback: Any) -> Dict[str, Any]:
+    if not feedback:
+        return {}
+    if isinstance(feedback, str):
+        try:
+            feedback = json.loads(feedback)
+        except (TypeError, json.JSONDecodeError):
+            return {}
+    if not isinstance(feedback, Mapping):
+        return {}
+    return _normalized_source_invariants(feedback.get("source_invariants"))
+
+
 def _compact_revision_feedback(value: Any) -> str:
     """Keep only decision-driving evidence in the next builder request."""
     if not value:
@@ -1366,6 +1698,11 @@ def _compact_revision_feedback(value: Any) -> str:
         for item in regions or []
         if isinstance(item, Mapping) and item.get("status") == "blocker"
     ]
+    derived_source_invariants = _source_invariants_from_reviews(best_review, current_review)
+    existing_source_invariants = _normalized_source_invariants(decoded.get("source_invariants"))
+    source_invariants = existing_source_invariants or _normalized_source_invariants(
+        derived_source_invariants
+    )
     projected = {
         "instruction": str(decoded.get("instruction") or "Apply every required change to the immutable best candidate.")[:300],
         "best_quality_score": decoded.get("best_quality_score", decoded.get("best_score")),
@@ -1389,6 +1726,7 @@ def _compact_revision_feedback(value: Any) -> str:
             decoded.get("required_changes"), limit=6, width=1200,
         ),
         "reason": str(current_review.get("reason") or "")[:1200],
+        "source_invariants": source_invariants,
     }
     return json.dumps(projected, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -1614,12 +1952,22 @@ _DETERMINISTIC_RENDERER_REJECTIONS = (
         r"(?:is below|cannot fit at) the \d+(?:\.\d+)?px readability floor",
         re.IGNORECASE,
     ),
+    re.compile(
+        r"(?:feed|story) text layer [A-Za-z0-9._:-]{1,160} with maxLines \d+ "
+        r"must use lineHeight at least 1",
+        re.IGNORECASE,
+    ),
     re.compile(r"ring vector [A-Za-z0-9._:-]{1,160} must use square geometry", re.IGNORECASE),
 )
 
 _TEXT_RENDERER_REJECTION = re.compile(
     r"(?P<placement>feed|story) text layer (?P<layer_id>[A-Za-z0-9._:-]{1,160}) "
     r"(?:is below|cannot fit at) the \d+(?:\.\d+)?px readability floor",
+    re.IGNORECASE,
+)
+_MULTILINE_RENDERER_REJECTION = re.compile(
+    r"(?P<placement>feed|story) text layer (?P<layer_id>[A-Za-z0-9._:-]{1,160}) "
+    r"with maxLines (?P<max_lines>\d+) must use lineHeight at least 1",
     re.IGNORECASE,
 )
 
@@ -1652,7 +2000,10 @@ def _renderer_rejection_instruction(
     previous_target_signature: str | None = None,
 ) -> tuple[str, str | None, bool]:
     """Describe the exact rejected text contract and detect a no-op retry."""
-    match = _TEXT_RENDERER_REJECTION.fullmatch(str(reason or "").strip())
+    reason_text = str(reason or "").strip()
+    match = _TEXT_RENDERER_REJECTION.fullmatch(reason_text)
+    multiline_match = _MULTILINE_RENDERER_REJECTION.fullmatch(reason_text)
+    match = match or multiline_match
     template = candidate.get("template") if isinstance(candidate, Mapping) else None
     if match is None or not isinstance(template, Mapping):
         return reason, None, False
@@ -1687,6 +2038,7 @@ def _renderer_rejection_instruction(
         "geometry": _prompt_rect(layer.get("geometry")),
         "font": _prompt_object(layer.get("font"), ("file",)),
         "fontSize": _prompt_value(layer.get("fontSize")),
+        "lineHeight": _prompt_value(layer.get("lineHeight")),
         "maxCharacters": _prompt_value(layer.get("maxCharacters")),
         "maxLines": _prompt_value(layer.get("maxLines")),
         "fit": str(layer.get("overflowBehaviour") or "")[:80],
@@ -1702,16 +2054,24 @@ def _renderer_rejection_instruction(
         if unchanged
         else ""
     )
-    instruction = (
-        f"{reason}. TARGETED TEXT CONTRACT: {signature}.{no_op_warning} "
-        "Allowed fix: widen or raise the text box, or shorten the neutral placeholder/input "
-        "contract; keep the rendered font at or above the readability floor."
-    )
+    if multiline_match is not None:
+        allowed_fix = (
+            "Allowed fix: set this named multiline layer lineHeight to at least 1.0; "
+            "preserve its distinct stacked lines, maxLines contract, and readability floor."
+        )
+    else:
+        allowed_fix = (
+            "Allowed fix: widen or raise the text box, or shorten the neutral placeholder/input "
+            "contract; keep the rendered font at or above the readability floor."
+        )
+    instruction = f"{reason}. TARGETED TEXT CONTRACT: {signature}.{no_op_warning} {allowed_fix}"
     return instruction, signature, unchanged
 
 
 def _renderer_rejection_target_key(reason: str) -> str:
     match = _TEXT_RENDERER_REJECTION.fullmatch(str(reason or "").strip())
+    if match is None:
+        match = _MULTILINE_RENDERER_REJECTION.fullmatch(str(reason or "").strip())
     if match is None:
         return str(reason)[:320]
     return f"{match.group('placement').lower()}:{match.group('layer_id')}"
@@ -1876,7 +2236,7 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
         'must be exactly left, center, or right and overflowBehaviour must be exactly refuse, truncate, or scale_down (never ellipsis). '
         'tracking is an absolute canvas-pixel value from -4 to 4, never em, percent, a multiplier, or arbitrary letter spacing. '
         'fontSize must be at least 24 native canvas pixels in Feed and 32 in Story; never shrink body or contact copy below these floors. '
-        'lineHeight is a unitless multiplier between 0.8 and 2.5, normally 1.1 to 1.6; never supply lineHeight in pixels. '
+        'lineHeight is a unitless multiplier between 0.8 and 2.5, normally 1.1 to 1.6; never supply lineHeight in pixels. Every multiline text layer with maxLines>1 requires lineHeight>=1.0. '
         ' For every vector layer, shape must be exactly one of rect, rounded, circle, line, pill, notched, wave, or ring; '
         'never use aliases such as rectangle or rounded_rect_stroke. Every icon layer must use exactly arrow, check, phone, mail, globe, or pin; '
         'Every layout requires one full-canvas background plate. A plate is only a plain rectangular fill and cannot express corners '
@@ -1934,7 +2294,7 @@ Reinspect the attached source pixels for every requested correction. Keep Feed f
 
 When a final reviewer returns a negative verdict with no explicit required_changes, treat its reason, differences, hard failures, and weakest rubric fields as required revision guidance.
 
-Never copy source identity, contact details, portraits, logos, URLs, or pixels. Keep their visual roles as neutral editable inputs. Do not duplicate facts or photographs. tracking remains absolute canvas pixels -4..4; lineHeight remains unitless 0.8..2.5. fontSize is at least 24 native canvas pixels in Feed and 32 in Story, including body and contact copy. Preserve the existing exact schema and use only these manifest-backed assets if a requested role must change:
+Never copy source identity, contact details, portraits, logos, URLs, or pixels. Keep their visual roles as neutral editable inputs. Do not duplicate facts or photographs. tracking remains absolute canvas pixels -4..4; lineHeight remains unitless 0.8..2.5, and every multiline text layer with maxLines>1 requires lineHeight>=1.0. fontSize is at least 24 native canvas pixels in Feed and 32 in Story, including body and contact copy. Preserve the existing exact schema and use only these manifest-backed assets if a requested role must change:
 Every layout requires one full-canvas background plate. A plate is only a plain rectangular fill and cannot express corners or an outline. ring is circular-only and requires square geometry. Build a rounded rectangular border with nested inset rounded vectors (outer border colour, inner background colour); never use same-bounds stacked filled plates.
 {catalog_lines}
 Run {run_id}; project {project_id}; placements {json.dumps(placements)}; brief {brief[:2000]}."""
@@ -1946,7 +2306,7 @@ Run {run_id}; project {project_id}; placements {json.dumps(placements)}; brief {
 
 The attached source is the authority. For a revision, apply every item in prior reviewer feedback to the prior valid candidate and leave already-matching regions unchanged. Story must be a native 1080x1920 translation of the same design system and hierarchy, with essential content outside the top 240px and bottom 300px platform zones; it is not evidence that Feed may diverge from the source. Story must not retain the Feed's horizontal split or two-column topology: reflow major Feed groups into a deliberate vertical hierarchy. For a listing like 006 use a full-width hero, price/brand card below, then stacked facts and readable contact. Every layout requires one full-canvas background plate. A plate is only a plain rectangular fill and cannot express corners or an outline. ring is circular-only and requires square geometry. Build a rounded rectangular border with nested inset rounded vectors (outer border colour, inner background colour); never use same-bounds stacked filled plates.
 
-Return JSON only with exactly {{"template":{{...}},"assets":[]}}. template must use schema "blockwise.ad-template" and contain exactly templateId, createdAt, feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata plus schema. Feed is 1080x1350 with safeZones=[{{"x":72,"y":96,"width":936,"height":1158}}]. Story is 1080x1920 with safeZones=[{{"x":72,"y":240,"width":936,"height":1380}}]. Geometry is always {{x,y,width,height}} from the top-left and must remain inside the canvas. Each layout contains exactly placement, layers, and safeZones. Every layer must match one exact shape: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. Do not omit layerId, opacity, protected, or any other required field. Text uses a declared bundled font, native-canvas fontSize of at least 24 in Feed and 32 in Story, unitless lineHeight 0.8-2.5, tracking as an absolute canvas-pixel value from -4 to 4 (never em, percent, or a multiplier), alignment left|center|right, maxCharacters, maxLines, colourRole, overflowBehaviour refuse|truncate|scale_down, and geometry. image_slot mask is rounded_rect|circle|none and defaultCrop is normalized {{"x":0,"y":0,"width":1,"height":1}}. imageInputs entries are exactly {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs entries are exactly {{key,label,placeholder,maxLength}}; fonts entries are exactly {{file}}. Every reference must resolve.
+Return JSON only with exactly {{"template":{{...}},"assets":[]}}. template must use schema "blockwise.ad-template" and contain exactly templateId, createdAt, feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata plus schema. Feed is 1080x1350 with safeZones=[{{"x":72,"y":96,"width":936,"height":1158}}]. Story is 1080x1920 with safeZones=[{{"x":72,"y":240,"width":936,"height":1380}}]. Geometry is always {{x,y,width,height}} from the top-left and must remain inside the canvas. Each layout contains exactly placement, layers, and safeZones. Every layer must match one exact shape: plate={{type,layerId,colourRole,assetKey?,geometry,protected}}; image_slot={{type,layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides}}; overlay_patch={{type,layerId,geometry,colourRole,opacity,assetKey?}}; text={{type,layerId,inputKey,font:{{file}},fontSize,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo={{type,layerId,inputKey,geometry}}; vector={{type,layerId,geometry,shape,colourRole,opacity}}; icon={{type,layerId,geometry,icon,colourRole}}. Do not omit layerId, opacity, protected, or any other required field. Text uses a declared bundled font, native-canvas fontSize of at least 24 in Feed and 32 in Story, unitless lineHeight 0.8-2.5 with lineHeight>=1.0 whenever maxLines>1, tracking as an absolute canvas-pixel value from -4 to 4 (never em, percent, or a multiplier), alignment left|center|right, maxCharacters, maxLines, colourRole, overflowBehaviour refuse|truncate|scale_down, and geometry. image_slot mask is rounded_rect|circle|none and defaultCrop is normalized {{"x":0,"y":0,"width":1,"height":1}}. imageInputs entries are exactly {{key,label,required?,acceptedTypes,defaultAssetKey?}}; textInputs entries are exactly {{key,label,placeholder,maxLength}}; fonts entries are exactly {{file}}. Every reference must resolve.
 
 semanticColours contains exactly background, primary, secondary, accent, mainText, inverseText. Allowed font files are {', '.join(sorted(ALLOWED_FONT_FILES))}. metadata contains exactly title:string, description:string, gallerySamples:{{feed?:{{assetKey?,placement,purpose}},story?:{{assetKey?,placement,purpose}}}}, metaCopyDefaults:{{primaryText:string[],headlines:string[],descriptions:string[],cta:string}}, aiWritingGuidance:{{summary:string,fields:record<string,string>}}, publishRequirements:{{objective:string,specialAdCategory:string|null,instantForm:{{required:boolean,dependency:string|null,defaults?:record<string,string>}},destination:{{required:boolean,kind:'website'|'instant_form'|'none',dependency:string|null}},requiredCtaTypes?:string[]}}, replacementAssets:{{inputKey,assetKey,purpose?}}[], realAssetRefs:{{inputKey,kind,required}}[]. For property ads set specialAdCategory to HOUSING. Every layer, input, font, colour, asset, replacement, gallery, and realAsset reference must resolve inside the same template. template.assets is required and is a declaration record shaped exactly {{"asset-key":{{"fileName":"normalized/catalog/path.webp","mimeType":"image/webp"}}}}; it is never a list and may be {{}} only when no asset is used. Top-level assets is always a list of {{assetKey,fileName,mimeType}} and must exactly mirror template.assets; never emit bytesBase64 anywhere. Choose only from this exact role-tagged safe catalog; prefer photo-default assets and use neutral-placeholder only when no suitable photo role exists:
 {catalog_lines}
@@ -1970,7 +2330,7 @@ def review_prompt(*, final: bool, candidate: Any = None, has_previous_best: bool
         "genuinely clears every gate."
     )
     output_contract = (
-        "Return JSON only with exactly reason, differences, visible_strings, hard_failures, and rubric."
+        "Return JSON only with exactly reason, differences, visible_strings, semantic_glyph_inventory, hard_failures, and rubric."
         if final
         else
         "Return JSON only with exactly reason, differences, required_changes, ranked_changes, visible_strings, "
@@ -2007,7 +2367,9 @@ Use this scale strictly: 10.0 means the Feed is visually indistinguishable in st
 
 {output_contract} {hierarchical_contract} visible_strings must be exactly an object with source, feed, and story arrays. Transcribe every visibly rendered word, number, currency value, CTA and logo wordmark in reading order; preserve visible splitting, missing glyphs and truncation exactly (for example, a broken HOUSE rendered as H U / O S / E must be transcribed that way, not silently corrected). differences is a list of concrete visible source-versus-render discrepancies, naming region and measurements or relative movement where possible. Every differences string must also appear verbatim in one source_inventory findings array. required_changes is the ordered list of all material work the builder should apply next. {change_list_contract} Every required_changes string must use this exact actionable structure: placement=feed|story; layers=comma-separated layerIds; current={{x:...,y:...,width:...,height:...}}; target={{x:...,y:...,width:...,height:...}}; change=specific instruction. Name all affected layer IDs and use their current and intended target geometry. Copy current geometry exactly from Candidate contract JSON, then check every proposed target rectangle against every existing layer before returning it. Never propose a target that newly overlaps an image slot or opaque vector panel with another image slot unless that overlap is visibly present in the source and the change text explicitly identifies and justifies the source-visible overlap. Use a separate required_changes item when affected layers do not share identical current and target geometry.
 
-For the comparator only, source_inventory must contain exactly macro_regions and micro_checks. macro_regions must contain these entries exactly once and in this order: frame_header, hero_offer_panel, image_gallery, about_features, contact_footer, story_recomposition. Each entry has exactly region, source_components, feed_components, story_components, source_count, feed_count, story_count, status, material, findings, required_change_refs. The component fields are arrays of visible component descriptions; each count is a non-negative integer exactly equal to its array length. micro_checks must contain these entries exactly once and in this order: brand_text, dividers, bullet_count_stacking, typography_spacing, overlap, punctuation. Each entry has exactly check, source_observation, feed_observation, story_observation, status, material, findings, required_change_refs. status is match or mismatch; material is boolean. A match has findings=[] and required_change_refs=[]. A mismatch has concrete findings. Every material mismatch has one or more 1-based required_change_refs pointing into required_changes; a non-material mismatch has none. Every required_change must be referenced. Inspect brand_text for a source-visible wordmark or brand-role text footprint and require a coherent neutral editable replacement when identity substitution is permitted; an icon alone does not replace source-visible brand text. Count divider rules and state their orientation/position. Count bullet glyphs and separately count stacked visible bullet lines; run-on bullets are not stacked. Compare type family/style/weight/scale/tracking/line height and region spacing. Report every visible overlap, including text crowding even when pixel bounds pass. Compare punctuation character-for-character for otherwise corresponding visible strings, including price separators. Do not mark any of these six checks match without recording what is visibly present in source, Feed, and Story.
+For the comparator only, source_inventory must contain exactly macro_regions and micro_checks. macro_regions must contain these entries exactly once and in this order: frame_header, hero_offer_panel, image_gallery, about_features, contact_footer, story_recomposition. Each entry has exactly region, source_components, feed_components, story_components, source_count, feed_count, story_count, status, material, findings, required_change_refs. The component fields are arrays of visible component descriptions; each count is a non-negative integer exactly equal to its array length. micro_checks must contain these entries exactly once and in this order: brand_text, dividers, bullet_count_stacking, typography_spacing, overlap, punctuation, semantic_glyphs. Each entry has exactly check, source_observation, feed_observation, story_observation, status, material, findings, required_change_refs. status is match or mismatch; material is boolean. A match has findings=[] and required_change_refs=[]. A mismatch has concrete findings. Every material mismatch has one or more 1-based required_change_refs pointing into required_changes; a non-material mismatch has none. Every required_change must be referenced. Inspect brand_text for a source-visible wordmark or brand-role text footprint and require a coherent neutral editable replacement when identity substitution is permitted; an icon alone does not replace source-visible brand text. Count divider rules and state their orientation/position. Count bullet glyphs and separately count stacked visible bullet lines; run-on bullets are not stacked. Compare type family/style/weight/scale/tracking/line height and region spacing. Report every visible overlap, including text crowding even when pixel bounds pass. Compare punctuation character-for-character for otherwise corresponding visible strings, including price separators. semantic_glyphs must inventory the source-visible phone, mail, web/globe, location/pin, and CTA/arrow/check roles and compare their Feed/Story pixels. Hollow rings, blank circles, and generic placeholder marks are mismatches when the source shows distinct semantic symbols; map each material mismatch to required_changes. Do not mark any micro check match without recording what is visibly present in source, Feed, and Story.
+
+For final reviewers only, semantic_glyph_inventory must contain exactly phone, mail, web, location, and cta in that order. Each value has exactly source_observation, feed_observation, story_observation, status, findings. Record absent roles explicitly. status is match or mismatch; match requires findings=[] and mismatch requires concrete findings. Hollow rings, blank circles, or generic placeholder marks cannot match a distinct source-visible semantic symbol. Any semantic glyph mismatch prevents final acceptance even when numeric scores otherwise pass.
 
 hard_failures is a list. rubric contains exactly these eight 0-10 numbers: feed_source_likeness, layout_geometry, spacing_proportions, typography_likeness, colour_likeness, image_slot_composition, editable_decomposition, native_story_translation. A passing candidate requires feed_source_likeness >= {THRESHOLD}, mean >= {THRESHOLD}, every field{'' if final else ' and every macro field'} >= {MIN_RUBRIC_SCORE}, no critical-region blocker, no regression, no hard failure, and no required change.
 
@@ -2125,6 +2487,7 @@ class SoleProcessOrchestrator:
         iteration_offsets = () if resume_final_check else range(MAX_ITERATIONS - total_iterations)
         for offset in iteration_offsets:
             index = total_iterations + offset + 1
+            source_invariants = _source_invariants_from_feedback(feedback)
             iteration_prior = working_candidate
             iteration_workspace = self.workspace / "iterations" / f"{index:02d}"
             self._check_stop()
@@ -2194,7 +2557,9 @@ class SoleProcessOrchestrator:
                 self._check_stop()
                 try:
                     candidate = normalize_asset_declarations(candidate)
-                    validate_builder_candidate(candidate)
+                    validate_builder_candidate(
+                        candidate, source_invariants=source_invariants,
+                    )
                 except AdTemplateProcessError as exc:
                     validation_feedback = str(exc)
                     renderer_feedback = ""
@@ -2584,7 +2949,9 @@ class SoleProcessOrchestrator:
                     retry_suffix = (
                         "\n\nYour previous final-review response was rejected by the strict evidence schema: "
                         f"{rejection}. Return the complete corrected JSON object with exactly reason, differences, "
-                        "visible_strings, hard_failures, and the eight-field rubric. Do not return required_changes. Do not lower "
+                        "visible_strings, semantic_glyph_inventory, hard_failures, and the eight-field rubric. "
+                        "semantic_glyph_inventory must cover phone, mail, web, location, and CTA from actual pixels. "
+                        "Do not return required_changes. Do not lower "
                         "scores to avoid the schema. Return only the corrected JSON object."
                     )
                 attempt_identity = identity if output_attempt == 0 else f"{identity}-retry-{output_attempt}"
@@ -2662,6 +3029,7 @@ class SoleProcessOrchestrator:
                     "rubric": item["rubric"],
                     "hard_failures": item["hard_failures"],
                     "differences": item["differences"],
+                    "semantic_glyph_inventory": item["semantic_glyph_inventory"],
                     "required_changes": item["required_changes"],
                     "reason": item["reason"],
                 }
