@@ -1,9 +1,9 @@
 import base64
 import json
-import os
 import shlex
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 import pytest
 from PIL import Image
 import gateway.ad_template_process as process
@@ -1037,10 +1037,31 @@ def test_hierarchical_comparator_rejects_macro_weakness_despite_passing_micro_me
 def test_orchestrator_calls_real_roles_and_persists_receipts(tmp_path, monkeypatch):
     source = tmp_path / "source.png"
     source.write_bytes(b"source")
-    renderer_command = os.environ.get("AD_TEMPLATE_GENERATOR_CMD") or (
-        f"/usr/bin/node {shlex.quote(str(Path('/projects/only-process-blockwise/packages/ad-template-renderer/dist/cli.js')))}"
+    # Exercise the real Hermes renderer-CLI boundary without coupling this
+    # repository's platform-neutral test to a Blockwise checkout at a fixed
+    # Linux path.  The renderer itself is covered in Blockwise; here the fake
+    # process writes its public receipt contract and real native PNGs.
+    monkeypatch.setenv(
+        "AD_TEMPLATE_GENERATOR_CMD",
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(tmp_path / 'renderer-stub.py'))}",
     )
-    monkeypatch.setenv("AD_TEMPLATE_GENERATOR_CMD", renderer_command)
+
+    def renderer_process(argv, **_kwargs):
+        out_dir = Path(argv[argv.index("--out-dir") + 1])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        outputs = {}
+        for placement, dimensions in (("feed", (1080, 1350)), ("story", (1080, 1920))):
+            path = out_dir / f"{placement}.png"
+            Image.new("RGB", dimensions, "white").save(path, format="PNG")
+            outputs[placement] = {
+                "path": str(path), "width": dimensions[0], "height": dimensions[1],
+            }
+        (out_dir / "receipt.json").write_text(
+            json.dumps({"outputs": outputs}), encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(process.subprocess, "run", renderer_process)
     monkeypatch.setattr(process, "import_template", lambda output, run_id, project_id: {"template_id": "tpl_real", "status": "imported"})
     calls = []
     events = []

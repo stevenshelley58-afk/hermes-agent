@@ -1473,10 +1473,12 @@ def generator_prompt(*, run_id: str, project_id: str, brief: str, placements: An
     if prior_json and not rejected_json and not validation_feedback:
         return f"""Revise the attached-source Blockwise template in place. Return JSON only with exactly {{"template":{{...}},"assets":[]}}. The prior candidate below is the exact editable contract: preserve every correct layer, input, placeholder, asset, font, metadata field, and cross-reference; apply every required change in the compact review evidence; never replace the template with a redesign.
 
-PRIOR VALID CANDIDATE: {prior_json}
+PRIOR VALID CANDIDATE TO REVISE IN PLACE: {prior_json}
 REVIEW EVIDENCE: {feedback_text}
 
 Reinspect the attached source pixels for every requested correction. Keep Feed faithful to the source geometry and information structure. Story must be an intentional 1080x1920 recomposition, not the Feed canvas scaled, contained, or rearranged with the same horizontal split and two-column topology. Reflow at least one major Feed side-by-side group into a vertical 9:16 hierarchy; for a listing like 006 use a full-width hero, the price/brand card below it, then stacked facts and readable contact. UI-unsafe Story bands y=0..239 and y=1620..1919 may contain backgrounds, frames, decoration, or nonessential full-bleed media, but essential text/logo/icon/CTA stays within x=72..1008 and y=240..1620.
+
+When a final reviewer returns a negative verdict with no explicit required_changes, treat its reason, differences, hard failures, and weakest rubric fields as required revision guidance.
 
 Never copy source identity, contact details, portraits, logos, URLs, or pixels. Keep their visual roles as neutral editable inputs. Do not duplicate facts or photographs. tracking remains absolute canvas pixels -4..4; lineHeight remains unitless 0.8..2.5. fontSize is at least 24 native canvas pixels in Feed and 32 in Story, including body and contact copy. Preserve the existing exact schema and use only these manifest-backed assets if a requested role must change:
 Every layout requires one full-canvas background plate. A plate is only a plain rectangular fill and cannot express corners or an outline. ring is circular-only and requires square geometry. Build a rounded rectangular border with nested inset rounded vectors (outer border colour, inner background colour); never use same-bounds stacked filled plates.

@@ -11,6 +11,8 @@ import gateway.tool_run_api as tool_run_api
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.tool_run_api import ToolRunAPIMixin
 from gateway.tool_runs import (
+    AD_TEMPLATE_OPTIONAL_ROUTE,
+    AD_TEMPLATE_ROUTE_ORDER,
     TOOL_RUN_COMMAND_SCHEMA,
     ToolRunStore,
     default_ad_template_policy,
@@ -490,15 +492,17 @@ class _ExplicitEventOrchestrator:
         self.emit = emit
 
     def run(self, *, routes, **_kwargs):
+        policy = default_ad_template_policy()
+        expected_stage_ids = [*AD_TEMPLATE_ROUTE_ORDER, AD_TEMPLATE_OPTIONAL_ROUTE]
         assert [
             (route["provider"], route["model"])
             for route in routes
         ] == [
-            ("openai-codex", "gpt-5.6-sol"),
-            ("openai-codex", "gpt-5.6-luna"),
-            ("openai-codex", "gpt-5.6-luna"),
-            ("openai-codex", "gpt-5.6-sol"),
-            ("openai-codex", "gpt-5.6-sol"),
+            (
+                policy["stages"][stage_id]["primary"]["provider"],
+                policy["stages"][stage_id]["primary"]["model"],
+            )
+            for stage_id in expected_stage_ids
         ]
         # A generic role activity preview happens before any orchestrator
         # lifecycle evidence. It must remain ordinary source-stage activity.
@@ -592,10 +596,14 @@ async def test_generic_terminal_preview_never_advances_or_emits_stage(tmp_path, 
     assert "thinking_callback" not in api.agent_kwargs[0]
     assert api.observed["api_max_retries"] == 1
     assert api.agent_kwargs[0]["route"] is None
-    assert api.preflighted == [
-        {"provider": "openai-codex", "model": "gpt-5.6-sol"},
-        {"provider": "openai-codex", "model": "gpt-5.6-luna"},
-    ]
+    policy = default_ad_template_policy()
+    expected_preflight = []
+    for stage_id in [*AD_TEMPLATE_ROUTE_ORDER, AD_TEMPLATE_OPTIONAL_ROUTE]:
+        candidate = policy["stages"][stage_id]["primary"]
+        route = {"provider": candidate["provider"], "model": candidate["model"]}
+        if route not in expected_preflight:
+            expected_preflight.append(route)
+    assert api.preflighted == expected_preflight
 
 
 @pytest.mark.asyncio
