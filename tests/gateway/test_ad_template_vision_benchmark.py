@@ -122,3 +122,58 @@ def test_comparator_assessment_requires_an_applicable_patch(monkeypatch):
     assert result["qualified"] is True
     assert result["patch_valid"] is True
     assert result["patch_operations"] == 1
+
+
+def test_catalog_json_schema_capability_reaches_benchmark_agent(monkeypatch):
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **_kwargs):
+            self.supports_responses_text_format = False
+            self.session_prompt_tokens = 1
+            self.session_completion_tokens = 1
+            self.session_total_tokens = 2
+            self.session_estimated_cost_usd = 0.0
+
+        def run_conversation(self, **_kwargs):
+            captured["enabled"] = self.supports_responses_text_format
+            return {"final_response": "{}"}
+
+    runtime_provider = types.ModuleType("hermes_cli.runtime_provider")
+    runtime_provider.resolve_runtime_provider = lambda **_kwargs: {
+        "base_url": "https://example.invalid/v1",
+        "api_key": "test",
+        "provider": "custom",
+        "api_mode": "codex_responses",
+        "credential_pool": None,
+    }
+    run_agent = types.ModuleType("run_agent")
+    run_agent.AIAgent = FakeAgent
+    tool_api = types.ModuleType("gateway.tool_run_api")
+    tool_api.ToolRunAPIMixin = types.SimpleNamespace(
+        _isolated_tool_role_prompt=lambda: "benchmark",
+        _tool_json_output=lambda value: value,
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", runtime_provider)
+    monkeypatch.setitem(sys.modules, "run_agent", run_agent)
+    monkeypatch.setitem(sys.modules, "gateway.tool_run_api", tool_api)
+    monkeypatch.setattr(
+        benchmark,
+        "_catalog_metadata",
+        lambda _model: {
+            "available": True,
+            "providers": {
+                "route": {
+                    "supports": {"text": {"format": {"json_schema": True}}}
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "assess_comparator_result",
+        lambda *_args, **_kwargs: {"qualified": False},
+    )
+
+    benchmark._run_model("concentrate", "qwen", {"message": [], "baseline": {}, "candidate": {}}, 100)
+    assert captured["enabled"] is True

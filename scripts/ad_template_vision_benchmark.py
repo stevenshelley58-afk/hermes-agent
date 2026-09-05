@@ -357,6 +357,17 @@ def _run_model(provider: str, model: str, case: Mapping[str, Any], max_tokens: i
             }
         )
         agent = AIAgent(**kwargs)
+        # The custom Responses transport keeps structured-output fields gated
+        # unless the selected model's live catalogue explicitly advertises
+        # JSON-schema text formatting.  Benchmark the same capability we will
+        # qualify instead of weakening the transport globally.
+        providers = catalog.get("providers") if isinstance(catalog, Mapping) else None
+        provider_details = providers.values() if isinstance(providers, Mapping) else ()
+        agent.supports_responses_text_format = any(
+            (((details.get("supports") or {}).get("text") or {}).get("format") or {}).get("json_schema") is True
+            for details in provider_details
+            if isinstance(details, Mapping)
+        )
         agent._persist_disabled = True
         agent._api_max_retries = 1
         agent._try_recover_primary_transport = lambda *_args, **_kwargs: False
