@@ -55,6 +55,7 @@ MAX_PATCH_REPLANS = 2
 MAX_PATCH_OPERATIONS = 64
 MAX_PATCH_BYTES = 32_000
 MAX_CONTRACT_REPAIRS = 6
+MAX_RENDERER_REASON_CHARS = 16_000
 REGRESSION_EPSILON = 0.05
 SOURCE_MAP_VERSION = 2
 QA_PROJECTION_VERSION = 3
@@ -827,7 +828,13 @@ def _renderer_reasons(stderr: str, stdout: str) -> list[str]:
     text = "\n".join(part for part in (stderr, stdout) if part).strip()
     if not text:
         return []
-    return [line.strip()[:500] for line in text.splitlines() if line.strip()][-20:]
+    # The Blockwise text preflight reports every violation in one JSON line.
+    # Truncating that line made the repair role see only the first field and
+    # waste one bounded repair per successive field.
+    return [
+        line.strip()[:MAX_RENDERER_REASON_CHARS]
+        for line in text.splitlines() if line.strip()
+    ][-20:]
 
 
 def build_ephemeral_qa_candidate(

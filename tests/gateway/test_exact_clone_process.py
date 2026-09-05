@@ -449,6 +449,21 @@ def test_near_complete_candidate_with_missing_layer_types_is_preserved_for_bound
     assert process.MAX_CONTRACT_REPAIRS == 6
 
 
+def test_renderer_reason_keeps_complete_batched_preflight_violations():
+    violations = ",".join(
+        f'{{"placement":"feed","layerId":"f-layer-{index}","kind":"cannot_fit_readability_floor"}}'
+        for index in range(20)
+    )
+    line = f'AD_TEMPLATE_TEXT_PREFLIGHT_FAILED {{"violations":[{violations}]}}'
+
+    reasons = process._renderer_reasons(line, "")
+
+    assert len(line) > 500
+    assert len(reasons) == 1
+    assert "f-layer-0" in reasons[0]
+    assert "f-layer-19" in reasons[0]
+
+
 def test_best_candidate_can_be_recovered_without_ephemeral_qa_inputs(tmp_path):
     template = _template()
     template["imageInputs"].append({
