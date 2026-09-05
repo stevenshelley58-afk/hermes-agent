@@ -2732,7 +2732,7 @@ class APIServerAdapter(BasePlatformAdapter):
     @staticmethod
     def _normalize_session_source(value: Any) -> str:
         text = str(value or "").strip().lower()
-        allowed = {"api_server", "hermes_browser", "browser", "cli", "telegram", "discord", "slack", "desktop", "dashboard"}
+        allowed = {"api_server", "hermes_browser", "browser", "cli", "telegram", "discord", "slack", "desktop", "dashboard", "mini_app"}
         if text in allowed:
             return "hermes_browser" if text == "browser" else text
         return "api_server"
@@ -2820,6 +2820,7 @@ class APIServerAdapter(BasePlatformAdapter):
         confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[Dict[str, Any]] = None,
         room_execution_policy: Optional[Dict[str, Any]] = None,
+        mini_execution_policy: Optional[Dict[str, str]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3087,6 +3088,13 @@ class APIServerAdapter(BasePlatformAdapter):
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
         max_iterations = _current_max_iterations()
+        mini_agent_kwargs: Dict[str, Any] = {}
+        if mini_execution_policy is not None:
+            from gateway.mini_execution_policy import agent_overrides as _mini_agent_overrides
+
+            mini_agent_kwargs = _mini_agent_overrides(mini_execution_policy)
+            enabled_toolsets = mini_agent_kwargs.pop("enabled_toolsets")
+            max_iterations = mini_agent_kwargs.pop("max_iterations", max_iterations)
         if room_dispatch is not None:
             from gateway.hosted_room_execution_policy import RoomExecutionPolicy
 
@@ -3135,6 +3143,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
+            **mini_agent_kwargs,
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
@@ -4336,6 +4345,20 @@ class APIServerAdapter(BasePlatformAdapter):
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
         source = self._normalize_session_source(body.get("source") or "api_server")
+        from gateway.mini_execution_policy import (
+            MiniExecutionPolicyError,
+            POLICY_MODEL_CONFIG_KEY,
+            policy_ack,
+            policy_from_create_body,
+        )
+        try:
+            mini_execution_policy = policy_from_create_body(
+                body, session_id=session_id, source=source
+            )
+        except MiniExecutionPolicyError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_execution_policy"), status=400
+            )
         runtime_request = self._session_runtime_request_from_body(body)
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
@@ -4365,6 +4388,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "updated_at": time.time(),
                 }
             }
+        if mini_execution_policy is not None:
+            model_config = dict(model_config or {})
+            model_config[POLICY_MODEL_CONFIG_KEY] = mini_execution_policy
         title = body.get("title")
 
         # Run the entire check-insert-title sequence inside a single
@@ -4423,7 +4449,13 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(f"Session already exists: {session_id}", code="session_exists"), status=409)
         if err and err.startswith("title:"):
             return web.json_response(_openai_error(err[len("title:"):], code="invalid_title"), status=400)
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)}, status=201)
+        response_body = {
+            "object": "hermes.session",
+            "session": self._session_response(session),
+        }
+        if mini_execution_policy is not None:
+            response_body["execution_policy_ack"] = policy_ack(mini_execution_policy)
+        return web.json_response(response_body, status=201)
 
     async def _handle_get_session(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions/{session_id}."""
@@ -4614,6 +4646,31 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
+        from gateway.mini_execution_policy import (
+            MiniExecutionPolicyError,
+            policy_from_session,
+            reject_turn_policy_fields,
+        )
+        try:
+            reject_turn_policy_fields(body)
+        except MiniExecutionPolicyError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_execution_policy"), status=400
+            )
+        try:
+            mini_execution_policy = policy_from_session(session)
+        except MiniExecutionPolicyError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="execution_policy_unavailable"), status=409
+            )
+        if mini_execution_policy is not None and gateway_session_key:
+            return web.json_response(
+                _openai_error(
+                    "Mini sessions do not accept external memory scopes",
+                    code="invalid_execution_policy",
+                ),
+                status=400,
+            )
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
@@ -4683,6 +4740,7 @@ class APIServerAdapter(BasePlatformAdapter):
             requested_runtime=runtime_request.get("requested") or {},
             route_source=runtime_request.get("route_source") or "global",
             confirmed_runtime_lock=lock_active,
+            mini_execution_policy=mini_execution_policy,
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
@@ -4731,6 +4789,31 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
+        from gateway.mini_execution_policy import (
+            MiniExecutionPolicyError,
+            policy_from_session,
+            reject_turn_policy_fields,
+        )
+        try:
+            reject_turn_policy_fields(body)
+        except MiniExecutionPolicyError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_execution_policy"), status=400
+            )
+        try:
+            mini_execution_policy = policy_from_session(session)
+        except MiniExecutionPolicyError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="execution_policy_unavailable"), status=409
+            )
+        if mini_execution_policy is not None and gateway_session_key:
+            return web.json_response(
+                _openai_error(
+                    "Mini sessions do not accept external memory scopes",
+                    code="invalid_execution_policy",
+                ),
+                status=400,
+            )
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
@@ -4856,6 +4939,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     requested_runtime=runtime_request.get("requested") or {},
                     route_source=runtime_request.get("route_source") or "global",
                     confirmed_runtime_lock=lock_active,
+                    mini_execution_policy=mini_execution_policy,
                     **agent_overrides,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -7265,6 +7349,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        mini_execution_policy: Optional[Dict[str, str]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7320,8 +7405,17 @@ class APIServerAdapter(BasePlatformAdapter):
                         request_browser_control_transport_family
                     ),
                 )
+                execution_context = None
+                execution_scope_entered = False
                 agent = None
                 try:
+                    from gateway.mini_execution_policy import execution_scope
+
+                    execution_context = execution_scope(
+                        mini_execution_policy, session_id or ""
+                    )
+                    execution_context.__enter__()
+                    execution_scope_entered = True
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
@@ -7336,6 +7430,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        mini_execution_policy=mini_execution_policy,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
@@ -7491,7 +7586,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         # shutdown.  pop() is a no-op when _create_agent
                         # succeeded but the turn never reached registration.
                         self._shutdown_interruptible_agents.pop(id(agent), None)
-                    clear_session_vars(tokens)
+                    try:
+                        clear_session_vars(tokens)
+                    finally:
+                        if execution_scope_entered and execution_context is not None:
+                            execution_context.__exit__(*sys.exc_info())
 
         self._activate_admitted_request()
         self._inflight_agent_runs += 1

@@ -180,6 +180,7 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
             _env_lock,
             _get_env_config,
             _resolve_container_task_id,
+            resolve_task_overrides,
         )
 
         try:
@@ -206,7 +207,13 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
             if isinstance(stamped, str) and stamped:
                 return stamped
         cfg = _get_env_config()
-        return str(cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local").lower()
+        overrides = resolve_task_overrides(task_id)
+        return str(
+            overrides.get("env_type")
+            or cfg.get("env_type")
+            or os.getenv("TERMINAL_ENV")
+            or "local"
+        ).lower()
     except Exception:
         return str(os.getenv("TERMINAL_ENV") or "local").lower()
 
@@ -1478,8 +1485,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             from tools.terminal_tool import resolve_task_overrides
 
             config = _get_env_config()
-            env_type = config["env_type"]
             overrides = resolve_task_overrides(raw_task_id)
+            env_type = overrides.get("env_type") or config["env_type"]
 
             if env_type == "docker":
                 image = overrides.get("docker_image") or config["docker_image"]
@@ -1521,21 +1528,13 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
-            from tools.terminal_tool import _is_container_backend as _is_container
+            from tools.terminal_tool import (
+                _container_config_from_config,
+                _is_container_backend as _is_container,
+            )
 
             if _is_container(env_type):
-                container_config = {
-                    "container_cpu": config.get("container_cpu", 1),
-                    "container_memory": config.get("container_memory", 5120),
-                    "container_disk": config.get("container_disk", 51200),
-                    "container_persistent": config.get("container_persistent", True),
-                    "vercel_runtime": config.get("vercel_runtime", ""),
-                    "docker_volumes": config.get("docker_volumes", []),
-                    "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
-                    "docker_forward_env": config.get("docker_forward_env", []),
-                    "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                    "docker_network": config.get("docker_network", True),
-                }
+                container_config = _container_config_from_config(config, raw_task_id)
 
             ssh_config = None
             if env_type == "ssh":
