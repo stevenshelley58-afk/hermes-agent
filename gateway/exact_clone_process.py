@@ -53,6 +53,7 @@ MAX_FINAL_REVIEW_ROUNDS = 2
 MAX_OUTPUT_RETRIES = 1
 MAX_PATCH_OPERATIONS = 64
 MAX_PATCH_BYTES = 32_000
+MAX_CONTRACT_REPAIRS = 2
 STAGES = (
     "source",
     "aspect-reference",
@@ -115,7 +116,7 @@ def _safe_json(value: Any, *, max_bytes: int = 200_000) -> str:
     return encoded
 
 
-def _candidate_envelope(value: Any) -> Dict[str, Any]:
+def _candidate_structure(value: Any) -> Dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {"template", "assets"}:
         raise AdTemplateProcessError("builder must return exactly template and assets")
     template = value.get("template")
@@ -164,6 +165,42 @@ def _candidate_envelope(value: Any) -> Dict[str, Any]:
         raise AdTemplateProcessError("builder must not return asset bytes")
     _safe_json(value)
     return copy.deepcopy(value)
+
+
+def _candidate_envelope(value: Any) -> Dict[str, Any]:
+    candidate = _candidate_structure(value)
+    violations: list[str] = []
+    allowed_types = {"plate", "image_slot", "overlay_patch", "text", "logo", "vector", "icon"}
+    for placement, field, canvas_height in (
+        ("feed", "feedLayout", 1350),
+        ("story", "storyLayout", 1920),
+    ):
+        layers = candidate["template"][field]["layers"]
+        if not layers:
+            violations.append(f"{field}.layers must not be empty")
+            continue
+        for index, layer in enumerate(layers):
+            if not isinstance(layer, dict) or layer.get("type") not in allowed_types:
+                violations.append(
+                    f"/template/{field}/layers/{index}/type must be one of "
+                    + ", ".join(sorted(allowed_types))
+                )
+        first = layers[0] if isinstance(layers[0], dict) else {}
+        geometry = first.get("geometry") if isinstance(first.get("geometry"), dict) else {}
+        try:
+            values = tuple(float(geometry[key]) for key in ("x", "y", "width", "height"))
+        except (KeyError, TypeError, ValueError):
+            values = ()
+        normalized = bool(values) and all(abs(value) <= 1.001 for value in values)
+        expected = (0.0, 0.0, 1.0, 1.0) if normalized else (0.0, 0.0, 1080.0, float(canvas_height))
+        if first.get("type") != "plate" or first.get("protected") is not True or values != expected:
+            violations.append(
+                f"{placement} first layer must be type plate, protected true, and full-canvas "
+                f"geometry 0,0,1080,{canvas_height} (or normalized 0,0,1,1)"
+            )
+    if violations:
+        raise AdTemplateRendererRejection(violations)
+    return candidate
 
 
 def _source_placement(path: str) -> tuple[str, str, Dict[str, int]]:
@@ -512,6 +549,13 @@ CORRECTIONS: {_safe_json(list(issues), max_bytes=80_000)}
 MANUAL REVIEW INSTRUCTIONS: {manual_instructions[:4000]}"""
 
 
+def contract_repair_prompt(*, candidate: Mapping[str, Any], reasons: Sequence[str]) -> str:
+    return f"""Repair only the listed Blockwise contract/renderer validation failures in this otherwise complete exact-clone candidate. Preserve its visual design, geometry, inputs, neutral assets, copy and metadata except where a listed failure requires a direct correction. Return a bounded JSON patch only: {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}}. Use JSON Pointer paths. Address every listed failure in this one patch. Do not return a full template and do not make creative changes. Maximum {MAX_PATCH_OPERATIONS} operations. Return JSON only.
+
+CURRENT CANDIDATE: {_safe_json(candidate)}
+BLOCKWISE CONTRACT/RENDERER FAILURES: {_safe_json(list(reasons), max_bytes=40_000)}"""
+
+
 def _decode_pointer_token(token: str) -> str:
     if re.search(r"~(?![01])", token):
         raise AdTemplateProcessError("patch path contains an invalid JSON Pointer escape")
@@ -545,7 +589,7 @@ def validate_patch(value: Any) -> Dict[str, Any]:
     return {"operations": normalized}
 
 
-def apply_patch(candidate: Mapping[str, Any], value: Any) -> Dict[str, Any]:
+def apply_patch(candidate: Mapping[str, Any], value: Any, *, strict: bool = True) -> Dict[str, Any]:
     patch = validate_patch(value)
     result = copy.deepcopy(dict(candidate))
     before = _safe_json(result)
@@ -606,7 +650,7 @@ def apply_patch(candidate: Mapping[str, Any], value: Any) -> Dict[str, Any]:
         "declarations": result.get("assets"),
     } != immutable:
         raise AdTemplateProcessError("revision patch changed immutable template identity or assets")
-    return _candidate_envelope(result)
+    return _candidate_envelope(result) if strict else _candidate_structure(result)
 
 
 def _renderer_reasons(stderr: str, stdout: str) -> list[str]:
@@ -918,7 +962,9 @@ def _checkpoint_candidate(checkpoint: Dict[str, Any]) -> Dict[str, Any] | None:
     if not candidate:
         return None
     try:
-        return _candidate_envelope(candidate)
+        # Preserve a direct-contract candidate that only needs a bounded
+        # renderer/schema patch. Old envelopes are discarded and rebuilt.
+        return _candidate_structure(candidate)
     except AdTemplateProcessError:
         # Old/incomplete model envelopes are not valid current candidates.
         # Preserve expensive deterministic/reference work, but force the
@@ -1379,18 +1425,63 @@ class ExactCloneOrchestrator:
         while cycle_comparisons < MAX_COMPARISONS:
             self._check_stop()
             global_iteration += 1
-            cycle_comparisons += 1
             iteration_root = self.workspace / "iterations" / f"{global_iteration:02d}"
-            self.emit("iteration.started", "build", {"iteration": global_iteration, "cycle_iteration": cycle_comparisons})
-            qa_candidate, qa_asset_overrides = build_ephemeral_qa_candidate(
-                candidate, source=source, reciprocal_reference=reciprocal_reference,
-                source_placement=source_placement, source_map=source_map,
-                target_map=target_map, workspace=iteration_root,
-            )
-            rendered = _copy_public_previews(
-                run_renderer(qa_candidate, iteration_root, asset_overrides=qa_asset_overrides),
-                self.workspace, global_iteration,
-            )
+            self.emit("iteration.started", "build", {"iteration": global_iteration, "cycle_iteration": cycle_comparisons + 1})
+            contract_repairs = 0
+            while True:
+                try:
+                    qa_candidate, qa_asset_overrides = build_ephemeral_qa_candidate(
+                        candidate, source=source, reciprocal_reference=reciprocal_reference,
+                        source_placement=source_placement, source_map=source_map,
+                        target_map=target_map, workspace=iteration_root,
+                    )
+                    rendered = _copy_public_previews(
+                        run_renderer(qa_candidate, iteration_root, asset_overrides=qa_asset_overrides),
+                        self.workspace, global_iteration,
+                    )
+                    break
+                except AdTemplateRendererRejection as rejection:
+                    if contract_repairs >= MAX_CONTRACT_REPAIRS:
+                        raise AdTemplateProcessError(
+                            f"Blockwise contract remained invalid after {MAX_CONTRACT_REPAIRS} bounded repairs: {rejection}"
+                        ) from rejection
+                    contract_repairs += 1
+                    reasons = list(rejection.reasons)
+                    self.emit("candidate.contract-rejected", "build", {
+                        "iteration": global_iteration,
+                        "repair": contract_repairs,
+                        "reasons": reasons,
+                    })
+                    repair_route = builder_route if contract_repairs == 1 else escalation_route
+                    repair = _call_json(
+                        self.call_agent,
+                        instance=f"contract-repair-{global_iteration}-{contract_repairs}",
+                        prompt=contract_repair_prompt(candidate=candidate, reasons=reasons),
+                        paths=[source, reciprocal_reference],
+                        route=repair_route,
+                        validate=validate_patch,
+                        emit=self.emit,
+                    )
+                    candidate = apply_patch(candidate, repair, strict=False)
+                    self.emit("candidate.patch-applied", "build", {
+                        "iteration": global_iteration,
+                        "source": "blockwise-contract",
+                        "repair": contract_repairs,
+                        "operations": len(repair["operations"]),
+                    })
+                    persist_checkpoint(self.workspace, {
+                        "reference": reference,
+                        "sourceMap": source_map,
+                        "targetReferenceMap": target_map,
+                        "reciprocalReference": reciprocal_reference,
+                        "sourcePlacement": source_placement,
+                        "targetPlacement": target_placement,
+                        "candidate": candidate,
+                        "iterations": iterations,
+                        "cycleComparisons": cycle_comparisons,
+                        "accepted": False,
+                    })
+            cycle_comparisons += 1
             comparison_views = _comparison_views(source, reciprocal_reference, rendered, self.workspace, global_iteration, source_placement, target_placement)
             metrics = _comparison_metrics(
                 source=source, reciprocal_reference=reciprocal_reference,

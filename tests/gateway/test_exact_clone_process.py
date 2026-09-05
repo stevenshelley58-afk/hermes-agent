@@ -15,6 +15,10 @@ def _template() -> dict:
         return {
             "placement": placement,
             "layers": [{
+                "type": "plate", "layerId": f"{placement}-plate",
+                "colourRole": "background", "protected": True,
+                "geometry": {"x": 0, "y": 0, "width": 1080, "height": height},
+            }, {
                 "type": "image_slot", "layerId": f"{placement}-hero",
                 "inputKey": "hero", "geometry": {"x": 0, "y": 0, "width": 1080, "height": height},
             }],
@@ -79,6 +83,8 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     imported: dict = {}
     comparison_count = 0
     patch_count = 0
+    contract_repair_count = 0
+    renderer_rejected = False
 
     real_source_map = process.build_source_map
 
@@ -96,7 +102,7 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
         return str(target)
 
     def call_agent(instance, prompt, route):
-        nonlocal comparison_count, patch_count
+        nonlocal comparison_count, patch_count, contract_repair_count
         agent_calls.append((instance, route))
         if instance.startswith("aspect-reference"):
             return {
@@ -112,6 +118,12 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
             }
         if instance == "builder-initial":
             return {"template": _template(), "assets": []}
+        if instance.startswith("contract-repair-"):
+            contract_repair_count += 1
+            return {"operations": [{
+                "op": "replace", "path": "/template/metadata/description",
+                "value": "contract-repaired",
+            }]}
         if instance.startswith("patch-"):
             patch_count += 1
             return {"operations": [{
@@ -126,6 +138,10 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
         raise AssertionError(instance)
 
     def render(candidate, workspace, *, asset_overrides=None):
+        nonlocal renderer_rejected
+        if not renderer_rejected:
+            renderer_rejected = True
+            raise process.AdTemplateRendererRejection(["synthetic strict schema failure"])
         rendered_candidates.append(copy.deepcopy(candidate))
         workspace.mkdir(parents=True, exist_ok=True)
         artifact = workspace / "artifact.json"
@@ -177,6 +193,7 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     assert len(image_calls) == 1
     assert comparison_count == process.MAX_COMPARISONS == 6
     assert patch_count == 5
+    assert contract_repair_count == 1
     patch_routes = [route for instance, route in agent_calls if instance.startswith("patch-")]
     assert patch_routes[:3] == ["openai-codex/builder"] * 3
     assert patch_routes[3:] == ["openai-codex/escalation"] * 2
@@ -242,6 +259,20 @@ def test_invalid_legacy_candidate_is_removed_without_losing_reference_checkpoint
     assert checkpoint["reference"] == {"regions": [{"regionId": "hero"}]}
     assert checkpoint["sourceMap"]["canvas"]["height"] == 1350
     assert checkpoint["reciprocalReference"] == "/run/story-reference.png"
+
+
+def test_near_complete_candidate_with_missing_layer_types_is_preserved_for_bounded_repair():
+    candidate = {"template": _template(), "assets": []}
+    del candidate["template"]["feedLayout"]["layers"][0]["type"]
+    del candidate["template"]["storyLayout"]["layers"][0]["type"]
+    checkpoint = {"candidate": candidate, "iterations": [], "cycleComparisons": 0}
+
+    assert process._checkpoint_candidate(checkpoint) == candidate
+    with pytest.raises(process.AdTemplateRendererRejection) as rejected:
+        process._candidate_envelope(candidate)
+    message = str(rejected.value)
+    assert "/template/feedLayout/layers/0/type" in message
+    assert "/template/storyLayout/layers/0/type" in message
 
 
 def test_review_url_is_derived_from_exact_import_route(monkeypatch):
