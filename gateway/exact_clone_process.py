@@ -55,6 +55,7 @@ MAX_PATCH_OPERATIONS = 64
 MAX_PATCH_BYTES = 32_000
 MAX_CONTRACT_REPAIRS = 6
 REGRESSION_EPSILON = 0.05
+QA_PROJECTION_VERSION = 2
 STAGES = (
     "source",
     "aspect-reference",
@@ -389,6 +390,40 @@ def deterministic_pixel_metrics(reference_path: str, candidate_path: str) -> Dic
     }
 
 
+def _reconstruct_ocr_text(words: Sequence[Mapping[str, Any]]) -> str:
+    """Preserve visual lines instead of interleaving OCR words by raw y."""
+    normalized = []
+    for word in words:
+        try:
+            x = float(word.get("x", 0))
+            y = float(word.get("y", 0))
+            height = max(1.0, float(word.get("height", 0)))
+        except (TypeError, ValueError):
+            continue
+        text = str(word.get("text") or "").strip()
+        if text:
+            normalized.append({"x": x, "y": y, "height": height, "center": y + height / 2, "text": text})
+    lines: list[dict[str, Any]] = []
+    for word in sorted(normalized, key=lambda item: (item["center"], item["x"])):
+        matches = [
+            line for line in lines
+            if abs(word["center"] - line["center"]) <= 0.6 * max(word["height"], line["height"])
+        ]
+        if matches:
+            line = min(matches, key=lambda item: abs(word["center"] - item["center"]))
+            line["words"].append(word)
+            count = len(line["words"])
+            line["center"] = ((line["center"] * (count - 1)) + word["center"]) / count
+            line["height"] = max(line["height"], word["height"])
+        else:
+            lines.append({"center": word["center"], "height": word["height"], "words": [word]})
+    output = []
+    for line in sorted(lines, key=lambda item: item["center"]):
+        text = " ".join(word["text"] for word in sorted(line["words"], key=lambda item: item["x"]))
+        output.append(re.sub(r"\s+([,.;:!?])", r"\1", text))
+    return "\n".join(output)
+
+
 def _validate_aspect_reference(
     value: Any, *, source_placement: str, target_placement: str, canvas: Mapping[str, int],
 ) -> Dict[str, Any]:
@@ -475,6 +510,16 @@ def _validate_issue(value: Any) -> Dict[str, Any]:
     instruction = value.get("instruction")
     if not isinstance(instruction, str) or not instruction.strip() or len(instruction) > 1200:
         raise AdTemplateProcessError("review issue instruction is invalid")
+    target_field = re.search(
+        r"\b(?:x|y|width|height|font|fontSize|fontFamily|fontWeight|lineHeight|tracking|colour|color|crop)\b",
+        instruction,
+        flags=re.IGNORECASE,
+    )
+    target_value = re.search(r"(?:#[0-9a-f]{3,8}\b|[-+]?\d+(?:\.\d+)?(?:px|%)?|/fonts/\S+)", instruction, flags=re.IGNORECASE)
+    if not target_field or not target_value:
+        raise AdTemplateProcessError(
+            "review issue instruction requires a concrete field and numeric, colour, crop or font target"
+        )
     if value.get("severity") not in {"blocker", "material", "minor"}:
         raise AdTemplateProcessError("review issue severity is invalid")
     return copy.deepcopy(value)
@@ -535,7 +580,7 @@ def review_prompt(*, final: bool, candidate: Mapping[str, Any], reference: Mappi
     role = "independent final reviewer" if final else "iteration comparator"
     return f"""You are one {role} for an exact-clone template. Attached images are ordered: source, reciprocal reference, source-filled Feed QA render, source-filled Story QA render, then overlay/difference/edge/Meta-shell views. Judge reconstruction fidelity only; do not reward creative improvement. The source-filled QA renders replace neutral reusable media and placeholder copy only inside the run workspace so pixel overlays measure the authored geometry, typography and effects. Feed must be as close to pixel-for-pixel as editable reconstruction permits. Story must preserve the same source design while following the reciprocal aspect reference. Missing shading, gradients, shadows, transparency, borders, masks, texture or decorative details are material defects.
 
-Return JSON only with exactly decision, scores, issues, warnings, effects, fontSubstitution. scores must contain exactly, in this order: overall, geometry, typography, colourEffects, imageCrop, details. effects must contain exactly, in this order: shading, gradients, shadows, transparency, borders, masks, texture; each is match, not_present, or mismatch. issues is a list of objects with exactly placement (feed|story|both), layerIds (real candidate layer IDs), category (geometry|typography|colourEffects|imageCrop|details), instruction, severity (blocker|material|minor). Every visible discrepancy is an issue; acceptance requires issues=[] and every effect matched or genuinely absent. decision is accept only when overall and every non-typography field are >=9.8; typography is also >=9.8 unless an unavailable-font substitution is explicitly recorded, in which case typography must be >=9.5. An obvious defect blocks acceptance regardless of average. fontSubstitution is null or exactly {{source,used,reason}}. Return no patch and no prose.
+Return JSON only with exactly decision, scores, issues, warnings, effects, fontSubstitution. scores must contain exactly, in this order: overall, geometry, typography, colourEffects, imageCrop, details. effects must contain exactly, in this order: shading, gradients, shadows, transparency, borders, masks, texture; each is match, not_present, or mismatch. issues is a list of objects with exactly placement (feed|story|both), layerIds (real candidate layer IDs), category (geometry|typography|colourEffects|imageCrop|details), instruction, severity (blocker|material|minor). Every issue instruction must be directly patchable: name at least one exact target field (x, y, width, height, font/fontSize/fontFamily/fontWeight, lineHeight, tracking, colour, or crop) and give its measured numeric/hex/font-file target or delta from the attached overlay. Vague phrases such as "match the source", "align", or "fix spacing" without target values are invalid. Every visible discrepancy is an issue; acceptance requires issues=[] and every effect matched or genuinely absent. decision is evidence only; the controller derives accept/revise from scores, issues, effects and the font rule. An obvious defect blocks acceptance regardless of average. fontSubstitution is null or exactly {{source,used,reason}}. Return no patch and no prose.
 
 RECIPROCAL ASPECT REFERENCE: {_safe_json(reference)}
 DETERMINISTIC PIXEL/EDGE/COLOUR DIAGNOSTICS: {_safe_json(metrics)}. These are measured from the source-filled QA renders; vision remains the fidelity judge.
@@ -723,7 +768,7 @@ def build_ephemeral_qa_candidate(
                 qa["assets"].append({"assetKey": asset_key, "fileName": file_name, "mimeType": "image/png"})
                 override_bytes[asset_key] = buffer.getvalue()
             elif layer_type == "text" and input_key in original_text_inputs:
-                words = []
+                words: list[Mapping[str, Any]] = []
                 for word in placement_map.get("ocr", []) if isinstance(placement_map, Mapping) else []:
                     if not isinstance(word, Mapping):
                         continue
@@ -735,12 +780,12 @@ def build_ephemeral_qa_candidate(
                         float(geometry.get("x", -1)) <= scaled_x <= float(geometry.get("x", -1)) + float(geometry.get("width", 0))
                         and float(geometry.get("y", -1)) <= scaled_y <= float(geometry.get("y", -1)) + float(geometry.get("height", 0))
                     ):
-                        words.append((float(word.get("y", 0)), float(word.get("x", 0)), str(word.get("text") or "")))
+                        words.append(word)
                 if words:
                     text_clone = copy.deepcopy(original_text_inputs[input_key])
                     qa_input_key = f"qa_{placement}_{index}_{input_key}"[:120]
                     text_clone["key"] = qa_input_key
-                    text_clone["placeholder"] = " ".join(item[2] for item in sorted(words))[: int(text_clone.get("maxLength") or 4000)]
+                    text_clone["placeholder"] = _reconstruct_ocr_text(words)[: int(text_clone.get("maxLength") or 4000)]
                     text_inputs.append(text_clone)
                     layer["inputKey"] = qa_input_key
     return _candidate_envelope(qa), override_bytes
@@ -1049,7 +1094,11 @@ def _neutral_candidate_from_iteration(workspace: Path, iteration: int) -> Dict[s
 
 
 def persist_checkpoint(workspace: Path, value: Mapping[str, Any]) -> None:
-    payload = {"process": PROCESS_ID, **copy.deepcopy(dict(value))}
+    payload = {
+        **copy.deepcopy(dict(value)),
+        "process": PROCESS_ID,
+        "qaProjectionVersion": QA_PROJECTION_VERSION,
+    }
     target = _checkpoint_path(workspace)
     temporary = target.with_suffix(".json.tmp")
     temporary.write_text(_safe_json(payload, max_bytes=2_000_000), encoding="utf-8")
@@ -1398,6 +1447,17 @@ class ExactCloneOrchestrator:
             raise AdTemplateProcessError("final reviewers must use independent routes")
         started = time.time()
         checkpoint = load_checkpoint(self.workspace)
+        if checkpoint and checkpoint.get("qaProjectionVersion") != QA_PROJECTION_VERSION:
+            previous_version = checkpoint.get("qaProjectionVersion")
+            checkpoint["cycleComparisons"] = 0
+            checkpoint["accepted"] = False
+            checkpoint.pop("finalReview", None)
+            persist_checkpoint(self.workspace, checkpoint)
+            self.emit("qa-projection.updated", "build", {
+                "from_version": previous_version,
+                "to_version": QA_PROJECTION_VERSION,
+                "preserved_iterations": len(checkpoint.get("iterations") or []),
+            })
         source_placement, target_placement, canvas = _source_placement(source)
 
         source_map = checkpoint.get("sourceMap")

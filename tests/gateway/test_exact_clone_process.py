@@ -45,7 +45,7 @@ def _review(*, accept: bool) -> dict:
         "placement": "feed",
         "layerIds": ["feed-title"],
         "category": "geometry",
-        "instruction": "Move the title two pixels right",
+        "instruction": "Set x to 102px (a +2px delta)",
         "severity": "material",
     }]
     return {
@@ -256,6 +256,27 @@ def test_visual_gate_derives_decision_from_evidence_not_model_label():
     regressed["scores"] = {key: 7.1 for key in regressed["scores"]}
     assert process._review_regressed(regressed, best)
     assert not process._review_regressed(best, best)
+
+    vague = _review(accept=False)
+    vague["issues"][0]["instruction"] = "Match the source alignment"
+    with pytest.raises(process.AdTemplateProcessError, match="concrete field"):
+        process.validate_review(vague)
+
+
+def test_ocr_reconstruction_preserves_lines_and_horizontal_word_order():
+    words = [
+        {"text": "move", "x": 60, "y": 31, "height": 10},
+        {"text": "Ready", "x": 10, "y": 10, "height": 12},
+        {"text": "home", "x": 50, "y": 9, "height": 12},
+        {"text": "to", "x": 10, "y": 30, "height": 11},
+        {"text": "in.", "x": 100, "y": 30, "height": 11},
+    ]
+    assert process._reconstruct_ocr_text(words) == "Ready home\nto move in."
+
+
+def test_checkpoint_always_advances_to_current_qa_projection(tmp_path):
+    process.persist_checkpoint(tmp_path, {"qaProjectionVersion": 1, "iterations": []})
+    assert process.load_checkpoint(tmp_path)["qaProjectionVersion"] == process.QA_PROJECTION_VERSION == 2
 
 
 def test_patch_application_error_is_fed_back_for_one_bounded_retry(tmp_path):
