@@ -273,6 +273,7 @@ def test_near_complete_candidate_with_missing_layer_types_is_preserved_for_bound
     message = str(rejected.value)
     assert "/template/feedLayout/layers/0/type" in message
     assert "/template/storyLayout/layers/0/type" in message
+    assert process.MAX_CONTRACT_REPAIRS == 6
 
 
 def test_review_url_is_derived_from_exact_import_route(monkeypatch):
