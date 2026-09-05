@@ -206,21 +206,21 @@ def test_ad_studio_profile_picker_changes_only_new_runs_and_persists_exact_snaps
     second, _ = store.create_run(second_command)
 
     assert first["model_policy_revision"] == 1
-    assert first["model_policy"]["stages"]["analyse"]["primary"]["model"] == "gpt-5.6-sol"
+    assert first["model_policy"]["stages"]["analyse"]["primary"]["model"] == "muse-spark-1.3-contributor"
     assert second["model_policy_revision"] == selected_record["revision"]
-    assert second["model_policy"]["stages"]["analyse"]["primary"]["model"] == "gpt-5.6-luna"
+    assert second["model_policy"]["stages"]["analyse"]["primary"]["model"] == "gemini-3.8-flash"
     assert store.get_run(first["run_id"])["model_policy"] == first["model_policy"]
 
     accepted = store.events(second["run_id"])[0]
     assert accepted["data"]["policy_revision"] == selected_record["revision"]
     assert accepted["data"]["model_profile"] == {
         "profile_revision": selected_record["revision"],
-        "aspect-reference": {"provider": "openai-codex", "model": "gpt-image-2-high"},
-        "builder": {"provider": "openai-codex", "model": "gpt-5.6-luna"},
-        "comparator": {"provider": "openai-codex", "model": "gpt-5.6-luna"},
-        "final-review-a": {"provider": "openai-codex", "model": "gpt-5.6-luna"},
-        "final-review-b": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
-        "fallback": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        "aspect-reference": {"provider": "meta-direct", "model": "muse-image-1.0"},
+        "builder": {"provider": "concentrate", "model": "gemini-3.8-flash"},
+        "comparator": {"provider": "concentrate", "model": "gemini-3.8-flash"},
+        "final-review-a": {"provider": "concentrate", "model": "gemini-3.8-flash"},
+        "final-review-b": {"provider": "meta-direct", "model": "muse-spark-1.3-contributor"},
+        "fallback": {"provider": "meta-direct", "model": "muse-spark-1.3-contributor"},
     }
     with pytest.raises(ToolRunError, match="immutable after submission"):
         store.replace_remaining_policy(first["run_id"], selected)
@@ -229,14 +229,14 @@ def test_ad_studio_profile_picker_changes_only_new_runs_and_persists_exact_snaps
 def test_builtin_policy_uses_only_audited_native_vision_roles():
     policy = default_ad_template_policy()
     expected = {
-        "aspect-reference-image": ("openai-codex", "gpt-image-2-high"),
-        "analyse": ("openai-codex", "gpt-5.6-sol"),
-        "compare": ("openai-codex", "gpt-5.6-luna"),
-        "final-review-a": ("openai-codex", "gpt-5.6-luna"),
-        "final-review-b": ("openai-codex", "gpt-5.6-sol"),
-        "quality-escalation": ("openai-codex", "gpt-5.6-sol"),
+        "aspect-reference-image": ("meta-direct", "muse-image-1.0"),
+        "analyse": ("meta-direct", "muse-spark-1.3-contributor"),
+        "compare": ("concentrate", "gemini-3.8-flash"),
+        "final-review-a": ("concentrate", "gemini-3.8-flash"),
+        "final-review-b": ("meta-direct", "muse-spark-1.3-contributor"),
+        "quality-escalation": ("meta-direct", "muse-spark-1.3-contributor"),
     }
-    assert policy["seed_revision"] == 13
+    assert policy["seed_revision"] == 14
     assert AD_TEMPLATE_ROUTE_ORDER == tuple(expected)[:-1]
     assert AD_TEMPLATE_OPTIONAL_ROUTE == "quality-escalation"
     for stage_id, route in expected.items():
@@ -247,8 +247,8 @@ def test_builtin_policy_uses_only_audited_native_vision_roles():
         assert candidate["supports_vision"] is True
         if stage_id == "aspect-reference-image":
             assert candidate["supports_tools"] is False
-            assert candidate["capabilities"] == ["masked_image_edit"]
-            assert stage["capability"] == "masked_image_edit"
+            assert candidate["capabilities"] == ["reference_image_edit"]
+            assert stage["capability"] == "reference_image_edit"
         else:
             assert candidate["supports_tools"] is True
             assert candidate["capabilities"] == ["vision_structured"]
@@ -306,7 +306,7 @@ def test_stale_sole_revisions_one_to_ten_are_preserved_and_revision_eleven_selec
     store = ToolRunStore(str(path))
     stale = default_ad_template_policy()
     stale["seed_revision"] = 10
-    stale["stages"]["analyse"]["primary"]["model"] = "gpt-5.6-luna"
+    stale["stages"]["analyse"]["primary"] = dict(stale["stages"]["compare"]["primary"])
     stale_json = json.dumps(stale, separators=(",", ":"), sort_keys=True)
     store._conn.execute(
         "UPDATE tool_model_policies SET is_default=0,policy_json=? WHERE tool_id=? AND revision=1",
@@ -337,17 +337,17 @@ def test_stale_sole_revisions_one_to_ten_are_preserved_and_revision_eleven_selec
     assert migrated.get_policy("ad-template-generator", 10)["policy"] == stale
     current = migrated.get_policy("ad-template-generator")
     assert current["revision"] == 11
-    assert current["policy"]["seed_revision"] == 13
+    assert current["policy"]["seed_revision"] == 14
     assert current["policy"]["stages"]["final-review-b"]["primary"] == {
-        "provider": "openai-codex",
-        "model": "gpt-5.6-sol",
+        "provider": "meta-direct",
+        "model": "muse-spark-1.3-contributor",
         "capability_verified": True,
         "capabilities": ["vision_structured"],
         "supports_vision": True,
         "supports_tools": True,
     }
-    assert current["policy"]["stages"]["analyse"]["primary"]["model"] == "gpt-5.6-sol"
-    assert current["policy"]["stages"]["quality-escalation"]["primary"]["model"] == "gpt-5.6-sol"
+    assert current["policy"]["stages"]["analyse"]["primary"]["model"] == "muse-spark-1.3-contributor"
+    assert current["policy"]["stages"]["quality-escalation"]["primary"]["model"] == "muse-spark-1.3-contributor"
     pinned, _ = migrated.create_run(command(
         request_id="req-stale",
         idempotency_key="stale-policy-pin",
@@ -386,9 +386,9 @@ def test_stale_builtin_project_default_is_superseded_without_touching_history(tm
     assert historical["policy"] == stale
     assert current["revision"] > stale_record["revision"]
     assert current["project_id"] == "blockwise"
-    assert current["policy"]["seed_revision"] == 13
-    assert current["policy"]["stages"]["final-review-b"]["primary"]["provider"] == "openai-codex"
-    assert current["policy"]["stages"]["final-review-b"]["primary"]["model"] == "gpt-5.6-sol"
+    assert current["policy"]["seed_revision"] == 14
+    assert current["policy"]["stages"]["final-review-b"]["primary"]["provider"] == "meta-direct"
+    assert current["policy"]["stages"]["final-review-b"]["primary"]["model"] == "muse-spark-1.3-contributor"
 
 
 
@@ -489,3 +489,11 @@ def test_model_capability_mismatch_is_rejected(tmp_path):
     custom["stages"]["masked-text-cleanup"]["primary"] = {"provider": "custom", "model": "unknown-image-model"}
     with pytest.raises(ToolRunError, match="has not verified"):
         store.create_policy("ad-template-generator", custom)
+
+
+def test_meta_direct_policy_uses_reference_edit_not_masked_edit():
+    policy = default_ad_template_policy()
+    stage = policy["stages"]["aspect-reference-image"]
+    assert stage["capability"] == "reference_image_edit"
+    assert stage["primary"]["provider"] == "meta-direct"
+    assert "masked_image_edit" not in stage["primary"]["capabilities"]
