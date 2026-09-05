@@ -5,6 +5,8 @@ selection is independent of the main chat model and does not use the gateway
 fallback chain. A route is usable only after it is present in the audited
 generator capability catalogue and passes the preflight resolver.
 
+The execution owner is Hermes: it performs source analysis, rendering, comparison, targeted patches, final checks, import and smoke testing. Frank's UI is the human control surface: only its Ready for Review approval permits Blockwise activation. The main chat model remains independent.
+
 Named provider entries belong in `~/.hermes/config.yaml`; secrets remain in
 `~/.hermes/.env`. For example, a Responses-compatible endpoint may be defined
 without placing its key in the configuration file:
@@ -28,6 +30,19 @@ Adding an entry does not make it selectable by the generator. A candidate must
 first pass a small real image plus strict structured-output qualification within
 the approved budget. Until then the audited policy and its defaults remain
 unchanged.
+
+## Current seed-14 process (5 September 2026)
+
+The source is durable before renderer preflight. Each run freezes independent routes:
+Contributor for analysis/build/repair, Gemini 3.8 Flash for comparison and final review A, Contributor for final review B, and Muse Image 1.0 for the reciprocal aspect reference and one generated example per eligible photo slot. The lifetime allowance is six comparisons (four normal plus two escalation); automatic retries do not reset it. A manual Frank revision may receive one new bounded allowance.
+
+The quality gate is 9.8 across the required likeness dimensions. Targeted JSON patches preserve the best candidate; OCR is source evidence only and never rewrites candidate text. No automatic geometry expansion is performed. Final reviewers inspect both source-filled comparisons and the actual neutral production render. The same run-local demo bytes are used by QA, the final production render and quarantined Blockwise import.
+
+A passing run stops at Ready for Review. It is not active in Blockwise until Frank approves it.
+
+## Pilot status
+
+Pilot trun_5ee434b975ac4f188ff0736694f98af7 is running; no pass or completion is claimed. Live Hermes revision is b2775efed9286dc9b7d6325108114a21e796b35a; renderer/Blockwise revision is d39771a94134c28081185bcf93a8d5e1947a39a4.
 
 ## Qualified low-cost profile (5 September 2026)
 
