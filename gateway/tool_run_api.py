@@ -797,9 +797,18 @@ class ToolRunAPIMixin:
 
         runtime = _resolve_request_runtime_agent_kwargs(provider, target_model=model)
         resolved_provider = str(runtime.get("provider") or "").strip()
-        if resolved_provider != provider:
+        # Named entries under ``providers:`` intentionally resolve through
+        # Hermes' generic ``custom`` transport. The frozen route must retain
+        # the configured entry identity in that case: accepting merely any
+        # ``custom`` runtime here would let an unrelated custom endpoint run a
+        # durable generator role. ``requested_provider`` is set only by the
+        # same resolver that selected the configured entry.
+        resolved_request = str(runtime.get("requested_provider") or "").strip()
+        if resolved_provider != provider and resolved_request != provider:
             raise RuntimeError(
-                f"Frozen ad-template provider resolved as {resolved_provider or 'none'}, expected {provider}"
+                "Frozen ad-template provider identity did not resolve as "
+                f"{provider}: runtime={resolved_provider or 'none'}, "
+                f"requested={resolved_request or 'none'}"
             )
 
     def _frozen_tool_route_plan(

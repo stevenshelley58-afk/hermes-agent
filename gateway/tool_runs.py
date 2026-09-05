@@ -47,7 +47,9 @@ AD_TEMPLATE_ROUTE_ORDER = (
 )
 AD_TEMPLATE_OPTIONAL_ROUTE = "quality-escalation"
 _AUDITED_NATIVE_VISION_MODELS = frozenset({
+    ("concentrate", "gemini-3.8-flash"),
     ("deepseek", "deepseek-v4-flash-vision-exp"),
+    ("meta-direct", "muse-spark-1.3-contributor"),
     ("openai-codex", "gpt-5.6-luna"),
     ("openai-codex", "gpt-5.6-sol"),
 })

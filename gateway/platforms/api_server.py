@@ -367,6 +367,7 @@ def _resolve_request_runtime_agent_kwargs(provider: str, target_model: Optional[
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
+        "requested_provider": runtime.get("requested_provider"),
         "max_tokens": max_tokens,
     }
 
