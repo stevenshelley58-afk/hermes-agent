@@ -258,6 +258,41 @@ def test_visual_gate_derives_decision_from_evidence_not_model_label():
     assert not process._review_regressed(best, best)
 
 
+def test_patch_application_error_is_fed_back_for_one_bounded_retry(tmp_path):
+    source = tmp_path / "source.png"
+    Image.new("RGB", (20, 20), "white").save(source)
+    calls: list[str] = []
+    events: list[tuple[str, dict]] = []
+
+    def call_agent(instance, _prompt, _route):
+        calls.append(instance)
+        if len(calls) == 1:
+            return {"operations": [{
+                "op": "replace", "path": "/template/metadata/missing",
+                "value": "invalid",
+            }]}
+        return {"operations": [{
+            "op": "replace", "path": "/template/metadata/description",
+            "value": "corrected",
+        }]}
+
+    patch, candidate = process._call_applied_patch(
+        call_agent,
+        instance="patch-semantic",
+        prompt="repair",
+        paths=[str(source)],
+        route={"provider": "openai-codex", "model": "gpt-5.6-sol"},
+        candidate={"template": _template(), "assets": []},
+        emit=lambda kind, _node, data: events.append((kind, data)),
+    )
+
+    assert calls == ["patch-semantic", "patch-semantic-format-retry"]
+    assert patch["operations"][0]["path"] == "/template/metadata/description"
+    assert candidate["template"]["metadata"]["description"] == "corrected"
+    assert events[0][0] == "role.output-retried"
+    assert "does not exist" in events[0][1]["reason"]
+
+
 def test_invalid_legacy_candidate_is_removed_without_losing_reference_checkpoint():
     checkpoint = {
         "sourceMap": {"canvas": {"width": 1080, "height": 1350}},

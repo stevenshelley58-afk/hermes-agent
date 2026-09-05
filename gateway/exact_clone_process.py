@@ -1221,6 +1221,29 @@ def _call_json(
     raise AssertionError("bounded output loop did not terminate")
 
 
+def _call_applied_patch(
+    call_agent: Callable[[str, Any, str], Dict[str, Any]],
+    *, instance: str, prompt: str, paths: Sequence[str], route: Mapping[str, str],
+    candidate: Mapping[str, Any], emit: Callable[[str, str, Dict[str, Any]], None],
+    strict: bool = True,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    def validate_and_apply(value: Any) -> Dict[str, Any]:
+        patch = validate_patch(value)
+        updated = apply_patch(candidate, patch, strict=strict)
+        return {"patch": patch, "candidate": updated}
+
+    result = _call_json(
+        call_agent,
+        instance=instance,
+        prompt=prompt,
+        paths=paths,
+        route=route,
+        validate=validate_and_apply,
+        emit=emit,
+    )
+    return result["patch"], result["candidate"]
+
+
 def _generation_review(
     *, source_placement: str, target_placement: str, comparator: Mapping[str, Any],
     final_review: Mapping[str, Any], warnings: Sequence[str],
@@ -1531,16 +1554,15 @@ class ExactCloneOrchestrator:
             persist_checkpoint(self.workspace, {"reference": reference, "sourceMap": source_map, "targetReferenceMap": target_map, "reciprocalReference": reciprocal_reference, "sourcePlacement": source_placement, "targetPlacement": target_placement, "candidate": candidate, "iterations": iterations, "cycleComparisons": cycle_comparisons})
         elif manual_instructions:
             manual_issue = [{"placement": "both", "layerIds": ["operator-selected"], "category": "details", "instruction": manual_instructions, "severity": "material"}]
-            patch = _call_json(
+            patch, candidate = _call_applied_patch(
                 self.call_agent,
                 instance=f"manual-revision-{int(checkpoint.get('manualRevision') or 1)}",
                 prompt=patch_prompt(candidate=candidate, issues=manual_issue, manual_instructions=manual_instructions),
                 paths=[source, reciprocal_reference],
                 route=escalation_route,
-                validate=validate_patch,
+                candidate=candidate,
                 emit=self.emit,
             )
-            candidate = apply_patch(candidate, patch)
             manual_instructions = ""
             self.emit("candidate.patch-applied", "build", {"source": "manual-review", "operations": len(patch["operations"])})
 
@@ -1579,16 +1601,16 @@ class ExactCloneOrchestrator:
                         "reasons": reasons,
                     })
                     repair_route = builder_route if contract_repairs == 1 else escalation_route
-                    repair = _call_json(
+                    repair, candidate = _call_applied_patch(
                         self.call_agent,
                         instance=f"contract-repair-{global_iteration}-{contract_repairs}",
                         prompt=contract_repair_prompt(candidate=candidate, reasons=reasons),
                         paths=[source, reciprocal_reference],
                         route=repair_route,
-                        validate=validate_patch,
+                        candidate=candidate,
                         emit=self.emit,
+                        strict=False,
                     )
-                    candidate = apply_patch(candidate, repair, strict=False)
                     self.emit("candidate.patch-applied", "build", {
                         "iteration": global_iteration,
                         "source": "blockwise-contract",
@@ -1702,16 +1724,15 @@ class ExactCloneOrchestrator:
                 "mode": "normal" if revision_route is builder_route else "escalation",
                 "issues": revision_review["issues"],
             })
-            patch = _call_json(
+            patch, candidate = _call_applied_patch(
                 self.call_agent,
                 instance=f"patch-{global_iteration}",
                 prompt=patch_prompt(candidate=candidate, issues=revision_review["issues"]),
                 paths=_vision_paths(source, reciprocal_reference, rendered, comparison_views),
                 route=revision_route,
-                validate=validate_patch,
+                candidate=candidate,
                 emit=self.emit,
             )
-            candidate = apply_patch(candidate, patch)
             self.emit("candidate.patch-applied", "build", {"iteration": global_iteration, "operations": len(patch["operations"])})
             persist_checkpoint(self.workspace, {
                 "reference": reference,
@@ -1762,16 +1783,15 @@ class ExactCloneOrchestrator:
             merged_issues = [issue for reviewer in reviewers for issue in reviewer["issues"]]
             if not merged_issues:
                 raise AdTemplateProcessError("final reviewers requested revision without actionable issues")
-            patch = _call_json(
+            patch, candidate = _call_applied_patch(
                 self.call_agent,
                 instance="final-merged-patch",
                 prompt=patch_prompt(candidate=candidate, issues=merged_issues),
                 paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views),
                 route=escalation_route,
-                validate=validate_patch,
+                candidate=candidate,
                 emit=self.emit,
             )
-            candidate = apply_patch(candidate, patch)
             global_iteration += 1
             iteration_root = self.workspace / "iterations" / f"{global_iteration:02d}"
             qa_candidate, qa_asset_overrides = build_ephemeral_qa_candidate(
