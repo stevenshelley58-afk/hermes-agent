@@ -735,6 +735,10 @@ When revision is required, return the exact correction as patch in this same res
 
 Return JSON only with exactly {output_fields}. scores must contain exactly, in this order: overall, geometry, typography, colourEffects, imageCrop, details. effects must contain exactly, in this order: shading, gradients, shadows, transparency, borders, masks, texture; each is match, not_present, or mismatch. issues is a list of objects with exactly placement (feed|story|both), layerIds (real candidate layer IDs), category (geometry|typography|colourEffects|imageCrop|details), instruction, severity (blocker|material|minor). Every issue instruction must be directly patchable: name at least one exact target field (x, y, width, height, font/fontSize/fontFamily/fontWeight, lineHeight, tracking, colour, or crop) and give its measured numeric/hex/font-file target or delta from the attached overlay. Vague phrases such as "match the source", "align", or "fix spacing" without target values are invalid. Every visible discrepancy is an issue; acceptance requires issues=[] and every effect matched or genuinely absent. decision is evidence only; the controller derives accept/revise from scores, issues, effects and the font rule. An obvious defect blocks acceptance regardless of average. fontSubstitution is null or exactly {{source,used,reason}}.{patch_contract} Return no prose.
 
+PRODUCTION SAFETY: Do not reproduce accidental source clipping, duplicate glyphs, or missing contact text as a requested correction. Match the source structure while keeping customer replacements readable; list unavoidable source defects as warnings, never a reason to damage the production template. Repeated feature wording intentionally present in the source is not itself a stray-glyph defect.
+AVAILABLE BUNDLED FONT FILES: {_safe_json(sorted(AVAILABLE_FONT_FILES))}. Existing declared asset-backed fonts may also be used. Never request a font file that is neither available here nor supplied by the candidate. Record unavoidable differences in fontSubstitution and choose the closest available face, weight and tracking; do not repeatedly demand unavailable proprietary fonts.
+IMAGE ORDER NOTE: When neutral production images are supplied, they immediately follow the four source/QA images and precede the overlay/difference views. Never interpret a difference heatmap as a customer preview.
+
 RECIPROCAL ASPECT REFERENCE: {_safe_json(reference)}
 DETERMINISTIC PIXEL/EDGE/COLOUR DIAGNOSTICS: {_safe_json(metrics)}. These are measured from the source-filled QA renders; vision remains the fidelity judge.
 CANDIDATE CONTRACT: {_safe_json(candidate)}"""
@@ -1000,35 +1004,6 @@ def _apply_deterministic_contract_repairs(
             floor = float(violation.get("readabilityFloorPx") or (24 if current_placement == "feed" else 28))
             if kind == "unsupported_overflow":
                 layer["overflowBehaviour"] = "shrink"
-            elif kind == "below_readability_floor":
-                layer.pop("sizeRatio", None)
-                layer["fontSize"] = max(floor, float(layer.get("fontSize") or 0))
-            elif kind == "multiline_line_height_below_minimum":
-                layer["lineHeight"] = max(
-                    float(layer.get("lineHeight") or 0),
-                    float(violation.get("minimumLineHeight") or 1.1),
-                )
-            elif kind == "cannot_fit_readability_floor":
-                layer["overflowBehaviour"] = "shrink"
-                layer.pop("sizeRatio", None)
-                layer["fontSize"] = max(floor, float(layer.get("fontSize") or 0))
-                qa_layout = qa_template.get(field) if isinstance(qa_template.get(field), dict) else {}
-                qa_layer = next((
-                    item for item in qa_layout.get("layers", [])
-                    if isinstance(item, dict) and item.get("layerId") == layer_id
-                ), None)
-                source_text = qa_text.get(qa_layer.get("inputKey")) if isinstance(qa_layer, dict) else None
-                if isinstance(source_text, str):
-                    layer["maxLines"] = max(
-                        int(layer.get("maxLines") or 1),
-                        len(source_text.splitlines()) or 1,
-                    )
-                _expand_text_box(
-                    layer,
-                    canvas_width=1080,
-                    canvas_height=1350 if current_placement == "feed" else 1920,
-                    floor=floor,
-                )
             if _safe_json(layer) != before:
                 changed_layers.add(f"{current_placement}:{layer_id}")
     return _candidate_structure(repaired), len(changed_layers)
@@ -1043,12 +1018,10 @@ def build_ephemeral_qa_candidate(
     qa = copy.deepcopy(_candidate_envelope(candidate))
     template = qa["template"]
     image_inputs = template.get("imageInputs")
-    text_inputs = template.get("textInputs")
     template_assets = template.get("assets")
-    if not isinstance(image_inputs, list) or not isinstance(text_inputs, list) or not isinstance(template_assets, dict):
+    if not isinstance(image_inputs, list) or not isinstance(template_assets, dict):
         raise AdTemplateProcessError("template inputs and assets are required for QA projection")
     original_image_inputs = {item.get("key"): item for item in image_inputs if isinstance(item, dict)}
-    original_text_inputs = {item.get("key"): item for item in text_inputs if isinstance(item, dict)}
     override_bytes: Dict[str, bytes] = {}
     qa_root = workspace / "qa-source-overrides"
     qa_root.mkdir(parents=True, exist_ok=True)
@@ -1065,10 +1038,6 @@ def build_ephemeral_qa_candidate(
         with Image.open(reference_path) as opened:
             reference_image = ImageOps.exif_transpose(opened).convert("RGB")
         canvas_width, canvas_height = (1080, 1350 if placement == "feed" else 1920)
-        ocr_by_layer = _ocr_words_by_text_layer(
-            layout["layers"], placement_map,
-            canvas_width=canvas_width, canvas_height=canvas_height,
-        )
         for index, layer in enumerate(layout["layers"]):
             if not isinstance(layer, dict):
                 continue
@@ -1099,17 +1068,8 @@ def build_ephemeral_qa_candidate(
                 template_assets[asset_key] = {"fileName": file_name, "mimeType": "image/png"}
                 qa["assets"].append({"assetKey": asset_key, "fileName": file_name, "mimeType": "image/png"})
                 override_bytes[asset_key] = buffer.getvalue()
-            elif layer_type == "text" and input_key in original_text_inputs:
-                words = ocr_by_layer.get(index, [])
-                if words:
-                    text_clone = copy.deepcopy(original_text_inputs[input_key])
-                    qa_input_key = f"qa_{placement}_{index}_{input_key}"[:120]
-                    text_clone["key"] = qa_input_key
-                    qa_text = _reconstruct_ocr_text(words)[:4000]
-                    text_clone["maxLength"] = max(int(text_clone.get("maxLength") or 0), len(qa_text))
-                    text_clone["placeholder"] = qa_text
-                    text_inputs.append(text_clone)
-                    layer["inputKey"] = qa_input_key
+            # OCR remains source-map evidence only. Keep candidate-authored
+            # neutral text in QA so words cannot merge or mutate layout.
     return _candidate_envelope(qa), override_bytes
 
 

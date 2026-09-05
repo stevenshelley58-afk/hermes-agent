@@ -576,13 +576,8 @@ def test_all_text_preflight_violations_are_repaired_in_one_deterministic_batch()
         qa_candidate=qa_candidate,
     )
 
-    assert count == 2
-    feed = repaired["template"]["feedLayout"]["layers"][-1]
-    story = repaired["template"]["storyLayout"]["layers"][-1]
-    assert feed["geometry"]["width"] > 100 and feed["geometry"]["height"] > 40
-    assert story["geometry"]["width"] > 100 and story["geometry"]["height"] > 40
-    assert feed["fontSize"] >= 24 and story["fontSize"] >= 28
-    assert feed["maxLines"] == 2
+    assert count == 0
+    assert repaired == candidate
 
 
 def test_best_candidate_can_be_recovered_without_ephemeral_qa_inputs(tmp_path):
@@ -743,3 +738,41 @@ def test_font_target_must_be_declared_and_unavailable_targets_are_rejected():
     candidate["template"]["feedLayout"]["layers"][-1]["font"] = {"file": "/fonts/adstudio/didot.woff2"}
     with pytest.raises(process.AdTemplateProcessError, match="undeclared font"):
         process._candidate_envelope(candidate)
+
+
+def test_qa_projection_keeps_authored_text_without_ocr_cloning(tmp_path):
+    source = tmp_path / "source.png"
+    Image.new("RGB", (800, 1000), "white").save(source)
+    candidate = {"template": _template(), "assets": []}
+    candidate["template"]["textInputs"] = [
+        {"key": "address", "label": "Address", "placeholder": "Neutral address", "maxLength": 80},
+    ]
+    candidate["template"]["fonts"] = [{"file": "/fonts/adstudio/poppins-500.woff2"}]
+    text_layer = {
+        "type": "text", "layerId": "feed-address", "inputKey": "address",
+        "geometry": {"x": 10, "y": 10, "width": 200, "height": 30},
+        "font": {"file": "/fonts/adstudio/poppins-500.woff2"},
+    }
+    candidate["template"]["feedLayout"]["layers"].append(text_layer)
+    candidate["template"]["storyLayout"]["layers"].append({**text_layer, "layerId": "story-address"})
+    before = copy.deepcopy(candidate["template"]["textInputs"])
+    qa, _ = process.build_ephemeral_qa_candidate(
+        candidate, source=str(source), reciprocal_reference=str(source),
+        source_placement="feed", source_map={"canvas": {"width": 800, "height": 1000}, "ocr": [{"text": "POSTCODE", "x": 10, "y": 10, "width": 100, "height": 20}]},
+        target_map={"canvas": {"width": 800, "height": 1000}, "ocr": []},
+        workspace=tmp_path / "qa",
+    )
+    assert qa["template"]["textInputs"] == before
+    assert all(not str(item["key"]).startswith("qa_") for item in qa["template"]["textInputs"])
+
+
+def test_text_fit_rejection_does_not_expand_authored_geometry():
+    candidate = {"template": _template(), "assets": []}
+    layer = {"type": "text", "layerId": "feed-address", "geometry": {"x": 10, "y": 20, "width": 100, "height": 20}}
+    candidate["template"]["feedLayout"]["layers"].append(layer)
+    candidate["template"]["storyLayout"]["layers"].append({**layer, "layerId": "story-address"})
+    before = copy.deepcopy(candidate)
+    reasons = ['AD_TEMPLATE_TEXT_PREFLIGHT_FAILED {"violations":[{"kind":"cannot_fit_readability_floor","layerId":"feed-address","placement":"feed"}]}']
+    repaired, count = process._apply_deterministic_contract_repairs(candidate, reasons)
+    assert repaired == before
+    assert count == 0
