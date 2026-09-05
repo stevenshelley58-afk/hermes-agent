@@ -56,6 +56,7 @@ MAX_PATCH_BYTES = 32_000
 MAX_CONTRACT_REPAIRS = 6
 REGRESSION_EPSILON = 0.05
 QA_PROJECTION_VERSION = 2
+EVALUATION_POLICY_VERSION = 1
 STAGES = (
     "source",
     "aspect-reference",
@@ -1105,6 +1106,7 @@ def persist_checkpoint(workspace: Path, value: Mapping[str, Any]) -> None:
         **copy.deepcopy(dict(value)),
         "process": PROCESS_ID,
         "qaProjectionVersion": QA_PROJECTION_VERSION,
+        "evaluationPolicyVersion": EVALUATION_POLICY_VERSION,
     }
     target = _checkpoint_path(workspace)
     temporary = target.with_suffix(".json.tmp")
@@ -1454,17 +1456,31 @@ class ExactCloneOrchestrator:
             raise AdTemplateProcessError("final reviewers must use independent routes")
         started = time.time()
         checkpoint = load_checkpoint(self.workspace)
+        checkpoint_policy_events: list[tuple[str, Dict[str, Any]]] = []
         if checkpoint and checkpoint.get("qaProjectionVersion") != QA_PROJECTION_VERSION:
             previous_version = checkpoint.get("qaProjectionVersion")
             checkpoint["cycleComparisons"] = 0
             checkpoint["accepted"] = False
             checkpoint.pop("finalReview", None)
-            persist_checkpoint(self.workspace, checkpoint)
-            self.emit("qa-projection.updated", "build", {
+            checkpoint_policy_events.append(("qa-projection.updated", {
                 "from_version": previous_version,
                 "to_version": QA_PROJECTION_VERSION,
                 "preserved_iterations": len(checkpoint.get("iterations") or []),
-            })
+            }))
+        if checkpoint and checkpoint.get("evaluationPolicyVersion") != EVALUATION_POLICY_VERSION:
+            previous_version = checkpoint.get("evaluationPolicyVersion")
+            checkpoint["cycleComparisons"] = 0
+            checkpoint["accepted"] = False
+            checkpoint.pop("finalReview", None)
+            checkpoint_policy_events.append(("evaluation-policy.updated", {
+                "from_version": previous_version,
+                "to_version": EVALUATION_POLICY_VERSION,
+                "preserved_iterations": len(checkpoint.get("iterations") or []),
+            }))
+        if checkpoint_policy_events:
+            persist_checkpoint(self.workspace, checkpoint)
+            for event_kind, event_data in checkpoint_policy_events:
+                self.emit(event_kind, "build", event_data)
         source_placement, target_placement, canvas = _source_placement(source)
 
         source_map = checkpoint.get("sourceMap")

@@ -301,7 +301,9 @@ def test_ocr_reconstruction_preserves_lines_and_horizontal_word_order():
 
 def test_checkpoint_always_advances_to_current_qa_projection(tmp_path):
     process.persist_checkpoint(tmp_path, {"qaProjectionVersion": 1, "iterations": []})
-    assert process.load_checkpoint(tmp_path)["qaProjectionVersion"] == process.QA_PROJECTION_VERSION == 2
+    checkpoint = process.load_checkpoint(tmp_path)
+    assert checkpoint["qaProjectionVersion"] == process.QA_PROJECTION_VERSION == 2
+    assert checkpoint["evaluationPolicyVersion"] == process.EVALUATION_POLICY_VERSION == 1
 
 
 def test_patch_application_error_is_fed_back_for_one_bounded_retry(tmp_path):
