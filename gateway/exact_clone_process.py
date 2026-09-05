@@ -1923,6 +1923,7 @@ class ExactCloneOrchestrator:
         while cycle_comparisons < MAX_COMPARISONS:
             self._check_stop()
             global_iteration += 1
+            escalation_iteration = global_iteration > NORMAL_COMPARISONS
             iteration_root = self.workspace / "iterations" / f"{global_iteration:02d}"
             self.emit("iteration.started", "build", {"iteration": global_iteration, "cycle_iteration": cycle_comparisons + 1})
             contract_repairs = 0
@@ -2027,14 +2028,14 @@ class ExactCloneOrchestrator:
                 instance=f"comparator-{global_iteration}",
                 prompt=review_prompt(final=False, candidate=candidate, reference=reference, metrics=metrics),
                 paths=_vision_paths(source, reciprocal_reference, rendered, comparison_views),
-                route=comparator_route if cycle_comparisons <= NORMAL_COMPARISONS else escalation_route,
+                route=escalation_route if escalation_iteration else comparator_route,
                 validate=validate_review,
                 emit=self.emit,
             )
             record = {
                 "iteration": global_iteration,
                 "cycle_iteration": cycle_comparisons,
-                "mode": "normal" if cycle_comparisons <= NORMAL_COMPARISONS else "escalation",
+                "mode": "escalation" if escalation_iteration else "normal",
                 "decision": "accepted" if review["decision"] == "accept" else "revise",
                 "comparison": review,
                 "previews": [item["name"] for item in rendered["previews"]],
@@ -2095,7 +2096,7 @@ class ExactCloneOrchestrator:
                 break
             if cycle_comparisons >= MAX_COMPARISONS:
                 break
-            revision_route = builder_route if cycle_comparisons < NORMAL_COMPARISONS else escalation_route
+            revision_route = escalation_route if escalation_iteration else builder_route
             self.emit("iteration.revision-requested", "build", {
                 "iteration": global_iteration,
                 "mode": "normal" if revision_route is builder_route else "escalation",
