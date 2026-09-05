@@ -1492,6 +1492,19 @@ class ToolRunAPIMixin:
         except (ToolRunError, ValueError, TypeError) as exc:
             return web.json_response(_error(str(exc), "invalid_tool_run"), status=400)
 
+    def _tool_run_monitor_view(self, run: Dict[str, Any]) -> Dict[str, Any]:
+        """Expose durable usage even when generation is running or failed."""
+        view = dict(run)
+        usage = self._tool_run_store.provider_usage_totals(run["run_id"])
+        if usage.get("api_call_count", 0) > 0:
+            output = dict(run.get("output") or {})
+            output["usage"] = usage
+            cost = dict(output.get("cost") or {})
+            cost["estimated_usd"] = usage["estimated_cost_usd"]
+            output["cost"] = cost
+            view["output"] = output
+        return view
+
     async def _handle_list_tool_runs(self, request: web.Request) -> web.Response:
         auth_err = self._check_auth(request)
         if auth_err:
@@ -1502,7 +1515,9 @@ class ToolRunAPIMixin:
                 project_id=request.query.get("project_id") or None,
                 limit=int(request.query.get("limit", "100")),
             )
-            return web.json_response({"object": "list", "data": runs})
+            return web.json_response({"object": "list", "data": [
+                self._tool_run_monitor_view(run) for run in runs
+            ]})
         except (ToolRunError, ValueError) as exc:
             return web.json_response(_error(str(exc), "invalid_tool_run_query"), status=400)
 
@@ -1511,7 +1526,8 @@ class ToolRunAPIMixin:
         if auth_err:
             return auth_err
         try:
-            return web.json_response(self._tool_run_store.get_run(request.match_info["run_id"]))
+            run = self._tool_run_store.get_run(request.match_info["run_id"])
+            return web.json_response(self._tool_run_monitor_view(run))
         except KeyError as exc:
             return web.json_response(_error(str(exc), "tool_run_not_found"), status=404)
 
