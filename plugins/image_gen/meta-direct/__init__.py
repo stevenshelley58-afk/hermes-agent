@@ -186,3 +186,8 @@ class MetaDirectImageGenProvider(ImageGenProvider):
         except Exception as exc:
             logger.debug("Meta Muse request failed: %s", type(exc).__name__)
             return error_response(error=f"Meta Muse request failed: {type(exc).__name__}", error_type="provider_error", provider=self.name, model=MODEL, prompt=prompt, aspect_ratio=aspect)
+
+
+def register(ctx) -> None:
+    """Register the bundled backend through Hermes' existing plugin loader."""
+    ctx.register_image_gen_provider(MetaDirectImageGenProvider())

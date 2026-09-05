@@ -17,6 +17,16 @@ plugin = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(plugin)
 
 
+
+def test_plugin_entry_point_registers_image_backend():
+    registered = []
+    class Context:
+        def register_image_gen_provider(self, provider):
+            registered.append(provider)
+    plugin.register(Context())
+    assert len(registered) == 1
+    assert registered[0].name == "meta-direct"
+
 _PNG = b""
 _buf = io.BytesIO()
 Image.new("RGB", (2, 2), "white").save(_buf, format="PNG")
