@@ -219,7 +219,7 @@ def test_ad_studio_profile_picker_changes_only_new_runs_and_persists_exact_snaps
         "builder": {"provider": "openai-codex", "model": "gpt-5.6-luna"},
         "comparator": {"provider": "openai-codex", "model": "gpt-5.6-luna"},
         "final-review-a": {"provider": "openai-codex", "model": "gpt-5.6-luna"},
-        "final-review-b": {"provider": "deepseek", "model": "deepseek-v4-flash-vision-exp"},
+        "final-review-b": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
         "fallback": {"provider": "openai-codex", "model": "gpt-5.6-sol"},
     }
     with pytest.raises(ToolRunError, match="immutable after submission"):
@@ -233,10 +233,10 @@ def test_builtin_policy_uses_only_audited_native_vision_roles():
         "analyse": ("openai-codex", "gpt-5.6-sol"),
         "compare": ("openai-codex", "gpt-5.6-luna"),
         "final-review-a": ("openai-codex", "gpt-5.6-luna"),
-        "final-review-b": ("deepseek", "deepseek-v4-flash-vision-exp"),
+        "final-review-b": ("openai-codex", "gpt-5.6-sol"),
         "quality-escalation": ("openai-codex", "gpt-5.6-sol"),
     }
-    assert policy["seed_revision"] == 12
+    assert policy["seed_revision"] == 13
     assert AD_TEMPLATE_ROUTE_ORDER == tuple(expected)[:-1]
     assert AD_TEMPLATE_OPTIONAL_ROUTE == "quality-escalation"
     for stage_id, route in expected.items():
@@ -337,7 +337,15 @@ def test_stale_sole_revisions_one_to_ten_are_preserved_and_revision_eleven_selec
     assert migrated.get_policy("ad-template-generator", 10)["policy"] == stale
     current = migrated.get_policy("ad-template-generator")
     assert current["revision"] == 11
-    assert current["policy"]["seed_revision"] == 12
+    assert current["policy"]["seed_revision"] == 13
+    assert current["policy"]["stages"]["final-review-b"]["primary"] == {
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "capability_verified": True,
+        "capabilities": ["vision_structured"],
+        "supports_vision": True,
+        "supports_tools": True,
+    }
     assert current["policy"]["stages"]["analyse"]["primary"]["model"] == "gpt-5.6-sol"
     assert current["policy"]["stages"]["quality-escalation"]["primary"]["model"] == "gpt-5.6-sol"
     pinned, _ = migrated.create_run(command(
