@@ -498,6 +498,34 @@ class ToolRunStore:
                     (tool_id, revision, "", _now(), 1, _json(policy, "model_policy")),
                 )
                 self._conn.commit()
+            if tool_id == "ad-template-generator":
+                scoped_defaults = self._conn.execute(
+                    "SELECT project_id,policy_json FROM tool_model_policies "
+                    "WHERE tool_id=? AND project_id<>'' AND is_default=1 ORDER BY revision",
+                    (tool_id,),
+                ).fetchall()
+                migrated_scoped = False
+                for scoped in scoped_defaults:
+                    if not _is_stale_audited_ad_template_policy(
+                        _loads(scoped["policy_json"], {})
+                    ):
+                        continue
+                    project_id = str(scoped["project_id"])
+                    revision = int(self._conn.execute(
+                        "SELECT COALESCE(MAX(revision),0)+1 FROM tool_model_policies WHERE tool_id=?",
+                        (tool_id,),
+                    ).fetchone()[0])
+                    self._conn.execute(
+                        "UPDATE tool_model_policies SET is_default=0 WHERE tool_id=? AND project_id=?",
+                        (tool_id, project_id),
+                    )
+                    self._conn.execute(
+                        "INSERT INTO tool_model_policies(tool_id,revision,project_id,created_at,is_default,policy_json) VALUES(?,?,?,?,?,?)",
+                        (tool_id, revision, project_id, _now(), 1, _json(policy, "model_policy")),
+                    )
+                    migrated_scoped = True
+                if migrated_scoped:
+                    self._conn.commit()
 
     def list_policies(self, tool_id: str, project_id: Optional[str] = None) -> List[Dict[str, Any]]:
         tool_id = _clean_id(tool_id, "tool_id")

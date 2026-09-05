@@ -357,6 +357,40 @@ def test_stale_sole_revisions_one_to_ten_are_preserved_and_revision_eleven_selec
     assert pinned["model_policy"] == stale
 
 
+def test_stale_builtin_project_default_is_superseded_without_touching_history(tmp_path):
+    path = tmp_path / "project-seed-migration.db"
+    store = ToolRunStore(str(path))
+    stale = default_ad_template_policy()
+    stale["seed_revision"] = 12
+    stale["stages"]["final-review-b"]["primary"] = {
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash-vision-exp",
+        "capability_verified": True,
+        "capabilities": ["vision_structured"],
+        "supports_vision": True,
+        "supports_tools": True,
+    }
+    stale_record = store.create_policy(
+        "ad-template-generator", stale, project_id="blockwise"
+    )
+    store.close()
+
+    migrated = ToolRunStore(str(path))
+    historical = migrated.get_policy(
+        "ad-template-generator", stale_record["revision"]
+    )
+    current = migrated.get_policy(
+        "ad-template-generator", project_id="blockwise"
+    )
+    assert historical["is_default"] is False
+    assert historical["policy"] == stale
+    assert current["revision"] > stale_record["revision"]
+    assert current["project_id"] == "blockwise"
+    assert current["policy"]["seed_revision"] == 13
+    assert current["policy"]["stages"]["final-review-b"]["primary"]["provider"] == "openai-codex"
+    assert current["policy"]["stages"]["final-review-b"]["primary"]["model"] == "gpt-5.6-sol"
+
+
 
 @pytest.mark.skip(reason="legacy generator policy migration is removed")
 def test_legacy_seed_is_superseded_without_rewriting_revision_one(tmp_path):
