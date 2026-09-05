@@ -452,6 +452,61 @@ def test_checkpoint_always_advances_to_current_qa_projection(tmp_path):
     assert checkpoint["evaluationPolicyVersion"] == process.EVALUATION_POLICY_VERSION
 
 
+def test_partial_checkpoint_update_retains_restart_state_and_explicit_removal(tmp_path):
+    source_map = {"sourceMapVersion": 1, "ocr": [{"text": "stable"}]}
+    reference = {"regions": [{"purpose": "history"}]}
+    iterations = [{"iteration": 1, "review": {"status": "kept"}}]
+    process.persist_checkpoint(tmp_path, {
+        "sourceCoordinateMode": "canvas-pixels",
+        "referenceMode": "source-only",
+        "sourceMap": source_map,
+        "reference": reference,
+        "iterations": iterations,
+        "comparisonBudgetUsed": 4,
+        "candidate": {"revision": "before"},
+    })
+
+    process.persist_checkpoint(
+        tmp_path, {"candidate": {"revision": "canonical"}}, merge=True,
+    )
+    checkpoint = process.load_checkpoint(tmp_path)
+    assert checkpoint["sourceCoordinateMode"] == "canvas-pixels"
+    assert checkpoint["referenceMode"] == "source-only"
+    assert checkpoint["sourceMap"] == source_map
+    assert checkpoint["reference"] == reference
+    assert checkpoint["iterations"] == iterations
+    assert checkpoint["comparisonBudgetUsed"] == 4
+    assert checkpoint["candidate"] == {"revision": "canonical"}
+
+    process.persist_checkpoint(
+        tmp_path, {"referenceMode": None, "reference": None}, merge=True,
+    )
+    checkpoint = process.load_checkpoint(tmp_path)
+    assert "referenceMode" not in checkpoint
+    assert "reference" not in checkpoint
+    assert checkpoint["sourceMap"] == source_map
+    assert checkpoint["iterations"] == iterations
+
+
+def test_fresh_checkpoint_retains_stable_modes_and_budget_only(tmp_path):
+    process.persist_checkpoint(tmp_path, {
+        "sourceCoordinateMode": "canvas-pixels",
+        "referenceMode": "source-only",
+        "sourceMap": {"sourceMapVersion": 1},
+        "iterations": [{"iteration": 1}],
+        "comparisonBudgetUsed": 3,
+    })
+
+    process.persist_checkpoint(tmp_path, {"candidate": {"revision": "fresh"}})
+    checkpoint = process.load_checkpoint(tmp_path)
+    assert checkpoint["sourceCoordinateMode"] == "canvas-pixels"
+    assert checkpoint["referenceMode"] == "source-only"
+    assert checkpoint["comparisonBudgetUsed"] == 3
+    assert checkpoint["candidate"] == {"revision": "fresh"}
+    assert "sourceMap" not in checkpoint
+    assert "iterations" not in checkpoint
+
+
 def test_patch_application_error_is_fed_back_for_one_bounded_retry(tmp_path):
     source = tmp_path / "source.png"
     Image.new("RGB", (20, 20), "white").save(source)

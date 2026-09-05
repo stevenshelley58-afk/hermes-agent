@@ -1508,17 +1508,41 @@ def _neutral_candidate_from_iteration(workspace: Path, iteration: int) -> Dict[s
         return None
 
 
-def persist_checkpoint(workspace: Path, value: Mapping[str, Any]) -> None:
+def persist_checkpoint(
+    workspace: Path,
+    value: Mapping[str, Any],
+    *,
+    merge: bool = False,
+) -> None:
+    """Atomically persist a stage snapshot or an explicitly partial update.
+
+    Fresh stage snapshots retain only restart-critical modes and the lifetime
+    comparison budget. Partial updates merge with the current checkpoint;
+    None explicitly removes a key so invalidation never resurrects stale state.
+    """
     previous = load_checkpoint(workspace)
-    budget = ({"comparisonBudgetUsed": previous["comparisonBudgetUsed"]}
-              if "comparisonBudgetUsed" in previous else {})
-    payload = {
-        **budget,
-        **copy.deepcopy(dict(value)),
-        "process": PROCESS_ID,
-        "qaProjectionVersion": QA_PROJECTION_VERSION,
-        "evaluationPolicyVersion": EVALUATION_POLICY_VERSION,
-    }
+    updates = copy.deepcopy(dict(value))
+    if merge:
+        payload = copy.deepcopy(previous)
+        for key, item in updates.items():
+            if item is None:
+                payload.pop(key, None)
+            else:
+                payload[key] = item
+    else:
+        stable = {}
+        for key in ("comparisonBudgetUsed", "sourceCoordinateMode", "referenceMode"):
+            if key not in updates and key in previous:
+                stable[key] = copy.deepcopy(previous[key])
+        payload = {**stable, **updates}
+        for key in ("sourceCoordinateMode", "referenceMode"):
+            if payload.get(key) is None:
+                payload.pop(key, None)
+    payload.update(
+        process=PROCESS_ID,
+        qaProjectionVersion=QA_PROJECTION_VERSION,
+        evaluationPolicyVersion=EVALUATION_POLICY_VERSION,
+    )
     target = _checkpoint_path(workspace)
     temporary = target.with_suffix(".json.tmp")
     temporary.write_text(_safe_json(payload, max_bytes=2_000_000), encoding="utf-8")
@@ -1917,6 +1941,7 @@ class ExactCloneOrchestrator:
         if checkpoint.get("sourceCoordinateMode") != "canvas-pixels":
             for key in ("sourceMap", "targetReferenceMap", "reference", "referenceMode", "bestReview", "bestCandidate", "bestIteration", "finalReview"):
                 checkpoint.pop(key, None)
+            checkpoint["referenceMode"] = None
             checkpoint.update(sourceCoordinateMode="canvas-pixels", accepted=False)
 
 
@@ -2075,7 +2100,7 @@ class ExactCloneOrchestrator:
         normalized_candidate = _canonical_catalog_paths(candidate)
         if normalized_candidate != candidate:
             candidate = normalized_candidate
-            persist_checkpoint(self.workspace, {"candidate": candidate})
+            persist_checkpoint(self.workspace, {"candidate": candidate}, merge=True)
 
         final_rendered: Dict[str, Any] | None = None
         final_comparison_views: list[dict[str, str]] = []
