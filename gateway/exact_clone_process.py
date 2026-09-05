@@ -1481,7 +1481,11 @@ def _neutral_candidate_from_iteration(workspace: Path, iteration: int) -> Dict[s
 
 
 def persist_checkpoint(workspace: Path, value: Mapping[str, Any]) -> None:
+    previous = load_checkpoint(workspace)
+    budget = ({"comparisonBudgetUsed": previous["comparisonBudgetUsed"]}
+              if "comparisonBudgetUsed" in previous else {})
     payload = {
+        **budget,
         **copy.deepcopy(dict(value)),
         "process": PROCESS_ID,
         "qaProjectionVersion": QA_PROJECTION_VERSION,

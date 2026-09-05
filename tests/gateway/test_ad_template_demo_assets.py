@@ -75,3 +75,12 @@ def test_import_sends_exact_generated_photo_bytes(tmp_path, monkeypatch):
     assert result["library_status"] == "quarantined"
     assert base64.b64decode(sent[0]["assets"][0]["bytesBase64"]) == overrides["photo"]
     assert sent[0]["template"]["assets"]["photo"]["mimeType"] == "image/png"
+
+
+def test_checkpoint_partial_updates_preserve_budget_but_explicit_reset_wins(tmp_path):
+    process.persist_checkpoint(tmp_path, {"comparisonBudgetUsed": 4, "candidate": {}})
+    process.persist_checkpoint(tmp_path, {"candidate": {"repaired": True}})
+    assert process.load_checkpoint(tmp_path)["comparisonBudgetUsed"] == 4
+    process.persist_checkpoint(tmp_path, {"comparisonBudgetUsed": 0})
+    process.persist_checkpoint(tmp_path, {"candidate": {"manualRevision": True}})
+    assert process.load_checkpoint(tmp_path)["comparisonBudgetUsed"] == 0
