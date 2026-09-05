@@ -1006,6 +1006,22 @@ class ToolRunAPIMixin:
         stop_events[run_id] = stop_event
         try:
             run = self._tool_run_store.get_run(run_id)
+            # Promote the staged intake before provider/schema preflight. The
+            # staging file is intentionally cleaned in ``finally`` even when
+            # preflight fails; same-run retry must therefore already have the
+            # authenticated durable preview to resolve.
+            from hermes_constants import get_hermes_home
+            workspace = (
+                get_hermes_home()
+                / "tool_runs"
+                / "ad-template-generator"
+                / run_id
+            ).resolve()
+            payload = run.get("payload") if isinstance(run.get("payload"), dict) else {}
+            sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
+            if len(sources) != 1 or not isinstance(sources[0], dict):
+                raise ToolRunError("exactly one persisted source is required per template run")
+            self._durable_tool_source(workspace, str(sources[0].get("path") or ""))
             run["model_policy"] = validate_model_policy(
                 run.get("model_policy"), tool_id=str(run.get("tool_id") or ""),
             )
@@ -1077,9 +1093,6 @@ class ToolRunAPIMixin:
 
 
             def run_sync(_candidate: Dict[str, str]):
-                from hermes_constants import get_hermes_home
-                workspace = (get_hermes_home() / "tool_runs" / "ad-template-generator" / run_id).resolve()
-                workspace.mkdir(parents=True, exist_ok=True)
                 usage = self._tool_run_store.provider_usage_totals(run_id)
                 usage_lock = threading.Lock()
                 run_cost_limit = float(os.environ.get("AD_TEMPLATE_MAX_RUN_COST_USD", "10.0"))
