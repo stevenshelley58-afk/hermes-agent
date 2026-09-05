@@ -2725,6 +2725,13 @@ def run_conversation(
                         allow_stream=False,
                         is_github_responses=agent._is_copilot_url(),
                         sanitize_harmony_tokens=agent._is_codex_backend(),
+                        # Custom Responses providers may explicitly advertise
+                        # structured output support. Native Codex keeps the
+                        # default False and therefore continues rejecting it.
+                        supports_text_format=bool(
+                            getattr(agent, "supports_text_format", False)
+                            or getattr(agent, "supports_responses_text_format", False)
+                        ),
                     )
                 # Copilot x-initiator: the first API call of a user turn is
                 # marked "user" so Copilot bills a premium request; tool-loop
@@ -2910,6 +2917,10 @@ def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
+                            supports_text_format=bool(
+                                getattr(agent, "supports_text_format", False)
+                                or getattr(agent, "supports_responses_text_format", False)
+                            ),
                         )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
