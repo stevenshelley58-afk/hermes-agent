@@ -456,7 +456,8 @@ def test_renderer_reason_keeps_complete_batched_preflight_violations():
     )
     line = f'AD_TEMPLATE_TEXT_PREFLIGHT_FAILED {{"violations":[{violations}]}}'
 
-    reasons = process._renderer_reasons(line, "")
+    rejection = process.AdTemplateRendererRejection(process._renderer_reasons(line, ""))
+    reasons = list(rejection.reasons)
 
     assert len(line) > 500
     assert len(reasons) == 1

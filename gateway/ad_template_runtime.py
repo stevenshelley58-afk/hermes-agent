@@ -16,6 +16,7 @@ VISION_MAX_SERIALIZED_IMAGE_BYTES = 96_000
 VISION_MAX_LONG_EDGE = 1440
 VISION_MAX_SERIALIZED_MESSAGE_BYTES = 1_500_000
 MAX_RENDERER_REJECTIONS = 32
+MAX_RENDERER_REJECTION_CHARS = 16_000
 
 
 class AdTemplateProcessError(ValueError):
@@ -25,7 +26,10 @@ class AdTemplateProcessError(ValueError):
 class AdTemplateRendererRejection(AdTemplateProcessError):
     def __init__(self, reasons: Any):
         raw = [reasons] if isinstance(reasons, str) else list(reasons or [])
-        bounded = tuple(str(item).strip()[:320] for item in raw if str(item).strip())[:MAX_RENDERER_REJECTIONS]
+        bounded = tuple(
+            str(item).strip()[:MAX_RENDERER_REJECTION_CHARS]
+            for item in raw if str(item).strip()
+        )[:MAX_RENDERER_REJECTIONS]
         if not bounded:
             raise ValueError("renderer rejection requires at least one reason")
         self.reasons = bounded
