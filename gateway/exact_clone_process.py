@@ -532,12 +532,19 @@ def validate_review(value: Any) -> Dict[str, Any]:
     scores = value.get("scores")
     if not isinstance(scores, dict) or set(scores) != set(SCORE_FIELDS):
         raise AdTemplateProcessError("visual review scores must use the exact ordered rubric")
+    raw_score_values = [scores[field] for field in SCORE_FIELDS]
+    unit_scale = all(
+        not isinstance(raw, bool)
+        and isinstance(raw, (int, float))
+        and 0 <= float(raw) <= 1
+        for raw in raw_score_values
+    )
     normalized_scores: Dict[str, float] = {}
     for field in SCORE_FIELDS:
         raw = scores[field]
         if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not 0 <= float(raw) <= 10:
             raise AdTemplateProcessError("visual review score must be between 0 and 10")
-        normalized_scores[field] = round(float(raw), 2)
+        normalized_scores[field] = round(float(raw) * (10 if unit_scale else 1), 2)
     effects = value.get("effects")
     if not isinstance(effects, dict) or set(effects) != set(EFFECT_FIELDS) or any(state not in _EFFECT_STATES for state in effects.values()):
         raise AdTemplateProcessError("visual effects review must explicitly cover every effect")

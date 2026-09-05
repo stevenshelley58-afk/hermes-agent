@@ -263,6 +263,31 @@ def test_visual_gate_derives_decision_from_evidence_not_model_label():
         process.validate_review(vague)
 
 
+def test_comparator_unit_interval_scores_are_normalized_to_ten_point_scale():
+    review = _review(accept=False)
+    review["scores"] = {
+        "overall": 0.98,
+        "geometry": 0.99,
+        "typography": 0.98,
+        "colourEffects": 1.0,
+        "imageCrop": 0.99,
+        "details": 0.98,
+    }
+    review["issues"] = []
+
+    normalized = process.validate_review(review)
+
+    assert normalized["scores"] == {
+        "overall": 9.8,
+        "geometry": 9.9,
+        "typography": 9.8,
+        "colourEffects": 10.0,
+        "imageCrop": 9.9,
+        "details": 9.8,
+    }
+    assert normalized["decision"] == "accept"
+
+
 def test_ocr_reconstruction_preserves_lines_and_horizontal_word_order():
     words = [
         {"text": "move", "x": 60, "y": 31, "height": 10},
