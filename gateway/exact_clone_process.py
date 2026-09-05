@@ -2213,6 +2213,7 @@ class ExactCloneOrchestrator:
 
         final_review: Dict[str, Any] | None = None
         for final_round in range(1, MAX_FINAL_REVIEW_ROUNDS + 1):
+            self._check_stop()
             reviewer_specs = (("a", final_a_route), ("b", final_b_route))
             for label, route in reviewer_specs:
                 identity = f"final-reviewer-{label}-{self.run_id}-{final_round}"
