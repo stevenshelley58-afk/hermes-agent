@@ -734,9 +734,27 @@ DETERMINISTIC PIXEL/EDGE/COLOUR DIAGNOSTICS: {_safe_json(metrics)}. These are me
 CANDIDATE CONTRACT: {_safe_json(candidate)}"""
 
 
-def patch_prompt(*, candidate: Mapping[str, Any], issues: Sequence[Mapping[str, Any]], manual_instructions: str = "") -> str:
-    return f"""Apply only the listed exact-clone corrections to the current valid Blockwise candidate. Do not redesign, regenerate or replace the document. Preserve every field and layer not named by the corrections. Return a bounded JSON patch only: {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}}. Use JSON Pointer paths. Do not change schema, templateId, createdAt, asset declarations or source-free asset assignments. Maximum {MAX_PATCH_OPERATIONS} operations. A remove operation omits value; add/replace requires value. Return JSON only.
+def _layer_pointer_map(candidate: Mapping[str, Any]) -> Dict[str, str]:
+    pointers: Dict[str, str] = {}
+    template = candidate.get("template")
+    if not isinstance(template, Mapping):
+        return pointers
+    for layout_key in ("feedLayout", "storyLayout"):
+        layout = template.get(layout_key)
+        layers = layout.get("layers") if isinstance(layout, Mapping) else None
+        if not isinstance(layers, list):
+            continue
+        for index, layer in enumerate(layers):
+            layer_id = layer.get("layerId") if isinstance(layer, Mapping) else None
+            if isinstance(layer_id, str) and layer_id:
+                pointers[layer_id] = f"/template/{layout_key}/layers/{index}"
+    return pointers
 
+
+def patch_prompt(*, candidate: Mapping[str, Any], issues: Sequence[Mapping[str, Any]], manual_instructions: str = "") -> str:
+    return f"""Apply only the listed exact-clone corrections to the current valid Blockwise candidate. Do not redesign, regenerate or replace the document. Preserve every field and layer not named by the corrections. Return a bounded JSON patch only: {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}}. Use the exact JSON Pointer map below. For a layer type change, replace the whole layer at its mapped pointer. When changing to a font not already declared, also add its {{"file":"..."}} declaration at /template/fonts/-. Append list items with /- or the current list length; remove multiple list items in descending index order. Do not change schema, templateId, createdAt, asset declarations or source-free asset assignments. Maximum {MAX_PATCH_OPERATIONS} operations. A remove operation omits value; add/replace requires value. Return JSON only.
+
+LAYER POINTERS: {_safe_json(_layer_pointer_map(candidate), max_bytes=40_000)}
 CURRENT CANDIDATE: {_safe_json(candidate)}
 CORRECTIONS: {_safe_json(list(issues), max_bytes=80_000)}
 MANUAL REVIEW INSTRUCTIONS: {manual_instructions[:4000]}"""
@@ -809,14 +827,18 @@ def apply_patch(candidate: Mapping[str, Any], value: Any, *, strict: bool = True
         if isinstance(parent, list):
             if operation["op"] == "add" and leaf == "-":
                 parent.append(copy.deepcopy(operation["value"]))
-            elif leaf.isdigit() and int(leaf) < len(parent):
+            elif leaf.isdigit():
                 index = int(leaf)
-                if operation["op"] == "remove":
-                    parent.pop(index)
-                elif operation["op"] == "replace":
-                    parent[index] = copy.deepcopy(operation["value"])
-                else:
+                if operation["op"] == "add":
+                    if index > len(parent):
+                        raise AdTemplateProcessError("revision list add is out of bounds")
                     parent.insert(index, copy.deepcopy(operation["value"]))
+                elif index >= len(parent):
+                    raise AdTemplateProcessError("revision list operation is out of bounds")
+                elif operation["op"] == "remove":
+                    parent.pop(index)
+                else:
+                    parent[index] = copy.deepcopy(operation["value"])
             else:
                 raise AdTemplateProcessError("revision list operation is out of bounds")
         elif isinstance(parent, dict):
@@ -1801,7 +1823,9 @@ def _call_applied_patch(
                 "role": instance, "reason": rejection,
                 "bounded_replans": MAX_PATCH_REPLANS,
             })
-            return {"operations": []}, copy.deepcopy(dict(candidate))
+            raise AdTemplateProcessError(
+                f"{instance} exhausted bounded patch replans: {rejection}"
+            ) from exc
     raise AssertionError("bounded patch re-plan loop did not terminate")
 
 

@@ -343,6 +343,21 @@ def test_build_prompt_preserves_logo_fit_and_body_copy_density(monkeypatch):
     assert "preserve the source line count, approximate words per line" in prompt
     assert "do not shorten dense copy into a sparse slogan" in prompt
 
+def test_patch_prompt_supplies_exact_layer_pointers_and_array_rules():
+    candidate = {"template": _template(), "assets": []}
+    prompt = process.patch_prompt(
+        candidate=candidate,
+        issues=[],
+        manual_instructions="Change the feed background layer type.",
+    )
+    assert '"feed-plate":"/template/feedLayout/layers/0"' in prompt
+    assert '"story-hero":"/template/storyLayout/layers/1"' in prompt
+    assert "replace the whole layer at its mapped pointer" in prompt
+    assert 'add its {"file":"..."} declaration at /template/fonts/-' in prompt
+    assert "Append list items with /- or the current list length" in prompt
+    assert "descending index order" in prompt
+
+
 
 def test_visual_gate_requires_every_score_and_effect_at_98():
     passing = _review(accept=True)
@@ -619,7 +634,82 @@ def test_exhausted_invalid_patch_paths_trigger_bounded_replan(tmp_path):
     assert any(kind == "revision.replanned" for kind, _ in events)
 
 
+def test_exhausted_patch_replans_raise_before_render_and_keep_checkpoint(tmp_path):
+    source = tmp_path / "source.png"
+    Image.new("RGB", (20, 20), "white").save(source)
+    candidate = {"template": _template(), "assets": []}
+    process.persist_checkpoint(tmp_path, {
+        "candidate": candidate,
+        "iterations": [{"iteration": 2}],
+        "comparisonBudgetUsed": 2,
+    })
+    before = process.load_checkpoint(tmp_path)
+    calls: list[str] = []
+    events: list[tuple[str, dict]] = []
+    render_calls: list[dict] = []
+
+    def call_agent(instance, _prompt, _route):
+        calls.append(instance)
+        return {"operations": [{
+            "op": "replace",
+            "path": "/template/metadata/missing",
+            "value": "still-invalid",
+        }]}
+
+    def repair_then_render():
+        _patch, updated = process._call_applied_patch(
+            call_agent,
+            instance="manual-revision-6",
+            prompt="repair",
+            paths=[str(source)],
+            route={"provider": "openai-codex", "model": "builder"},
+            candidate=candidate,
+            emit=lambda kind, _node, data: events.append((kind, data)),
+        )
+        render_calls.append(updated)
+
+    with pytest.raises(
+        process.AdTemplateProcessError,
+        match="manual-revision-6 exhausted bounded patch replans",
+    ):
+        repair_then_render()
+
+    assert len(calls) == (process.MAX_PATCH_REPLANS + 1) * (process.MAX_OUTPUT_RETRIES + 1)
+    assert render_calls == []
+    assert process.load_checkpoint(tmp_path) == before
+    assert events[-1][0] == "revision.skipped"
+    assert events[-1][1]["bounded_replans"] == process.MAX_PATCH_REPLANS
+
+
+def test_json_patch_numeric_add_accepts_length_but_other_bounds_remain_strict():
+    candidate = {"template": _template(), "assets": []}
+    text_input = {
+        "key": "body",
+        "label": "Body",
+        "placeholder": "Neutral body copy",
+        "maxLength": 120,
+    }
+    updated = process.apply_patch(candidate, {"operations": [{
+        "op": "add",
+        "path": "/template/textInputs/0",
+        "value": text_input,
+    }]})
+    assert updated["template"]["textInputs"] == [text_input]
+
+    for op in ("replace", "remove"):
+        operation = {"op": op, "path": "/template/textInputs/0"}
+        if op == "replace":
+            operation["value"] = text_input
+        with pytest.raises(process.AdTemplateProcessError, match="out of bounds"):
+            process.apply_patch(candidate, {"operations": [operation]})
+    with pytest.raises(process.AdTemplateProcessError, match="add is out of bounds"):
+        process.apply_patch(candidate, {"operations": [{
+            "op": "add", "path": "/template/textInputs/1", "value": text_input,
+        }]})
+
+
 def test_invalid_legacy_candidate_is_removed_without_losing_reference_checkpoint():
+
     checkpoint = {
         "sourceMap": {"canvas": {"width": 1080, "height": 1350}},
         "reciprocalReference": "/run/story-reference.png",
