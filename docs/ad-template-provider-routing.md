@@ -68,6 +68,16 @@ No template from this pilot was activated.
 
 Restart checkpoint modes and lifetime budget now survive fresh stage snapshots.
 Fallback patch calls use the operations schema, not the full builder schema.
-Focused checkpoint tests: 34 passed; structured-runtime tests: 9 passed.
+Focused exact-clone tests: 41 passed; structured-runtime tests: 9 passed.
 Runtime import root must contain both template and Mini policy code; the gateway
 working directory must not shadow that immutable release with an old checkout.
+
+Live VPS source: `b97c8553c2b68321dd4181fed71a3e73d79c3831`, deployed from
+`/opt/releases/hermes-template-b97c8553c2`. Manual corrections establish a new
+best-candidate boundary without deleting prior iterations; automatic retries do
+not reset the comparison budget. Escalation uses the current cycle, not historical
+iteration numbering. Rejected patches fail visibly instead of reporting a no-op
+as a successful edit. Logo layers retain their neutral production asset during
+QA, avoiding false clipping introduced by source-advertiser crops. Restored best
+candidates receive matching saved visual evidence. The pilot still requires
+visual acceptance; deployment of these fixes does not approve a template.
