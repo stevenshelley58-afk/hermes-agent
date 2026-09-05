@@ -8,6 +8,13 @@ from types import SimpleNamespace
 from gateway.tool_run_api import ToolRunAPIMixin
 
 
+def test_comparator_budget_covers_review_plus_patch_without_retry_truncation():
+    from gateway.tool_run_api import _AD_TEMPLATE_ROLE_OUTPUT_TOKENS
+    assert _AD_TEMPLATE_ROLE_OUTPUT_TOKENS["comparator"] >= _AD_TEMPLATE_ROLE_OUTPUT_TOKENS["patch"]
+    assert _AD_TEMPLATE_ROLE_OUTPUT_TOKENS["comparator"] > _AD_TEMPLATE_ROLE_OUTPUT_TOKENS["review"]
+
+
+
 def test_catalog_basename_normalization_is_unambiguous_and_consistent(monkeypatch):
     from gateway import exact_clone_process as process
     a = SimpleNamespace(file_name="interior/living.webp", mime_type="image/webp")

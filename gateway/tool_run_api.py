@@ -70,7 +70,7 @@ AD_TEMPLATE_STAGE_INACTIVITY_MULTIPLIERS = {
 _AD_TEMPLATE_ROLE_OUTPUT_TOKENS = {
     "builder": 32_768,
     "patch": 8_192,
-    "comparator": 4_096,
+    "comparator": 8_192,
     "review": 4_096,
     "aspect-reference": 4_096,
 }
