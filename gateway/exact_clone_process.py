@@ -1654,7 +1654,7 @@ def _call_json(
         try:
             raw = call_agent(
                 instance if attempt == 0 else f"{instance}-format-retry",
-                vision_message(prompt + suffix, list(paths), bounded=True),
+                vision_message(prompt + suffix, list(dict.fromkeys(paths)), bounded=True),
                 f"{route.get('provider')}/{route.get('model')}",
             )
             return validate(raw)
