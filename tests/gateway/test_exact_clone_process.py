@@ -336,7 +336,7 @@ def test_checkpoint_always_advances_to_current_qa_projection(tmp_path):
     process.persist_checkpoint(tmp_path, {"qaProjectionVersion": 1, "iterations": []})
     checkpoint = process.load_checkpoint(tmp_path)
     assert checkpoint["qaProjectionVersion"] == process.QA_PROJECTION_VERSION == 3
-    assert checkpoint["evaluationPolicyVersion"] == process.EVALUATION_POLICY_VERSION == 1
+    assert checkpoint["evaluationPolicyVersion"] == process.EVALUATION_POLICY_VERSION == 2
 
 
 def test_patch_application_error_is_fed_back_for_one_bounded_retry(tmp_path):
