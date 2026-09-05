@@ -996,6 +996,7 @@ def _preflight_codex_api_kwargs(
     allow_stream: bool = False,
     is_github_responses: bool = False,
     sanitize_harmony_tokens: bool = False,
+    supports_text_format: bool = False,
 ) -> Dict[str, Any]:
     if not isinstance(api_kwargs, dict):
         raise ValueError("Codex Responses request must be a dict.")
@@ -1145,6 +1146,18 @@ def _preflight_codex_api_kwargs(
     context_management = api_kwargs.get("context_management")
     if isinstance(context_management, list) and context_management:
         normalized["context_management"] = context_management
+
+    # ``text.format`` is part of the Responses API structured-output
+    # contract, but it is not implemented by the native Codex endpoint.  A
+    # custom provider must explicitly advertise this capability before the
+    # field can cross the transport boundary; otherwise retaining the old
+    # rejection is important because silently forwarding it to Codex changes
+    # the security/compatibility contract.
+    if supports_text_format:
+        text_format = api_kwargs.get("text")
+        if isinstance(text_format, dict):
+            normalized["text"] = dict(text_format)
+            allowed_keys.add("text")
 
     extra_headers = api_kwargs.get("extra_headers")
     if extra_headers is not None:

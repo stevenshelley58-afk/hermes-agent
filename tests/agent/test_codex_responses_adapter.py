@@ -125,6 +125,19 @@ def test_codex_api_preflight_rejects_reserved_token_in_structural_key():
         _preflight_codex_api_kwargs(kwargs, sanitize_harmony_tokens=True)
 
 
+def test_preflight_accepts_responses_text_format_only_when_advertised():
+    kwargs = {
+        "model": "hermes-custom",
+        "instructions": "test",
+        "input": [{"role": "user", "content": "hi"}],
+        "text": {"format": {"type": "json_schema", "name": "answer", "schema": {"type": "object"}}},
+    }
+    with pytest.raises(ValueError, match="unsupported field.*text"):
+        _preflight_codex_api_kwargs(kwargs)
+    normalized = _preflight_codex_api_kwargs(kwargs, supports_text_format=True)
+    assert normalized["text"] == kwargs["text"]
+
+
 def test_codex_api_preflight_defangs_every_outbound_text_carrier():
     raw = [
         {

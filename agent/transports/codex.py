@@ -773,6 +773,7 @@ class ResponsesApiTransport(ProviderTransport):
         allow_stream: bool = False,
         is_github_responses: bool = False,
         sanitize_harmony_tokens: bool = False,
+        supports_text_format: bool = False,
     ) -> dict:
         """Validate and sanitize Codex API kwargs before the call.
 
@@ -787,6 +788,7 @@ class ResponsesApiTransport(ProviderTransport):
             allow_stream=allow_stream,
             is_github_responses=is_github_responses,
             sanitize_harmony_tokens=sanitize_harmony_tokens,
+            supports_text_format=supports_text_format,
         )
         if "prompt_cache_key" in normalized:
             bounded = _bounded_prompt_cache_key(normalized["prompt_cache_key"])
