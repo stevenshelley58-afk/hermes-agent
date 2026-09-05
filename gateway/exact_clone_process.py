@@ -972,7 +972,12 @@ def import_template(output: Mapping[str, Any], *, run_id: str, project_id: str) 
         raise AdTemplateProcessError("Blockwise import templateId mismatch")
     if result.get("libraryStatus") != "quarantined":
         raise AdTemplateProcessError("Blockwise import did not remain quarantined")
-    if result.get("assetCount") != len(resolved):
+    asset_count = result.get("assetCount")
+    if (
+        isinstance(asset_count, bool)
+        or not isinstance(asset_count, int)
+        or asset_count != len(resolved)
+    ):
         raise AdTemplateProcessError("Blockwise import asset count mismatch")
     return {
         "template_id": str(result["templateId"]),
@@ -1223,6 +1228,13 @@ class ExactCloneOrchestrator:
             })
             checkpoint.update(sourceMap=source_map, reciprocalReference=reciprocal_reference)
             persist_checkpoint(self.workspace, checkpoint)
+
+        reference_preview = self.workspace / "previews" / f"reference-{target_placement}.png"
+        reference_preview.parent.mkdir(parents=True, exist_ok=True)
+        if not reference_preview.is_file():
+            temporary_reference = reference_preview.with_suffix(".png.tmp")
+            shutil.copyfile(reciprocal_reference, temporary_reference)
+            os.replace(temporary_reference, reference_preview)
 
         target_map = checkpoint.get("targetReferenceMap")
         if not isinstance(target_map, dict):
@@ -1522,7 +1534,11 @@ class ExactCloneOrchestrator:
             "diffs": final_comparison_views,
             "references": [
                 {"name": "source-map.json", "sourcePlacement": source_placement, "sourceMap": source_map},
-                {"name": Path(reciprocal_reference).name, "placement": target_placement, "path": reciprocal_reference},
+                {
+                    "name": reference_preview.name,
+                    "placement": target_placement,
+                    "kind": "reciprocal-image-reference",
+                },
                 {"name": "target-reference-map.json", "placement": target_placement, "sourceMap": target_map},
                 {"name": "aspect-reference.json", "sourcePlacement": source_placement, "targetPlacement": target_placement, "reference": reference},
             ],

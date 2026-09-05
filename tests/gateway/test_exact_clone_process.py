@@ -195,6 +195,12 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     )
     assert all(not str(key).startswith("qa-") for key in rendered_candidates[-1]["template"]["assets"])
     assert result["previews"] and all(item["kind"] == "final-neutral-shippable" for item in result["previews"])
+    reciprocal = next(
+        item for item in result["references"]
+        if item.get("kind") == "reciprocal-image-reference"
+    )
+    assert reciprocal["name"] == "reference-story.png"
+    assert (tmp_path / "run" / "previews" / reciprocal["name"]).is_file()
 
 
 def test_visual_gate_requires_every_score_and_effect_at_98():
@@ -227,6 +233,54 @@ def test_review_url_is_derived_from_exact_import_route(monkeypatch):
         "body": {"action": "smoke_test", "runId": "trun_1"},
         "scope": "adstudio.templates.review",
     }
+
+
+@pytest.mark.parametrize("library_status", [None, "active"])
+def test_import_fails_closed_until_blockwise_confirms_quarantine(
+    monkeypatch, library_status,
+):
+    monkeypatch.setenv(
+        "BLOCKWISE_TEMPLATE_IMPORT_URL",
+        "http://127.0.0.1:8080/api/internal/adstudio/template-artifacts",
+    )
+    monkeypatch.setattr(process, "_runtime_catalog", lambda: object())
+    monkeypatch.setattr(process, "resolve_declared_assets", lambda *_args: [])
+    response = {
+        "templateId": "exact-clone-test",
+        "assetCount": 0,
+        "replayed": False,
+    }
+    if library_status is not None:
+        response["libraryStatus"] = library_status
+    monkeypatch.setattr(process, "_post_blockwise", lambda *_args, **_kwargs: response)
+
+    with pytest.raises(process.AdTemplateProcessError, match="quarantined"):
+        process.import_template(
+            {"template": _template(), "assets": []},
+            run_id="trun_test", project_id="blockwise",
+        )
+
+
+@pytest.mark.parametrize("asset_count", [False, "0", 1])
+def test_import_requires_exact_integer_asset_count(monkeypatch, asset_count):
+    monkeypatch.setenv(
+        "BLOCKWISE_TEMPLATE_IMPORT_URL",
+        "http://127.0.0.1:8080/api/internal/adstudio/template-artifacts",
+    )
+    monkeypatch.setattr(process, "_runtime_catalog", lambda: object())
+    monkeypatch.setattr(process, "resolve_declared_assets", lambda *_args: [])
+    monkeypatch.setattr(process, "_post_blockwise", lambda *_args, **_kwargs: {
+        "templateId": "exact-clone-test",
+        "assetCount": asset_count,
+        "replayed": False,
+        "libraryStatus": "quarantined",
+    })
+
+    with pytest.raises(process.AdTemplateProcessError, match="asset count"):
+        process.import_template(
+            {"template": _template(), "assets": []},
+            run_id="trun_test", project_id="blockwise",
+        )
 
 
 def test_ready_review_publish_and_discard_states_are_atomic(tmp_path):
