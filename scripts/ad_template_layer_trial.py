@@ -3,13 +3,9 @@
 import copy, hashlib, json, os, sys, time
 from datetime import datetime, timezone
 from pathlib import Path
-os.environ.setdefault('HERMES_HOME', '/home/hermes/.hermes')
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dotenv import load_dotenv
 from PIL import Image, ImageChops
-load_dotenv('/home/hermes/.hermes/.env', override=False)
-load_dotenv('/srv/hermes/secrets/ad-template.env', override=False)
-load_dotenv('/srv/hermes/secrets/ad-template-renderer-current.env', override=False)
 from agent.auxiliary_client import OpenAI
 from gateway.ad_template_runtime import AdTemplateProcessError, vision_message
 from gateway.exact_clone_process import apply_patch, run_renderer
@@ -77,6 +73,10 @@ def call(provider, model, name, prompt, pics, schema):
         c.close()
 
 def main():
+    os.environ.setdefault('HERMES_HOME', '/home/hermes/.hermes')
+    load_dotenv('/home/hermes/.hermes/.env', override=False)
+    load_dotenv('/srv/hermes/secrets/ad-template.env', override=False)
+    load_dotenv('/srv/hermes/secrets/ad-template-renderer-current.env', override=False)
     if not os.getenv('AD_TEMPLATE_GENERATOR_CMD'):
         raise SystemExit('AD_TEMPLATE_GENERATOR_CMD required')
     root = ROOT
