@@ -24,14 +24,25 @@ from aiohttp import web
 
 from agent.interrupt_compat import request_hard_interrupt
 from agent.redact import redact_sensitive_text
-from gateway.ad_template_process import AdTemplateProcessError, AdTemplateRendererRejection, AdTemplateStructuredOutputError, AdTemplateTransportError, SoleProcessOrchestrator, _compact_revision_feedback, _quality_ranking_score, _renderer_rejection_instructions, validate_artifacts, validate_builder_candidate, validate_iterations, validate_final_review, deterministic_documents, generator_prompt, run_generator_cli, MAX_ITERATIONS as AD_TEMPLATE_MAX_ITERATIONS, THRESHOLD as AD_TEMPLATE_THRESHOLD
+from gateway.ad_template_runtime import (
+    AdTemplateProcessError,
+    AdTemplateStructuredOutputError,
+    AdTemplateTransportError,
+)
+from gateway.exact_clone_process import (
+    ExactCloneOrchestrator,
+    bounded_review_output,
+    request_checkpoint_revision,
+    review_template_action,
+    validate_exact_clone_output,
+)
 from gateway.tool_runs import (
     AD_TEMPLATE_ROUTE_ORDER,
     AD_TEMPLATE_OPTIONAL_ROUTE,
     TOOL_MODEL_POLICY_SCHEMA,
     ToolRunError,
+    ad_template_profile_snapshot,
     ad_template_model_catalog,
-    validate_generation_records,
     validate_model_policy,
 )
 
@@ -83,7 +94,7 @@ class ToolRunAPIMixin:
 
     @staticmethod
     def _tool_stage_order() -> List[str]:
-        return list(("source", "build", "render", "compare", "final-check", "live"))
+        return list(("source", "aspect-reference", "build", "render", "compare", "final-check", "import", "smoke-test", "ready-for-review", "publish", "live"))
 
     @staticmethod
     def _isolated_tool_role_prompt() -> str:
@@ -95,7 +106,7 @@ class ToolRunAPIMixin:
             "search, discover, or read repositories or the filesystem, and do not "
             "use terminal, read_file, search_files, or broad shell searches. In "
             "particular, never traverse /srv or the retired "
-            "/opt/ad-template-builder tree. The SoleProcessOrchestrator alone "
+            "/opt/ad-template-builder tree. The exact-clone controller alone "
             "executes the renderer and Blockwise import; do not run either. Return "
             "exactly one requested JSON object with no prose or code fences."
         )
@@ -116,7 +127,17 @@ class ToolRunAPIMixin:
             "final-review.started": "final-check",
             "final-review.retried": "final-check",
             "final-review.completed": "final-check",
-            "template.imported": "live",
+            "source-map.completed": "source",
+            "aspect-reference-image.started": "aspect-reference",
+            "aspect-reference-image.completed": "aspect-reference",
+            "aspect-reference.started": "aspect-reference",
+            "aspect-reference.completed": "aspect-reference",
+            "candidate.build-started": "build",
+            "candidate.built": "build",
+            "candidate.patch-applied": "build",
+            "iteration.revision-requested": "build",
+            "template.imported": "import",
+            "template.smoke-tested": "smoke-test",
         }.get(kind)
         return stage if expected == stage else None
 
@@ -130,8 +151,11 @@ class ToolRunAPIMixin:
             "render": "render",
             "compare": "compare", "qa": "compare", "visual-review": "compare",
             "check": "compare", "subject-invariance": "compare", "studio-qa": "compare",
-            "final-review": "final-check", "final-check": "final-check", "ready": "final-check",
-            "import": "live", "release": "live", "live": "live",
+            "aspect-reference": "aspect-reference",
+            "final-review": "final-check", "final-check": "final-check",
+            "ready": "ready-for-review", "ready-for-review": "ready-for-review",
+            "import": "import", "smoke-test": "smoke-test",
+            "publish": "publish", "release": "live", "live": "live",
         }
         return aliases.get(value, "source")
 
@@ -144,11 +168,11 @@ class ToolRunAPIMixin:
 
     @staticmethod
     def _ingest_tool_sources(command: Dict[str, Any]) -> Dict[str, Any]:
-        """Stage the source only for the duration of this run; no vault or hash."""
+        """Stage exactly one source as the durable run input and review reference."""
         payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
         sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
-        if not sources:
-            raise ToolRunError("at least one source is required")
+        if len(sources) != 1:
+            raise ToolRunError("exactly one source image is required per template run")
         try:
             from hermes_constants import get_hermes_home
             staging_root = (get_hermes_home() / "tool_runs" / "staging").resolve()
@@ -168,7 +192,7 @@ class ToolRunAPIMixin:
             try:
                 source.relative_to(shared_root)
             except ValueError as exc:
-                raise ToolRunError("source path is outside the Frank upload mount") from exc
+                raise ToolRunError("source path is outside the configured Frank source intake") from exc
             if not source.is_file() or source.suffix.lower() not in allowed:
                 raise ToolRunError("source is not a supported image")
             target = staging_root / f"source-{uuid.uuid4().hex}{source.suffix.lower()}"
@@ -695,21 +719,9 @@ class ToolRunAPIMixin:
     @staticmethod
     def _tool_json_output(value: Any, *, process_result: bool = False) -> Dict[str, Any]:
         if process_result:
-            required = {
-                "template", "iterations", "final_review", "previews",
-                "documents", "import", "process",
-            }
-            if (
-                not isinstance(value, dict)
-                or value.get("process") != "only-ad-template-process"
-                or not required.issubset(value)
-            ):
-                raise RuntimeError("Sole ad-template process returned an invalid result")
-            # The executable orchestrator already returns a structured object;
-            # its nested evidence is validated immediately afterward by
-            # _prepare_candidate_output. Keep the default agent-transport parser
-            # strict so arbitrary direct dictionaries are never accepted here.
-            return dict(value)
+            if not isinstance(value, dict) or value.get("process") != "exact-clone":
+                raise RuntimeError("Exact-clone process returned an invalid result")
+            return validate_exact_clone_output(value, require_import=True)
         text = ""
         if isinstance(value, dict):
             text = str(value.get("final_response") or value.get("output") or "")
@@ -748,87 +760,11 @@ class ToolRunAPIMixin:
 
     @staticmethod
     def _prepare_candidate_output(run_id: str, output: Dict[str, Any]) -> Dict[str, Any]:
-        required = {"template", "iterations", "final_review", "previews", "documents", "import"}
-        missing = sorted(key for key in required if key not in output)
-        if missing:
-            raise RuntimeError(f"Generator result is incomplete: {', '.join(missing)}")
-        iteration_budget_extension = int(output.get("iteration_budget_extension") or 0)
-        iterations = validate_iterations(
-            output.get("iterations"),
-            iteration_budget_extension=iteration_budget_extension,
-        )
-        final_review = validate_final_review(output.get("final_review"), accepted=iterations[-1]["decision"] == "accepted")
-        if final_review.get("decision") != "accepted":
-            raise RuntimeError("final reviewers did not pass")
-        docs = deterministic_documents(output.get("template"))
-        imported = output.get("import")
-        if not isinstance(imported, dict) or not imported.get("template_id") or not imported.get("status"):
-            raise RuntimeError("Blockwise import receipt is missing")
-        # The complete layered template and deterministic documents are already
-        # stored in the run artifact and imported into Blockwise. Persist only
-        # a bounded control-plane projection here: real templates routinely
-        # exceed the generic 32k per-string Tool-run ledger limit.
-        template = output.get("template") or {}
-        metadata = template.get("metadata") if isinstance(template.get("metadata"), dict) else {}
-        artifact_ref = output.get("template_path")
-        result = {key: output.get(key) for key in (
-            "previews", "template_path", "render_path", "import", "process",
-            "usage", "cost", "builder_escalated", "builder_route",
-            "model_policy_revision",
-            "iteration_budget_extension",
-        )}
-        result["template"] = {
-            "schema": template.get("schema"),
-            "templateId": template.get("templateId"),
-            "title": metadata.get("title"),
-            "artifact": artifact_ref,
-        }
-        result["documents"] = {
-            name: {"bytes": len(value.encode("utf-8")), "artifact": artifact_ref}
-            for name, value in docs.items()
-        }
-        result["iterations"] = [
-            {
-                "iteration": item["iteration"],
-                "decision": item["decision"],
-                "score": item["comparison"]["score"],
-                "minimum_score": item["comparison"]["minimum_score"],
-                "rubric": item["comparison"]["rubric"],
-                "final_review_failed": bool(item.get("final_review_failed")),
-            }
-            for item in iterations
-        ]
-        result["final_review"] = {
-            "decision": final_review["decision"],
-            "threshold": final_review["threshold"],
-            "reviewers": [
-                {
-                    "id": item["id"],
-                    "route": item["route"],
-                    "score": item["score"],
-                    "minimum_score": item["minimum_score"],
-                    "rubric": item["rubric"],
-                }
-                for item in final_review["reviewers"]
-            ],
-        }
-        result["process"] = "only-ad-template-process"
-        return result
-
-    @staticmethod
-    def _validated_generation_gate(output: Any) -> Dict[str, Any]:
-        if not isinstance(output, dict):
-            raise ToolRunError("generator output is required")
-        iterations = validate_iterations(
-            output.get("iterations"),
-            iteration_budget_extension=int(output.get("iteration_budget_extension") or 0),
-        )
-        return validate_final_review(output.get("final_review"), accepted=iterations[-1]["decision"] == "accepted")
-
-    def _project_generation_events(self, run_id: str, records: List[Dict[str, Any]]) -> None:
-        # The executable orchestrator persists each real comparator and reviewer
-        # event as it happens. Never reconstruct or synthesize process truth.
-        return None
+        del run_id
+        if output.get("process") != "exact-clone":
+            raise RuntimeError("Only exact-clone generator output is supported")
+        model_profile = output.pop("model_profile", {})
+        return bounded_review_output(output, model_profile=model_profile)
 
     def _tool_candidate(self, run: Dict[str, Any], stage: str) -> Dict[str, str]:
         stages = (run.get("model_policy") or {}).get("stages") or {}
@@ -885,21 +821,29 @@ class ToolRunAPIMixin:
                 pair = (candidate["provider"], candidate["model"])
                 role_pairs.setdefault(pair, []).append(role)
         for (provider, model), route_roles in role_pairs.items():
-            self._preflight_tool_candidate({"provider": provider, "model": model})
+            if route_roles == ["aspect-reference-image"]:
+                from agent.image_gen_registry import get_provider
+                image_provider = get_provider(provider)
+                supported = {
+                    str(item.get("id") or "")
+                    for item in image_provider.list_models()
+                } if image_provider is not None else set()
+                if (
+                    image_provider is None
+                    or not image_provider.is_available()
+                    or model not in supported
+                    or "image" not in (image_provider.capabilities().get("modalities") or [])
+                ):
+                    raise RuntimeError(
+                        f"Frozen ad-template image route is unavailable: {provider}/{model}"
+                    )
+            else:
+                self._preflight_tool_candidate({"provider": provider, "model": model})
             self._tool_run_store.append_event(
                 run["run_id"], "provider.preflight", status="ok", node_id="source",
                 data={"provider": provider, "model": model, "roles": route_roles},
             )
         return plan
-
-    def _tool_prompt(self, run: Dict[str, Any], *, finalize: bool = False) -> str:
-        payload = run.get("payload") or {}
-        sources = payload.get("sources") or []
-        source = (sources[0] or {}).get("path") if isinstance(sources[0], dict) else ""
-        return generator_prompt(run_id=run["run_id"],
-            project_id=str((run.get("scope") or {}).get("project_id") or ""),
-            brief=str(payload.get("brief") or ""), placements=payload.get("placements") or [],
-            source=str(source or ""))
 
     def _drain_tool_future(self, future: "asyncio.Future[Any]") -> None:
         """Consume a stopped executor future, including any late exception."""
@@ -1076,13 +1020,55 @@ class ToolRunAPIMixin:
                         active.pop(instance_id, None)
                         if not active:
                             self._tool_run_agents.pop(run_id, None)
+
+                def call_image_model(
+                    prompt: str, source_path: str, target_placement: str,
+                    route: Dict[str, str],
+                ) -> str:
+                    from agent.image_gen_provider import save_url_image
+                    from agent.image_gen_registry import get_provider
+
+                    provider_name = str(route.get("provider") or "")
+                    model_name = str(route.get("model") or "")
+                    provider = get_provider(provider_name)
+                    if provider is None or not provider.is_available():
+                        raise RuntimeError(
+                            f"configured aspect-reference image provider is unavailable: {provider_name}"
+                        )
+                    mark_activity()
+                    response = provider.generate(
+                        prompt=prompt,
+                        aspect_ratio="portrait",
+                        image_url=source_path,
+                        model=model_name,
+                    )
+                    if not isinstance(response, dict) or response.get("success") is not True:
+                        reason = response.get("error") if isinstance(response, dict) else "invalid response"
+                        raise RuntimeError(f"aspect-reference image generation failed: {reason}")
+                    image = response.get("image")
+                    if not isinstance(image, str) or not image.strip():
+                        raise RuntimeError("aspect-reference image generation returned no image")
+                    if image.startswith(("http://", "https://")):
+                        image = str(save_url_image(image, prefix=f"ad-template-{run_id}-reference"))
+                    generated_path = Path(image).expanduser().resolve(strict=True)
+                    if not generated_path.is_file():
+                        raise RuntimeError("aspect-reference image generation returned an invalid file")
+                    extra = response.get("extra") if isinstance(response.get("extra"), dict) else {}
+                    if isinstance(extra.get("cost_usd"), (int, float)):
+                        usage["estimated_cost_usd"] += float(extra["cost_usd"])
+                    self._tool_run_store.append_event(
+                        run_id, "image-model.completed", status="ok", node_id="aspect-reference",
+                        data={"provider": provider_name, "model": model_name, "placement": target_placement},
+                    )
+                    mark_activity()
+                    return str(generated_path)
                 routes = [
                     dict(route_plan[role][0][0]) for role in AD_TEMPLATE_ROUTE_ORDER
                 ]
                 # A configured analyse fallback must actually replace the
                 # builder route on retry; the previous implementation ignored
                 # ``_candidate`` and silently repeated the failed primary.
-                routes[0] = dict(_candidate)
+                routes[AD_TEMPLATE_ROUTE_ORDER.index("analyse")] = dict(_candidate)
                 if AD_TEMPLATE_OPTIONAL_ROUTE in route_plan:
                     routes.append(dict(route_plan[AD_TEMPLATE_OPTIONAL_ROUTE][0][0]))
                 def emit(kind: str, node: str, data: Dict[str, Any]):
@@ -1107,31 +1093,14 @@ class ToolRunAPIMixin:
                 if not source:
                     raise RuntimeError("source image is missing")
                 source = str(self._durable_tool_source(workspace, source))
-                checkpoint = self._ad_template_iteration_checkpoint(
-                    run_id, workspace, current_stage
-                )
-                result = SoleProcessOrchestrator(
-                    call_agent=call_agent, workspace=workspace, run_id=run_id,
+                result = ExactCloneOrchestrator(
+                    call_agent=call_agent, call_image_model=call_image_model,
+                    workspace=workspace, run_id=run_id,
                     project_id=str((run.get("scope") or {}).get("project_id") or ""), emit=emit,
                     should_stop=should_stop,
                 ).run(
                     source=source, brief=str(payload.get("brief") or ""),
                     placements=payload.get("placements") or [], routes=routes,
-                    require_quality_route=True,
-                    resume_final_check=bool((checkpoint or {}).get("resume_final_check")),
-                    revision_candidate=(checkpoint or {}).get("candidate"),
-                    history=(checkpoint or {}).get("history"),
-                    total_iterations=len((checkpoint or {}).get("history") or []),
-                    previous_score=(checkpoint or {}).get("previous_score"),
-                    best_quality_score=(checkpoint or {}).get("best_quality_score"),
-                    best_iteration=(checkpoint or {}).get("best_iteration"),
-                    selected_builder_route=(checkpoint or {}).get("selected_builder_route"),
-                    builder_escalated=bool((checkpoint or {}).get("builder_escalated")),
-                    low_gain_streak=int((checkpoint or {}).get("low_gain_streak") or 0),
-                    feedback=str((checkpoint or {}).get("feedback") or ""),
-                    iteration_budget_extension=int(
-                        (checkpoint or {}).get("iteration_budget_extension") or 0
-                    ),
                 )
                 return result, usage
 
@@ -1233,15 +1202,23 @@ class ToolRunAPIMixin:
             output["cost"]["reported_usd"] = usage.get("estimated_cost_usd") or reported_cost
             output["cost"]["estimated_usd"] = usage.get("estimated_cost_usd", 0.0)
             output["model_policy_revision"] = refreshed["model_policy_revision"]
-            output = self._prepare_candidate_output(run_id, output)
-            self._project_generation_events(run_id, output["iterations"])
-            self._tool_run_store.update_run(
-                run_id, status="completed", stage="live", progress=1,
-                output=output, attention=False,
+            output["model_profile"] = ad_template_profile_snapshot(
+                refreshed["model_policy"], revision=refreshed["model_policy_revision"],
             )
-            self._tool_run_store.append_event(
-                run_id, "template.imported", status="ok", node_id="live",
-                data=dict(output["import"]),
+            output = self._prepare_candidate_output(run_id, output)
+            self._tool_run_store.transition_run(
+                run_id,
+                expected_statuses={"running"},
+                status="ready_for_review",
+                stage="ready-for-review",
+                attention=True,
+                event_kind="template.ready-for-review",
+                event_status="ok",
+                event_data={
+                    "template_id": output["template"]["templateId"],
+                    "smoke_status": output["smoke_test"].get("status"),
+                },
+                output=output,
             )
         except asyncio.CancelledError:
             try:
@@ -1400,7 +1377,7 @@ class ToolRunAPIMixin:
                     await response.write(f"id: {cursor}\nevent: {event['kind']}\ndata: {payload}\n\n".encode())
                     idle = 0
                 run = self._tool_run_store.get_run(run_id)
-                if run["status"] in {"completed", "failed", "cancelled"} and not events:
+                if run["status"] in {"ready_for_review", "completed", "failed", "cancelled", "discarded"} and not events:
                     break
                 if not events:
                     idle += 1
@@ -1516,52 +1493,173 @@ class ToolRunAPIMixin:
                 if not isinstance(parsed, dict):
                     raise ToolRunError("retry body must be an object")
                 body = parsed
-            unknown = set(body) - {"mode"}
-            if unknown:
-                raise ToolRunError("retry body contains unsupported fields")
-            mode = body.get("mode")
-            if mode not in (None, "build-from-best"):
-                raise ToolRunError("unsupported Tool retry mode")
+            if body:
+                raise ToolRunError("retry body must be an empty object")
             run = self._tool_run_store.get_run(run_id)
             if run["status"] not in {"failed", "cancelled", "blocked"}:
                 raise ToolRunError("only failed, cancelled, or blocked Tool runs can be retried")
-            if mode == "build-from-best":
-                if run["status"] not in {"failed", "cancelled"}:
-                    raise ToolRunError(
-                        "build-from-best retry requires a failed or cancelled terminal Tool run"
-                    )
-                identity = {
-                    key: run.get(key)
-                    for key in (
-                        "run_id", "tool_id", "action", "scope", "payload",
-                        "model_policy_revision", "model_policy",
-                    )
-                }
-                _checkpoint, evidence = await asyncio.to_thread(
-                    self._validate_build_from_best_retry, run
-                )
-                current = self._tool_run_store.get_run(run_id)
-                if current["status"] not in {"failed", "cancelled", "blocked"} or any(
-                    current.get(key) != value for key, value in identity.items()
-                ):
-                    raise ToolRunError("Tool run changed while validating build-from-best retry")
-                run = self._tool_run_store.requeue(
-                    run_id,
-                    stage="build",
-                    expected_statuses={"failed", "cancelled"},
-                    event_data=evidence,
-                )
-            else:
-                run = self._tool_run_store.requeue(
-                    run_id,
-                    expected_statuses={"failed", "cancelled", "blocked"},
-                )
-            self._start_tool_task(run_id, finalize=run.get("stage") == "release")
+            run = self._tool_run_store.requeue(
+                run_id,
+                expected_statuses={"failed", "cancelled", "blocked"},
+            )
+            self._start_tool_task(run_id)
             return web.json_response(run, status=202)
         except KeyError as exc:
             return web.json_response(_error(str(exc), "tool_run_not_found"), status=404)
         except ToolRunError as exc:
             return web.json_response(_error(str(exc), "invalid_tool_retry"), status=400)
+
+    async def _handle_approve_tool_run(self, request: web.Request) -> web.Response:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = request.match_info["run_id"]
+        try:
+            body = await request.json() if getattr(request, "can_read_body", False) else {}
+            if body not in ({}, None):
+                raise ToolRunError("approve body must be an empty object")
+            run = self._tool_run_store.get_run(run_id)
+            output = run.get("output") if isinstance(run.get("output"), dict) else {}
+            template = output.get("template") if isinstance(output.get("template"), dict) else {}
+            template_id = template.get("templateId")
+            if not isinstance(template_id, str) or not template_id:
+                raise ToolRunError("reviewed template identity is unavailable")
+            self._tool_run_store.transition_run(
+                run_id, expected_statuses={"ready_for_review"}, status="publishing",
+                stage="publish", attention=False, event_kind="command.approve",
+                event_data={"template_id": template_id},
+            )
+            try:
+                receipt = await asyncio.to_thread(
+                    review_template_action, template_id=template_id, run_id=run_id,
+                    action="activate",
+                )
+            except Exception as exc:
+                self._tool_run_store.transition_run(
+                    run_id, expected_statuses={"publishing"}, status="ready_for_review",
+                    stage="ready-for-review", attention=True,
+                    event_kind="template.publish-failed", event_status="error",
+                    event_data={"error": redact_sensitive_text(str(exc), force=True)[:1000]},
+                )
+                raise
+            output["publish"] = receipt
+            return web.json_response(self._tool_run_store.transition_run(
+                run_id, expected_statuses={"publishing"}, status="completed",
+                stage="live", attention=False, event_kind="template.published",
+                event_status="ok", event_data={"template_id": template_id}, output=output,
+            ))
+        except KeyError as exc:
+            return web.json_response(_error(str(exc), "tool_run_not_found"), status=404)
+        except (
+            ToolRunError, AdTemplateProcessError, json.JSONDecodeError,
+            web.HTTPException, ValueError, TypeError,
+        ) as exc:
+            return web.json_response(_error(str(exc), "invalid_template_approval"), status=409)
+
+    async def _handle_request_changes_tool_run(self, request: web.Request) -> web.Response:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = request.match_info["run_id"]
+        try:
+            body = await request.json()
+            if not isinstance(body, dict) or set(body) != {"instructions"}:
+                raise ToolRunError("request-changes body must contain exactly instructions")
+            instructions = body.get("instructions")
+            if not isinstance(instructions, str) or not instructions.strip() or len(instructions) > 4000:
+                raise ToolRunError("review instructions must be a bounded non-empty string")
+            run = self._tool_run_store.get_run(run_id)
+            output = run.get("output") if isinstance(run.get("output"), dict) else {}
+            template_id = ((output.get("template") or {}).get("templateId") if isinstance(output.get("template"), dict) else None)
+            if not isinstance(template_id, str) or not template_id:
+                raise ToolRunError("reviewed template identity is unavailable")
+            from hermes_constants import get_hermes_home
+            workspace = (get_hermes_home() / "tool_runs" / "ad-template-generator" / run_id).resolve()
+            await asyncio.to_thread(request_checkpoint_revision, workspace, instructions)
+            self._tool_run_store.transition_run(
+                run_id, expected_statuses={"ready_for_review"}, status="discarding",
+                stage="ready-for-review", attention=False,
+                event_kind="command.changes-requested",
+                event_data={"instructions": instructions.strip()},
+            )
+            try:
+                await asyncio.to_thread(
+                    review_template_action, template_id=template_id, run_id=run_id,
+                    action="discard", reason="operator requested changes",
+                )
+            except Exception as exc:
+                self._tool_run_store.transition_run(
+                    run_id, expected_statuses={"discarding"}, status="ready_for_review",
+                    stage="ready-for-review", attention=True,
+                    event_kind="template.discard-failed", event_status="error",
+                    event_data={"error": redact_sensitive_text(str(exc), force=True)[:1000]},
+                )
+                raise
+            queued = self._tool_run_store.requeue(
+                run_id, stage="build", expected_statuses={"discarding"},
+                event_data={"reason": "operator-requested-changes"},
+            )
+            self._start_tool_task(run_id)
+            return web.json_response(queued, status=202)
+        except KeyError as exc:
+            return web.json_response(_error(str(exc), "tool_run_not_found"), status=404)
+        except (
+            ToolRunError, AdTemplateProcessError, json.JSONDecodeError,
+            web.HTTPException, ValueError, TypeError,
+        ) as exc:
+            return web.json_response(_error(str(exc), "invalid_template_changes"), status=409)
+
+    async def _handle_discard_tool_run(self, request: web.Request) -> web.Response:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = request.match_info["run_id"]
+        try:
+            body = await request.json() if getattr(request, "can_read_body", False) else {}
+            if body is None:
+                body = {}
+            if not isinstance(body, dict) or set(body) - {"reason"}:
+                raise ToolRunError("discard body supports only reason")
+            reason = body.get("reason") or "operator discarded template"
+            if not isinstance(reason, str) or len(reason) > 1000:
+                raise ToolRunError("discard reason is invalid")
+            run = self._tool_run_store.get_run(run_id)
+            output = run.get("output") if isinstance(run.get("output"), dict) else {}
+            template_id = ((output.get("template") or {}).get("templateId") if isinstance(output.get("template"), dict) else None)
+            if not isinstance(template_id, str) or not template_id:
+                raise ToolRunError("reviewed template identity is unavailable")
+            self._tool_run_store.transition_run(
+                run_id, expected_statuses={"ready_for_review"}, status="discarding",
+                stage="ready-for-review", attention=False,
+                event_kind="command.discard", event_data={"reason": reason},
+            )
+            try:
+                receipt = await asyncio.to_thread(
+                    review_template_action, template_id=template_id, run_id=run_id,
+                    action="discard", reason=reason,
+                )
+            except Exception as exc:
+                self._tool_run_store.transition_run(
+                    run_id, expected_statuses={"discarding"}, status="ready_for_review",
+                    stage="ready-for-review", attention=True,
+                    event_kind="template.discard-failed", event_status="error",
+                    event_data={"error": redact_sensitive_text(str(exc), force=True)[:1000]},
+                )
+                raise
+            output["discard"] = receipt
+            return web.json_response(self._tool_run_store.transition_run(
+                run_id, expected_statuses={"discarding"}, status="discarded",
+                stage="ready-for-review", attention=False,
+                event_kind="template.discarded", event_status="cancelled",
+                event_data={"template_id": template_id, "reason": reason}, output=output,
+            ))
+        except KeyError as exc:
+            return web.json_response(_error(str(exc), "tool_run_not_found"), status=404)
+        except (
+            ToolRunError, AdTemplateProcessError, json.JSONDecodeError,
+            web.HTTPException, ValueError, TypeError,
+        ) as exc:
+            return web.json_response(_error(str(exc), "invalid_template_discard"), status=409)
 
     async def _handle_cancel_tool_run(self, request: web.Request) -> web.Response:
         auth_err = self._check_auth(request)

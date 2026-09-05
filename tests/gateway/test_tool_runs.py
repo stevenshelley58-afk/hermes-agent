@@ -71,6 +71,39 @@ def test_restart_requeues_interrupted_runs_with_checkpoint(tmp_path):
     assert store.events(run["run_id"])[-1]["kind"] == "run.recovered"
 
 
+@pytest.mark.parametrize("interrupted_status", ["publishing", "discarding"])
+def test_restart_returns_interrupted_review_action_to_ready_for_review(
+    tmp_path, interrupted_status,
+):
+    store = ToolRunStore(str(tmp_path / f"recover-{interrupted_status}.db"))
+    run, _ = store.create_run(command(idempotency_key=f"recover-{interrupted_status}"))
+    store.update_run(
+        run["run_id"], status=interrupted_status,
+        stage="publish" if interrupted_status == "publishing" else "ready-for-review",
+        attention=False,
+    )
+
+    recovered = store.recover_incomplete()
+
+    assert recovered[0]["status"] == "ready_for_review"
+    assert recovered[0]["stage"] == "ready-for-review"
+    assert recovered[0]["attention"] is True
+    event = store.events(run["run_id"])[-1]
+    assert event["kind"] == "run.recovered"
+    assert event["data"]["resume_from"] == "ready-for-review"
+
+
+def test_review_stage_cannot_use_generic_cancel(tmp_path):
+    store = ToolRunStore(str(tmp_path / "review-cancel.db"))
+    run, _ = store.create_run(command(idempotency_key="review-cancel"))
+    store.update_run(
+        run["run_id"], status="ready_for_review", stage="ready-for-review",
+    )
+
+    with pytest.raises(ToolRunError, match="must use approve"):
+        store.request_cancel(run["run_id"])
+
+
 def test_restart_recovers_only_recent_cancelled_rows_without_operator_intent(tmp_path):
     store = ToolRunStore(str(tmp_path / "recover-cancel-race.db"))
     recent, _ = store.create_run(command(idempotency_key="recent-cancel-race"))
@@ -182,6 +215,7 @@ def test_ad_studio_profile_picker_changes_only_new_runs_and_persists_exact_snaps
     assert accepted["data"]["policy_revision"] == selected_record["revision"]
     assert accepted["data"]["model_profile"] == {
         "profile_revision": selected_record["revision"],
+        "aspect-reference": {"provider": "openai-codex", "model": "gpt-image-2-high"},
         "builder": {"provider": "openai-codex", "model": "gpt-5.6-luna"},
         "comparator": {"provider": "openai-codex", "model": "gpt-5.6-luna"},
         "final-review-a": {"provider": "openai-codex", "model": "gpt-5.6-luna"},
@@ -195,13 +229,14 @@ def test_ad_studio_profile_picker_changes_only_new_runs_and_persists_exact_snaps
 def test_builtin_policy_uses_only_audited_native_vision_roles():
     policy = default_ad_template_policy()
     expected = {
+        "aspect-reference-image": ("openai-codex", "gpt-image-2-high"),
         "analyse": ("openai-codex", "gpt-5.6-sol"),
         "compare": ("openai-codex", "gpt-5.6-luna"),
         "final-review-a": ("openai-codex", "gpt-5.6-luna"),
         "final-review-b": ("deepseek", "deepseek-v4-flash-vision-exp"),
         "quality-escalation": ("openai-codex", "gpt-5.6-sol"),
     }
-    assert policy["seed_revision"] == 11
+    assert policy["seed_revision"] == 12
     assert AD_TEMPLATE_ROUTE_ORDER == tuple(expected)[:-1]
     assert AD_TEMPLATE_OPTIONAL_ROUTE == "quality-escalation"
     for stage_id, route in expected.items():
@@ -210,8 +245,13 @@ def test_builtin_policy_uses_only_audited_native_vision_roles():
         assert (candidate["provider"], candidate["model"]) == route
         assert candidate["capability_verified"] is True
         assert candidate["supports_vision"] is True
-        assert candidate["supports_tools"] is True
-        assert candidate["capabilities"] == ["vision_structured"]
+        if stage_id == "aspect-reference-image":
+            assert candidate["supports_tools"] is False
+            assert candidate["capabilities"] == ["masked_image_edit"]
+            assert stage["capability"] == "masked_image_edit"
+        else:
+            assert candidate["supports_tools"] is True
+            assert candidate["capabilities"] == ["vision_structured"]
         assert stage["fallbacks"] == []
         assert stage["max_attempts"] == 1
     assert validate_model_policy(policy) == policy
@@ -297,7 +337,7 @@ def test_stale_sole_revisions_one_to_ten_are_preserved_and_revision_eleven_selec
     assert migrated.get_policy("ad-template-generator", 10)["policy"] == stale
     current = migrated.get_policy("ad-template-generator")
     assert current["revision"] == 11
-    assert current["policy"]["seed_revision"] == 11
+    assert current["policy"]["seed_revision"] == 12
     assert current["policy"]["stages"]["analyse"]["primary"]["model"] == "gpt-5.6-sol"
     assert current["policy"]["stages"]["quality-escalation"]["primary"]["model"] == "gpt-5.6-sol"
     pinned, _ = migrated.create_run(command(

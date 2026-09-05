@@ -548,7 +548,18 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        tier_id, meta = _resolve_model()
+        requested_model = kwargs.get("model")
+        if requested_model is not None:
+            if not isinstance(requested_model, str) or requested_model not in _MODELS:
+                return error_response(
+                    error="Explicit image model is not supported by the OpenAI Codex provider",
+                    error_type="invalid_model",
+                    provider="openai-codex",
+                    aspect_ratio=aspect,
+                )
+            tier_id, meta = requested_model, _MODELS[requested_model]
+        else:
+            tier_id, meta = _resolve_model()
         size = _SIZES.get(aspect, _SIZES["square"])
 
         token = _read_codex_access_token()

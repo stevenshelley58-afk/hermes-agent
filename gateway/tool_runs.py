@@ -17,9 +17,6 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
-from gateway.ad_template_process import validate_iterations, validate_final_review, deterministic_documents
-
-
 TOOL_RUN_COMMAND_SCHEMA = "schema://hermes.tool-run-command/v1"
 TOOL_RUN_EVENT_SCHEMA = "schema://hermes.tool-run-event/v1"
 TOOL_MODEL_POLICY_SCHEMA = "schema://hermes.tool-model-policy/v1"
@@ -27,21 +24,20 @@ TOOL_MODEL_POLICY_SCHEMA = "schema://hermes.tool-model-policy/v1"
 _ID = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$")
 _TRACE_ID = re.compile(r"^[0-9a-f]{32}$")
 _SPAN_ID = re.compile(r"^[0-9a-f]{16}$")
-_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "discarded"})
 _RUN_STATUSES = frozenset({
     "queued", "running", "blocked", "completed",
-    "failed", "cancelling", "cancelled",
+    "failed", "cancelling", "cancelled", "ready_for_review",
+    "publishing", "discarding", "discarded",
 })
 _EVENT_STATUSES = frozenset({"queued", "running", "ok", "blocked", "error", "cancelled"})
 _SECRET_KEY = re.compile(r"(?:api[_-]?key|token|secret|password|credential|private[_-]?key|authorization)", re.I)
 _SAFE_USAGE_KEYS = frozenset({"input_tokens", "output_tokens", "total_tokens"})
 _MAX_JSON_BYTES = 512 * 1024
-_MASKED_EDIT_MODELS = frozenset({
-    "gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2",
-})
 _KNOWN_IMAGE_ONLY = frozenset({"gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2"})
-_AD_TEMPLATE_POLICY_SEED_REVISION = 11
+_AD_TEMPLATE_POLICY_SEED_REVISION = 12
 AD_TEMPLATE_ROUTE_ORDER = (
+    "aspect-reference-image",
     "analyse",
     "compare",
     "final-review-a",
@@ -53,11 +49,14 @@ _AUDITED_NATIVE_VISION_MODELS = frozenset({
     ("openai-codex", "gpt-5.6-luna"),
     ("openai-codex", "gpt-5.6-sol"),
 })
+_AUDITED_IMAGE_EDIT_MODELS = frozenset({
+    ("openai-codex", "gpt-image-2-high"),
+})
 
 
 def ad_template_model_catalog() -> List[Dict[str, Any]]:
     """Return the same audited capability catalogue used by policy validation."""
-    return [
+    structured = [
         {
             "provider": provider,
             "model": model,
@@ -67,11 +66,23 @@ def ad_template_model_catalog() -> List[Dict[str, Any]]:
         }
         for provider, model in sorted(_AUDITED_NATIVE_VISION_MODELS)
     ]
+    image_edits = [
+        {
+            "provider": provider,
+            "model": model,
+            "capabilities": ["masked_image_edit"],
+            "supports_vision": True,
+            "supports_tools": False,
+        }
+        for provider, model in sorted(_AUDITED_IMAGE_EDIT_MODELS)
+    ]
+    return structured + image_edits
 
 
-def _ad_template_profile_snapshot(policy: Mapping[str, Any], *, revision: int) -> Dict[str, Any]:
+def ad_template_profile_snapshot(policy: Mapping[str, Any], *, revision: int) -> Dict[str, Any]:
     stages = policy.get("stages") if isinstance(policy.get("stages"), dict) else {}
     aliases = {
+        "aspect-reference": "aspect-reference-image",
         "builder": "analyse",
         "comparator": "compare",
         "final-review-a": "final-review-a",
@@ -88,18 +99,9 @@ def _ad_template_profile_snapshot(policy: Mapping[str, Any], *, revision: int) -
                 "model": str(primary.get("model") or ""),
             }
     return snapshot
-_GENERATION_EVENT_KINDS = frozenset({
-    "generation.started", "generation.rendered", "generation.scored",
-    "generation.revision-requested", "generation.accepted", "generation.failed",
-})
-
-
 class ToolRunError(ValueError):
     """Raised when a Tool-run contract or state transition is invalid."""
 
-
-# The sole process records comparator scores and final-review decisions. It never persists source or artifact hashes.
-validate_generation_records = validate_iterations
 
 def _now() -> float:
     return time.time()
@@ -166,6 +168,17 @@ def _audited_native_vision_candidate(provider: str, model: str) -> Dict[str, Any
     }
 
 
+def _audited_image_edit_candidate(provider: str, model: str) -> Dict[str, Any]:
+    return {
+        "provider": provider,
+        "model": model,
+        "capability_verified": True,
+        "capabilities": ["masked_image_edit"],
+        "supports_vision": True,
+        "supports_tools": False,
+    }
+
+
 def default_ad_template_policy() -> Dict[str, Any]:
     """Bounded audited routes for the sole autonomous generator process."""
     return {
@@ -173,13 +186,17 @@ def default_ad_template_policy() -> Dict[str, Any]:
         "name": "Sole ad-template process", "preset": "cheap-quality",
         "seed_revision": _AD_TEMPLATE_POLICY_SEED_REVISION,
         "stages": {
+            "aspect-reference-image": {"capability": "masked_image_edit", "primary": _audited_image_edit_candidate("openai-codex", "gpt-image-2-high"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 180, "max_cost_usd": 0.35},
             "analyse": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-sol"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
             "compare": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-luna"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
             "final-review-a": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-luna"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
             "final-review-b": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("deepseek", "deepseek-v4-flash-vision-exp"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
             "quality-escalation": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-sol"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
         },
-        "deterministic_stages": ["qa", "import"],
+        "deterministic_stages": [
+            "source-map", "render", "pixel-compare", "validate", "import",
+            "smoke-test",
+        ],
     }
 
 
@@ -228,9 +245,14 @@ def validate_model_policy(policy: Any, *, tool_id: Optional[str] = None) -> Dict
             model = model.strip().lower()
             declared = candidate.get("capabilities") if isinstance(candidate.get("capabilities"), list) else []
             verified = candidate.get("capability_verified") is True
-            if stage.get("capability") == "masked_image_edit" and model not in _MASKED_EDIT_MODELS:
-                if not verified or "masked_image_edit" not in declared:
-                    raise ToolRunError(f"model {model} has not verified masked-image-edit support")
+            if stage.get("capability") == "masked_image_edit":
+                provider = str(candidate.get("provider") or "").strip().lower()
+                if (
+                    (provider, model) not in _AUDITED_IMAGE_EDIT_MODELS
+                    or not verified or "masked_image_edit" not in declared
+                    or candidate.get("supports_vision") is not True
+                ):
+                    raise ToolRunError(f"model {provider}/{model} has not verified image-edit support")
             if stage.get("capability") == "vision_structured" and model in _KNOWN_IMAGE_ONLY:
                 raise ToolRunError(f"image-generation model {model} cannot perform structured vision analysis")
             if stage.get("capability") == "vision_structured":
@@ -261,9 +283,18 @@ def validate_model_policy(policy: Any, *, tool_id: Optional[str] = None) -> Dict
             )
         for stage_id in stages:
             stage = stages[stage_id]
-            if stage.get("capability") != "vision_structured":
+            required_capability = (
+                "masked_image_edit" if stage_id == "aspect-reference-image"
+                else "vision_structured"
+            )
+            if stage.get("capability") != required_capability:
+                label = (
+                    "audited image editing"
+                    if required_capability == "masked_image_edit"
+                    else "audited structured vision"
+                )
                 raise ToolRunError(
-                    f"ad-template role {stage_id} requires audited structured vision"
+                    f"ad-template role {stage_id} requires {label}"
                 )
             if stage.get("fallbacks") != []:
                 raise ToolRunError(
@@ -278,7 +309,12 @@ def validate_model_policy(policy: Any, *, tool_id: Optional[str] = None) -> Dict
                 str(primary.get("provider") or "").strip().lower(),
                 str(primary.get("model") or "").strip().lower(),
             )
-            if route not in _AUDITED_NATIVE_VISION_MODELS:
+            allowed_routes = (
+                _AUDITED_IMAGE_EDIT_MODELS
+                if stage_id == "aspect-reference-image"
+                else _AUDITED_NATIVE_VISION_MODELS
+            )
+            if route not in allowed_routes:
                 raise ToolRunError(
                     f"ad-template role {stage_id} must use a model from the Hermes audited capability catalogue"
                 )
@@ -569,7 +605,7 @@ class ToolRunStore:
             self._conn.commit()
         self.append_event(run_id, "command.accepted", status="queued", node_id="source", data={
             "policy_revision": policy_record["revision"],
-            "model_profile": _ad_template_profile_snapshot(
+            "model_profile": ad_template_profile_snapshot(
                 policy_record["policy"], revision=policy_record["revision"]
             )
             if tool_id == "ad-template-generator" else None,
@@ -740,10 +776,87 @@ class ToolRunStore:
             self._conn.commit()
         return self.get_run(run_id)
 
+    def transition_run(
+        self,
+        run_id: str,
+        *,
+        expected_statuses: Iterable[str],
+        status: str,
+        stage: str,
+        attention: bool,
+        event_kind: str,
+        event_status: str = "running",
+        event_data: Optional[Mapping[str, Any]] = None,
+        output: Any = None,
+    ) -> Dict[str, Any]:
+        """Atomically change lifecycle state and append its durable event."""
+        _clean_id(run_id, "run_id")
+        allowed = frozenset(str(item) for item in expected_statuses)
+        if not allowed or not allowed.issubset(_RUN_STATUSES):
+            raise ToolRunError("expected transition statuses are invalid")
+        if status not in _RUN_STATUSES:
+            raise ToolRunError("unsupported run status")
+        clean_stage = _clean_id(stage, "stage")
+        clean_kind = _clean_id(event_kind, "event kind")
+        if event_status not in _EVENT_STATUSES:
+            raise ToolRunError("unsupported event status")
+        payload = dict(event_data or {})
+        data_json = _json(payload, "event.data")
+        now = _now()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status,trace_id,started_at FROM tool_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Tool run not found: {run_id}")
+            if row["status"] not in allowed:
+                raise ToolRunError("Tool run is no longer eligible for this transition")
+            updates: Dict[str, Any] = {
+                "status": status,
+                "stage": clean_stage,
+                "attention": int(bool(attention)),
+                "updated_at": now,
+                "completed_at": now if status in _TERMINAL_STATUSES else None,
+            }
+            if status == "running" and row["started_at"] is None:
+                updates["started_at"] = now
+            if output is not None:
+                updates["output_json"] = _json(output, "output")
+            columns = ",".join(f"{key}=?" for key in updates)
+            placeholders = ",".join("?" for _ in allowed)
+            params = [*updates.values(), run_id, *sorted(allowed)]
+            try:
+                cursor = self._conn.execute(
+                    f"UPDATE tool_runs SET {columns} WHERE run_id=? AND status IN ({placeholders})",
+                    tuple(params),
+                )
+                if cursor.rowcount != 1:
+                    raise ToolRunError("Tool run is no longer eligible for this transition")
+                sequence = int(self._conn.execute(
+                    "SELECT COALESCE(MAX(sequence),-1)+1 FROM tool_run_events WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()[0])
+                self._conn.execute(
+                    """INSERT INTO tool_run_events(
+                        run_id,sequence,schema,kind,status,timestamp,node_id,trace_id,span_id,data_json
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        run_id, sequence, TOOL_RUN_EVENT_SCHEMA, clean_kind, event_status,
+                        now, clean_stage, row["trace_id"], None, data_json,
+                    ),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return self.get_run(run_id)
+
     def request_cancel(self, run_id: str) -> Dict[str, Any]:
         run = self.get_run(run_id)
         if run["status"] in _TERMINAL_STATUSES:
             return run
+        if run["status"] in {"ready_for_review", "publishing", "discarding"}:
+            raise ToolRunError("review-stage templates must use approve, request changes, or discard")
         with self._lock:
             self._conn.execute(
                 "UPDATE tool_runs SET cancel_requested=1,status='cancelling',updated_at=? WHERE run_id=?",
@@ -933,28 +1046,39 @@ class ToolRunStore:
         with self._lock:
             rows = self._conn.execute(
                 """SELECT run_id,stage,status FROM tool_runs
-                   WHERE status IN ('running','cancelling')
+                   WHERE status IN ('running','cancelling','publishing','discarding')
                       OR (status='cancelled' AND cancel_requested=0 AND updated_at>=?)
                    ORDER BY created_at""",
                 (recent_cutoff,),
             ).fetchall()
             self._conn.execute(
                 """UPDATE tool_runs
-                   SET status='queued',cancel_requested=0,attention=1,
+                   SET status=CASE
+                         WHEN status IN ('publishing','discarding') THEN 'ready_for_review'
+                         ELSE 'queued'
+                       END,
+                       stage=CASE
+                         WHEN status IN ('publishing','discarding') THEN 'ready-for-review'
+                         ELSE stage
+                       END,
+                       cancel_requested=0,attention=1,
                        completed_at=NULL,updated_at=?
-                   WHERE status IN ('running','cancelling')
+                   WHERE status IN ('running','cancelling','publishing','discarding')
                       OR (status='cancelled' AND cancel_requested=0 AND updated_at>=?)""",
                 (_now(), recent_cutoff),
             )
             self._conn.commit()
         recovered: List[Dict[str, Any]] = []
         for row in rows:
+            review_recovery = row["status"] in {"publishing", "discarding"}
             self.append_event(
-                row["run_id"], "run.recovered", status="queued", node_id=row["stage"],
+                row["run_id"], "run.recovered",
+                status="blocked" if review_recovery else "queued",
+                node_id="ready-for-review" if review_recovery else row["stage"],
                 data={
                     "reason": "unrequested-cancellation"
                     if row["status"] == "cancelled" else "gateway-restart",
-                    "resume_from": row["stage"],
+                    "resume_from": "ready-for-review" if review_recovery else row["stage"],
                 },
             )
             recovered.append(self.get_run(row["run_id"]))

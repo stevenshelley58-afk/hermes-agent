@@ -2121,6 +2121,9 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
             ("POST", "/v1/tool-runs/{run_id}/models", self._handle_tool_run_model_change),
             ("POST", "/v1/tool-runs/{run_id}/retry", self._handle_retry_tool_run),
             ("POST", "/v1/tool-runs/{run_id}/cancel", self._handle_cancel_tool_run),
+            ("POST", "/v1/tool-runs/{run_id}/approve", self._handle_approve_tool_run),
+            ("POST", "/v1/tool-runs/{run_id}/request-changes", self._handle_request_changes_tool_run),
+            ("POST", "/v1/tool-runs/{run_id}/discard", self._handle_discard_tool_run),
         ]
         if _CRON_AVAILABLE:
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
@@ -3251,6 +3254,9 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
                 "tool_run_models": {"method": "POST", "path": "/v1/tool-runs/{run_id}/models"},
                 "tool_run_retry": {"method": "POST", "path": "/v1/tool-runs/{run_id}/retry"},
                 "tool_run_cancel": {"method": "POST", "path": "/v1/tool-runs/{run_id}/cancel"},
+                "tool_run_approve": {"method": "POST", "path": "/v1/tool-runs/{run_id}/approve"},
+                "tool_run_request_changes": {"method": "POST", "path": "/v1/tool-runs/{run_id}/request-changes"},
+                "tool_run_discard": {"method": "POST", "path": "/v1/tool-runs/{run_id}/discard"},
                 "tool_model_policies": {"method": "GET", "path": "/v1/tool-runs/policies/{tool_id}"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},

@@ -120,6 +120,30 @@ class TestGenerate:
         # tell the two backends apart.
         assert saved.name.startswith("openai_codex_")
 
+    def test_explicit_model_override_is_independent_of_global_picker(self, provider, monkeypatch):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+        monkeypatch.setattr(
+            codex_plugin, "_resolve_model",
+            lambda: (_ for _ in ()).throw(AssertionError("global picker must not be read")),
+        )
+        captured = {}
+
+        def collect(_token, *, prompt, size, quality, input_images=None):
+            captured.update(prompt=prompt, size=size, quality=quality, input_images=input_images)
+            return _b64_png()
+
+        monkeypatch.setattr(codex_plugin, "_collect_image_b64", collect)
+        result = provider.generate(
+            "make an opposite-placement reference",
+            aspect_ratio="portrait",
+            model="gpt-image-2-high",
+        )
+
+        assert result["success"] is True
+        assert result["model"] == "gpt-image-2-high"
+        assert result["quality"] == "high"
+        assert captured["quality"] == "high"
+
     def test_codex_stream_request_shape(self, provider, monkeypatch):
         monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
 
