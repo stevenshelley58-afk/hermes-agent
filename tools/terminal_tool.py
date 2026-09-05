@@ -1428,7 +1428,19 @@ def _resolve_task_host_cwd(config: Dict[str, Any], task_id: Optional[str]) -> Op
       actually attached to THIS session (``cwd_source: "session"`` or an
       untagged override from ACP/RL surfaces) mounts.
     """
-    if config.get("env_type") != "docker":
+    overrides = resolve_task_overrides(task_id)
+    if overrides.get("mini_restricted_docker"):
+        candidate = overrides.get("host_cwd")
+        if not isinstance(candidate, str) or not candidate.strip():
+            raise ValueError("Restricted Docker workspace is unavailable")
+        absolute = os.path.abspath(os.path.expanduser(candidate))
+        resolved = os.path.realpath(absolute)
+        if absolute != resolved or not os.path.isabs(absolute) or not os.path.isdir(resolved):
+            raise ValueError("Restricted Docker workspace is unsafe")
+        return resolved
+
+    env_type = overrides.get("env_type") or config.get("env_type")
+    if env_type != "docker":
         return None
     if not config.get("docker_mount_cwd_to_workspace"):
         return None
@@ -1437,7 +1449,6 @@ def _resolve_task_host_cwd(config: Dict[str, Any], task_id: Optional[str]) -> Op
     if _resolve_container_task_id(task_id) == "default":
         # Top-level CLI parent — single-session process, legacy behavior.
         return config.get("host_cwd")
-    overrides = resolve_task_overrides(task_id)
     if overrides.get("cwd_source") == "process":
         return None
     candidate = overrides.get("cwd")
@@ -1726,13 +1737,15 @@ def _ssh_config_from_config(config: Dict[str, Any]) -> dict:
     }
 
 
-def _container_config_from_config(config: Dict[str, Any]) -> dict:
+def _container_config_from_config(
+    config: Dict[str, Any], task_id: Optional[str] = None
+) -> dict:
     """Build the ``container_config`` dict passed to :func:`_create_environment`.
 
     Shared by the terminal tool's own get-or-create path and the lazy
     :func:`ensure_task_env` bring-up (see :func:`_ssh_config_from_config`).
     """
-    return {
+    result = {
         "container_cpu": config.get("container_cpu", 1),
         "container_memory": config.get("container_memory", 5120),
         "container_disk": config.get("container_disk", 51200),
@@ -1750,6 +1763,29 @@ def _container_config_from_config(config: Dict[str, Any]) -> dict:
         "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
         "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
     }
+    overrides = resolve_task_overrides(task_id) if task_id else {}
+    if overrides.get("mini_restricted_docker"):
+        workspace = _resolve_task_host_cwd(config, task_id)
+        if not workspace:
+            raise RuntimeError("Mini restricted Docker requires a validated workspace")
+        workspace_group_gid = os.stat(workspace, follow_symlinks=False).st_gid
+        result.update({
+            "container_persistent": False,
+            "docker_volumes": [],
+            "docker_mount_cwd_to_workspace": True,
+            "docker_forward_env": [],
+            "docker_env": {},
+            "docker_run_as_host_user": True,
+            "docker_extra_args": [],
+            "docker_network": False,
+            "docker_persist_across_processes": False,
+            "docker_shared_container_key": "",
+            "docker_allow_shared_mounts": False,
+            "docker_allow_env_passthrough": False,
+            "docker_read_only_root": True,
+            "docker_supplemental_group_gid": workspace_group_gid,
+        })
+    return result
 
 
 def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
@@ -1784,6 +1820,10 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     docker_env = cc.get("docker_env", {})
     docker_extra_args = cc.get("docker_extra_args", [])
     docker_network = cc.get("docker_network", True)
+    docker_allow_shared_mounts = cc.get("docker_allow_shared_mounts", True)
+    docker_allow_env_passthrough = cc.get("docker_allow_env_passthrough", True)
+    docker_read_only_root = cc.get("docker_read_only_root", False)
+    docker_supplemental_group_gid = cc.get("docker_supplemental_group_gid")
 
     if env_type == "local":
         return _LocalEnvironment(cwd=cwd, timeout=timeout)
@@ -1824,6 +1864,10 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                 else cc.get("docker_persist_across_processes", True)
             ),
             shm_size=cc.get("docker_shm_size", "1g"),
+            allow_shared_mounts=docker_allow_shared_mounts,
+            allow_env_passthrough=docker_allow_env_passthrough,
+            read_only_root=docker_read_only_root,
+            supplemental_group_gid=docker_supplemental_group_gid,
         )
         # Marker read by is_persistent_env(): a session-scoped container
         # survives BETWEEN turns (skip per-turn teardown) but is removed at
@@ -2066,7 +2110,8 @@ def ensure_task_env(task_id: Optional[str] = None):
     failure leaves the caller's fail-closed error path intact).
     """
     config = _get_env_config()
-    env_type = config["env_type"]
+    overrides = resolve_task_overrides(task_id)
+    env_type = overrides.get("env_type") or config["env_type"]
     if env_type == "local":
         return None
 
@@ -2079,7 +2124,6 @@ def ensure_task_env(task_id: Optional[str] = None):
             _last_activity[effective_task_id] = time.time()
         return existing
 
-    overrides = resolve_task_overrides(task_id)
     if env_type == "docker":
         image = overrides.get("docker_image") or config["docker_image"]
     elif env_type == "singularity":
@@ -2110,7 +2154,7 @@ def ensure_task_env(task_id: Optional[str] = None):
                 timeout=config["timeout"],
                 ssh_config=_ssh_config_from_config(config) if env_type == "ssh" else None,
                 container_config=(
-                    _container_config_from_config(config)
+                    _container_config_from_config(config, task_id)
                     if env_type in _CONTAINER_BACKENDS else None
                 ),
                 local_config=None,
@@ -2588,7 +2632,8 @@ def terminal_tool(
 
         # Get configuration
         config = _get_env_config()
-        env_type = config["env_type"]
+        overrides = resolve_task_overrides(task_id)
+        env_type = overrides.get("env_type") or config["env_type"]
 
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
@@ -2602,8 +2647,6 @@ def terminal_tool(
         # CWD-only override (which collapses ``effective_task_id`` to
         # ``"default"``) is still found under its originating session id while
         # isolation-keyed RL/benchmark overrides keep resolving as before.
-        overrides = resolve_task_overrides(task_id)
-        
         # Select image based on env type, with per-task override support
         if env_type == "docker":
             image = overrides.get("docker_image") or config["docker_image"]
@@ -2728,7 +2771,7 @@ def terminal_tool(
                     try:
                         ssh_config = _ssh_config_from_config(config) if env_type == "ssh" else None
                         container_config = (
-                            _container_config_from_config(config)
+                            _container_config_from_config(config, task_id)
                             if env_type in _CONTAINER_BACKENDS else None
                         )
 

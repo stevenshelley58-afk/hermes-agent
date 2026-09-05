@@ -887,6 +887,10 @@ class DockerEnvironment(BaseEnvironment):
         extra_args: list = None,
         persist_across_processes: bool = True,
         shm_size: str = _DEFAULT_SHM_SIZE,
+        allow_shared_mounts: bool = True,
+        allow_env_passthrough: bool = True,
+        read_only_root: bool = False,
+        supplemental_group_gid: int | None = None,
     ):
         if cwd == "~":
             cwd = "/root"
@@ -900,6 +904,13 @@ class DockerEnvironment(BaseEnvironment):
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
+        self._allow_shared_mounts = bool(allow_shared_mounts)
+        self._allow_env_passthrough = bool(allow_env_passthrough)
+        self._read_only_root = bool(read_only_root)
+        if supplemental_group_gid is not None:
+            if not isinstance(supplemental_group_gid, int) or supplemental_group_gid < 0:
+                raise ValueError("supplemental_group_gid must be a non-negative integer")
+        self._supplemental_group_gid = supplemental_group_gid
         self._init_unset_passthrough_names: tuple[str, ...] = ()
         self._container_id: Optional[str] = None
         self._labels: dict[str, str] = {}
@@ -1010,91 +1021,95 @@ class DockerEnvironment(BaseEnvironment):
 
         # Mount credential files (OAuth tokens, etc.) declared by skills.
         # Read-only so the container can authenticate but not modify host creds.
-        try:
-            from tools.credential_files import (
-                get_credential_file_mounts,
-                get_skills_directory_mount,
-                get_cache_directory_mounts,
-            )
-
-            for mount_entry in get_credential_file_mounts():
-                src = Path(mount_entry["host_path"])
-                if src.is_dir():
-                    # Docker-in-Docker: Docker auto-created the source path as
-                    # a directory when it didn't exist on the host.  Mounting a
-                    # directory over a file destination causes exit 125.
-                    logger.warning(
-                        "Docker: skipping credential mount — source is a directory "
-                        "(likely Docker-in-Docker auto-creation): %s",
-                        src,
-                    )
-                    continue
-                if not src.is_file():
-                    logger.warning(
-                        "Docker: skipping credential mount — source not found: %s", src,
-                    )
-                    continue
-                volume_args.extend([
-                    "-v",
-                    f"{mount_entry['host_path']}:{mount_entry['container_path']}:ro",
-                ])
-                logger.info(
-                    "Docker: mounting credential %s -> %s",
-                    mount_entry["host_path"],
-                    mount_entry["container_path"],
+        if self._allow_shared_mounts:
+            try:
+                from tools.credential_files import (
+                    get_credential_file_mounts,
+                    get_skills_directory_mount,
+                    get_cache_directory_mounts,
                 )
 
-            # Mount skill directories (local + external) so skill
-            # scripts/templates are available inside the container.
-            for skills_mount in get_skills_directory_mount():
-                src = Path(skills_mount["host_path"])
-                if not src.is_dir():
-                    logger.warning(
-                        "Docker: skipping skills mount — source is not a directory: %s",
-                        src,
+                for mount_entry in get_credential_file_mounts():
+                    src = Path(mount_entry["host_path"])
+                    if src.is_dir():
+                        # Docker-in-Docker: Docker auto-created the source path as
+                        # a directory when it didn't exist on the host.  Mounting a
+                        # directory over a file destination causes exit 125.
+                        logger.warning(
+                            "Docker: skipping credential mount — source is a directory "
+                            "(likely Docker-in-Docker auto-creation): %s",
+                            src,
+                        )
+                        continue
+                    if not src.is_file():
+                        logger.warning(
+                            "Docker: skipping credential mount — source not found: %s", src,
+                        )
+                        continue
+                    volume_args.extend([
+                        "-v",
+                        f"{mount_entry['host_path']}:{mount_entry['container_path']}:ro",
+                    ])
+                    logger.info(
+                        "Docker: mounting credential %s -> %s",
+                        mount_entry["host_path"],
+                        mount_entry["container_path"],
                     )
-                    continue
-                volume_args.extend([
-                    "-v",
-                    f"{skills_mount['host_path']}:{skills_mount['container_path']}:ro",
-                ])
-                logger.info(
-                    "Docker: mounting skills dir %s -> %s",
-                    skills_mount["host_path"],
-                    skills_mount["container_path"],
-                )
 
-            # Mount host-side cache directories (documents, images, audio,
-            # screenshots) so the agent can access uploaded files and other
-            # cached media from inside the container.  Read-only — the
-            # container reads these but the host gateway manages writes.
-            for cache_mount in get_cache_directory_mounts():
-                src = Path(cache_mount["host_path"])
-                if not src.is_dir():
-                    logger.warning(
-                        "Docker: skipping cache mount — source is not a directory: %s",
-                        src,
+                # Mount skill directories (local + external) so skill
+                # scripts/templates are available inside the container.
+                for skills_mount in get_skills_directory_mount():
+                    src = Path(skills_mount["host_path"])
+                    if not src.is_dir():
+                        logger.warning(
+                            "Docker: skipping skills mount — source is not a directory: %s",
+                            src,
+                        )
+                        continue
+                    volume_args.extend([
+                        "-v",
+                        f"{skills_mount['host_path']}:{skills_mount['container_path']}:ro",
+                    ])
+                    logger.info(
+                        "Docker: mounting skills dir %s -> %s",
+                        skills_mount["host_path"],
+                        skills_mount["container_path"],
                     )
-                    continue
-                volume_args.extend([
-                    "-v",
-                    f"{cache_mount['host_path']}:{cache_mount['container_path']}:ro",
-                ])
-                logger.info(
-                    "Docker: mounting cache dir %s -> %s",
-                    cache_mount["host_path"],
-                    cache_mount["container_path"],
-                )
-        except Exception as e:
-            logger.debug("Docker: could not load credential file mounts: %s", e)
+
+                # Mount host-side cache directories (documents, images, audio,
+                # screenshots) so the agent can access uploaded files and other
+                # cached media from inside the container.  Read-only — the
+                # container reads these but the host gateway manages writes.
+                for cache_mount in get_cache_directory_mounts():
+                    src = Path(cache_mount["host_path"])
+                    if not src.is_dir():
+                        logger.warning(
+                            "Docker: skipping cache mount — source is not a directory: %s",
+                            src,
+                        )
+                        continue
+                    volume_args.extend([
+                        "-v",
+                        f"{cache_mount['host_path']}:{cache_mount['container_path']}:ro",
+                    ])
+                    logger.info(
+                        "Docker: mounting cache dir %s -> %s",
+                        cache_mount["host_path"],
+                        cache_mount["container_path"],
+                    )
+            except Exception as e:
+                logger.debug("Docker: could not load credential file mounts: %s", e)
 
         # Egress credential-injection proxy (iron-proxy) — when configured,
         # mount the CA cert into the sandbox and set HTTPS_PROXY + CA-bundle
         # env vars so outbound traffic routes through the host-side proxy.
         # The sandbox receives PROXY tokens instead of real API keys.
-        egress_volume_args, egress_env_overrides, egress_host_args = (
-            _egress_proxy_args_for_docker()
-        )
+        if self._allow_shared_mounts:
+            egress_volume_args, egress_env_overrides, egress_host_args = (
+                _egress_proxy_args_for_docker()
+            )
+        else:
+            egress_volume_args, egress_env_overrides, egress_host_args = ([], {}, [])
         egress_label = _egress_reuse_fingerprint(
             egress_volume_args, egress_env_overrides, egress_host_args,
         )
@@ -1287,6 +1302,10 @@ class DockerEnvironment(BaseEnvironment):
             user_spec = _resolve_host_user_spec()
             if user_spec is not None:
                 user_args = ["--user", user_spec]
+                if self._supplemental_group_gid is not None:
+                    user_args.extend(
+                        ["--group-add", str(self._supplemental_group_gid)]
+                    )
                 logger.info("Docker: running container as host user %s", user_spec)
             else:
                 logger.warning(
@@ -1348,7 +1367,8 @@ class DockerEnvironment(BaseEnvironment):
                 )
 
         all_run_args = (
-            security_args
+            (["--read-only"] if self._read_only_root else [])
+            + security_args
             + user_args
             + writable_args
             + resource_args
@@ -1547,6 +1567,8 @@ class DockerEnvironment(BaseEnvironment):
 
     def _resolve_passthrough_env(self) -> tuple[dict[str, str], set[str]]:
         """Return forwarded values and scoped names that must be unset."""
+        if not getattr(self, "_allow_env_passthrough", True):
+            return {}, set()
         exec_env: dict[str, str] = {}
         explicit_forward_keys = set(self._forward_env)
         passthrough_keys: set[str] = set()
