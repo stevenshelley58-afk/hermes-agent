@@ -12,6 +12,21 @@ from gateway.tool_runs import TOOL_RUN_COMMAND_SCHEMA, ToolRunError, ToolRunStor
 import pytest
 
 
+def test_source_canvas_reference_preserves_edges_and_original(tmp_path):
+    source = tmp_path / "input.png"
+    image = Image.new("RGB", (561, 756), "white")
+    image.paste("red", (0, 0, 40, 756))
+    image.paste("blue", (521, 0, 561, 756))
+    image.save(source)
+    original = source.read_bytes()
+    target = process.source_canvas_reference(str(source), tmp_path / "run", "feed")
+    with Image.open(target) as normalized:
+        assert normalized.size == (1080, 1350)
+        assert normalized.getpixel((0, 600)) == (255, 0, 0)
+        assert normalized.getpixel((1079, 600)) == (0, 0, 255)
+    assert source.read_bytes() == original
+    assert process.source_canvas_reference(str(source), tmp_path / "run", "feed") == target
+
 def test_source_only_qa_uses_original_slot_not_reflowed_coordinates(tmp_path):
     import io
     source = tmp_path / "source.png"

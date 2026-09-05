@@ -246,6 +246,24 @@ def _source_placement(path: str) -> tuple[str, str, Dict[str, int]]:
     canvas = {"width": 1080, "height": 1920 if target == "story" else 1350}
     return source, target, canvas
 
+def source_canvas_reference(source: str, workspace: Path, placement: str) -> str:
+    """Put all source measurements and vision images in renderer pixel units."""
+    root = workspace / "references"
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / "source-canvas.png"
+    dimensions = (1080, 1350 if placement == "feed" else 1920)
+    with Image.open(source) as image:
+        image = ImageOps.exif_transpose(image).convert("RGBA")
+        white = Image.new("RGBA", image.size, "white")
+        white.alpha_composite(image)
+        # Preserve the entire input, not an ImageOps.fit/center crop. The
+        # original upload remains untouched in previews/source.*.
+        normalized = white.convert("RGB").resize(dimensions, Image.Resampling.LANCZOS)
+    temporary = target.with_suffix(".png.tmp")
+    normalized.save(temporary, format="PNG")
+    os.replace(temporary, target)
+    return str(target)
+
 
 def build_source_map(path: str) -> Dict[str, Any]:
     """Measure source pixels before a model is allowed to infer coordinates."""
@@ -591,6 +609,8 @@ DIRECT BLOCKWISE CONTRACT:
 - semanticColours contains exactly background, primary, secondary, accent, mainText, inverseText. assets is an object mapping each assetKey to {{fileName,mimeType}}. fonts is a list of unique {{file}} objects; text layer font.file must be declared. Use matching available font paths such as /fonts/adstudio/poppins-500.woff2, /fonts/adstudio/poppins-700.woff2, /fonts/adstudio/manrope-400.woff2, /fonts/adstudio/manrope-700.woff2, /fonts/adstudio/playfair-display-700.woff2 or /fonts/adstudio/cormorant-garamond-700.woff2.
 - metadata contains exactly title, description, gallerySamples, metaCopyDefaults, aiWritingGuidance, publishRequirements, replacementAssets, realAssetRefs. gallerySamples is {{feed?:{{assetKey?,placement:"feed",purpose}},story?:{{assetKey?,placement:"story",purpose}}}}. metaCopyDefaults is {{primaryText:[],headlines:[],descriptions:[],cta}}. aiWritingGuidance is {{summary,fields}}. publishRequirements is {{objective,specialAdCategory,instantForm:{{required,dependency,defaults?}},destination:{{required,kind,dependency}},fulfilment?,offer?,claims?,requiredCtaTypes}}. replacementAssets is a list of {{inputKey,assetKey,purpose?}}. realAssetRefs is a list of {{inputKey,kind,required}}. Do not create generationReview; the controller adds it after final review.
 - The outer assets list contains exactly one {{assetKey,fileName,mimeType}} declaration for every template.assets entry, with matching values. Never return bytes, hashes, signatures, source paths or a flattened source image.
+- Use colourRole (British spelling), never colorRole; vector/icon layers still require their own colourRole even when stroke/effects are present. Do not invent maxSourceWidth/maxSourceHeight; image slots require minSourceWidth, minSourceHeight and allowedPlacementOverrides.
+- Omit optional offer/fulfilment/claims when not applicable, never use empty objects as placeholders. If supplied, fulfilment requires required:boolean and dependency:string|null. offer is null or {{name,promise:string|null,terms:string[],eligibility:string|null,expiresAt:ISO-datetime|null}}. Real advertiser fulfilment/evidence must be supplied before publishing; do not invent it.
 
 Use only these catalog files:\n{catalog}
 
@@ -702,6 +722,8 @@ When revision is required, return the exact correction as patch in this same res
 Return JSON only with exactly {output_fields}. scores must contain exactly, in this order: overall, geometry, typography, colourEffects, imageCrop, details. effects must contain exactly, in this order: shading, gradients, shadows, transparency, borders, masks, texture; each is match, not_present, or mismatch. issues is a list of objects with exactly placement (feed|story|both), layerIds (real candidate layer IDs), category (geometry|typography|colourEffects|imageCrop|details), instruction, severity (blocker|material|minor). Every issue instruction must be directly patchable: name at least one exact target field (x, y, width, height, font/fontSize/fontFamily/fontWeight, lineHeight, tracking, colour, or crop) and give its measured numeric/hex/font-file target or delta from the attached overlay. Vague phrases such as "match the source", "align", or "fix spacing" without target values are invalid. Every visible discrepancy is an issue; acceptance requires issues=[] and every effect matched or genuinely absent. decision is evidence only; the controller derives accept/revise from scores, issues, effects and the font rule. An obvious defect blocks acceptance regardless of average. fontSubstitution is null or exactly {{source,used,reason}}.{patch_contract} Return no prose.
 
 PRODUCTION SAFETY: Do not reproduce accidental source clipping, duplicate glyphs, or missing contact text as a requested correction. Match the source structure while keeping customer replacements readable; list unavoidable source defects as warnings, never a reason to damage the production template. Repeated feature wording intentionally present in the source is not itself a stray-glyph defect.
+COORDINATE AND FIT RULES: Feed is exactly 1080x1350; Story is exactly 1080x1920. The original-source comparison image is normalized to its matching canvas without cropping. All geometry targets use those canvas pixels, NEVER thumbnail/display pixels. Preserve the renderer's minimum font sizes: Feed 24px and Story 32px, multiline lineHeight >= 1. Do not request a smaller font; reflow the native adaptation or resize the editable box instead. The comparison source map and render share the same coordinate scale.
+
 AVAILABLE BUNDLED FONT FILES: {_safe_json(sorted(AVAILABLE_FONT_FILES))}. Existing declared asset-backed fonts may also be used. Never request a font file that is neither available here nor supplied by the candidate. Record unavoidable differences in fontSubstitution and choose the closest available face, weight and tracking; do not repeatedly demand unavailable proprietary fonts.
 IMAGE ORDER NOTE: Neutral production images follow the three original-source/QA images and precede the original-placement overlay/difference views. Never interpret a difference heatmap as a customer preview.
 
@@ -1891,6 +1913,12 @@ class ExactCloneOrchestrator:
             for event_kind, event_data in checkpoint_policy_events:
                 self.emit(event_kind, "build", event_data)
         source_placement, target_placement, canvas = _source_placement(source)
+        source = source_canvas_reference(source, self.workspace, source_placement)
+        if checkpoint.get("sourceCoordinateMode") != "canvas-pixels":
+            for key in ("sourceMap", "targetReferenceMap", "reference", "referenceMode", "bestReview", "bestCandidate", "bestIteration", "finalReview"):
+                checkpoint.pop(key, None)
+            checkpoint.update(sourceCoordinateMode="canvas-pixels", accepted=False)
+
 
         source_map = checkpoint.get("sourceMap")
         if not isinstance(source_map, dict) or source_map.get("sourceMapVersion") != SOURCE_MAP_VERSION:
