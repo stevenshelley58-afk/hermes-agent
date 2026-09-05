@@ -837,6 +837,110 @@ def _renderer_reasons(stderr: str, stdout: str) -> list[str]:
     ][-20:]
 
 
+def _renderer_text_violations(reasons: Sequence[str]) -> list[Dict[str, Any]]:
+    """Recover the renderer's complete machine-readable text failure set."""
+    violations: list[Dict[str, Any]] = []
+    decoder = json.JSONDecoder()
+    marker = "AD_TEMPLATE_TEXT_PREFLIGHT_FAILED "
+    for reason in reasons:
+        if marker in reason:
+            try:
+                payload, _ = decoder.raw_decode(reason.split(marker, 1)[1].lstrip())
+            except (json.JSONDecodeError, TypeError):
+                continue
+            items = payload.get("violations") if isinstance(payload, dict) else None
+            if isinstance(items, list):
+                violations.extend(copy.deepcopy(item) for item in items if isinstance(item, dict))
+        else:
+            match = re.fullmatch(r"Unsupported text overflow behaviour on ([A-Za-z0-9._:-]+)", reason.strip())
+            if match:
+                violations.append({"kind": "unsupported_overflow", "layerId": match.group(1)})
+    return violations
+
+
+def _expand_text_box(layer: Dict[str, Any], *, canvas_width: int, canvas_height: int, floor: float) -> None:
+    geometry = layer.get("geometry")
+    if not isinstance(geometry, dict):
+        return
+    try:
+        raw = {key: float(geometry[key]) for key in ("x", "y", "width", "height")}
+    except (KeyError, TypeError, ValueError):
+        return
+    normalized = all(abs(value) <= 1.001 for value in raw.values())
+    scale_x = canvas_width if normalized else 1.0
+    scale_y = canvas_height if normalized else 1.0
+    x, y = raw["x"] * scale_x, raw["y"] * scale_y
+    width, height = raw["width"] * scale_x, raw["height"] * scale_y
+    max_lines = max(1, int(layer.get("maxLines") or 1))
+    line_height = max(1.0, float(layer.get("lineHeight") or 1.0))
+    target_width = min(float(canvas_width), max(width + 2 * floor, width * 1.35))
+    target_height = min(
+        float(canvas_height),
+        max(height * 1.2, floor * (1 + (max_lines - 1) * line_height) + floor * 0.35),
+    )
+    alignment = layer.get("alignment")
+    if alignment == "right":
+        x = max(0.0, x + width - target_width)
+    elif alignment == "center":
+        x = max(0.0, x - (target_width - width) / 2)
+    target_width = min(target_width, canvas_width - x)
+    if y + target_height > canvas_height:
+        y = max(0.0, canvas_height - target_height)
+    values = {"x": x, "y": y, "width": target_width, "height": target_height}
+    for key, value in values.items():
+        converted = value / (canvas_width if key in {"x", "width"} else canvas_height) if normalized else value
+        geometry[key] = round(converted, 6) if normalized else int(round(converted))
+
+
+def _apply_deterministic_contract_repairs(
+    candidate: Mapping[str, Any], reasons: Sequence[str],
+) -> tuple[Dict[str, Any], int]:
+    """Repair every mechanical text violation together without spending an LLM turn."""
+    violations = _renderer_text_violations(reasons)
+    if not violations:
+        return copy.deepcopy(dict(candidate)), 0
+    repaired = copy.deepcopy(dict(candidate))
+    template = repaired.get("template") if isinstance(repaired.get("template"), dict) else {}
+    changed_layers: set[str] = set()
+    for violation in violations:
+        layer_id = violation.get("layerId")
+        placement = violation.get("placement")
+        placements = (placement,) if placement in {"feed", "story"} else ("feed", "story")
+        for current_placement in placements:
+            field = "feedLayout" if current_placement == "feed" else "storyLayout"
+            layout = template.get(field) if isinstance(template.get(field), dict) else {}
+            layers = layout.get("layers") if isinstance(layout.get("layers"), list) else []
+            layer = next((item for item in layers if isinstance(item, dict) and item.get("layerId") == layer_id), None)
+            if not isinstance(layer, dict) or layer.get("type") != "text":
+                continue
+            before = _safe_json(layer)
+            kind = violation.get("kind")
+            floor = float(violation.get("readabilityFloorPx") or (24 if current_placement == "feed" else 28))
+            if kind == "unsupported_overflow":
+                layer["overflowBehaviour"] = "shrink"
+            elif kind == "below_readability_floor":
+                layer.pop("sizeRatio", None)
+                layer["fontSize"] = max(floor, float(layer.get("fontSize") or 0))
+            elif kind == "multiline_line_height_below_minimum":
+                layer["lineHeight"] = max(
+                    float(layer.get("lineHeight") or 0),
+                    float(violation.get("minimumLineHeight") or 1.1),
+                )
+            elif kind == "cannot_fit_readability_floor":
+                layer["overflowBehaviour"] = "shrink"
+                layer.pop("sizeRatio", None)
+                layer["fontSize"] = max(floor, float(layer.get("fontSize") or 0))
+                _expand_text_box(
+                    layer,
+                    canvas_width=1080,
+                    canvas_height=1350 if current_placement == "feed" else 1920,
+                    floor=floor,
+                )
+            if _safe_json(layer) != before:
+                changed_layers.add(f"{current_placement}:{layer_id}")
+    return _candidate_structure(repaired), len(changed_layers)
+
+
 def build_ephemeral_qa_candidate(
     candidate: Mapping[str, Any], *, source: str, reciprocal_reference: str,
     source_placement: str, source_map: Mapping[str, Any], target_map: Mapping[str, Any],
@@ -1829,6 +1933,31 @@ class ExactCloneOrchestrator:
                         "repair": contract_repairs,
                         "reasons": reasons,
                     })
+                    deterministic_candidate, repaired_layers = _apply_deterministic_contract_repairs(candidate, reasons)
+                    if repaired_layers:
+                        candidate = deterministic_candidate
+                        self.emit("candidate.patch-applied", "build", {
+                            "iteration": global_iteration,
+                            "source": "deterministic-text-preflight",
+                            "repair": contract_repairs,
+                            "operations": repaired_layers,
+                        })
+                        persist_checkpoint(self.workspace, {
+                            "reference": reference,
+                            "sourceMap": source_map,
+                            "targetReferenceMap": target_map,
+                            "reciprocalReference": reciprocal_reference,
+                            "sourcePlacement": source_placement,
+                            "targetPlacement": target_placement,
+                            "candidate": candidate,
+                            "iterations": iterations,
+                            "cycleComparisons": cycle_comparisons,
+                            "accepted": False,
+                            "bestCandidate": best_candidate,
+                            "bestReview": best_review,
+                            "bestIteration": best_iteration,
+                        })
+                        continue
                     repair_route = builder_route if contract_repairs == 1 else escalation_route
                     repair, candidate = _call_applied_patch(
                         self.call_agent,

@@ -464,6 +464,35 @@ def test_renderer_reason_keeps_complete_batched_preflight_violations():
     assert "f-layer-19" in reasons[0]
 
 
+def test_all_text_preflight_violations_are_repaired_in_one_deterministic_batch():
+    candidate = {"template": _template(), "assets": []}
+    for placement, field in (("feed", "feedLayout"), ("story", "storyLayout")):
+        candidate["template"][field]["layers"].append({
+            "type": "text", "layerId": f"{placement}-copy", "inputKey": "copy",
+            "fontSize": 32, "lineHeight": 1.0, "maxLines": 2,
+            "alignment": "left", "overflowBehaviour": "shrink",
+            "geometry": {"x": 100, "y": 100, "width": 100, "height": 40},
+        })
+    payload = {
+        "code": "AD_TEMPLATE_TEXT_PREFLIGHT_FAILED",
+        "violations": [
+            {"placement": "feed", "layerId": "feed-copy", "kind": "cannot_fit_readability_floor", "readabilityFloorPx": 24},
+            {"placement": "story", "layerId": "story-copy", "kind": "cannot_fit_readability_floor", "readabilityFloorPx": 28},
+        ],
+    }
+
+    repaired, count = process._apply_deterministic_contract_repairs(
+        candidate, [f"AD_TEMPLATE_TEXT_PREFLIGHT_FAILED {process._safe_json(payload)}"],
+    )
+
+    assert count == 2
+    feed = repaired["template"]["feedLayout"]["layers"][-1]
+    story = repaired["template"]["storyLayout"]["layers"][-1]
+    assert feed["geometry"]["width"] > 100 and feed["geometry"]["height"] > 40
+    assert story["geometry"]["width"] > 100 and story["geometry"]["height"] > 40
+    assert feed["fontSize"] >= 24 and story["fontSize"] >= 28
+
+
 def test_best_candidate_can_be_recovered_without_ephemeral_qa_inputs(tmp_path):
     template = _template()
     template["imageInputs"].append({
