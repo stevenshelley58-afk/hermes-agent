@@ -716,3 +716,30 @@ def test_ready_review_publish_and_discard_states_are_atomic(tmp_path):
         stage="live", attention=False, event_kind="template.published", event_status="ok",
     )
     assert completed["completed_at"] is not None
+
+
+def test_comparison_budget_is_lifetime_and_manual_revision_is_explicit_reset():
+    checkpoint = {"iterations": [{"iteration": i} for i in range(6)], "comparisonBudgetUsed": 6}
+    assert process._comparison_budget_used(checkpoint, checkpoint["iterations"]) == 6
+    policy_updated = dict(checkpoint)
+    policy_updated["evaluationPolicyVersion"] = 99
+    assert process._comparison_budget_used(policy_updated, policy_updated["iterations"]) == 6
+    explicit_revision = dict(checkpoint)
+    explicit_revision["comparisonBudgetUsed"] = 0
+    explicit_revision["manualRevision"] = 1
+    assert process._comparison_budget_used(explicit_revision, explicit_revision["iterations"]) == 0
+
+
+def test_font_target_must_be_declared_and_unavailable_targets_are_rejected():
+    candidate = {"template": _template(), "assets": []}
+    candidate["template"]["fonts"] = [{"file": "/fonts/adstudio/poppins-700.woff2"}]
+    text_layer = {
+        "type": "text", "layerId": "feed-title", "inputKey": "title",
+        "font": {"file": "/fonts/adstudio/poppins-700.woff2"},
+    }
+    candidate["template"]["feedLayout"]["layers"].append(text_layer)
+    candidate["template"]["storyLayout"]["layers"].append({**text_layer, "layerId": "story-title"})
+    process._candidate_envelope(candidate)
+    candidate["template"]["feedLayout"]["layers"][-1]["font"] = {"file": "/fonts/adstudio/didot.woff2"}
+    with pytest.raises(process.AdTemplateProcessError, match="undeclared font"):
+        process._candidate_envelope(candidate)

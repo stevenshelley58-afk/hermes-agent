@@ -58,6 +58,14 @@ MAX_PATCH_BYTES = 32_000
 MAX_CONTRACT_REPAIRS = 6
 MAX_RENDERER_REASON_CHARS = 16_000
 REGRESSION_EPSILON = 0.05
+AVAILABLE_FONT_FILES = frozenset({
+    "/fonts/adstudio/poppins-500.woff2",
+    "/fonts/adstudio/poppins-700.woff2",
+    "/fonts/adstudio/manrope-400.woff2",
+    "/fonts/adstudio/manrope-700.woff2",
+    "/fonts/adstudio/playfair-display-700.woff2",
+    "/fonts/adstudio/cormorant-garamond-700.woff2",
+})
 SOURCE_MAP_VERSION = 2
 QA_PROJECTION_VERSION = 3
 EVALUATION_POLICY_VERSION = 3
@@ -205,6 +213,18 @@ def _candidate_envelope(value: Any) -> Dict[str, Any]:
                 f"{placement} first layer must be type plate, protected true, and full-canvas "
                 f"geometry 0,0,1080,{canvas_height} (or normalized 0,0,1,1)"
             )
+    template = candidate["template"]
+    declared_fonts = {
+        item.get("file") for item in template.get("fonts", [])
+        if isinstance(item, dict)
+    }
+    for layout_key in ("feedLayout", "storyLayout"):
+        for layer in template[layout_key]["layers"]:
+            if isinstance(layer, dict) and layer.get("type") == "text":
+                font = layer.get("font")
+                file = font.get("file") if isinstance(font, dict) else None
+                if not isinstance(file, str) or not file.strip() or file not in declared_fonts:
+                    raise AdTemplateProcessError(f"text layer {layer.get('layerId')} requests an undeclared font")
     if violations:
         raise AdTemplateRendererRejection(violations)
     return candidate
@@ -711,7 +731,7 @@ def review_prompt(*, final: bool, candidate: Mapping[str, Any], reference: Mappi
     )
     patch_contract = "" if final else f"""
 When revision is required, return the exact correction as patch in this same response. patch must be {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}} with no more than {MAX_PATCH_OPERATIONS} operations and no more than {MAX_PATCH_BYTES} encoded bytes. A remove operation omits value; add/replace requires value. Every operation must directly implement a listed issue against the current candidate using an existing JSON Pointer path (add may create only an allowed missing field). Do not change schema, templateId, createdAt, asset declarations or source-free asset assignments. When the evidence passes the 9.8 gate, issues must be [] and patch must be null. Do not return a full replacement template."""
-    return f"""You are one {role} for an exact-clone template. Attached images are ordered: source, reciprocal aspect reference, source-filled Feed QA render, source-filled Story QA render, then each placement's overlay and difference view. Judge reconstruction fidelity only; do not reward creative improvement. The source-filled QA renders replace neutral reusable media and placeholder copy only inside the run workspace so pixel overlays measure the authored geometry, typography and effects. Feed must be as close to pixel-for-pixel as editable reconstruction permits. Story must preserve the same source design while following the reciprocal aspect reference. Missing shading, gradients, shadows, transparency, borders, masks, texture or decorative details are material defects.
+    return f"""You are one {role} for an exact-clone template. Attached images are ordered: source, reciprocal aspect reference, source-filled Feed QA render, source-filled Story QA render, then (for final review) neutral production Feed and Story renders, followed by each placement's overlay and difference view. Separate two decisions: source likeness (geometry, typography, effects, crop) and production correctness (all replacement text/media present, legible, unclipped, non-overlapping, with no duplicate or stray glyphs). A production defect is a blocker even when the source-filled QA likeness score is high. Before scoring, perform a whole-frame severe-defects checklist: overlapping elements, clipped or missing text, stray glyphs, illegible text, and missing media. Judge reconstruction fidelity only; do not reward creative improvement. The source-filled QA renders replace neutral reusable media and placeholder copy only inside the run workspace so pixel overlays measure the authored geometry, typography and effects. Feed must be as close to pixel-for-pixel as editable reconstruction permits. Story must preserve the same source design while following the reciprocal aspect reference. Missing shading, gradients, shadows, transparency, borders, masks, texture or decorative details are material defects.
 
 Return JSON only with exactly {output_fields}. scores must contain exactly, in this order: overall, geometry, typography, colourEffects, imageCrop, details. effects must contain exactly, in this order: shading, gradients, shadows, transparency, borders, masks, texture; each is match, not_present, or mismatch. issues is a list of objects with exactly placement (feed|story|both), layerIds (real candidate layer IDs), category (geometry|typography|colourEffects|imageCrop|details), instruction, severity (blocker|material|minor). Every issue instruction must be directly patchable: name at least one exact target field (x, y, width, height, font/fontSize/fontFamily/fontWeight, lineHeight, tracking, colour, or crop) and give its measured numeric/hex/font-file target or delta from the attached overlay. Vague phrases such as "match the source", "align", or "fix spacing" without target values are invalid. Every visible discrepancy is an issue; acceptance requires issues=[] and every effect matched or genuinely absent. decision is evidence only; the controller derives accept/revise from scores, issues, effects and the font rule. An obvious defect blocks acceptance regardless of average. fontSubstitution is null or exactly {{source,used,reason}}.{patch_contract} Return no prose.
 
@@ -1235,8 +1255,10 @@ def _comparison_views(
         raise AdTemplateProcessError("comparison views could not be generated") from exc
 
 
-def _vision_paths(source: str, reciprocal_reference: str, rendered: Mapping[str, Any], comparisons: Sequence[Mapping[str, str]]) -> list[str]:
+def _vision_paths(source: str, reciprocal_reference: str, rendered: Mapping[str, Any], comparisons: Sequence[Mapping[str, str]], production_rendered: Mapping[str, Any] | None = None) -> list[str]:
     paths = [source, reciprocal_reference, rendered["render"]["feed"], rendered["render"]["story"]]
+    if production_rendered is not None:
+        paths.extend((production_rendered["render"]["feed"], production_rendered["render"]["story"]))
     # Pixel overlays and absolute differences expose the material visual delta;
     # edge similarity is already supplied as deterministic numeric evidence.
     # Bounding the image set keeps every role request inside one stable vision
@@ -1321,6 +1343,13 @@ def _checkpoint_candidate(checkpoint: Dict[str, Any]) -> Dict[str, Any] | None:
         checkpoint["iterations"] = []
         checkpoint["cycleComparisons"] = 0
         return None
+
+
+def _comparison_budget_used(checkpoint: Mapping[str, Any], iterations: Sequence[Any]) -> int:
+    """Read the lifetime budget; legacy checkpoints derive it once from history."""
+    if "comparisonBudgetUsed" in checkpoint:
+        return max(0, int(checkpoint.get("comparisonBudgetUsed") or 0))
+    return len(iterations)
 
 
 def _review_quality(review: Mapping[str, Any]) -> tuple[float, float]:
@@ -1419,6 +1448,7 @@ def request_checkpoint_revision(workspace: Path, instructions: str) -> Dict[str,
         accepted=False,
         finalReview=None,
         cycleComparisons=0,
+        comparisonBudgetUsed=0,
         manualRevision=int(checkpoint.get("manualRevision") or 0) + 1,
     )
     persist_checkpoint(workspace, checkpoint)
@@ -1777,7 +1807,6 @@ class ExactCloneOrchestrator:
         checkpoint_policy_events: list[tuple[str, Dict[str, Any]]] = []
         if checkpoint and checkpoint.get("qaProjectionVersion") != QA_PROJECTION_VERSION:
             previous_version = checkpoint.get("qaProjectionVersion")
-            checkpoint["cycleComparisons"] = 0
             checkpoint["accepted"] = False
             checkpoint.pop("finalReview", None)
             checkpoint_policy_events.append(("qa-projection.updated", {
@@ -1787,7 +1816,6 @@ class ExactCloneOrchestrator:
             }))
         if checkpoint and checkpoint.get("evaluationPolicyVersion") != EVALUATION_POLICY_VERSION:
             previous_version = checkpoint.get("evaluationPolicyVersion")
-            checkpoint["cycleComparisons"] = 0
             checkpoint["accepted"] = False
             checkpoint.pop("finalReview", None)
             checkpoint_policy_events.append(("evaluation-policy.updated", {
@@ -1889,6 +1917,7 @@ class ExactCloneOrchestrator:
             })
         iterations = list(checkpoint.get("iterations") or [])
         cycle_comparisons = int(checkpoint.get("cycleComparisons") or 0)
+        comparison_budget_used = _comparison_budget_used(checkpoint, iterations)
         manual_instructions = str(checkpoint.get("manualInstructions") or "")
         global_iteration = len(iterations)
         best_candidate = None
@@ -1976,7 +2005,7 @@ class ExactCloneOrchestrator:
         final_rendered: Dict[str, Any] | None = None
         final_comparison_views: list[dict[str, str]] = []
         final_metrics: Dict[str, Any] = {}
-        while cycle_comparisons < MAX_COMPARISONS:
+        while comparison_budget_used < MAX_COMPARISONS:
             self._check_stop()
             global_iteration += 1
             escalation_iteration = global_iteration > NORMAL_COMPARISONS
@@ -2101,6 +2130,7 @@ class ExactCloneOrchestrator:
                 emit=self.emit,
             )
             review = comparator_result["review"]
+            comparison_budget_used += 1
             record = {
                 "iteration": global_iteration,
                 "cycle_iteration": cycle_comparisons,
@@ -2157,6 +2187,7 @@ class ExactCloneOrchestrator:
                 "candidate": candidate,
                 "iterations": iterations,
                 "cycleComparisons": cycle_comparisons,
+                "comparisonBudgetUsed": comparison_budget_used,
                 "accepted": review["decision"] == "accept",
                 "bestCandidate": best_candidate,
                 "bestReview": best_review,
@@ -2168,7 +2199,7 @@ class ExactCloneOrchestrator:
                 final_comparison_views = comparison_views
                 final_metrics = metrics
                 break
-            if cycle_comparisons >= MAX_COMPARISONS:
+            if comparison_budget_used >= MAX_COMPARISONS:
                 break
             comparator_patch = comparator_result["patch"]
             if fallback_reason is None and comparator_patch is not None:
@@ -2224,6 +2255,9 @@ class ExactCloneOrchestrator:
             raise AdTemplateProcessError(f"exact-clone quality loop exhausted {MAX_COMPARISONS} comparisons below 9.8")
 
         final_review: Dict[str, Any] | None = None
+        production_rendered = run_renderer(
+            candidate, self.workspace / f"final-review-production-{global_iteration:02d}",
+        )
         for final_round in range(1, MAX_FINAL_REVIEW_ROUNDS + 1):
             self._check_stop()
             reviewer_specs = (("a", final_a_route), ("b", final_b_route))
@@ -2238,7 +2272,7 @@ class ExactCloneOrchestrator:
                     self.call_agent,
                     instance=identity,
                     prompt=review_prompt(final=True, candidate=candidate, reference=reference, metrics=final_metrics),
-                    paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views),
+                    paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
                     route=route,
                     validate=validate_review,
                     emit=lambda kind, node, data: buffered_events.append((kind, node, data)),
@@ -2272,7 +2306,7 @@ class ExactCloneOrchestrator:
                 self.call_agent,
                 instance="final-merged-patch",
                 prompt=patch_prompt(candidate=candidate, issues=merged_issues),
-                paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views),
+                paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
                 route=escalation_route,
                 candidate=candidate,
                 emit=self.emit,
@@ -2288,6 +2322,9 @@ class ExactCloneOrchestrator:
                 run_renderer(qa_candidate, iteration_root, asset_overrides=qa_asset_overrides),
                 self.workspace, global_iteration,
             )
+            production_rendered = run_renderer(
+                candidate, self.workspace / f"final-review-production-{global_iteration:02d}",
+            )
             final_comparison_views = _comparison_views(source, reciprocal_reference, final_rendered, self.workspace, global_iteration, source_placement, target_placement)
             final_metrics = _comparison_metrics(
                 source=source, reciprocal_reference=reciprocal_reference,
@@ -2298,7 +2335,7 @@ class ExactCloneOrchestrator:
                 self.call_agent,
                 instance="comparator-final-repair",
                 prompt=review_prompt(final=False, candidate=candidate, reference=reference, metrics=final_metrics),
-                paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views),
+                paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
                 route=comparator_route,
                 validate=lambda value: validate_comparator_result(value, candidate=candidate),
                 emit=self.emit,
