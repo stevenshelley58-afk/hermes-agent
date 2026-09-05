@@ -8,6 +8,27 @@ from types import SimpleNamespace
 from gateway.tool_run_api import ToolRunAPIMixin
 
 
+def test_catalog_basename_normalization_is_unambiguous_and_consistent(monkeypatch):
+    from gateway import exact_clone_process as process
+    a = SimpleNamespace(file_name="interior/living.webp", mime_type="image/webp")
+    b = SimpleNamespace(file_name="other/living.webp", mime_type="image/webp")
+    catalog = SimpleNamespace(assets={a.file_name: a})
+    monkeypatch.setattr(process, "_runtime_catalog", lambda: catalog)
+    candidate = {"assets": [{"assetKey": "photo", "fileName": "living.webp", "mimeType": "image/webp"}],
+                 "template": {"assets": {"photo": {"fileName": "living.webp", "mimeType": "image/webp"}}}}
+    result = process._canonical_catalog_paths(candidate)
+    assert result["assets"][0]["fileName"] == "interior/living.webp"
+    assert result["template"]["assets"]["photo"]["fileName"] == "interior/living.webp"
+    assert candidate["assets"][0]["fileName"] == "living.webp"
+    catalog.assets[b.file_name] = b
+    assert process._canonical_catalog_paths(candidate) == candidate
+    catalog.assets.clear()
+    assert process._canonical_catalog_paths(candidate) == candidate
+    catalog.assets[a.file_name] = a
+    candidate["template"]["assets"]["photo"]["fileName"] = "different.webp"
+    assert process._canonical_catalog_paths(candidate) == candidate
+
+
 def _usage(input_tokens, output_tokens, cached_tokens=0):
     return SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens,
         total_tokens=input_tokens + output_tokens,

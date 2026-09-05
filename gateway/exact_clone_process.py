@@ -622,6 +622,7 @@ DIRECT BLOCKWISE CONTRACT:
 - colourRole is one of background, primary, secondary, accent, mainText, inverseText. vector shape is rect, rounded, circle, line, pill, notched, wave or ring. icon is arrow, check, tick, phone, mail, globe or location.
 - effects may contain rotationDegrees, blendMode, shadow and stroke. fill may be {{type:"linear_gradient",angleDegrees,stops:[{{offset,colourRole,opacity}},...]}}. Preserve every visible source effect with these fields.
 - image_slot mask is rounded_rect, circle or none; defaultCrop is {{x:0,y:0,width:1,height:1}}; allowedPlacementOverrides contains only crop and/or position. Text overflowBehaviour is refuse, truncate or scale_down; alignment is left, center or right; font is {{file:"/fonts/adstudio/...woff2"}}; tracking is absolute pixels from -4 to 4.
+- Renderer text constraints: Feed effective font size must be at least 24px; Story at least 32px. Multiline lineHeight must be at least 1.05. Preserve source geometry and hierarchy within these constraints; do not let text exceed its box or erase contacts.
 - imageInputs is a list of {{key,label,required?,acceptedTypes,defaultAssetKey?}}. textInputs is a list of {{key,label,placeholder,maxLength}}. Every image/logo/text layer inputKey is declared. Keep neutral reusable placeholders here with lengths close to the source; QA retains these authored strings and only substitutes source photo crops.
 - semanticColours contains exactly background, primary, secondary, accent, mainText, inverseText. assets is an object mapping each assetKey to {{fileName,mimeType}}. fonts is a list of unique {{file}} objects; text layer font.file must be declared. Use matching available font paths such as /fonts/adstudio/poppins-500.woff2, /fonts/adstudio/poppins-700.woff2, /fonts/adstudio/manrope-400.woff2, /fonts/adstudio/manrope-700.woff2, /fonts/adstudio/playfair-display-700.woff2 or /fonts/adstudio/cormorant-garamond-700.woff2.
 - metadata contains exactly title, description, gallerySamples, metaCopyDefaults, aiWritingGuidance, publishRequirements, replacementAssets, realAssetRefs. gallerySamples is {{feed?:{{assetKey?,placement:"feed",purpose}},story?:{{assetKey?,placement:"story",purpose}}}}. metaCopyDefaults is {{primaryText:[],headlines:[],descriptions:[],cta}}. aiWritingGuidance is {{summary,fields}}. publishRequirements is {{objective,specialAdCategory,instantForm:{{required,dependency,defaults?}},destination:{{required,kind,dependency}},fulfilment?,offer?,claims?,requiredCtaTypes}}. replacementAssets is a list of {{inputKey,assetKey,purpose?}}. realAssetRefs is a list of {{inputKey,kind,required}}. Do not create generationReview; the controller adds it after final review.
@@ -1165,6 +1166,26 @@ def prepare_demo_assets(candidate, *, source, source_placement, workspace, route
         template["assets"][key] = declaration
         declarations[key].update(declaration)
     return document, overrides
+
+def _canonical_catalog_paths(candidate: Mapping[str, Any]) -> Dict[str, Any]:
+    """Resolve unambiguous catalog basenames; never guess or change asset identity."""
+    result = copy.deepcopy(candidate)
+    catalog = _runtime_catalog()
+    for declaration in result["assets"]:
+        name = declaration["fileName"]
+        if name in catalog.assets or "/" in name or "\\" in name:
+            continue
+        matches = [asset for asset in catalog.assets.values()
+                   if Path(asset.file_name).name == name and asset.mime_type == declaration["mimeType"]]
+        if len(matches) != 1:
+            continue  # Unknown/ambiguous references still fail catalog validation.
+        linked = result["template"]["assets"].get(declaration["assetKey"])
+        if not isinstance(linked, dict) or linked.get("fileName") != name or linked.get("mimeType") != declaration["mimeType"]:
+            continue  # Do not conceal disagreement between the two declarations.
+        declaration["fileName"] = matches[0].file_name
+        linked["fileName"] = matches[0].file_name
+    return result
+
 
 def _resolve_runtime_assets(document: Mapping[str, Any], overrides: Mapping[str, bytes] | None = None) -> list[dict[str, Any]]:
     overrides = dict(overrides or {})
@@ -2060,6 +2081,11 @@ class ExactCloneOrchestrator:
             self.emit("candidate.patch-applied", "build", {"source": "manual-review", "operations": len(patch["operations"])})
 
         accepted_review: Dict[str, Any] | None = None
+        normalized_candidate = _canonical_catalog_paths(candidate)
+        if normalized_candidate != candidate:
+            candidate = normalized_candidate
+            persist_checkpoint(self.workspace, {"candidate": candidate})
+
         final_rendered: Dict[str, Any] | None = None
         final_comparison_views: list[dict[str, str]] = []
         final_metrics: Dict[str, Any] = {}
