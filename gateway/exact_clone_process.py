@@ -517,9 +517,9 @@ def validate_review(value: Any) -> Dict[str, Any]:
         and not normalized_issues
         and "mismatch" not in effects.values()
     )
+    # The model reports evidence; the controller owns the gate decision.
+    # A contradictory label must never fail or accidentally pass a run.
     expected = "accept" if passed else "revise"
-    if value.get("decision") != expected:
-        raise AdTemplateProcessError("visual review decision does not match the 9.8 gates")
     return {
         "decision": expected,
         "scores": normalized_scores,

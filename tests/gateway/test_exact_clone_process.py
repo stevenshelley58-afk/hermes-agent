@@ -233,6 +233,16 @@ def test_visual_gate_requires_every_score_and_effect_at_98():
     assert process.validate_review(effect_failure)["decision"] == "revise"
 
 
+def test_visual_gate_derives_decision_from_evidence_not_model_label():
+    passing = _review(accept=True)
+    passing["decision"] = "revise"
+    assert process.validate_review(passing)["decision"] == "accept"
+
+    failing = _review(accept=False)
+    failing["decision"] = "accept"
+    assert process.validate_review(failing)["decision"] == "revise"
+
+
 def test_invalid_legacy_candidate_is_removed_without_losing_reference_checkpoint():
     checkpoint = {
         "sourceMap": {"canvas": {"width": 1080, "height": 1350}},
