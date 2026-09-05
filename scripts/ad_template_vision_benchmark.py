@@ -35,7 +35,7 @@ _TARGET_VALUE = re.compile(r"(?:#[0-9a-f]{3,8}|-?\d+(?:\.\d+)?|\.woff2\b)", re.I
 _REVIEW_JSON_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["decision", "scores", "issues", "warnings", "effects", "fontSubstitution"],
+    "required": ["decision", "scores", "issues", "warnings", "effects", "fontSubstitution", "patch"],
     "properties": {
         "decision": {"enum": ["accept", "revise"]},
         "scores": {
@@ -84,6 +84,31 @@ _REVIEW_JSON_SCHEMA = {
                         "source": {"type": "string"},
                         "used": {"type": "string"},
                         "reason": {"type": "string"},
+                    },
+                },
+            ]
+        },
+        "patch": {
+            "anyOf": [
+                {"type": "null"},
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["operations"],
+                    "properties": {
+                        "operations": {
+                            "type": "array",
+                            "maxItems": 64,
+                            "items": {
+                                "type": "object",
+                                "required": ["op", "path"],
+                                "properties": {
+                                    "op": {"enum": ["replace", "add", "remove"]},
+                                    "path": {"type": "string"},
+                                    "value": {},
+                                },
+                            },
+                        }
                     },
                 },
             ]
@@ -175,6 +200,34 @@ def assess_review(
         "invalid_layer_ids": invalid_layers,
         "review": validated,
     }
+
+
+def assess_comparator_result(
+    value: Mapping[str, Any],
+    *,
+    baseline: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate both the visual diagnosis and its one-call correction patch."""
+    from gateway.exact_clone_process import validate_comparator_result
+
+    comparator = validate_comparator_result(dict(value), candidate=candidate)
+    result = assess_review(
+        comparator["review"], baseline=baseline, candidate=candidate
+    )
+    requires_patch = comparator["review"]["decision"] == "revise"
+    patch_valid = comparator["patchError"] is None and (
+        comparator["patch"] is not None if requires_patch else comparator["patch"] is None
+    )
+    result["patch_valid"] = patch_valid
+    result["patch_error"] = comparator["patchError"]
+    result["patch_operations"] = (
+        len(comparator["patch"].get("operations") or [])
+        if isinstance(comparator["patch"], Mapping)
+        else 0
+    )
+    result["qualified"] = bool(result["qualified"] and patch_valid)
+    return result
 
 
 def load_benchmark_case(run_root: Path, iteration: int) -> dict[str, Any]:
@@ -335,10 +388,8 @@ def _run_model(provider: str, model: str, case: Mapping[str, Any], max_tokens: i
             pass
         if not strict_json:
             parsed = ToolRunAPIMixin._tool_json_output(result)
-        assessment = assess_review(
-            parsed,
-            baseline=case["baseline"],
-            candidate=case["candidate"],
+        assessment = assess_comparator_result(
+            parsed, baseline=case["baseline"], candidate=case["candidate"]
         )
         assessment["qualified"] = bool(strict_json and assessment["qualified"])
         return {

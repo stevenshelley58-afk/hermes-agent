@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -88,3 +90,35 @@ def test_report_cannot_modify_the_tool_run_workspace(tmp_path):
 def test_response_text_exposes_provider_errors_without_credentials():
     text = benchmark._response_text({"final_response": "HTTP 402 insufficient credits"})
     assert text == "HTTP 402 insufficient credits"
+
+
+def test_comparator_assessment_requires_an_applicable_patch(monkeypatch):
+    valid = _review()
+    valid["patch"] = {
+        "operations": [
+            {
+                "op": "replace",
+                "path": "/template/feedLayout/layers/0/x",
+                "value": 765,
+            }
+        ]
+    }
+
+    def fake_validate(value, *, candidate):
+        return {
+            "review": {key: item for key, item in value.items() if key != "patch"},
+            "patch": value["patch"],
+            "candidate": candidate,
+            "patchError": None,
+        }
+
+    process = types.ModuleType("gateway.exact_clone_process")
+    process.validate_comparator_result = fake_validate
+    process.validate_review = lambda value: value
+    monkeypatch.setitem(sys.modules, "gateway.exact_clone_process", process)
+    result = benchmark.assess_comparator_result(
+        valid, baseline=_review(), candidate=_candidate()
+    )
+    assert result["qualified"] is True
+    assert result["patch_valid"] is True
+    assert result["patch_operations"] == 1
