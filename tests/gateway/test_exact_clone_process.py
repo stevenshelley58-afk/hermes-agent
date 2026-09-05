@@ -12,6 +12,23 @@ from gateway.tool_runs import TOOL_RUN_COMMAND_SCHEMA, ToolRunError, ToolRunStor
 import pytest
 
 
+def test_source_only_qa_uses_original_slot_not_reflowed_coordinates(tmp_path):
+    import io
+    source = tmp_path / "source.png"
+    im = Image.new("RGB", (100, 100), "blue")
+    im.paste("red", (0, 0, 50, 100))
+    im.save(source)
+    candidate = {"template": _template(), "assets": []}
+    candidate["template"]["feedLayout"]["layers"][1]["geometry"] = {"x": 0, "y": 0, "width": 540, "height": 1350}
+    candidate["template"]["storyLayout"]["layers"][1]["geometry"] = {"x": 540, "y": 0, "width": 540, "height": 1920}
+    qa, overrides = process.build_ephemeral_qa_candidate(
+        candidate, source=str(source), reciprocal_reference=str(source), source_placement="feed",
+        source_map={}, target_map={}, workspace=tmp_path / "qa")
+    for placement in ("feed", "story"):
+        with Image.open(io.BytesIO(overrides[f"qa-{placement}-1"])) as crop:
+            assert crop.getpixel((crop.width // 2, crop.height // 2)) == (255, 0, 0)
+    assert candidate["template"]["storyLayout"]["layers"][1]["inputKey"] == "hero"
+
 def test_bounded_vision_payload_reuses_unchanged_image_encoding(tmp_path, monkeypatch):
     image_path = tmp_path / "source.png"
     Image.new("RGB", (32, 32), (12, 34, 56)).save(image_path)
@@ -229,8 +246,8 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
         emit=lambda kind, node, data: emitted.append((kind, node, data)),
     ).run(source=str(source), brief="clone", placements=["feed", "story"], routes=routes)
 
-    assert order[:2] == ["source-map", "image-model"]
-    assert len(image_calls) == 1
+    assert order == ["source-map"]
+    assert image_calls == []  # Image models are reserved for photo assets.
     assert comparison_count == process.MAX_COMPARISONS == 6
     assert fallback_patch_count == 1
     assert contract_repair_count == 1
@@ -264,12 +281,10 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     )
     assert all(not str(key).startswith("qa-") for key in rendered_candidates[-1]["template"]["assets"])
     assert result["previews"] and all(item["kind"] == "final-neutral-shippable" for item in result["previews"])
-    reciprocal = next(
-        item for item in result["references"]
-        if item.get("kind") == "reciprocal-image-reference"
-    )
-    assert reciprocal["name"] == "reference-story.png"
-    assert (tmp_path / "run" / "previews" / reciprocal["name"]).is_file()
+    assert not any(item.get("kind") == "reciprocal-image-reference" for item in result["references"])
+    assert result["metrics"]["story"] == {"mode": "native-reflow", "pixelComparison": False}
+    assert all(item["placement"] == "feed" for item in result["diffs"])
+    assert any(kind == "reference.source-only" for kind, _, _ in emitted)
 
 
 def test_visual_gate_requires_every_score_and_effect_at_98():
@@ -324,10 +339,10 @@ def test_comparator_returns_validated_review_and_applied_patch_together():
 def test_iteration_comparator_and_final_reviewer_have_distinct_output_contracts():
     candidate = {"template": _template(), "assets": []}
     iteration_prompt = process.review_prompt(
-        final=False, candidate=candidate, reference={}, metrics={},
+        final=False, candidate=candidate, reference={"sourcePlacement": "feed"}, metrics={},
     )
     final_prompt = process.review_prompt(
-        final=True, candidate=candidate, reference={}, metrics={},
+        final=True, candidate=candidate, reference={"sourcePlacement": "feed"}, metrics={},
     )
 
     assert "fontSubstitution, patch" in iteration_prompt

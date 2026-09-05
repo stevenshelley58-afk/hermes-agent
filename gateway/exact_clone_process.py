@@ -383,42 +383,6 @@ def build_source_map(path: str) -> Dict[str, Any]:
     }
 
 
-def generate_reciprocal_reference(
-    *,
-    call_image_model: Callable[[str, str, str, Mapping[str, str]], str],
-    source: str,
-    target_placement: str,
-    canvas: Mapping[str, int],
-    source_map: Mapping[str, Any],
-    route: Mapping[str, str],
-    workspace: Path,
-) -> str:
-    """Generate and cache the actual opposite-aspect pixel reference once."""
-    prompt = (
-        "Recompose this exact advertisement into the opposite placement. Preserve every visible "
-        "layout region, hierarchy, spacing relationship, wording footprint, image role, crop intent, "
-        "colour, shading, gradient, shadow, transparency, border, mask, texture and decorative detail. "
-        "Do not redesign, simplify, modernise or invent. This image is the run's opposite-placement reference. "
-        f"Target {target_placement}, exact canvas {canvas['width']}x{canvas['height']}. "
-        f"Measured source map (use it instead of guessing coordinates): {_safe_json(source_map)}"
-    )
-    raw_path = Path(call_image_model(prompt, source, target_placement, route)).resolve(strict=True)
-    if not raw_path.is_file():
-        raise AdTemplateProcessError("aspect-reference image model returned no image")
-    try:
-        with Image.open(raw_path) as generated:
-            normalized = ImageOps.fit(
-                ImageOps.exif_transpose(generated).convert("RGB"),
-                (int(canvas["width"]), int(canvas["height"])),
-                method=Image.Resampling.LANCZOS,
-            )
-    except (OSError, UnidentifiedImageError) as exc:
-        raise AdTemplateProcessError("aspect-reference image is unreadable") from exc
-    reference_root = workspace / "references"
-    reference_root.mkdir(parents=True, exist_ok=True)
-    output = reference_root / f"{target_placement}-reference.png"
-    normalized.save(output, format="PNG", optimize=True)
-    return str(output.resolve())
 
 
 def deterministic_pixel_metrics(reference_path: str, candidate_path: str) -> Dict[str, float]:
@@ -622,7 +586,7 @@ DIRECT BLOCKWISE CONTRACT:
 - colourRole is one of background, primary, secondary, accent, mainText, inverseText. vector shape is rect, rounded, circle, line, pill, notched, wave or ring. icon is arrow, check, tick, phone, mail, globe or location.
 - effects may contain rotationDegrees, blendMode, shadow and stroke. fill may be {{type:"linear_gradient",angleDegrees,stops:[{{offset,colourRole,opacity}},...]}}. Preserve every visible source effect with these fields.
 - image_slot mask is rounded_rect, circle or none; defaultCrop is {{x:0,y:0,width:1,height:1}}; allowedPlacementOverrides contains only crop and/or position. Text overflowBehaviour is refuse, truncate or scale_down; alignment is left, center or right; font is {{file:"/fonts/adstudio/...woff2"}}; tracking is absolute pixels from -4 to 4.
-- Renderer text constraints: Feed effective font size must be at least 24px; Story at least 32px. Multiline lineHeight must be at least 1.05. Preserve source geometry and hierarchy within these constraints; do not let text exceed its box or erase contacts.
+- Renderer text constraints: Feed effective font size must be at least 24px; Story at least 32px. Multiline lineHeight must be at least 1. Preserve source geometry and hierarchy within these constraints; do not let text exceed its box or erase contacts.
 - imageInputs is a list of {{key,label,required?,acceptedTypes,defaultAssetKey?}}. textInputs is a list of {{key,label,placeholder,maxLength}}. Every image/logo/text layer inputKey is declared. Keep neutral reusable placeholders here with lengths close to the source; QA retains these authored strings and only substitutes source photo crops.
 - semanticColours contains exactly background, primary, secondary, accent, mainText, inverseText. assets is an object mapping each assetKey to {{fileName,mimeType}}. fonts is a list of unique {{file}} objects; text layer font.file must be declared. Use matching available font paths such as /fonts/adstudio/poppins-500.woff2, /fonts/adstudio/poppins-700.woff2, /fonts/adstudio/manrope-400.woff2, /fonts/adstudio/manrope-700.woff2, /fonts/adstudio/playfair-display-700.woff2 or /fonts/adstudio/cormorant-garamond-700.woff2.
 - metadata contains exactly title, description, gallerySamples, metaCopyDefaults, aiWritingGuidance, publishRequirements, replacementAssets, realAssetRefs. gallerySamples is {{feed?:{{assetKey?,placement:"feed",purpose}},story?:{{assetKey?,placement:"story",purpose}}}}. metaCopyDefaults is {{primaryText:[],headlines:[],descriptions:[],cta}}. aiWritingGuidance is {{summary,fields}}. publishRequirements is {{objective,specialAdCategory,instantForm:{{required,dependency,defaults?}},destination:{{required,kind,dependency}},fulfilment?,offer?,claims?,requiredCtaTypes}}. replacementAssets is a list of {{inputKey,assetKey,purpose?}}. realAssetRefs is a list of {{inputKey,kind,required}}. Do not create generationReview; the controller adds it after final review.
@@ -733,13 +697,13 @@ def review_prompt(*, final: bool, candidate: Mapping[str, Any], reference: Mappi
     )
     patch_contract = "" if final else f"""
 When revision is required, return the exact correction as patch in this same response. patch must be {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}} with no more than {MAX_PATCH_OPERATIONS} operations and no more than {MAX_PATCH_BYTES} encoded bytes. A remove operation omits value; add/replace requires value. Every operation must directly implement a listed issue against the current candidate using an existing JSON Pointer path (add may create only an allowed missing field). Do not change schema, templateId, createdAt, asset declarations or source-free asset assignments. When the evidence passes the 9.8 gate, issues must be [] and patch must be null. Do not return a full replacement template."""
-    return f"""You are one {role} for an exact-clone template. Attached images are ordered: source, reciprocal aspect reference, source-filled Feed QA render, source-filled Story QA render, then (for final review) neutral production Feed and Story renders, followed by each placement's overlay and difference view. Separate two decisions: source likeness (geometry, typography, effects, crop) and production correctness (all replacement text/media present, legible, unclipped, non-overlapping, with no duplicate or stray glyphs). A production defect is a blocker even when the source-filled QA likeness score is high. Before scoring, perform a whole-frame severe-defects checklist: overlapping elements, clipped or missing text, stray glyphs, illegible text, and missing media. Judge reconstruction fidelity only; do not reward creative improvement. The source-filled QA renders replace neutral reusable media and placeholder copy only inside the run workspace so pixel overlays measure the authored geometry, typography and effects. Feed must be as close to pixel-for-pixel as editable reconstruction permits. Story must preserve the same source design while following the reciprocal aspect reference. Missing shading, gradients, shadows, transparency, borders, masks, texture or decorative details are material defects.
+    return f"""You are one {role} for an exact-clone template. Attached images are ordered: original source, source-photo-filled Feed QA render, source-photo-filled Story QA render, then (for final review) neutral production Feed and Story renders, followed by the original-placement overlay and difference views. The original source is the ONLY design authority. Source placement is {reference["sourcePlacement"]}; it must match the source as close to pixel-for-pixel as editable reconstruction permits. The other placement is a native aspect adaptation using the measured layout plan below: preserve the source design, hierarchy, effects and image roles without stretching or cropping the whole ad. There is no separate generated-ad target and no pixel-similarity score for that different aspect ratio. Score its composition, source-design preservation and production correctness visually. Both placements must pass the same 9.8 quality gate. QA substitutes source photo crops but retains authored neutral text. Separate source likeness from production correctness. Before scoring, check the whole frame for overlapping elements, clipped or missing text, stray glyphs, illegible text and missing media. Any such defect blocks acceptance regardless of average score. Do not reward creative redesign. Missing shading, gradients, shadows, transparency, borders, masks, texture or decorative details are material defects.
 
 Return JSON only with exactly {output_fields}. scores must contain exactly, in this order: overall, geometry, typography, colourEffects, imageCrop, details. effects must contain exactly, in this order: shading, gradients, shadows, transparency, borders, masks, texture; each is match, not_present, or mismatch. issues is a list of objects with exactly placement (feed|story|both), layerIds (real candidate layer IDs), category (geometry|typography|colourEffects|imageCrop|details), instruction, severity (blocker|material|minor). Every issue instruction must be directly patchable: name at least one exact target field (x, y, width, height, font/fontSize/fontFamily/fontWeight, lineHeight, tracking, colour, or crop) and give its measured numeric/hex/font-file target or delta from the attached overlay. Vague phrases such as "match the source", "align", or "fix spacing" without target values are invalid. Every visible discrepancy is an issue; acceptance requires issues=[] and every effect matched or genuinely absent. decision is evidence only; the controller derives accept/revise from scores, issues, effects and the font rule. An obvious defect blocks acceptance regardless of average. fontSubstitution is null or exactly {{source,used,reason}}.{patch_contract} Return no prose.
 
 PRODUCTION SAFETY: Do not reproduce accidental source clipping, duplicate glyphs, or missing contact text as a requested correction. Match the source structure while keeping customer replacements readable; list unavoidable source defects as warnings, never a reason to damage the production template. Repeated feature wording intentionally present in the source is not itself a stray-glyph defect.
 AVAILABLE BUNDLED FONT FILES: {_safe_json(sorted(AVAILABLE_FONT_FILES))}. Existing declared asset-backed fonts may also be used. Never request a font file that is neither available here nor supplied by the candidate. Record unavoidable differences in fontSubstitution and choose the closest available face, weight and tracking; do not repeatedly demand unavailable proprietary fonts.
-IMAGE ORDER NOTE: When neutral production images are supplied, they immediately follow the four source/QA images and precede the overlay/difference views. Never interpret a difference heatmap as a customer preview.
+IMAGE ORDER NOTE: Neutral production images follow the three original-source/QA images and precede the original-placement overlay/difference views. Never interpret a difference heatmap as a customer preview.
 
 RECIPROCAL ASPECT REFERENCE: {_safe_json(reference)}
 DETERMINISTIC PIXEL/EDGE/COLOUR DIAGNOSTICS: {_safe_json(metrics)}. These are measured from the source-filled QA renders; vision remains the fidelity judge.
@@ -1032,6 +996,12 @@ def build_ephemeral_qa_candidate(
         source_placement: (source, source_map),
         target_placement: (reciprocal_reference, target_map),
     }
+    source_only = Path(source).resolve() == Path(reciprocal_reference).resolve()
+    source_layout = template["feedLayout" if source_placement == "feed" else "storyLayout"]
+    source_geometries = {layer.get("inputKey"): copy.deepcopy(layer.get("geometry"))
+                         for layer in source_layout["layers"]
+                         if layer.get("type") in {"image_slot", "logo"}}
+
     for placement, layout_key in (("feed", "feedLayout"), ("story", "storyLayout")):
         layout = template.get(layout_key)
         if not isinstance(layout, dict) or not isinstance(layout.get("layers"), list):
@@ -1047,11 +1017,21 @@ def build_ephemeral_qa_candidate(
             input_key = layer.get("inputKey")
             geometry = layer.get("geometry") if isinstance(layer.get("geometry"), dict) else {}
             if layer_type in {"image_slot", "logo"} and input_key in original_image_inputs:
+                crop_width, crop_height = canvas_width, canvas_height
+                if source_only and placement != source_placement:
+                    geometry = source_geometries.get(input_key)
+                    if not isinstance(geometry, dict):
+                        continue
+                    crop_height = 1350 if source_placement == "feed" else 1920
+                geometry = dict(geometry)
                 try:
-                    left = max(0, round(float(geometry["x"]) * reference_image.width / canvas_width))
-                    top = max(0, round(float(geometry["y"]) * reference_image.height / canvas_height))
-                    right = min(reference_image.width, round((float(geometry["x"]) + float(geometry["width"])) * reference_image.width / canvas_width))
-                    bottom = min(reference_image.height, round((float(geometry["y"]) + float(geometry["height"])) * reference_image.height / canvas_height))
+                    if all(abs(float(geometry.get(key, 2))) <= 1.001 for key in ("x", "y", "width", "height")):
+                        for key in ("x", "width"): geometry[key] *= crop_width
+                        for key in ("y", "height"): geometry[key] *= crop_height
+                    left = max(0, round(float(geometry["x"]) * reference_image.width / crop_width))
+                    top = max(0, round(float(geometry["y"]) * reference_image.height / crop_height))
+                    right = min(reference_image.width, round((float(geometry["x"]) + float(geometry["width"])) * reference_image.width / crop_width))
+                    bottom = min(reference_image.height, round((float(geometry["y"]) + float(geometry["height"])) * reference_image.height / crop_height))
                 except (KeyError, TypeError, ValueError):
                     continue
                 if right <= left or bottom <= top:
@@ -1314,6 +1294,8 @@ def _comparison_views(
         for placement, reference_path in (
             (source_placement, source), (target_placement, reciprocal_reference),
         ):
+            if placement == target_placement and Path(source).resolve() == Path(reciprocal_reference).resolve():
+                continue  # No fabricated pixel target for a different aspect ratio.
             current_path = Path(str(rendered["render"][placement]))
             with Image.open(reference_path) as source_image, Image.open(current_path) as current_image:
                 reference = source_image.convert("RGB").resize(current_image.size, Image.Resampling.LANCZOS)
@@ -1359,7 +1341,9 @@ def _comparison_metrics(
         raise AdTemplateProcessError("native placement renders are unavailable for comparison")
     return {
         source_placement: deterministic_pixel_metrics(source, source_render),
-        target_placement: deterministic_pixel_metrics(reciprocal_reference, target_render),
+        target_placement: ({"mode": "native-reflow", "pixelComparison": False}
+                           if Path(source).resolve() == Path(reciprocal_reference).resolve()
+                           else deterministic_pixel_metrics(reciprocal_reference, target_render)),
     }
 
 
@@ -1929,44 +1913,23 @@ class ExactCloneOrchestrator:
             checkpoint.setdefault("cycleComparisons", 0)
             persist_checkpoint(self.workspace, checkpoint)
 
-        reciprocal_reference = checkpoint.get("reciprocalReference")
-        if not isinstance(reciprocal_reference, str) or not Path(reciprocal_reference).is_file():
-            self._check_stop()
-            self.emit("aspect-reference-image.started", "aspect-reference", {
-                "source_placement": source_placement, "target_placement": target_placement,
-                "route": f"{image_route.get('provider')}/{image_route.get('model')}",
-            })
-            reciprocal_reference = generate_reciprocal_reference(
-                call_image_model=self.call_image_model, source=source,
-                target_placement=target_placement, canvas=canvas,
-                source_map=source_map,
-                route=image_route, workspace=self.workspace,
-            )
-            self.emit("aspect-reference-image.completed", "aspect-reference", {
-                "source_placement": source_placement, "target_placement": target_placement,
-                "name": Path(reciprocal_reference).name,
-            })
-            checkpoint.update(sourceMap=source_map, reciprocalReference=reciprocal_reference)
+        # The original source is the only design authority. Image models create
+        # photo assets, not a second ad which could drift or be silently cropped.
+        reciprocal_reference = source
+        target_map = source_map
+        if checkpoint.get("referenceMode") != "source-only":
+            previous = checkpoint.get("reciprocalReference")
+            if previous and previous != source:
+                checkpoint.setdefault("supersededReferences", []).append(previous)
+            checkpoint.update(referenceMode="source-only", reciprocalReference=source,
+                              targetReferenceMap=source_map, reference=None, accepted=False)
+            for key in ("finalReview", "bestReview", "bestCandidate", "bestIteration"):
+                checkpoint.pop(key, None)
             persist_checkpoint(self.workspace, checkpoint)
-
-        reference_preview = self.workspace / "previews" / f"reference-{target_placement}.png"
-        reference_preview.parent.mkdir(parents=True, exist_ok=True)
-        if not reference_preview.is_file():
-            temporary_reference = reference_preview.with_suffix(".png.tmp")
-            shutil.copyfile(reciprocal_reference, temporary_reference)
-            os.replace(temporary_reference, reference_preview)
-
-        target_map = checkpoint.get("targetReferenceMap")
-        if not isinstance(target_map, dict) or target_map.get("sourceMapVersion") != SOURCE_MAP_VERSION:
-            target_map = build_source_map(reciprocal_reference)
-            (self.workspace / "references" / "target-reference-map.json").write_text(
-                _safe_json(target_map), encoding="utf-8",
-            )
-            checkpoint.update(
-                sourceMap=source_map, reciprocalReference=reciprocal_reference,
-                targetReferenceMap=target_map,
-            )
-            persist_checkpoint(self.workspace, checkpoint)
+            self.emit("reference.source-only", "aspect-reference", {
+                "source_placement": source_placement, "target_placement": target_placement,
+                "summary": "Original source retained; other placement uses a native layout plan, not a generated ad reference",
+            })
 
         reference = checkpoint.get("reference")
         if not reference:
@@ -2490,12 +2453,6 @@ class ExactCloneOrchestrator:
             "diffs": final_comparison_views,
             "references": [
                 {"name": "source-map.json", "sourcePlacement": source_placement, "sourceMap": source_map},
-                {
-                    "name": reference_preview.name,
-                    "placement": target_placement,
-                    "kind": "reciprocal-image-reference",
-                },
-                {"name": "target-reference-map.json", "placement": target_placement, "sourceMap": target_map},
                 {"name": "aspect-reference.json", "sourcePlacement": source_placement, "targetPlacement": target_placement, "reference": reference},
             ],
             "documents": documents,
