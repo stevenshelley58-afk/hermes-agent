@@ -33,6 +33,8 @@ _RUN_STATUSES = frozenset({
 _EVENT_STATUSES = frozenset({"queued", "running", "ok", "blocked", "error", "cancelled"})
 _SECRET_KEY = re.compile(r"(?:api[_-]?key|token|secret|password|credential|private[_-]?key|authorization)", re.I)
 _SAFE_USAGE_KEYS = frozenset({"input_tokens", "output_tokens", "total_tokens"})
+_USAGE_COST_STATUSES = frozenset({"actual", "estimated", "included", "unknown"})
+_USAGE_OUTCOMES = frozenset({"ok", "error", "cancelled"})
 _MAX_JSON_BYTES = 512 * 1024
 _KNOWN_IMAGE_ONLY = frozenset({"gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2"})
 _AD_TEMPLATE_POLICY_SEED_REVISION = 13
@@ -741,6 +743,116 @@ class ToolRunStore:
             "span_id": span_id,
             "data": _loads(data_json, {}),
         }
+
+    def record_provider_usage(
+        self,
+        run_id: str,
+        *,
+        call_id: str,
+        provider: str,
+        model: str,
+        role: str,
+        duration_ms: int,
+        input_tokens: int,
+        output_tokens: int,
+        total_tokens: int,
+        api_calls: int,
+        estimated_cost_usd: float,
+        cost_status: str,
+        outcome: str,
+    ) -> Dict[str, Any]:
+        """Persist one bounded provider-call accounting record.
+
+        The record is appended immediately after the isolated role returns (or
+        raises), so a later process retry/restart can enforce the whole-run
+        budget from the ledger instead of starting again at zero.
+        """
+        for value, field, maximum in (
+            (call_id, "call_id", 240),
+            (provider, "provider", 128),
+            (model, "model", 192),
+            (role, "role", 192),
+        ):
+            if not isinstance(value, str) or not value or len(value) > maximum:
+                raise ToolRunError(f"provider usage {field} is invalid")
+        for value, field in (
+            (duration_ms, "duration_ms"),
+            (input_tokens, "input_tokens"),
+            (output_tokens, "output_tokens"),
+            (total_tokens, "total_tokens"),
+            (api_calls, "api_calls"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ToolRunError(f"provider usage {field} must be a non-negative integer")
+        if not isinstance(estimated_cost_usd, (int, float)) or isinstance(estimated_cost_usd, bool):
+            raise ToolRunError("provider usage estimated_cost_usd must be numeric")
+        if not 0 <= float(estimated_cost_usd) < 1_000_000:
+            raise ToolRunError("provider usage estimated_cost_usd is out of range")
+        if cost_status not in _USAGE_COST_STATUSES:
+            raise ToolRunError("provider usage cost_status is invalid")
+        if outcome not in _USAGE_OUTCOMES:
+            raise ToolRunError("provider usage outcome is invalid")
+        self.append_event(
+            run_id,
+            "provider.usage",
+            status="ok" if outcome == "ok" else ("cancelled" if outcome == "cancelled" else "error"),
+            node_id=role,
+            data={
+                "call_id": call_id,
+                "provider": provider,
+                "model": model,
+                "role": role,
+                "duration_ms": duration_ms,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
+                "api_calls": api_calls,
+                "estimated_cost_usd": round(float(estimated_cost_usd), 8),
+                "cost_status": cost_status,
+                "outcome": outcome,
+            },
+        )
+        return self.provider_usage_totals(run_id)
+
+    def provider_usage_totals(self, run_id: str) -> Dict[str, Any]:
+        """Aggregate all durable provider usage for a run across resumes."""
+        _clean_id(run_id, "run_id")
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM tool_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if exists is None:
+                raise KeyError(f"Tool run not found: {run_id}")
+            rows = self._conn.execute(
+                "SELECT data_json FROM tool_run_events WHERE run_id=? AND kind='provider.usage' ORDER BY sequence",
+                (run_id,),
+            ).fetchall()
+        totals: Dict[str, Any] = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "estimated_cost_usd": 0.0,
+            "duration_ms": 0,
+            "call_count": 0,
+            "api_call_count": 0,
+            "unpriced_call_count": 0,
+        }
+        for row in rows:
+            data = _loads(row["data_json"], {})
+            totals["input_tokens"] += int(data.get("input_tokens") or 0)
+            totals["output_tokens"] += int(data.get("output_tokens") or 0)
+            totals["total_tokens"] += int(data.get("total_tokens") or 0)
+            totals["estimated_cost_usd"] += float(data.get("estimated_cost_usd") or 0.0)
+            totals["duration_ms"] += int(data.get("duration_ms") or 0)
+            totals["call_count"] += 1
+            api_calls = int(data.get("api_calls") or 0)
+            totals["api_call_count"] += api_calls
+            if data.get("cost_status") == "unknown" and (
+                api_calls > 0 or int(data.get("total_tokens") or 0) > 0
+            ):
+                totals["unpriced_call_count"] += 1
+        totals["estimated_cost_usd"] = round(totals["estimated_cost_usd"], 8)
+        return totals
 
     def events(
         self, run_id: str, *, after: int = -1, limit: int = 1000,

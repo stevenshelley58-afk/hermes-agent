@@ -45,6 +45,7 @@ from gateway.tool_runs import (
     ad_template_model_catalog,
     validate_model_policy,
 )
+from gateway.tool_run_usage import agent_provider_usage, assert_run_usage_accounted
 
 
 logger = logging.getLogger(__name__)
@@ -966,9 +967,10 @@ class ToolRunAPIMixin:
                 from hermes_constants import get_hermes_home
                 workspace = (get_hermes_home() / "tool_runs" / "ad-template-generator" / run_id).resolve()
                 workspace.mkdir(parents=True, exist_ok=True)
-                usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "estimated_cost_usd": 0.0}
+                usage = self._tool_run_store.provider_usage_totals(run_id)
                 usage_lock = threading.Lock()
                 run_cost_limit = float(os.environ.get("AD_TEMPLATE_MAX_RUN_COST_USD", "10.0"))
+                assert_run_usage_accounted(usage, run_cost_limit, before_call=True)
 
                 def should_stop() -> bool:
                     if stop_event.is_set():
@@ -982,9 +984,15 @@ class ToolRunAPIMixin:
 
                 def call_agent(instance_id: str, prompt: Any, route_name: str):
                     provider, model = route_name.split("/", 1)
+                    with usage_lock:
+                        durable_before = self._tool_run_store.provider_usage_totals(run_id)
+                        assert_run_usage_accounted(
+                            durable_before, run_cost_limit, before_call=True,
+                        )
+                    call_id = f"{run_id}:{instance_id}:{uuid.uuid4().hex}"
                     agent = self._create_agent(
                         ephemeral_system_prompt=self._isolated_tool_role_prompt(),
-                        session_id=f"{run_id}:{instance_id}:{uuid.uuid4().hex}",
+                        session_id=call_id,
                         tool_progress_callback=progress_callback,
                         requested_model=model, requested_provider=provider, route=None,
                         confirmed_runtime_lock=True,
@@ -993,6 +1001,8 @@ class ToolRunAPIMixin:
                         stream_delta_callback=role_heartbeat,
                         reasoning_callback=role_heartbeat,
                     )
+                    started_at = time.monotonic()
+                    outcome = "error"
                     # The durable role policy owns retry/fallback. Disable the
                     # generic agent's nested three-attempt loop so one stalled
                     # vision route cannot multiply every orchestrator retry.
@@ -1010,18 +1020,31 @@ class ToolRunAPIMixin:
                     active[instance_id] = agent
                     try:
                         result = agent.run_conversation(user_message=prompt, conversation_history=[], task_id=f"{run_id}:{instance_id}")
-                        with usage_lock:
-                            usage["input_tokens"] += getattr(agent, "session_prompt_tokens", 0) or 0
-                            usage["output_tokens"] += getattr(agent, "session_completion_tokens", 0) or 0
-                            usage["total_tokens"] += getattr(agent, "session_total_tokens", 0) or 0
-                            usage["estimated_cost_usd"] += float(getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0)
-                            if run_cost_limit > 0 and usage["estimated_cost_usd"] > run_cost_limit:
-                                raise RuntimeError(f"sole ad-template process exceeded whole-run cost limit {run_cost_limit:.2f}")
-                        return self._tool_json_output(result)
+                        parsed = self._tool_json_output(result)
+                        outcome = "ok"
+                        return parsed
                     finally:
-                        active.pop(instance_id, None)
-                        if not active:
-                            self._tool_run_agents.pop(run_id, None)
+                        try:
+                            snapshot = agent_provider_usage(agent)
+                            with usage_lock:
+                                usage.clear()
+                                usage.update(self._tool_run_store.record_provider_usage(
+                                    run_id,
+                                    call_id=call_id,
+                                    provider=str(getattr(agent, "provider", None) or provider),
+                                    model=str(getattr(agent, "model", None) or model),
+                                    role=instance_id,
+                                    duration_ms=max(0, round((time.monotonic() - started_at) * 1000)),
+                                    outcome="cancelled" if stop_event.is_set() else outcome,
+                                    **snapshot,
+                                ))
+                                assert_run_usage_accounted(
+                                    usage, run_cost_limit, before_call=False,
+                                )
+                        finally:
+                            active.pop(instance_id, None)
+                            if not active:
+                                self._tool_run_agents.pop(run_id, None)
 
                 def call_image_model(
                     prompt: str, source_path: str, target_placement: str,
@@ -1032,39 +1055,76 @@ class ToolRunAPIMixin:
 
                     provider_name = str(route.get("provider") or "")
                     model_name = str(route.get("model") or "")
+                    with usage_lock:
+                        assert_run_usage_accounted(
+                            self._tool_run_store.provider_usage_totals(run_id),
+                            run_cost_limit,
+                            before_call=True,
+                        )
                     provider = get_provider(provider_name)
                     if provider is None or not provider.is_available():
                         raise RuntimeError(
                             f"configured aspect-reference image provider is unavailable: {provider_name}"
                         )
-                    mark_activity()
-                    response = provider.generate(
-                        prompt=prompt,
-                        aspect_ratio="portrait",
-                        image_url=source_path,
-                        model=model_name,
-                    )
-                    if not isinstance(response, dict) or response.get("success") is not True:
-                        reason = response.get("error") if isinstance(response, dict) else "invalid response"
-                        raise RuntimeError(f"aspect-reference image generation failed: {reason}")
-                    image = response.get("image")
-                    if not isinstance(image, str) or not image.strip():
-                        raise RuntimeError("aspect-reference image generation returned no image")
-                    if image.startswith(("http://", "https://")):
-                        image = str(save_url_image(image, prefix=f"ad-template-{run_id}-reference"))
-                    generated_path = Path(image).expanduser().resolve(strict=True)
-                    if not generated_path.is_file():
-                        raise RuntimeError("aspect-reference image generation returned an invalid file")
-                    extra = response.get("extra") if isinstance(response.get("extra"), dict) else {}
-                    if isinstance(extra.get("cost_usd"), (int, float)):
+                    call_id = f"{run_id}:aspect-reference-image:{uuid.uuid4().hex}"
+                    started_at = time.monotonic()
+                    outcome = "error"
+                    response: Dict[str, Any] = {}
+                    try:
+                        mark_activity()
+                        raw_response = provider.generate(
+                            prompt=prompt,
+                            aspect_ratio="portrait",
+                            image_url=source_path,
+                            model=model_name,
+                        )
+                        response = raw_response if isinstance(raw_response, dict) else {}
+                        if response.get("success") is not True:
+                            reason = response.get("error") or "invalid response"
+                            raise RuntimeError(f"aspect-reference image generation failed: {reason}")
+                        image = response.get("image")
+                        if not isinstance(image, str) or not image.strip():
+                            raise RuntimeError("aspect-reference image generation returned no image")
+                        if image.startswith(("http://", "https://")):
+                            image = str(save_url_image(image, prefix=f"ad-template-{run_id}-reference"))
+                        generated_path = Path(image).expanduser().resolve(strict=True)
+                        if not generated_path.is_file():
+                            raise RuntimeError("aspect-reference image generation returned an invalid file")
+                        self._tool_run_store.append_event(
+                            run_id, "image-model.completed", status="ok", node_id="aspect-reference",
+                            data={"provider": provider_name, "model": model_name, "placement": target_placement},
+                        )
+                        mark_activity()
+                        outcome = "ok"
+                        return str(generated_path)
+                    finally:
+                        extra = response.get("extra") if isinstance(response.get("extra"), dict) else {}
+                        reported_image_cost = extra.get("cost_usd")
+                        included = provider_name == "openai-codex"
+                        cost_status = str(extra.get("cost_status") or ("included" if included else "unknown"))
+                        if cost_status not in {"actual", "estimated", "included", "unknown"}:
+                            cost_status = "unknown"
+                        cost = float(reported_image_cost or 0.0)
                         with usage_lock:
-                            usage["estimated_cost_usd"] += float(extra["cost_usd"])
-                    self._tool_run_store.append_event(
-                        run_id, "image-model.completed", status="ok", node_id="aspect-reference",
-                        data={"provider": provider_name, "model": model_name, "placement": target_placement},
-                    )
-                    mark_activity()
-                    return str(generated_path)
+                            usage.clear()
+                            usage.update(self._tool_run_store.record_provider_usage(
+                                run_id,
+                                call_id=call_id,
+                                provider=provider_name,
+                                model=model_name,
+                                role="aspect-reference-image",
+                                duration_ms=max(0, round((time.monotonic() - started_at) * 1000)),
+                                input_tokens=0,
+                                output_tokens=0,
+                                total_tokens=0,
+                                api_calls=1,
+                                estimated_cost_usd=cost,
+                                cost_status=cost_status,
+                                outcome="cancelled" if stop_event.is_set() else outcome,
+                            ))
+                            assert_run_usage_accounted(
+                                usage, run_cost_limit, before_call=False,
+                            )
                 routes = [
                     dict(route_plan[role][0][0]) for role in AD_TEMPLATE_ROUTE_ORDER
                 ]
