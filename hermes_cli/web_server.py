@@ -575,6 +575,9 @@ from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
 
 app.include_router(_memory_oauth_router)
 
+from hermes_cli.ad_db_api import router as _ad_db_router  # noqa: E402
+
+app.include_router(_ad_db_router)
 # ---------------------------------------------------------------------------
 # Session token for protecting sensitive endpoints (reveal).
 # The desktop shell mints the token and injects it via
