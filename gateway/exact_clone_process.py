@@ -51,11 +51,13 @@ ESCALATION_COMPARISONS = 2
 MAX_COMPARISONS = NORMAL_COMPARISONS + ESCALATION_COMPARISONS
 MAX_FINAL_REVIEW_ROUNDS = 2
 MAX_OUTPUT_RETRIES = 1
+MAX_PATCH_REPLANS = 2
 MAX_PATCH_OPERATIONS = 64
 MAX_PATCH_BYTES = 32_000
 MAX_CONTRACT_REPAIRS = 6
 REGRESSION_EPSILON = 0.05
-QA_PROJECTION_VERSION = 2
+SOURCE_MAP_VERSION = 2
+QA_PROJECTION_VERSION = 3
 EVALUATION_POLICY_VERSION = 1
 STAGES = (
     "source",
@@ -291,36 +293,65 @@ def build_source_map(path: str) -> Dict[str, Any]:
     ocr_status = "unavailable"
     if tesseract:
         try:
-            result = subprocess.run(
-                [tesseract, str(Path(path).resolve()), "stdout", "tsv"],
-                capture_output=True, text=True, timeout=30, check=False,
-            )
-            if result.returncode == 0:
+            for pass_name, extra_args, minimum_confidence in (
+                ("layout", [], 20.0),
+                ("sparse", ["--psm", "11"], 50.0),
+            ):
+                result = subprocess.run(
+                    [tesseract, str(Path(path).resolve()), "stdout", *extra_args, "tsv"],
+                    capture_output=True, text=True, timeout=30, check=False,
+                )
+                if result.returncode != 0:
+                    if pass_name == "layout":
+                        ocr_status = "failed"
+                    continue
                 reader = csv.DictReader(io.StringIO(result.stdout), delimiter="\t")
                 for row in reader:
                     text = str(row.get("text") or "").strip()
                     try:
                         confidence = float(row.get("conf") or -1)
+                        left = int(row.get("left") or 0)
+                        top = int(row.get("top") or 0)
+                        item_width = int(row.get("width") or 0)
+                        item_height = int(row.get("height") or 0)
                     except ValueError:
-                        confidence = -1
-                    if not text or confidence < 20:
                         continue
-                    ocr.append({
+                    if not text or confidence < minimum_confidence or item_width <= 0 or item_height <= 0:
+                        continue
+                    candidate = {
                         "text": text[:200],
-                        "x": int(row.get("left") or 0),
-                        "y": int(row.get("top") or 0),
-                        "width": int(row.get("width") or 0),
-                        "height": int(row.get("height") or 0),
+                        "x": left, "y": top, "width": item_width, "height": item_height,
                         "confidence": round(confidence, 1),
-                    })
-                    if len(ocr) >= 200:
+                        "ocrPass": pass_name,
+                        "pageId": int(row.get("page_num") or 0),
+                        "blockId": int(row.get("block_num") or 0),
+                        "paragraphId": int(row.get("par_num") or 0),
+                        "lineId": int(row.get("line_num") or 0),
+                        "wordId": int(row.get("word_num") or 0),
+                    }
+                    if pass_name == "sparse":
+                        candidate_area = item_width * item_height
+                        duplicate = False
+                        for existing in ocr:
+                            overlap_width = max(0, min(left + item_width, existing["x"] + existing["width"]) - max(left, existing["x"]))
+                            overlap_height = max(0, min(top + item_height, existing["y"] + existing["height"]) - max(top, existing["y"]))
+                            overlap = overlap_width * overlap_height
+                            existing_area = max(1, existing["width"] * existing["height"])
+                            if overlap / max(1, min(candidate_area, existing_area)) >= 0.6:
+                                duplicate = True
+                                break
+                        if duplicate:
+                            continue
+                    ocr.append(candidate)
+                    if len(ocr) >= 300:
                         break
                 ocr_status = "completed"
-            else:
-                ocr_status = "failed"
+                if len(ocr) >= 300:
+                    break
         except (OSError, subprocess.SubprocessError, ValueError):
             ocr_status = "failed"
     return {
+        "sourceMapVersion": SOURCE_MAP_VERSION,
         "canvas": {"width": width, "height": height},
         "ocrStatus": ocr_status,
         "ocr": ocr,
@@ -398,16 +429,36 @@ def _reconstruct_ocr_text(words: Sequence[Mapping[str, Any]]) -> str:
         try:
             x = float(word.get("x", 0))
             y = float(word.get("y", 0))
+            width = max(1.0, float(word.get("width", 0)))
             height = max(1.0, float(word.get("height", 0)))
         except (TypeError, ValueError):
             continue
         text = str(word.get("text") or "").strip()
         if text:
-            normalized.append({"x": x, "y": y, "height": height, "center": y + height / 2, "text": text})
+            line_key = None
+            if all(word.get(key) is not None for key in ("ocrPass", "pageId", "blockId", "paragraphId", "lineId")):
+                line_key = (
+                    str(word.get("ocrPass")), int(word.get("pageId") or 0),
+                    int(word.get("blockId") or 0), int(word.get("paragraphId") or 0),
+                    int(word.get("lineId") or 0),
+                )
+            normalized.append({
+                "x": x, "y": y, "width": width, "height": height,
+                "center": y + height / 2, "text": text, "lineKey": line_key,
+                "confidence": float(word.get("confidence") or 0),
+            })
     lines: list[dict[str, Any]] = []
     for word in sorted(normalized, key=lambda item: (item["center"], item["x"])):
+        if word["lineKey"] is not None:
+            keyed = next((line for line in lines if line.get("lineKey") == word["lineKey"]), None)
+            if keyed is not None:
+                keyed["words"].append(word)
+                keyed["center"] = sum(item["center"] for item in keyed["words"]) / len(keyed["words"])
+                continue
+            lines.append({"center": word["center"], "height": word["height"], "lineKey": word["lineKey"], "words": [word]})
+            continue
         matches = [
-            line for line in lines
+            line for line in lines if line.get("lineKey") is None
             if abs(word["center"] - line["center"]) <= 0.6 * max(word["height"], line["height"])
         ]
         if matches:
@@ -417,12 +468,77 @@ def _reconstruct_ocr_text(words: Sequence[Mapping[str, Any]]) -> str:
             line["center"] = ((line["center"] * (count - 1)) + word["center"]) / count
             line["height"] = max(line["height"], word["height"])
         else:
-            lines.append({"center": word["center"], "height": word["height"], "words": [word]})
+            lines.append({"center": word["center"], "height": word["height"], "lineKey": None, "words": [word]})
     output = []
     for line in sorted(lines, key=lambda item: item["center"]):
-        text = " ".join(word["text"] for word in sorted(line["words"], key=lambda item: item["x"]))
+        ordered = sorted(line["words"], key=lambda item: item["x"])
+        tokens = [word["text"] for word in ordered]
+        if tokens and (
+            tokens[0] in {"*", "©", "®", "•", "·"}
+            or (len(tokens[0]) == 1 and ordered[0]["confidence"] < 55 and ordered[0]["width"] <= ordered[0]["height"])
+        ):
+            tokens[0] = "•"
+            if len(tokens) > 1:
+                tokens[1] = re.sub(r"^(\d+)[.,](?=[A-Z])", r"\1 ", tokens[1])
+                tokens[1] = re.sub(r"^(\d+)(?=[A-Z])", r"\1 ", tokens[1])
+        text = " ".join(tokens)
         output.append(re.sub(r"\s+([,.;:!?])", r"\1", text))
     return "\n".join(output)
+
+
+def _ocr_words_by_text_layer(
+    layers: Sequence[Mapping[str, Any]], placement_map: Mapping[str, Any],
+    *, canvas_width: int, canvas_height: int,
+) -> Dict[int, list[Mapping[str, Any]]]:
+    """Assign each OCR token to at most one overlapping editable text layer."""
+    source_canvas = placement_map.get("canvas") if isinstance(placement_map.get("canvas"), Mapping) else {}
+    source_width = max(1.0, float(source_canvas.get("width") or canvas_width))
+    source_height = max(1.0, float(source_canvas.get("height") or canvas_height))
+    text_boxes: list[tuple[int, tuple[float, float, float, float]]] = []
+    for index, layer in enumerate(layers):
+        if not isinstance(layer, Mapping) or layer.get("type") != "text":
+            continue
+        geometry = layer.get("geometry") if isinstance(layer.get("geometry"), Mapping) else {}
+        try:
+            x, y, width, height = (float(geometry[key]) for key in ("x", "y", "width", "height"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if max(abs(x), abs(y), abs(width), abs(height)) <= 1.001:
+            x, width = x * canvas_width, width * canvas_width
+            y, height = y * canvas_height, height * canvas_height
+        if width > 0 and height > 0:
+            text_boxes.append((index, (x, y, x + width, y + height)))
+
+    assignments: Dict[int, list[Mapping[str, Any]]] = {}
+    for word in placement_map.get("ocr", []):
+        if not isinstance(word, Mapping):
+            continue
+        try:
+            left = float(word.get("x", 0)) * canvas_width / source_width
+            top = float(word.get("y", 0)) * canvas_height / source_height
+            width = float(word.get("width", 0)) * canvas_width / source_width
+            height = float(word.get("height", 0)) * canvas_height / source_height
+        except (TypeError, ValueError):
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        right, bottom = left + width, top + height
+        word_area = width * height
+        center_x, center_y = left + width / 2, top + height / 2
+        candidates = []
+        for index, (box_left, box_top, box_right, box_bottom) in text_boxes:
+            intersection = max(0.0, min(right, box_right) - max(left, box_left)) * max(0.0, min(bottom, box_bottom) - max(top, box_top))
+            ratio = intersection / max(1.0, word_area)
+            if ratio < 0.25:
+                continue
+            box_center_x, box_center_y = (box_left + box_right) / 2, (box_top + box_bottom) / 2
+            distance = (center_x - box_center_x) ** 2 + (center_y - box_center_y) ** 2
+            area = (box_right - box_left) * (box_bottom - box_top)
+            candidates.append((-ratio, distance, area, index))
+        if candidates:
+            index = min(candidates)[3]
+            assignments.setdefault(index, []).append(word)
+    return assignments
 
 
 def _validate_aspect_reference(
@@ -745,6 +861,10 @@ def build_ephemeral_qa_candidate(
         with Image.open(reference_path) as opened:
             reference_image = ImageOps.exif_transpose(opened).convert("RGB")
         canvas_width, canvas_height = (1080, 1350 if placement == "feed" else 1920)
+        ocr_by_layer = _ocr_words_by_text_layer(
+            layout["layers"], placement_map,
+            canvas_width=canvas_width, canvas_height=canvas_height,
+        )
         for index, layer in enumerate(layout["layers"]):
             if not isinstance(layer, dict):
                 continue
@@ -776,24 +896,14 @@ def build_ephemeral_qa_candidate(
                 qa["assets"].append({"assetKey": asset_key, "fileName": file_name, "mimeType": "image/png"})
                 override_bytes[asset_key] = buffer.getvalue()
             elif layer_type == "text" and input_key in original_text_inputs:
-                words: list[Mapping[str, Any]] = []
-                for word in placement_map.get("ocr", []) if isinstance(placement_map, Mapping) else []:
-                    if not isinstance(word, Mapping):
-                        continue
-                    center_x = float(word.get("x", 0)) + float(word.get("width", 0)) / 2
-                    center_y = float(word.get("y", 0)) + float(word.get("height", 0)) / 2
-                    scaled_x = center_x * canvas_width / max(1, float((placement_map.get("canvas") or {}).get("width", canvas_width)))
-                    scaled_y = center_y * canvas_height / max(1, float((placement_map.get("canvas") or {}).get("height", canvas_height)))
-                    if (
-                        float(geometry.get("x", -1)) <= scaled_x <= float(geometry.get("x", -1)) + float(geometry.get("width", 0))
-                        and float(geometry.get("y", -1)) <= scaled_y <= float(geometry.get("y", -1)) + float(geometry.get("height", 0))
-                    ):
-                        words.append(word)
+                words = ocr_by_layer.get(index, [])
                 if words:
                     text_clone = copy.deepcopy(original_text_inputs[input_key])
                     qa_input_key = f"qa_{placement}_{index}_{input_key}"[:120]
                     text_clone["key"] = qa_input_key
-                    text_clone["placeholder"] = _reconstruct_ocr_text(words)[: int(text_clone.get("maxLength") or 4000)]
+                    qa_text = _reconstruct_ocr_text(words)[:4000]
+                    text_clone["maxLength"] = max(int(text_clone.get("maxLength") or 0), len(qa_text))
+                    text_clone["placeholder"] = qa_text
                     text_inputs.append(text_clone)
                     layer["inputKey"] = qa_input_key
     return _candidate_envelope(qa), override_bytes
@@ -1290,16 +1400,40 @@ def _call_applied_patch(
         updated = apply_patch(candidate, patch, strict=strict)
         return {"patch": patch, "candidate": updated}
 
-    result = _call_json(
-        call_agent,
-        instance=instance,
-        prompt=prompt,
-        paths=paths,
-        route=route,
-        validate=validate_and_apply,
-        emit=emit,
-    )
-    return result["patch"], result["candidate"]
+    rejection = ""
+    for replan in range(MAX_PATCH_REPLANS + 1):
+        replan_prompt = prompt
+        if rejection:
+            replan_prompt += (
+                "\n\nThe previous patch and its format retry were rejected by the current document: "
+                f"{rejection}. Re-plan from the CURRENT CANDIDATE above. Every replace/remove path must "
+                "already exist exactly in that candidate; use add only for an allowed missing field. "
+                "Return a different complete patch, not the rejected operations."
+            )
+        try:
+            result = _call_json(
+                call_agent,
+                instance=instance if replan == 0 else f"{instance}-replan-{replan}",
+                prompt=replan_prompt,
+                paths=paths,
+                route=route,
+                validate=validate_and_apply,
+                emit=emit,
+            )
+            return result["patch"], result["candidate"]
+        except (AdTemplateProcessError, AdTemplateStructuredOutputError) as exc:
+            rejection = str(exc)
+            if replan < MAX_PATCH_REPLANS:
+                emit("revision.replanned", "build", {
+                    "role": instance, "attempt": replan + 1, "reason": rejection,
+                })
+                continue
+            emit("revision.skipped", "build", {
+                "role": instance, "reason": rejection,
+                "bounded_replans": MAX_PATCH_REPLANS,
+            })
+            return {"operations": []}, copy.deepcopy(dict(candidate))
+    raise AssertionError("bounded patch re-plan loop did not terminate")
 
 
 def _generation_review(
@@ -1484,20 +1618,25 @@ class ExactCloneOrchestrator:
         source_placement, target_placement, canvas = _source_placement(source)
 
         source_map = checkpoint.get("sourceMap")
-        if not isinstance(source_map, dict):
+        if not isinstance(source_map, dict) or source_map.get("sourceMapVersion") != SOURCE_MAP_VERSION:
             source_map = build_source_map(source)
+            checkpoint.pop("targetReferenceMap", None)
             reference_root = self.workspace / "references"
             reference_root.mkdir(parents=True, exist_ok=True)
             (reference_root / "source-map.json").write_text(_safe_json(source_map), encoding="utf-8")
             self.emit("source-map.completed", "source", {
+                "version": SOURCE_MAP_VERSION,
                 "ocr_status": source_map["ocrStatus"],
                 "ocr_boxes": len(source_map["ocr"]),
                 "edge_regions": len(source_map["edgeRegions"]),
             })
-            persist_checkpoint(self.workspace, {
-                "sourceMap": source_map, "sourcePlacement": source_placement,
-                "targetPlacement": target_placement, "iterations": [], "cycleComparisons": 0,
-            })
+            checkpoint.update(
+                sourceMap=source_map, sourcePlacement=source_placement,
+                targetPlacement=target_placement,
+            )
+            checkpoint.setdefault("iterations", [])
+            checkpoint.setdefault("cycleComparisons", 0)
+            persist_checkpoint(self.workspace, checkpoint)
 
         reciprocal_reference = checkpoint.get("reciprocalReference")
         if not isinstance(reciprocal_reference, str) or not Path(reciprocal_reference).is_file():
@@ -1527,7 +1666,7 @@ class ExactCloneOrchestrator:
             os.replace(temporary_reference, reference_preview)
 
         target_map = checkpoint.get("targetReferenceMap")
-        if not isinstance(target_map, dict):
+        if not isinstance(target_map, dict) or target_map.get("sourceMapVersion") != SOURCE_MAP_VERSION:
             target_map = build_source_map(reciprocal_reference)
             (self.workspace / "references" / "target-reference-map.json").write_text(
                 _safe_json(target_map), encoding="utf-8",

@@ -299,10 +299,40 @@ def test_ocr_reconstruction_preserves_lines_and_horizontal_word_order():
     assert process._reconstruct_ocr_text(words) == "Ready home\nto move in."
 
 
+def test_ocr_reconstruction_uses_tesseract_lines_and_repairs_bullet_tokens():
+    words = [
+        {"text": "2.Bedrooms", "x": 20, "y": 10, "width": 80, "height": 10, "confidence": 46,
+         "ocrPass": "layout", "pageId": 1, "blockId": 2, "paragraphId": 1, "lineId": 1},
+        {"text": "*", "x": 5, "y": 12, "width": 4, "height": 4, "confidence": 32,
+         "ocrPass": "layout", "pageId": 1, "blockId": 2, "paragraphId": 1, "lineId": 1},
+        {"text": "2Bathrooms", "x": 20, "y": 30, "width": 80, "height": 10, "confidence": 43,
+         "ocrPass": "layout", "pageId": 1, "blockId": 2, "paragraphId": 1, "lineId": 2},
+        {"text": "©", "x": 5, "y": 32, "width": 4, "height": 4, "confidence": 47,
+         "ocrPass": "layout", "pageId": 1, "blockId": 2, "paragraphId": 1, "lineId": 2},
+    ]
+    assert process._reconstruct_ocr_text(words) == "• 2 Bedrooms\n• 2 Bathrooms"
+
+
+def test_ocr_token_is_assigned_once_to_best_overlapping_normalized_text_layer():
+    layers = [
+        {"type": "text", "geometry": {"x": 0, "y": 0, "width": 1, "height": 1}},
+        {"type": "text", "geometry": {"x": 0.1, "y": 0.1, "width": 0.2, "height": 0.1}},
+    ]
+    source_map = {
+        "canvas": {"width": 100, "height": 100},
+        "ocr": [{"text": "Price", "x": 12, "y": 12, "width": 10, "height": 5}],
+    }
+    assigned = process._ocr_words_by_text_layer(
+        layers, source_map, canvas_width=1080, canvas_height=1350,
+    )
+    assert list(assigned) == [1]
+    assert assigned[1][0]["text"] == "Price"
+
+
 def test_checkpoint_always_advances_to_current_qa_projection(tmp_path):
     process.persist_checkpoint(tmp_path, {"qaProjectionVersion": 1, "iterations": []})
     checkpoint = process.load_checkpoint(tmp_path)
-    assert checkpoint["qaProjectionVersion"] == process.QA_PROJECTION_VERSION == 2
+    assert checkpoint["qaProjectionVersion"] == process.QA_PROJECTION_VERSION == 3
     assert checkpoint["evaluationPolicyVersion"] == process.EVALUATION_POLICY_VERSION == 1
 
 
@@ -339,6 +369,41 @@ def test_patch_application_error_is_fed_back_for_one_bounded_retry(tmp_path):
     assert candidate["template"]["metadata"]["description"] == "corrected"
     assert events[0][0] == "role.output-retried"
     assert "does not exist" in events[0][1]["reason"]
+
+
+def test_exhausted_invalid_patch_paths_trigger_bounded_replan(tmp_path):
+    source = tmp_path / "source.png"
+    Image.new("RGB", (20, 20), "white").save(source)
+    calls: list[str] = []
+    events: list[tuple[str, dict]] = []
+
+    def call_agent(instance, _prompt, _route):
+        calls.append(instance)
+        if len(calls) <= process.MAX_OUTPUT_RETRIES + 1:
+            return {"operations": [{
+                "op": "replace", "path": "/template/metadata/missing", "value": "wrong",
+            }]}
+        return {"operations": [{
+            "op": "replace", "path": "/template/metadata/description", "value": "replanned",
+        }]}
+
+    candidate = {"template": _template(), "assets": []}
+    patch, updated = process._call_applied_patch(
+        call_agent,
+        instance="patch-semantic",
+        prompt="patch",
+        paths=[str(source)],
+        route={"provider": "openai-codex", "model": "builder"},
+        candidate=candidate,
+        emit=lambda kind, _node, data: events.append((kind, data)),
+    )
+
+    assert calls == [
+        "patch-semantic", "patch-semantic-format-retry", "patch-semantic-replan-1",
+    ]
+    assert patch["operations"][0]["path"] == "/template/metadata/description"
+    assert updated["template"]["metadata"]["description"] == "replanned"
+    assert any(kind == "revision.replanned" for kind, _ in events)
 
 
 def test_invalid_legacy_candidate_is_removed_without_losing_reference_checkpoint():
