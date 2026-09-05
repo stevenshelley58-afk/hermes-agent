@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import base64
 import copy
+import csv
 import hashlib
 import hmac
+import io
 import json
 import mimetypes
 import os
@@ -22,8 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import csv
-import io
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Sequence
 
@@ -59,7 +60,7 @@ MAX_RENDERER_REASON_CHARS = 16_000
 REGRESSION_EPSILON = 0.05
 SOURCE_MAP_VERSION = 2
 QA_PROJECTION_VERSION = 3
-EVALUATION_POLICY_VERSION = 2
+EVALUATION_POLICY_VERSION = 3
 STAGES = (
     "source",
     "aspect-reference",
@@ -703,9 +704,16 @@ def validate_review(value: Any) -> Dict[str, Any]:
 
 def review_prompt(*, final: bool, candidate: Mapping[str, Any], reference: Mapping[str, Any], metrics: Mapping[str, Any]) -> str:
     role = "independent final reviewer" if final else "iteration comparator"
-    return f"""You are one {role} for an exact-clone template. Attached images are ordered: source, reciprocal reference, source-filled Feed QA render, source-filled Story QA render, then overlay/difference/edge/Meta-shell views. Judge reconstruction fidelity only; do not reward creative improvement. The source-filled QA renders replace neutral reusable media and placeholder copy only inside the run workspace so pixel overlays measure the authored geometry, typography and effects. Feed must be as close to pixel-for-pixel as editable reconstruction permits. Story must preserve the same source design while following the reciprocal aspect reference. Missing shading, gradients, shadows, transparency, borders, masks, texture or decorative details are material defects.
+    output_fields = (
+        "decision, scores, issues, warnings, effects, fontSubstitution"
+        if final else
+        "decision, scores, issues, warnings, effects, fontSubstitution, patch"
+    )
+    patch_contract = "" if final else f"""
+When revision is required, return the exact correction as patch in this same response. patch must be {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}} with no more than {MAX_PATCH_OPERATIONS} operations and no more than {MAX_PATCH_BYTES} encoded bytes. A remove operation omits value; add/replace requires value. Every operation must directly implement a listed issue against the current candidate using an existing JSON Pointer path (add may create only an allowed missing field). Do not change schema, templateId, createdAt, asset declarations or source-free asset assignments. When the evidence passes the 9.8 gate, issues must be [] and patch must be null. Do not return a full replacement template."""
+    return f"""You are one {role} for an exact-clone template. Attached images are ordered: source, reciprocal aspect reference, source-filled Feed QA render, source-filled Story QA render, then each placement's overlay and difference view. Judge reconstruction fidelity only; do not reward creative improvement. The source-filled QA renders replace neutral reusable media and placeholder copy only inside the run workspace so pixel overlays measure the authored geometry, typography and effects. Feed must be as close to pixel-for-pixel as editable reconstruction permits. Story must preserve the same source design while following the reciprocal aspect reference. Missing shading, gradients, shadows, transparency, borders, masks, texture or decorative details are material defects.
 
-Return JSON only with exactly decision, scores, issues, warnings, effects, fontSubstitution. scores must contain exactly, in this order: overall, geometry, typography, colourEffects, imageCrop, details. effects must contain exactly, in this order: shading, gradients, shadows, transparency, borders, masks, texture; each is match, not_present, or mismatch. issues is a list of objects with exactly placement (feed|story|both), layerIds (real candidate layer IDs), category (geometry|typography|colourEffects|imageCrop|details), instruction, severity (blocker|material|minor). Every issue instruction must be directly patchable: name at least one exact target field (x, y, width, height, font/fontSize/fontFamily/fontWeight, lineHeight, tracking, colour, or crop) and give its measured numeric/hex/font-file target or delta from the attached overlay. Vague phrases such as "match the source", "align", or "fix spacing" without target values are invalid. Every visible discrepancy is an issue; acceptance requires issues=[] and every effect matched or genuinely absent. decision is evidence only; the controller derives accept/revise from scores, issues, effects and the font rule. An obvious defect blocks acceptance regardless of average. fontSubstitution is null or exactly {{source,used,reason}}. Return no patch and no prose.
+Return JSON only with exactly {output_fields}. scores must contain exactly, in this order: overall, geometry, typography, colourEffects, imageCrop, details. effects must contain exactly, in this order: shading, gradients, shadows, transparency, borders, masks, texture; each is match, not_present, or mismatch. issues is a list of objects with exactly placement (feed|story|both), layerIds (real candidate layer IDs), category (geometry|typography|colourEffects|imageCrop|details), instruction, severity (blocker|material|minor). Every issue instruction must be directly patchable: name at least one exact target field (x, y, width, height, font/fontSize/fontFamily/fontWeight, lineHeight, tracking, colour, or crop) and give its measured numeric/hex/font-file target or delta from the attached overlay. Vague phrases such as "match the source", "align", or "fix spacing" without target values are invalid. Every visible discrepancy is an issue; acceptance requires issues=[] and every effect matched or genuinely absent. decision is evidence only; the controller derives accept/revise from scores, issues, effects and the font rule. An obvious defect blocks acceptance regardless of average. fontSubstitution is null or exactly {{source,used,reason}}.{patch_contract} Return no prose.
 
 RECIPROCAL ASPECT REFERENCE: {_safe_json(reference)}
 DETERMINISTIC PIXEL/EDGE/COLOUR DIAGNOSTICS: {_safe_json(metrics)}. These are measured from the source-filled QA renders; vision remains the fidelity judge.
@@ -822,6 +830,54 @@ def apply_patch(candidate: Mapping[str, Any], value: Any, *, strict: bool = True
     } != immutable:
         raise AdTemplateProcessError("revision patch changed immutable template identity or assets")
     return _candidate_envelope(result) if strict else _candidate_structure(result)
+
+
+def validate_comparator_result(value: Any, *, candidate: Mapping[str, Any]) -> Dict[str, Any]:
+    """Keep valid visual evidence even when a cheap model proposes a bad patch.
+
+    A malformed review still receives the existing bounded format retry.  A
+    semantically invalid patch does not: the controller can retain the scored
+    evidence and route only the correction step to the strong fallback model.
+    """
+    review_fields = {
+        "decision", "scores", "issues", "warnings", "effects",
+        "fontSubstitution",
+    }
+    if not isinstance(value, dict) or not review_fields.issubset(value) or not set(value).issubset(review_fields | {"patch"}):
+        raise AdTemplateProcessError("comparator result has an invalid shape")
+    review = validate_review({field: value[field] for field in review_fields})
+    raw_patch = value.get("patch")
+    if review["decision"] == "accept":
+        return {
+            "review": review,
+            "patch": None,
+            "candidate": copy.deepcopy(dict(candidate)),
+            "patchError": None if raw_patch is None else "accepted comparison must return patch null",
+        }
+
+    if raw_patch is None:
+        return {
+            "review": review,
+            "patch": None,
+            "candidate": copy.deepcopy(dict(candidate)),
+            "patchError": "revising comparison omitted its bounded patch",
+        }
+    try:
+        patch = validate_patch(raw_patch)
+        updated = apply_patch(candidate, patch)
+    except (AdTemplateProcessError, AdTemplateStructuredOutputError) as exc:
+        return {
+            "review": review,
+            "patch": None,
+            "candidate": copy.deepcopy(dict(candidate)),
+            "patchError": str(exc),
+        }
+    return {
+        "review": review,
+        "patch": patch,
+        "candidate": updated,
+        "patchError": None,
+    }
 
 
 def _renderer_reasons(stderr: str, stdout: str) -> list[str]:
@@ -2023,15 +2079,16 @@ class ExactCloneOrchestrator:
                 "diffs": [item["name"] for item in comparison_views],
                 "metrics": metrics,
             })
-            review = _call_json(
+            comparator_result = _call_json(
                 self.call_agent,
                 instance=f"comparator-{global_iteration}",
                 prompt=review_prompt(final=False, candidate=candidate, reference=reference, metrics=metrics),
                 paths=_vision_paths(source, reciprocal_reference, rendered, comparison_views),
                 route=escalation_route if escalation_iteration else comparator_route,
-                validate=validate_review,
+                validate=lambda value: validate_comparator_result(value, candidate=candidate),
                 emit=self.emit,
             )
+            review = comparator_result["review"]
             record = {
                 "iteration": global_iteration,
                 "cycle_iteration": cycle_comparisons,
@@ -2044,6 +2101,7 @@ class ExactCloneOrchestrator:
             }
             iterations.append(record)
             revision_review = review
+            fallback_reason: str | None = comparator_result["patchError"]
             if best_candidate is None or best_review is None:
                 best_candidate = copy.deepcopy(candidate)
                 best_review = copy.deepcopy(review)
@@ -2059,10 +2117,14 @@ class ExactCloneOrchestrator:
                     candidate = copy.deepcopy(best_candidate)
                     revision_review = copy.deepcopy(best_review)
                     record["regressed"] = True
+                    fallback_reason = "comparison regressed; patch the restored best candidate"
                 elif _review_improved(review, best_review):
                     best_candidate = copy.deepcopy(candidate)
                     best_review = copy.deepcopy(review)
                     best_iteration = global_iteration
+                else:
+                    record["plateaued"] = True
+                    fallback_reason = "comparison plateaued; route correction to the strong model"
             self.emit("iteration.compared", "compare", {
                 "iteration": global_iteration,
                 "cycle_iteration": cycle_comparisons,
@@ -2096,22 +2158,40 @@ class ExactCloneOrchestrator:
                 break
             if cycle_comparisons >= MAX_COMPARISONS:
                 break
-            revision_route = escalation_route if global_iteration >= NORMAL_COMPARISONS else builder_route
-            self.emit("iteration.revision-requested", "build", {
+            comparator_patch = comparator_result["patch"]
+            if fallback_reason is None and comparator_patch is not None:
+                self.emit("iteration.revision-requested", "build", {
+                    "iteration": global_iteration,
+                    "mode": "comparator-patch",
+                    "issues": revision_review["issues"],
+                })
+                patch = comparator_patch
+                candidate = comparator_result["candidate"]
+                patch_source = "iteration-comparator"
+            else:
+                revision_route = escalation_route if global_iteration >= NORMAL_COMPARISONS else builder_route
+                self.emit("iteration.revision-requested", "build", {
+                    "iteration": global_iteration,
+                    "mode": "strong-fallback",
+                    "route": f"{revision_route.get('provider')}/{revision_route.get('model')}",
+                    "reason": fallback_reason or "comparator patch was unavailable",
+                    "issues": revision_review["issues"],
+                })
+                patch, candidate = _call_applied_patch(
+                    self.call_agent,
+                    instance=f"patch-fallback-{global_iteration}",
+                    prompt=patch_prompt(candidate=candidate, issues=revision_review["issues"]),
+                    paths=_vision_paths(source, reciprocal_reference, rendered, comparison_views),
+                    route=revision_route,
+                    candidate=candidate,
+                    emit=self.emit,
+                )
+                patch_source = "strong-fallback"
+            self.emit("candidate.patch-applied", "build", {
                 "iteration": global_iteration,
-                "mode": "normal" if revision_route is builder_route else "escalation",
-                "issues": revision_review["issues"],
+                "source": patch_source,
+                "operations": len(patch["operations"]),
             })
-            patch, candidate = _call_applied_patch(
-                self.call_agent,
-                instance=f"patch-{global_iteration}",
-                prompt=patch_prompt(candidate=candidate, issues=revision_review["issues"]),
-                paths=_vision_paths(source, reciprocal_reference, rendered, comparison_views),
-                route=revision_route,
-                candidate=candidate,
-                emit=self.emit,
-            )
-            self.emit("candidate.patch-applied", "build", {"iteration": global_iteration, "operations": len(patch["operations"])})
             persist_checkpoint(self.workspace, {
                 "reference": reference,
                 "sourceMap": source_map,
@@ -2133,10 +2213,14 @@ class ExactCloneOrchestrator:
 
         final_review: Dict[str, Any] | None = None
         for final_round in range(1, MAX_FINAL_REVIEW_ROUNDS + 1):
-            reviewers = []
-            for label, route in (("a", final_a_route), ("b", final_b_route)):
+            reviewer_specs = (("a", final_a_route), ("b", final_b_route))
+            for label, route in reviewer_specs:
                 identity = f"final-reviewer-{label}-{self.run_id}-{final_round}"
                 self.emit("final-review.started", "final-check", {"reviewer": identity, "route": f"{route.get('provider')}/{route.get('model')}", "round": final_round})
+
+            def run_final_reviewer(label: str, route: Mapping[str, str]) -> tuple[Dict[str, Any], list[tuple[str, str, Dict[str, Any]]]]:
+                identity = f"final-reviewer-{label}-{self.run_id}-{final_round}"
+                buffered_events: list[tuple[str, str, Dict[str, Any]]] = []
                 result = _call_json(
                     self.call_agent,
                     instance=identity,
@@ -2144,9 +2228,19 @@ class ExactCloneOrchestrator:
                     paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views),
                     route=route,
                     validate=validate_review,
-                    emit=self.emit,
+                    emit=lambda kind, node, data: buffered_events.append((kind, node, data)),
                 )
-                reviewers.append({"id": identity, "route": f"{route.get('provider')}/{route.get('model')}", **result})
+                return ({"id": identity, "route": f"{route.get('provider')}/{route.get('model')}", **result}, buffered_events)
+
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ad-template-final-review") as executor:
+                futures = [executor.submit(run_final_reviewer, label, route) for label, route in reviewer_specs]
+                completed_reviewers = [future.result() for future in futures]
+            self._check_stop()
+            reviewers = []
+            for reviewer, buffered_events in completed_reviewers:
+                for kind, node, data in buffered_events:
+                    self.emit(kind, node, data)
+                reviewers.append(reviewer)
             accepted = all(
                 item["decision"] == "accept"
                 and item.get("fontSubstitution") == accepted_review.get("fontSubstitution")
@@ -2187,15 +2281,16 @@ class ExactCloneOrchestrator:
                 source_placement=source_placement, target_placement=target_placement,
                 rendered=final_rendered,
             )
-            accepted_review = _call_json(
+            final_comparator_result = _call_json(
                 self.call_agent,
                 instance="comparator-final-repair",
                 prompt=review_prompt(final=False, candidate=candidate, reference=reference, metrics=final_metrics),
                 paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views),
                 route=comparator_route,
-                validate=validate_review,
+                validate=lambda value: validate_comparator_result(value, candidate=candidate),
                 emit=self.emit,
             )
+            accepted_review = final_comparator_result["review"]
             if accepted_review["decision"] != "accept":
                 raise AdTemplateProcessError("merged final repair regressed below the 9.8 comparator gate")
             iterations.append({

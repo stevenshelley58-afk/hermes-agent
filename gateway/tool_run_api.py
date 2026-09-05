@@ -967,6 +967,7 @@ class ToolRunAPIMixin:
                 workspace = (get_hermes_home() / "tool_runs" / "ad-template-generator" / run_id).resolve()
                 workspace.mkdir(parents=True, exist_ok=True)
                 usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "estimated_cost_usd": 0.0}
+                usage_lock = threading.Lock()
                 run_cost_limit = float(os.environ.get("AD_TEMPLATE_MAX_RUN_COST_USD", "10.0"))
 
                 def should_stop() -> bool:
@@ -1009,12 +1010,13 @@ class ToolRunAPIMixin:
                     active[instance_id] = agent
                     try:
                         result = agent.run_conversation(user_message=prompt, conversation_history=[], task_id=f"{run_id}:{instance_id}")
-                        usage["input_tokens"] += getattr(agent, "session_prompt_tokens", 0) or 0
-                        usage["output_tokens"] += getattr(agent, "session_completion_tokens", 0) or 0
-                        usage["total_tokens"] += getattr(agent, "session_total_tokens", 0) or 0
-                        usage["estimated_cost_usd"] += float(getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0)
-                        if run_cost_limit > 0 and usage["estimated_cost_usd"] > run_cost_limit:
-                            raise RuntimeError(f"sole ad-template process exceeded whole-run cost limit {run_cost_limit:.2f}")
+                        with usage_lock:
+                            usage["input_tokens"] += getattr(agent, "session_prompt_tokens", 0) or 0
+                            usage["output_tokens"] += getattr(agent, "session_completion_tokens", 0) or 0
+                            usage["total_tokens"] += getattr(agent, "session_total_tokens", 0) or 0
+                            usage["estimated_cost_usd"] += float(getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0)
+                            if run_cost_limit > 0 and usage["estimated_cost_usd"] > run_cost_limit:
+                                raise RuntimeError(f"sole ad-template process exceeded whole-run cost limit {run_cost_limit:.2f}")
                         return self._tool_json_output(result)
                     finally:
                         active.pop(instance_id, None)
@@ -1055,7 +1057,8 @@ class ToolRunAPIMixin:
                         raise RuntimeError("aspect-reference image generation returned an invalid file")
                     extra = response.get("extra") if isinstance(response.get("extra"), dict) else {}
                     if isinstance(extra.get("cost_usd"), (int, float)):
-                        usage["estimated_cost_usd"] += float(extra["cost_usd"])
+                        with usage_lock:
+                            usage["estimated_cost_usd"] += float(extra["cost_usd"])
                     self._tool_run_store.append_event(
                         run_id, "image-model.completed", status="ok", node_id="aspect-reference",
                         data={"provider": provider_name, "model": model_name, "placement": target_placement},

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import threading
 from pathlib import Path
 
 from PIL import Image
@@ -73,6 +74,16 @@ def _review(*, accept: bool) -> dict:
     }
 
 
+def _comparison(*, accept: bool, value: str = "comparator-patch") -> dict:
+    result = _review(accept=accept)
+    result["patch"] = None if accept else {"operations": [{
+        "op": "replace",
+        "path": "/template/metadata/description",
+        "value": value,
+    }]}
+    return result
+
+
 def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(monkeypatch, tmp_path):
     source = tmp_path / "source.png"
     Image.new("RGB", (800, 1000), "white").save(source)
@@ -82,10 +93,11 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     rendered_candidates: list[dict] = []
     imported: dict = {}
     comparison_count = 0
-    patch_count = 0
+    fallback_patch_count = 0
     contract_repair_count = 0
     renderer_rejected = False
     emitted: list[tuple[str, str, dict]] = []
+    final_review_barrier = threading.Barrier(2)
 
     real_source_map = process.build_source_map
 
@@ -103,7 +115,7 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
         return str(target)
 
     def call_agent(instance, prompt, route):
-        nonlocal comparison_count, patch_count, contract_repair_count
+        nonlocal comparison_count, fallback_patch_count, contract_repair_count
         agent_calls.append((instance, route))
         if instance.startswith("aspect-reference"):
             return {
@@ -125,19 +137,23 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
                 "op": "replace", "path": "/template/metadata/description",
                 "value": "contract-repaired",
             }]}
-        if instance.startswith("patch-"):
-            patch_count += 1
+        if instance.startswith("patch-fallback-"):
+            fallback_patch_count += 1
             return {"operations": [{
                 "op": "replace", "path": "/template/metadata/description",
-                "value": f"patch-{patch_count}",
+                "value": f"fallback-patch-{fallback_patch_count}",
             }]}
         if instance.startswith("comparator-"):
             comparison_count += 1
-            result = _review(accept=comparison_count == 6)
-            if comparison_count == 3:
-                result["scores"] = {key: 7.1 for key in result["scores"]}
+            result = _comparison(
+                accept=comparison_count == 6,
+                value=f"comparator-patch-{comparison_count}",
+            )
+            score = {1: 9.0, 2: 9.2, 3: 7.1, 4: 9.4, 5: 9.6, 6: 9.8}[comparison_count]
+            result["scores"] = {key: score for key in result["scores"]}
             return result
         if instance.startswith("final-reviewer-"):
+            final_review_barrier.wait(timeout=10)
             return _review(accept=True)
         raise AssertionError(instance)
 
@@ -196,20 +212,24 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     assert order[:2] == ["source-map", "image-model"]
     assert len(image_calls) == 1
     assert comparison_count == process.MAX_COMPARISONS == 6
-    assert patch_count == 5
+    assert fallback_patch_count == 1
     assert contract_repair_count == 1
     regression = next(data for kind, _, data in emitted if kind == "regression.reverted")
     assert regression == {
         "from_iteration": 3, "from_score": 7.1,
-        "to_iteration": 1, "to_score": 9.2,
+        "to_iteration": 2, "to_score": 9.2,
     }
-    patch_routes = [route for instance, route in agent_calls if instance.startswith("patch-")]
-    assert patch_routes[:3] == ["openai-codex/builder"] * 3
-    assert patch_routes[3:] == ["openai-codex/escalation"] * 2
+    patch_routes = [route for instance, route in agent_calls if instance.startswith("patch-fallback-")]
+    assert patch_routes == ["openai-codex/builder"]
     comparator_routes = [route for instance, route in agent_calls if instance.startswith("comparator-")]
     assert comparator_routes[:4] == ["openai-codex/comparator"] * 4
     assert comparator_routes[4:] == ["openai-codex/escalation"] * 2
     assert len([name for name, _ in agent_calls if name.startswith("final-reviewer-")]) == 2
+    assert len(agent_calls) == 12
+    assert sum(
+        data.get("source") == "iteration-comparator"
+        for kind, _, data in emitted if kind == "candidate.patch-applied"
+    ) == 4
     assert result["import"]["library_status"] == "quarantined"
     assert result["smoke_test"]["status"] == "passed"
     assert result["template"]["metadata"]["generationReview"]["likenessThreshold"] == 9.8
@@ -264,6 +284,49 @@ def test_visual_gate_derives_decision_from_evidence_not_model_label():
     vague["issues"][0]["instruction"] = "Match the source alignment"
     with pytest.raises(process.AdTemplateProcessError, match="concrete field"):
         process.validate_review(vague)
+
+
+def test_comparator_returns_validated_review_and_applied_patch_together():
+    candidate = {"template": _template(), "assets": []}
+
+    result = process.validate_comparator_result(
+        _comparison(accept=False, value="one-call-revision"),
+        candidate=candidate,
+    )
+
+    assert result["review"]["decision"] == "revise"
+    assert result["patchError"] is None
+    assert result["patch"]["operations"][0]["path"] == "/template/metadata/description"
+    assert result["candidate"]["template"]["metadata"]["description"] == "one-call-revision"
+    assert candidate["template"]["metadata"]["description"] == "initial"
+
+
+def test_iteration_comparator_and_final_reviewer_have_distinct_output_contracts():
+    candidate = {"template": _template(), "assets": []}
+    iteration_prompt = process.review_prompt(
+        final=False, candidate=candidate, reference={}, metrics={},
+    )
+    final_prompt = process.review_prompt(
+        final=True, candidate=candidate, reference={}, metrics={},
+    )
+
+    assert "fontSubstitution, patch" in iteration_prompt
+    assert "patch must be null" in iteration_prompt
+    assert "fontSubstitution, patch" not in final_prompt
+
+
+def test_invalid_comparator_patch_preserves_score_for_strong_fallback():
+    candidate = {"template": _template(), "assets": []}
+    comparison = _comparison(accept=False)
+    comparison["patch"]["operations"][0]["path"] = "/template/metadata/missing"
+
+    result = process.validate_comparator_result(comparison, candidate=candidate)
+
+    assert result["review"]["scores"]["overall"] == 9.2
+    assert result["review"]["decision"] == "revise"
+    assert result["patch"] is None
+    assert "does not exist" in result["patchError"]
+    assert result["candidate"] == candidate
 
 
 def test_comparator_unit_interval_scores_are_normalized_to_ten_point_scale():
@@ -335,8 +398,8 @@ def test_ocr_token_is_assigned_once_to_best_overlapping_normalized_text_layer():
 def test_checkpoint_always_advances_to_current_qa_projection(tmp_path):
     process.persist_checkpoint(tmp_path, {"qaProjectionVersion": 1, "iterations": []})
     checkpoint = process.load_checkpoint(tmp_path)
-    assert checkpoint["qaProjectionVersion"] == process.QA_PROJECTION_VERSION == 3
-    assert checkpoint["evaluationPolicyVersion"] == process.EVALUATION_POLICY_VERSION == 2
+    assert checkpoint["qaProjectionVersion"] == process.QA_PROJECTION_VERSION
+    assert checkpoint["evaluationPolicyVersion"] == process.EVALUATION_POLICY_VERSION
 
 
 def test_patch_application_error_is_fed_back_for_one_bounded_retry(tmp_path):
