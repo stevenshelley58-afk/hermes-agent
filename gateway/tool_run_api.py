@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
 
 from aiohttp import web
 
@@ -45,7 +45,7 @@ from gateway.tool_runs import (
     ad_template_model_catalog,
     validate_model_policy,
 )
-from gateway.tool_run_usage import agent_provider_usage, assert_run_usage_accounted
+from gateway.tool_run_usage import assert_run_usage_accounted
 
 
 logger = logging.getLogger(__name__)
@@ -65,6 +65,20 @@ AD_TEMPLATE_STAGE_INACTIVITY_MULTIPLIERS = {
     "compare": 1.0,
     "final-check": 1.0,
     "live": 1.0,
+}
+
+_AD_TEMPLATE_ROLE_OUTPUT_TOKENS = {
+    "builder": 32_768,
+    "patch": 8_192,
+    "comparator": 4_096,
+    "review": 4_096,
+    "aspect-reference": 4_096,
+}
+
+# Meta's audited contributor price for the new 1.3 id until models.dev catches up.
+_AD_TEMPLATE_DIRECT_PRICING_PER_MILLION = {
+    ("meta-direct", "muse-spark-1.3-contributor"): (0.10, 0.002, 0.20),
+    ("concentrate", "gemini-3.8-flash"): (0.75, 0.75, 3.75),
 }
 
 
@@ -760,6 +774,98 @@ class ToolRunAPIMixin:
         )
 
     @staticmethod
+    def _tool_role_kind(instance_id: str) -> str:
+        name = str(instance_id or "").lower()
+        if name.startswith("aspect-reference"):
+            return "aspect-reference"
+        if name.startswith("comparator"):
+            return "comparator"
+        if name.startswith("final-reviewer"):
+            return "review"
+        if any(part in name for part in ("revision", "repair", "replan")):
+            return "patch"
+        return "builder"
+
+    @staticmethod
+    def _tool_patch_schema() -> Dict[str, Any]:
+        value_operation = {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "enum": ["add", "replace"]},
+                "path": {"type": "string"},
+                "value": {},
+            },
+            "required": ["op", "path", "value"],
+            "additionalProperties": False,
+        }
+        remove_operation = {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "enum": ["remove"]},
+                "path": {"type": "string"},
+            },
+            "required": ["op", "path"],
+            "additionalProperties": False,
+        }
+        return {
+            "type": "object",
+            "properties": {"operations": {
+                "type": "array",
+                "items": {"anyOf": [value_operation, remove_operation]},
+            }},
+            "required": ["operations"],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _tool_review_schema(*, comparator: bool) -> Dict[str, Any]:
+        scores = ("overall", "geometry", "typography", "colourEffects", "imageCrop", "details")
+        effects = ("shading", "gradients", "shadows", "transparency", "borders", "masks", "texture")
+        issue = {
+            "type": "object",
+            "properties": {
+                "placement": {"type": "string", "enum": ["feed", "story", "both"]},
+                "layerIds": {"type": "array", "items": {"type": "string"}},
+                "category": {"type": "string", "enum": ["geometry", "typography", "colourEffects", "imageCrop", "details"]},
+                "instruction": {"type": "string"},
+                "severity": {"type": "string", "enum": ["blocker", "material", "minor"]},
+            },
+            "required": ["placement", "layerIds", "category", "instruction", "severity"],
+            "additionalProperties": False,
+        }
+        properties: Dict[str, Any] = {
+            "decision": {"type": "string", "enum": ["accept", "revise"]},
+            "scores": {
+                "type": "object",
+                "properties": {field: {"type": "number"} for field in scores},
+                "required": list(scores), "additionalProperties": False,
+            },
+            "issues": {"type": "array", "items": issue},
+            "warnings": {"type": "array", "items": {"type": "string"}},
+            "effects": {
+                "type": "object",
+                "properties": {field: {
+                    "type": "string", "enum": ["match", "not_present", "mismatch"],
+                } for field in effects},
+                "required": list(effects), "additionalProperties": False,
+            },
+            "fontSubstitution": {"anyOf": [
+                {"type": "null"},
+                {
+                    "type": "object",
+                    "properties": {key: {"type": "string"} for key in ("source", "used", "reason")},
+                    "required": ["source", "used", "reason"],
+                    "additionalProperties": False,
+                },
+            ]},
+        }
+        required = ["decision", "scores", "issues", "warnings", "effects", "fontSubstitution"]
+        if comparator:
+            properties["patch"] = {"anyOf": [{"type": "null"}, ToolRunAPIMixin._tool_patch_schema()]}
+            required.append("patch")
+        return {"type": "object", "properties": properties, "required": required, "additionalProperties": False}
+
+    @staticmethod
     def _prepare_candidate_output(run_id: str, output: Dict[str, Any]) -> Dict[str, Any]:
         del run_id
         if output.get("process") != "exact-clone":
@@ -969,8 +1075,6 @@ class ToolRunAPIMixin:
                     node_id=current_stage, data=data,
                 )
 
-            def role_heartbeat(*_args, **_kwargs) -> None:
-                mark_activity()
 
             def run_sync(_candidate: Dict[str, str]):
                 from hermes_constants import get_hermes_home
@@ -999,58 +1103,76 @@ class ToolRunAPIMixin:
                             durable_before, run_cost_limit, before_call=True,
                         )
                     call_id = f"{run_id}:{instance_id}:{uuid.uuid4().hex}"
-                    agent = self._create_agent(
-                        ephemeral_system_prompt=self._isolated_tool_role_prompt(),
-                        session_id=call_id,
-                        tool_progress_callback=progress_callback,
-                        requested_model=model, requested_provider=provider, route=None,
-                        confirmed_runtime_lock=True,
-                        persistence_disabled=True,
-                        enabled_toolsets_override=[],
-                        stream_delta_callback=role_heartbeat,
-                        reasoning_callback=role_heartbeat,
-                    )
+                    from agent.auxiliary_client import OpenAI
+                    from gateway.platforms.api_server import _resolve_request_runtime_agent_kwargs
+
+                    runtime = _resolve_request_runtime_agent_kwargs(provider, target_model=model)
+                    if str(runtime.get("requested_provider") or "") != provider:
+                        raise AdTemplateTransportError("frozen structured role provider identity changed")
+                    if runtime.get("api_mode") != "codex_responses":
+                        raise AdTemplateTransportError("frozen structured role requires Responses transport")
+                    api_key = runtime.get("api_key")
+                    base_url = str(runtime.get("base_url") or "").rstrip("/")
+                    if not api_key or not base_url:
+                        raise AdTemplateTransportError("frozen structured role credentials are unavailable")
+                    client = OpenAI(api_key=api_key, base_url=base_url, timeout=150.0, max_retries=0)
                     started_at = time.monotonic()
                     outcome = "error"
-                    # The durable role policy owns retry/fallback. Disable the
-                    # generic agent's nested three-attempt loop so one stalled
-                    # vision route cannot multiply every orchestrator retry.
-                    agent._api_max_retries = 1
-                    # A durable Tool role must also skip the generic Agent's
-                    # one-time primary-transport rebuild. The orchestrator owns
-                    # the frozen role fallback (for example Luna comparator ->
-                    # Sol quality escalation); silently rebuilding Luna here
-                    # previously doubled a 120-second TTFB failure before that
-                    # fallback could run.
-                    agent._try_recover_primary_transport = (
-                        lambda *_args, **_kwargs: False
-                    )
+                    usage_snapshot = {
+                        "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                        "api_calls": 1, "estimated_cost_usd": 0.0,
+                        "cost_status": "estimated",
+                    }
                     active = self._tool_run_agents.setdefault(run_id, {})
-                    active[instance_id] = agent
+                    active[instance_id] = client
                     try:
-                        result = agent.run_conversation(user_message=prompt, conversation_history=[], task_id=f"{run_id}:{instance_id}")
-                        parsed = self._tool_json_output(result)
+                        role_kind = self._tool_role_kind(instance_id)
+                        response = client.responses.create(
+                            model=model,
+                            input=self._tool_responses_input(prompt),
+                            text={"format": {
+                                "type": "json_schema",
+                                "name": f"ad_template_{role_kind.replace('-', '_')}",
+                                "strict": True,
+                                "schema": self._tool_role_json_schema(instance_id),
+                            }},
+                            reasoning={"effort": "minimal"},
+                            max_output_tokens=_AD_TEMPLATE_ROLE_OUTPUT_TOKENS[role_kind],
+                        )
+                        mark_activity()
+                        usage_snapshot = self._tool_response_usage(
+                            response, provider=provider, model=model,
+                            base_url=base_url, api_key=api_key,
+                        )
+                        parsed = self._tool_json_output(self._tool_response_text(response))
                         outcome = "ok"
                         return parsed
+                    except (AdTemplateProcessError, AdTemplateStructuredOutputError, AdTemplateTransportError):
+                        raise
+                    except Exception as exc:
+                        raise AdTemplateTransportError("frozen structured Responses role failed") from exc
                     finally:
                         try:
-                            snapshot = agent_provider_usage(agent)
                             with usage_lock:
                                 usage.clear()
                                 usage.update(self._tool_run_store.record_provider_usage(
                                     run_id,
                                     call_id=call_id,
-                                    provider=str(getattr(agent, "provider", None) or provider),
-                                    model=str(getattr(agent, "model", None) or model),
+                                    provider=provider,
+                                    model=model,
                                     role=instance_id,
                                     duration_ms=max(0, round((time.monotonic() - started_at) * 1000)),
                                     outcome="cancelled" if stop_event.is_set() else outcome,
-                                    **snapshot,
+                                    **usage_snapshot,
                                 ))
                                 assert_run_usage_accounted(
                                     usage, run_cost_limit, before_call=False,
                                 )
                         finally:
+                            try:
+                                client.close()
+                            except Exception:
+                                pass
                             active.pop(instance_id, None)
                             if not active:
                                 self._tool_run_agents.pop(run_id, None)
@@ -1107,13 +1229,21 @@ class ToolRunAPIMixin:
                         outcome = "ok"
                         return str(generated_path)
                     finally:
-                        extra = response.get("extra") if isinstance(response.get("extra"), dict) else {}
+                        extra = response.get("extra") if isinstance(response.get("extra"), dict) else response
                         reported_image_cost = extra.get("cost_usd")
                         included = provider_name == "openai-codex"
-                        cost_status = str(extra.get("cost_status") or ("included" if included else "unknown"))
+                        metered = self._tool_response_usage(
+                            response, provider=provider_name, model=model_name,
+                            base_url="https://api.meta.ai/v1" if provider_name == "meta-direct" else "",
+                            api_key=None,
+                        )
+                        meta_flat_price = (provider_name, model_name) == ("meta-direct", "muse-image-1.0")
+                        cost_status = str(extra.get("cost_status") or (
+                            "included" if included else ("estimated" if meta_flat_price else metered["cost_status"])
+                        ))
                         if cost_status not in {"actual", "estimated", "included", "unknown"}:
                             cost_status = "unknown"
-                        cost = float(reported_image_cost or 0.0)
+                        cost = float(reported_image_cost if reported_image_cost is not None else (0.01 if meta_flat_price else metered["estimated_cost_usd"]))
                         with usage_lock:
                             usage.clear()
                             usage.update(self._tool_run_store.record_provider_usage(
@@ -1123,9 +1253,9 @@ class ToolRunAPIMixin:
                                 model=model_name,
                                 role="aspect-reference-image",
                                 duration_ms=max(0, round((time.monotonic() - started_at) * 1000)),
-                                input_tokens=0,
-                                output_tokens=0,
-                                total_tokens=0,
+                                input_tokens=metered["input_tokens"],
+                                output_tokens=metered["output_tokens"],
+                                total_tokens=metered["total_tokens"],
                                 api_calls=1,
                                 estimated_cost_usd=cost,
                                 cost_status=cost_status,
@@ -1232,7 +1362,7 @@ class ToolRunAPIMixin:
                     if running_agents is not None:
                         agents = running_agents.values() if isinstance(running_agents, dict) else [running_agents]
                         for active_agent in list(agents):
-                            request_hard_interrupt(active_agent, "api_server_tool_run_cancel")
+                            self._stop_tool_role_runtime(active_agent, "api_server_tool_run_cancel")
                     if future is not None:
                         self._drain_tool_future(future)
                     raise
@@ -1243,7 +1373,7 @@ class ToolRunAPIMixin:
                         if running_agents is not None:
                             agents = running_agents.values() if isinstance(running_agents, dict) else [running_agents]
                             for active_agent in list(agents):
-                                request_hard_interrupt(active_agent, "api_server_tool_run_stage_timeout")
+                                self._stop_tool_role_runtime(active_agent, "api_server_tool_run_stage_timeout")
                         if future is not None:
                             self._drain_tool_future(future)
                     failure = redact_sensitive_text(str(exc), force=True)[:600]
@@ -1747,7 +1877,7 @@ class ToolRunAPIMixin:
             if agents is not None:
                 values = agents.values() if isinstance(agents, dict) else [agents]
                 for active_agent in list(values):
-                    request_hard_interrupt(active_agent, "api_server_tool_run_cancel")
+                    self._stop_tool_role_runtime(active_agent, "api_server_tool_run_cancel")
             task = self._tool_run_tasks.get(run_id)
             if task is not None and not task.done():
                 task.cancel()
@@ -1757,3 +1887,125 @@ class ToolRunAPIMixin:
             return web.json_response(self._tool_run_store.get_run(run_id), status=202)
         except KeyError as exc:
             return web.json_response(_error(str(exc), "tool_run_not_found"), status=404)
+    @staticmethod
+    def _tool_role_json_schema(instance_id: str) -> Dict[str, Any]:
+        kind = ToolRunAPIMixin._tool_role_kind(instance_id)
+        if kind == "patch":
+            return ToolRunAPIMixin._tool_patch_schema()
+        if kind in {"review", "comparator"}:
+            return ToolRunAPIMixin._tool_review_schema(comparator=kind == "comparator")
+        if kind == "aspect-reference":
+            geometry = {
+                "type": "object",
+                "properties": {key: {"type": "number"} for key in ("x", "y", "width", "height")},
+                "required": ["x", "y", "width", "height"],
+                "additionalProperties": False,
+            }
+            return {
+                "type": "object",
+                "properties": {
+                    "sourcePlacement": {"type": "string", "enum": ["feed", "story"]},
+                    "targetPlacement": {"type": "string", "enum": ["feed", "story"]},
+                    "canvas": {
+                        "type": "object",
+                        "properties": {key: {"type": "number"} for key in ("width", "height")},
+                        "required": ["width", "height"], "additionalProperties": False,
+                    },
+                    "regions": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "regionId": {"type": "string"}, "sourceRole": {"type": "string"},
+                            "target": geometry, "zIndex": {"type": "integer"},
+                        },
+                        "required": ["regionId", "sourceRole", "target", "zIndex"],
+                        "additionalProperties": False,
+                    }},
+                    "preserve": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["sourcePlacement", "targetPlacement", "canvas", "regions", "preserve"],
+                "additionalProperties": False,
+            }
+        return {
+            "type": "object",
+            "properties": {"template": {}, "assets": {"type": "array", "items": {}}},
+            "required": ["template", "assets"],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _tool_responses_input(prompt: Any) -> List[Dict[str, Any]]:
+        if not isinstance(prompt, list):
+            raise AdTemplateProcessError("structured role prompt must be multimodal content")
+        content: List[Dict[str, Any]] = []
+        for part in prompt:
+            if not isinstance(part, dict):
+                raise AdTemplateProcessError("structured role prompt part is invalid")
+            if part.get("type") == "text":
+                content.append({"type": "input_text", "text": str(part.get("text") or "")})
+            elif part.get("type") == "image_url":
+                raw_url = part.get("image_url")
+                url = raw_url.get("url") if isinstance(raw_url, dict) else raw_url
+                if not isinstance(url, str) or not url.startswith("data:image/"):
+                    raise AdTemplateProcessError("structured role image must be an inline data URL")
+                content.append({"type": "input_image", "image_url": url})
+            else:
+                raise AdTemplateProcessError("structured role prompt part type is unsupported")
+        if not content or content[0].get("type") != "input_text":
+            raise AdTemplateProcessError("structured role prompt must start with text")
+        content[0]["text"] = ToolRunAPIMixin._isolated_tool_role_prompt() + "\n\nROLE CONTRACT\n" + content[0]["text"]
+        return [{"role": "user", "content": content}]
+
+    @staticmethod
+    def _tool_response_text(response: Any) -> str:
+        output_text = getattr(response, "output_text", None)
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text
+        fragments = [
+            part.text
+            for item in (getattr(response, "output", None) or [])
+            for part in (getattr(item, "content", None) or [])
+            if isinstance(getattr(part, "text", None), str)
+        ]
+        joined = "".join(fragments).strip()
+        if not joined:
+            raise AdTemplateTransportError("structured Responses role returned no output text")
+        return joined
+
+    @staticmethod
+    def _tool_response_usage(response: Any, *, provider: str, model: str, base_url: str, api_key: Any) -> Dict[str, Any]:
+        from agent.usage_pricing import estimate_usage_cost, normalize_usage
+
+        raw_usage = response.get("usage") if isinstance(response, Mapping) else getattr(response, "usage", None)
+        canonical = normalize_usage(raw_usage, provider=provider, api_mode="codex_responses")
+        pricing_provider = "google" if provider == "concentrate" and model.startswith("gemini-") else ("meta-ai" if provider == "meta-direct" else provider)
+        cost = estimate_usage_cost(model, canonical, provider=pricing_provider, base_url=base_url, api_key=api_key)
+        amount = float(cost.amount_usd) if cost.amount_usd is not None else None
+        status = cost.status
+        direct_price = _AD_TEMPLATE_DIRECT_PRICING_PER_MILLION.get((provider, model))
+        if amount is None and direct_price is not None:
+            input_rate, cache_rate, output_rate = direct_price
+            amount = (
+                canonical.input_tokens * input_rate
+                + canonical.cache_read_tokens * cache_rate
+                + canonical.output_tokens * output_rate
+            ) / 1_000_000
+            status = "estimated"
+        return {
+            "input_tokens": canonical.input_tokens,
+            "output_tokens": canonical.output_tokens,
+            "total_tokens": canonical.total_tokens,
+            "api_calls": 1,
+            "estimated_cost_usd": float(amount or 0.0),
+            "cost_status": status if amount is not None else "unknown",
+        }
+
+    @staticmethod
+    def _stop_tool_role_runtime(runtime: Any, message: str) -> None:
+        if request_hard_interrupt(runtime, message):
+            return
+        closer = getattr(runtime, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:
+                pass
