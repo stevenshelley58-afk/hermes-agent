@@ -206,6 +206,9 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     patch_routes = [route for instance, route in agent_calls if instance.startswith("patch-")]
     assert patch_routes[:3] == ["openai-codex/builder"] * 3
     assert patch_routes[3:] == ["openai-codex/escalation"] * 2
+    comparator_routes = [route for instance, route in agent_calls if instance.startswith("comparator-")]
+    assert comparator_routes[:4] == ["openai-codex/comparator"] * 4
+    assert comparator_routes[4:] == ["openai-codex/escalation"] * 2
     assert len([name for name, _ in agent_calls if name.startswith("final-reviewer-")]) == 2
     assert result["import"]["library_status"] == "quarantined"
     assert result["smoke_test"]["status"] == "passed"

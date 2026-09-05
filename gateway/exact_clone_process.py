@@ -2027,7 +2027,7 @@ class ExactCloneOrchestrator:
                 instance=f"comparator-{global_iteration}",
                 prompt=review_prompt(final=False, candidate=candidate, reference=reference, metrics=metrics),
                 paths=_vision_paths(source, reciprocal_reference, rendered, comparison_views),
-                route=comparator_route,
+                route=comparator_route if cycle_comparisons <= NORMAL_COMPARISONS else escalation_route,
                 validate=validate_review,
                 emit=self.emit,
             )
