@@ -67,8 +67,8 @@ AVAILABLE_FONT_FILES = frozenset({
     "/fonts/adstudio/cormorant-garamond-700.woff2",
 })
 SOURCE_MAP_VERSION = 2
-QA_PROJECTION_VERSION = 3
-EVALUATION_POLICY_VERSION = 3
+QA_PROJECTION_VERSION = 4
+EVALUATION_POLICY_VERSION = 4
 STAGES = (
     "source",
     "aspect-reference",
@@ -1073,28 +1073,124 @@ def build_ephemeral_qa_candidate(
     return _candidate_envelope(qa), override_bytes
 
 
+def prepare_demo_assets(candidate, *, source, source_placement, workspace, route, call_image_model, emit):
+    """Generate photo defaults once; preserve a per-run plan across retries."""
+    document = copy.deepcopy(candidate)
+    template = document["template"]
+    root = (workspace / "demo-assets").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    plan_path = root / "plan.json"
+    if plan_path.exists():
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        if not isinstance(plan, dict) or not isinstance(plan.get("assets"), list):
+            raise AdTemplateProcessError("demo asset plan is invalid")
+    else:
+        inputs = {item["key"]: item for item in template["imageInputs"]}
+        declarations = {item["assetKey"]: item for item in document["assets"]}
+        catalog = _runtime_catalog()
+        layout = template["feedLayout" if source_placement == "feed" else "storyLayout"]
+        planned = {}
+        for layer in layout["layers"]:
+            if layer.get("type") != "image_slot":
+                continue
+            item = inputs.get(layer.get("inputKey"), {})
+            key = item.get("defaultAssetKey")
+            declared = declarations.get(key, {})
+            asset = catalog.assets.get(declared.get("fileName"))
+            if key in planned or asset is None or asset.usage != "photo-default":
+                continue
+            planned[key] = {
+                "assetKey": key, "file": f"photo-{len(planned)}.png",
+                "label": str(item.get("label") or "Property photograph")[:200],
+                "geometry": copy.deepcopy(layer["geometry"]),
+            }
+        if len(planned) > 8:
+            raise AdTemplateProcessError("demo photo plan exceeds eight assets")
+        plan = {"route": dict(route), "placement": source_placement, "assets": list(planned.values())}
+        temporary = plan_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(plan), encoding="utf-8")
+        os.replace(temporary, plan_path)
+    if plan.get("route") != dict(route):
+        raise AdTemplateProcessError("demo photo route changed; resume with the original model")
+    declarations = {item["assetKey"]: item for item in document["assets"]}
+    overrides = {}
+    with Image.open(source) as original:
+        reference = ImageOps.exif_transpose(original).convert("RGB")
+    canvas_width, canvas_height = (1080, 1350 if source_placement == "feed" else 1920)
+    for item in plan["assets"]:
+        key = item["assetKey"]
+        if key not in declarations or key not in template["assets"]:
+            raise AdTemplateProcessError("demo photo asset key changed during revision")
+        target = (root / item["file"]).resolve()
+        if target.parent != root or target.suffix != ".png":
+            raise AdTemplateProcessError("demo photo path escaped its run")
+        pending = target.with_suffix(".pending")
+        if not target.exists():
+            if pending.exists():
+                raise AdTemplateProcessError("demo photo call outcome is unknown; inspect its provider receipt before retry")
+            geometry = item["geometry"]
+            x, y, width, height = (float(geometry[field]) for field in ("x", "y", "width", "height"))
+            if max(abs(x), abs(y), abs(width), abs(height)) <= 1.001:
+                x, width, y, height = x * canvas_width, width * canvas_width, y * canvas_height, height * canvas_height
+            box = (max(0, round(x * reference.width / canvas_width)), max(0, round(y * reference.height / canvas_height)),
+                   min(reference.width, round((x + width) * reference.width / canvas_width)),
+                   min(reference.height, round((y + height) * reference.height / canvas_height)))
+            if box[2] <= box[0] or box[3] <= box[1]:
+                raise AdTemplateProcessError("demo photo reference crop is empty")
+            crop_path = target.with_name(target.stem + "-reference.png")
+            reference.crop(box).save(crop_path, format="PNG")
+            prompt = (
+                "Create one photorealistic fictional property photograph for an editable ad template. "
+                "Use the attached crop only as a composition, lighting, camera angle and subject-type reference. "
+                "Create a different property, not an exact reproduction. No text, logo, watermark, contact details, "
+                "people, collage, border, or ad interface. This is only the photo asset. "
+                f"Slot: {item['label']}. Match the reference crop aspect ratio."
+            )
+            pending.write_text("Provider call started; do not blindly repeat.", encoding="utf-8")
+            emit("asset.generation-started", "build", {"assetKey": key, "provider": route.get("provider"), "model": route.get("model")})
+            raw = Path(call_image_model(prompt, str(crop_path), source_placement, route))
+            with Image.open(raw) as generated:
+                if generated.width < 64 or generated.height < 64 or generated.width * generated.height > 40_000_000:
+                    raise AdTemplateProcessError("generated demo photo has invalid dimensions")
+                temporary = target.with_suffix(".tmp")
+                ImageOps.exif_transpose(generated).convert("RGB").save(temporary, format="PNG", optimize=True)
+                os.replace(temporary, target)
+            pending.unlink()
+            emit("asset.generated", "build", {"assetKey": key, "fileName": item["file"]})
+        with Image.open(target) as verified:
+            verified.verify()
+        overrides[key] = target.read_bytes()
+        declaration = {"fileName": f"demo/{item['file']}", "mimeType": "image/png"}
+        template["assets"][key] = declaration
+        declarations[key].update(declaration)
+    return document, overrides
+
+def _resolve_runtime_assets(document: Mapping[str, Any], overrides: Mapping[str, bytes] | None = None) -> list[dict[str, Any]]:
+    overrides = dict(overrides or {})
+    declarations = list(document["assets"])
+    try:
+        resolved = list(resolve_declared_assets(
+            _runtime_catalog(),
+            [item for item in declarations if item.get("assetKey") not in overrides],
+        ))
+    except CatalogIntegrityError as exc:
+        raise AdTemplateProcessError(f"safe asset resolution failed: {exc}") from exc
+    by_key = {item.get("assetKey"): item for item in declarations if isinstance(item, dict)}
+    for key, payload in overrides.items():
+        declaration = by_key.get(key)
+        if not isinstance(declaration, dict) or declaration.get("mimeType") != "image/png":
+            raise AdTemplateProcessError("run-local asset override must be declared as PNG")
+        resolved.append({"assetKey": key, "fileName": declaration["fileName"], "mimeType": "image/png", "bytesBase64": base64.b64encode(payload).decode("ascii")})
+    return resolved
+
+
 def run_renderer(candidate: Mapping[str, Any], workspace: Path, *, asset_overrides: Mapping[str, bytes] | None = None) -> Dict[str, Any]:
     command = os.environ.get("AD_TEMPLATE_GENERATOR_CMD", "").strip()
     if not command:
         raise AdTemplateProcessError("AD_TEMPLATE_GENERATOR_CMD must point to the shared Blockwise renderer CLI")
     document = _candidate_envelope(candidate)
     overrides = dict(asset_overrides or {})
-    try:
-        catalog_declarations = [item for item in document["assets"] if item.get("assetKey") not in overrides]
-        resolved = list(resolve_declared_assets(_runtime_catalog(), catalog_declarations))
-    except CatalogIntegrityError as exc:
-        raise AdTemplateProcessError(f"safe asset resolution failed: {exc}") from exc
-    declarations = {item.get("assetKey"): item for item in document["assets"] if isinstance(item, dict)}
-    for asset_key, payload in overrides.items():
-        declaration = declarations.get(asset_key)
-        if not isinstance(declaration, dict) or declaration.get("mimeType") != "image/png":
-            raise AdTemplateProcessError("QA asset override is not declared as PNG")
-        resolved.append({
-            "assetKey": asset_key,
-            "fileName": declaration["fileName"],
-            "mimeType": "image/png",
-            "bytesBase64": base64.b64encode(payload).decode("ascii"),
-        })
+    resolved = _resolve_runtime_assets(document, overrides)
     workspace.mkdir(parents=True, exist_ok=True)
     artifact_path = workspace / "artifact.json"
     temporary = artifact_path.with_suffix(".json.tmp")
@@ -1476,7 +1572,7 @@ def _post_blockwise(url: str, payload: Mapping[str, Any], *, scope: str) -> Dict
     return value
 
 
-def import_template(output: Mapping[str, Any], *, run_id: str, project_id: str) -> Dict[str, Any]:
+def import_template(output: Mapping[str, Any], *, run_id: str, project_id: str, asset_overrides: Mapping[str, bytes] | None = None) -> Dict[str, Any]:
     del project_id
     url = os.environ.get("BLOCKWISE_TEMPLATE_IMPORT_URL", "").strip()
     if not url:
@@ -1484,10 +1580,7 @@ def import_template(output: Mapping[str, Any], *, run_id: str, project_id: str) 
     template = output.get("template")
     declarations = output.get("assets")
     candidate = _candidate_envelope({"template": template, "assets": declarations})
-    try:
-        resolved = list(resolve_declared_assets(_runtime_catalog(), candidate["assets"]))
-    except CatalogIntegrityError as exc:
-        raise AdTemplateProcessError(f"safe asset resolution failed: {exc}") from exc
+    resolved = _resolve_runtime_assets(candidate, asset_overrides)
     result = _post_blockwise(
         url,
         {"template": candidate["template"], "assets": resolved},
@@ -1965,6 +2058,12 @@ class ExactCloneOrchestrator:
         final_rendered: Dict[str, Any] | None = None
         final_comparison_views: list[dict[str, str]] = []
         final_metrics: Dict[str, Any] = {}
+        demo_overrides: Dict[str, bytes] = {}
+        if (self.workspace / "demo-assets" / "plan.json").exists():
+            candidate, demo_overrides = prepare_demo_assets(
+                candidate, source=source, source_placement=source_placement, workspace=self.workspace,
+                route=image_route, call_image_model=self.call_image_model, emit=self.emit,
+            )
         while comparison_budget_used < MAX_COMPARISONS:
             self._check_stop()
             global_iteration += 1
@@ -1980,7 +2079,7 @@ class ExactCloneOrchestrator:
                         target_map=target_map, workspace=iteration_root,
                     )
                     rendered = _copy_public_previews(
-                        run_renderer(qa_candidate, iteration_root, asset_overrides=qa_asset_overrides),
+                        run_renderer(qa_candidate, iteration_root, asset_overrides={**demo_overrides, **qa_asset_overrides}),
                         self.workspace, global_iteration,
                     )
                     break
@@ -2215,8 +2314,13 @@ class ExactCloneOrchestrator:
             raise AdTemplateProcessError(f"exact-clone quality loop exhausted {MAX_COMPARISONS} comparisons below 9.8")
 
         final_review: Dict[str, Any] | None = None
+        candidate, demo_overrides = prepare_demo_assets(
+            candidate, source=source, source_placement=source_placement, workspace=self.workspace,
+            route=image_route, call_image_model=self.call_image_model, emit=self.emit,
+        )
         production_rendered = run_renderer(
             candidate, self.workspace / f"final-review-production-{global_iteration:02d}",
+            asset_overrides=demo_overrides,
         )
         for final_round in range(1, MAX_FINAL_REVIEW_ROUNDS + 1):
             self._check_stop()
@@ -2279,11 +2383,12 @@ class ExactCloneOrchestrator:
                 target_map=target_map, workspace=iteration_root,
             )
             final_rendered = _copy_public_previews(
-                run_renderer(qa_candidate, iteration_root, asset_overrides=qa_asset_overrides),
+                run_renderer(qa_candidate, iteration_root, asset_overrides={**demo_overrides, **qa_asset_overrides}),
                 self.workspace, global_iteration,
             )
             production_rendered = run_renderer(
                 candidate, self.workspace / f"final-review-production-{global_iteration:02d}",
+                asset_overrides=demo_overrides,
             )
             final_comparison_views = _comparison_views(source, reciprocal_reference, final_rendered, self.workspace, global_iteration, source_placement, target_placement)
             final_metrics = _comparison_metrics(
@@ -2341,7 +2446,7 @@ class ExactCloneOrchestrator:
         # still rendered once so Blockwise's shared schema is the last word.
         final_root = self.workspace / "final"
         final_rendered = _copy_public_previews(
-            run_renderer(candidate, final_root), self.workspace, global_iteration + 1,
+            run_renderer(candidate, final_root, asset_overrides=demo_overrides), self.workspace, global_iteration + 1,
             kind="final-neutral-shippable",
         )
         documents = deterministic_documents(template)
@@ -2375,7 +2480,7 @@ class ExactCloneOrchestrator:
         }
         # Fully validate the output before the first external write.
         validate_exact_clone_output(validated, require_import=False)
-        imported = import_template(validated, run_id=self.run_id, project_id=self.project_id)
+        imported = import_template(validated, run_id=self.run_id, project_id=self.project_id, asset_overrides=demo_overrides)
         self.emit("template.imported", "import", imported)
         smoke = review_template_action(
             template_id=imported["template_id"], run_id=self.run_id, action="smoke_test",

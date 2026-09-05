@@ -37,7 +37,7 @@ _USAGE_COST_STATUSES = frozenset({"actual", "estimated", "included", "unknown"})
 _USAGE_OUTCOMES = frozenset({"ok", "error", "cancelled"})
 _MAX_JSON_BYTES = 512 * 1024
 _KNOWN_IMAGE_ONLY = frozenset({"gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2"})
-_AD_TEMPLATE_POLICY_SEED_REVISION = 13
+_AD_TEMPLATE_POLICY_SEED_REVISION = 14
 AD_TEMPLATE_ROUTE_ORDER = (
     "aspect-reference-image",
     "analyse",
@@ -54,6 +54,7 @@ _AUDITED_NATIVE_VISION_MODELS = frozenset({
     ("openai-codex", "gpt-5.6-sol"),
 })
 _AUDITED_IMAGE_EDIT_MODELS = frozenset({
+    ("meta-direct", "muse-image-1.0"),
     ("openai-codex", "gpt-image-2-high"),
 })
 
@@ -74,7 +75,7 @@ def ad_template_model_catalog() -> List[Dict[str, Any]]:
         {
             "provider": provider,
             "model": model,
-            "capabilities": ["masked_image_edit"],
+            "capabilities": ["reference_image_edit"] if provider == "meta-direct" else ["masked_image_edit"],
             "supports_vision": True,
             "supports_tools": False,
         }
@@ -177,7 +178,7 @@ def _audited_image_edit_candidate(provider: str, model: str) -> Dict[str, Any]:
         "provider": provider,
         "model": model,
         "capability_verified": True,
-        "capabilities": ["masked_image_edit"],
+        "capabilities": ["reference_image_edit"] if provider == "meta-direct" else ["masked_image_edit"],
         "supports_vision": True,
         "supports_tools": False,
     }
@@ -190,12 +191,12 @@ def default_ad_template_policy() -> Dict[str, Any]:
         "name": "Sole ad-template process", "preset": "cheap-quality",
         "seed_revision": _AD_TEMPLATE_POLICY_SEED_REVISION,
         "stages": {
-            "aspect-reference-image": {"capability": "masked_image_edit", "primary": _audited_image_edit_candidate("openai-codex", "gpt-image-2-high"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 180, "max_cost_usd": 0.35},
-            "analyse": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-sol"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
-            "compare": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-luna"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
-            "final-review-a": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-luna"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
-            "final-review-b": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-sol"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
-            "quality-escalation": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("openai-codex", "gpt-5.6-sol"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
+            "aspect-reference-image": {"capability": "reference_image_edit", "primary": _audited_image_edit_candidate("meta-direct", "muse-image-1.0"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 180, "max_cost_usd": 0.35},
+            "analyse": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("meta-direct", "muse-spark-1.3-contributor"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
+            "compare": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("concentrate", "gemini-3.8-flash"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
+            "final-review-a": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("concentrate", "gemini-3.8-flash"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
+            "final-review-b": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("meta-direct", "muse-spark-1.3-contributor"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
+            "quality-escalation": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("meta-direct", "muse-spark-1.3-contributor"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
         },
         "deterministic_stages": [
             "source-map", "render", "pixel-compare", "validate", "import",
@@ -249,11 +250,11 @@ def validate_model_policy(policy: Any, *, tool_id: Optional[str] = None) -> Dict
             model = model.strip().lower()
             declared = candidate.get("capabilities") if isinstance(candidate.get("capabilities"), list) else []
             verified = candidate.get("capability_verified") is True
-            if stage.get("capability") == "masked_image_edit":
+            if stage.get("capability") in {"masked_image_edit", "reference_image_edit"}:
                 provider = str(candidate.get("provider") or "").strip().lower()
                 if (
                     (provider, model) not in _AUDITED_IMAGE_EDIT_MODELS
-                    or not verified or "masked_image_edit" not in declared
+                    or not verified or stage["capability"] not in _audited_image_edit_candidate(provider, model)["capabilities"] or stage["capability"] not in declared
                     or candidate.get("supports_vision") is not True
                 ):
                     raise ToolRunError(f"model {provider}/{model} has not verified image-edit support")
@@ -288,7 +289,7 @@ def validate_model_policy(policy: Any, *, tool_id: Optional[str] = None) -> Dict
         for stage_id in stages:
             stage = stages[stage_id]
             required_capability = (
-                "masked_image_edit" if stage_id == "aspect-reference-image"
+                stage.get("capability") if stage_id == "aspect-reference-image" and stage.get("capability") in {"masked_image_edit", "reference_image_edit"} else "masked_image_edit" if stage_id == "aspect-reference-image"
                 else "vision_structured"
             )
             if stage.get("capability") != required_capability:
