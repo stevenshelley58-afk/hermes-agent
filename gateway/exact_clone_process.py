@@ -893,7 +893,7 @@ def _expand_text_box(layer: Dict[str, Any], *, canvas_width: int, canvas_height:
 
 
 def _apply_deterministic_contract_repairs(
-    candidate: Mapping[str, Any], reasons: Sequence[str],
+    candidate: Mapping[str, Any], reasons: Sequence[str], *, qa_candidate: Mapping[str, Any] | None = None,
 ) -> tuple[Dict[str, Any], int]:
     """Repair every mechanical text violation together without spending an LLM turn."""
     violations = _renderer_text_violations(reasons)
@@ -901,6 +901,12 @@ def _apply_deterministic_contract_repairs(
         return copy.deepcopy(dict(candidate)), 0
     repaired = copy.deepcopy(dict(candidate))
     template = repaired.get("template") if isinstance(repaired.get("template"), dict) else {}
+    qa_template = qa_candidate.get("template") if isinstance(qa_candidate, Mapping) and isinstance(qa_candidate.get("template"), dict) else {}
+    qa_text = {
+        item.get("key"): item.get("placeholder")
+        for item in qa_template.get("textInputs", [])
+        if isinstance(item, dict) and isinstance(item.get("key"), str) and isinstance(item.get("placeholder"), str)
+    }
     changed_layers: set[str] = set()
     for violation in violations:
         layer_id = violation.get("layerId")
@@ -930,6 +936,17 @@ def _apply_deterministic_contract_repairs(
                 layer["overflowBehaviour"] = "shrink"
                 layer.pop("sizeRatio", None)
                 layer["fontSize"] = max(floor, float(layer.get("fontSize") or 0))
+                qa_layout = qa_template.get(field) if isinstance(qa_template.get(field), dict) else {}
+                qa_layer = next((
+                    item for item in qa_layout.get("layers", [])
+                    if isinstance(item, dict) and item.get("layerId") == layer_id
+                ), None)
+                source_text = qa_text.get(qa_layer.get("inputKey")) if isinstance(qa_layer, dict) else None
+                if isinstance(source_text, str):
+                    layer["maxLines"] = max(
+                        int(layer.get("maxLines") or 1),
+                        len(source_text.splitlines()) or 1,
+                    )
                 _expand_text_box(
                     layer,
                     canvas_width=1080,
@@ -1933,7 +1950,9 @@ class ExactCloneOrchestrator:
                         "repair": contract_repairs,
                         "reasons": reasons,
                     })
-                    deterministic_candidate, repaired_layers = _apply_deterministic_contract_repairs(candidate, reasons)
+                    deterministic_candidate, repaired_layers = _apply_deterministic_contract_repairs(
+                        candidate, reasons, qa_candidate=qa_candidate,
+                    )
                     if repaired_layers:
                         candidate = deterministic_candidate
                         self.emit("candidate.patch-applied", "build", {

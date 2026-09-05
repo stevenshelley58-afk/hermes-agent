@@ -482,8 +482,12 @@ def test_all_text_preflight_violations_are_repaired_in_one_deterministic_batch()
         ],
     }
 
+    qa_candidate = copy.deepcopy(candidate)
+    qa_candidate["template"]["textInputs"] = [{"key": "qa-copy", "placeholder": "line one\nline two"}]
+    qa_candidate["template"]["feedLayout"]["layers"][-1]["inputKey"] = "qa-copy"
     repaired, count = process._apply_deterministic_contract_repairs(
         candidate, [f"AD_TEMPLATE_TEXT_PREFLIGHT_FAILED {process._safe_json(payload)}"],
+        qa_candidate=qa_candidate,
     )
 
     assert count == 2
@@ -492,6 +496,7 @@ def test_all_text_preflight_violations_are_repaired_in_one_deterministic_batch()
     assert feed["geometry"]["width"] > 100 and feed["geometry"]["height"] > 40
     assert story["geometry"]["width"] > 100 and story["geometry"]["height"] > 40
     assert feed["fontSize"] >= 24 and story["fontSize"] >= 28
+    assert feed["maxLines"] == 2
 
 
 def test_best_candidate_can_be_recovered_without_ephemeral_qa_inputs(tmp_path):
