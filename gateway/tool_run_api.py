@@ -782,7 +782,7 @@ class ToolRunAPIMixin:
             return "comparator"
         if name.startswith("final-reviewer"):
             return "review"
-        if any(part in name for part in ("revision", "repair", "replan")):
+        if any(part in name for part in ("patch", "revision", "repair", "replan")):
             return "patch"
         return "builder"
 

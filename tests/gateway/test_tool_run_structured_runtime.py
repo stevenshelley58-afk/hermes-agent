@@ -46,6 +46,19 @@ def test_roles_use_distinct_strict_response_schemas():
     assert all(item["additionalProperties"] is False for item in (comparator, reviewer, builder))
 
 
+def test_patch_fallback_uses_operations_schema_not_full_builder_envelope():
+    import jsonschema
+    import pytest
+    for role in ("patch-fallback-2", "contract-repair-1-1", "manual-revision-1"):
+        schema = ToolRunAPIMixin._tool_role_json_schema(role)
+        assert schema["required"] == ["operations"]
+        jsonschema.validate({"operations": [{"op": "replace", "path": "/template/feedLayout/layers/0/geometry/y", "value": 48}]}, schema)
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate({"template": {}, "assets": []}, schema)
+
+
+
+
 def test_builder_schema_rejects_missing_or_wrong_placement_layout():
     import jsonschema
     import pytest
