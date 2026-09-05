@@ -44,6 +44,27 @@ def test_source_only_qa_uses_original_slot_not_reflowed_coordinates(tmp_path):
             assert crop.getpixel((crop.width // 2, crop.height // 2)) == (255, 0, 0)
     assert candidate["template"]["storyLayout"]["layers"][1]["inputKey"] == "hero"
 
+def test_qa_projects_photos_but_keeps_complete_production_logo(tmp_path):
+    source = tmp_path / "source.png"
+    Image.new("RGB", (1080, 1350), "red").save(source)
+    candidate = {"template": _template(), "assets": []}
+    template = candidate["template"]
+    template["imageInputs"].append({"key": "brand", "label": "Brand", "acceptedTypes": ["image/png"], "defaultAssetKey": "brand"})
+    template["assets"]["brand"] = {"fileName": "brand.png", "mimeType": "image/png"}
+    candidate["assets"].append({"assetKey": "brand", "fileName": "brand.png", "mimeType": "image/png"})
+    for placement in ("feed", "story"):
+        template[placement + "Layout"]["layers"].append({"type": "logo", "layerId": placement + "-logo", "inputKey": "brand", "geometry": {"x": 100, "y": 100, "width": 240, "height": 145}})
+    qa, overrides = process.build_ephemeral_qa_candidate(
+        candidate, source=str(source), reciprocal_reference=str(source), source_placement="feed",
+        source_map={}, target_map={}, workspace=tmp_path / "qa")
+    for placement in ("feed", "story"):
+        assert qa["template"][placement + "Layout"]["layers"][-1] == template[placement + "Layout"]["layers"][-1]
+        assert f"qa-{placement}-1" in overrides
+        assert f"qa-{placement}-2" not in overrides
+    assert "brand" not in overrides
+    assert qa["template"]["assets"]["brand"] == template["assets"]["brand"]
+
+
 def test_bounded_vision_payload_reuses_unchanged_image_encoding(tmp_path, monkeypatch):
     image_path = tmp_path / "source.png"
     Image.new("RGB", (32, 32), (12, 34, 56)).save(image_path)
@@ -583,20 +604,100 @@ def test_patch_application_error_is_fed_back_for_one_bounded_retry(tmp_path):
         }]}
 
     patch, candidate = process._call_applied_patch(
-        call_agent,
-        instance="patch-semantic",
-        prompt="repair",
-        paths=[str(source)],
+        call_agent, instance="patch-semantic", prompt="repair", paths=[str(source)],
         route={"provider": "openai-codex", "model": "gpt-5.6-sol"},
         candidate={"template": _template(), "assets": []},
         emit=lambda kind, _node, data: events.append((kind, data)),
     )
-
     assert calls == ["patch-semantic", "patch-semantic-format-retry"]
     assert patch["operations"][0]["path"] == "/template/metadata/description"
     assert candidate["template"]["metadata"]["description"] == "corrected"
     assert events[0][0] == "role.output-retried"
     assert "does not exist" in events[0][1]["reason"]
+
+
+def test_manual_revision_starts_new_best_candidate_scope(monkeypatch, tmp_path):
+    historical = {"template": _template(), "assets": []}
+    historical["template"]["metadata"]["description"] = "historical-high"
+    current_best = copy.deepcopy(historical)
+    current_best["template"]["metadata"]["description"] = "manual-cycle-best"
+    current_regression = copy.deepcopy(historical)
+    current_regression["template"]["metadata"]["description"] = "manual-cycle-regression"
+
+    old_review = _review(accept=False)
+    old_review["scores"] = {key: 9.2 for key in old_review["scores"]}
+    new_review = _review(accept=False)
+    new_review["scores"] = {key: 8.0 for key in new_review["scores"]}
+    regressed_review = _review(accept=False)
+    regressed_review["scores"] = {key: 7.0 for key in regressed_review["scores"]}
+    iterations = [
+        {"iteration": 2, "comparison": old_review},
+        {"iteration": 7, "comparison": new_review},
+        {"iteration": 8, "comparison": regressed_review},
+    ]
+    by_iteration = {
+        2: historical,
+        7: current_best,
+        8: current_regression,
+    }
+    monkeypatch.setattr(
+        process,
+        "_neutral_candidate_from_iteration",
+        lambda _workspace, iteration: copy.deepcopy(by_iteration[iteration]),
+    )
+    events = []
+    checkpoint = {
+        "manualStartIteration": 6,
+        "bestIteration": 2,
+        "bestCandidate": historical,
+        "bestReview": old_review,
+    }
+
+    candidate, review, iteration = process._recover_checkpoint_best(
+        checkpoint,
+        iterations,
+        tmp_path,
+        lambda kind, node, data: events.append((kind, node, data)),
+    )
+    assert iteration == 7
+    assert candidate["template"]["metadata"]["description"] == "manual-cycle-best"
+    assert review["scores"]["overall"] == 8.0
+    assert events[-1][2]["iteration"] == 7
+
+    checkpoint.update(
+        bestIteration=7,
+        bestCandidate=current_best,
+        bestReview=new_review,
+    )
+    candidate, review, iteration = process._recover_checkpoint_best(
+        checkpoint, iterations, tmp_path, lambda *_args: None,
+    )
+    assert iteration == 7
+    assert candidate["template"]["metadata"]["description"] == "manual-cycle-best"
+    assert review["scores"]["overall"] == 8.0
+
+
+def test_request_manual_revision_invalidates_historical_best_and_persists_boundary(tmp_path):
+    candidate = {"template": _template(), "assets": []}
+    process.persist_checkpoint(tmp_path, {
+        "candidate": candidate,
+        "iterations": [{"iteration": 2}, {"iteration": 6}],
+        "bestCandidate": candidate,
+        "bestReview": _review(accept=False),
+        "bestIteration": 2,
+        "comparisonBudgetUsed": 6,
+    })
+    revised = process.request_checkpoint_revision(tmp_path, "Repair the logo.")
+    assert revised["manualStartIteration"] == 6
+    assert revised["manualRevision"] == 1
+    assert revised["comparisonBudgetUsed"] == 0
+    assert revised["iterations"] == [{"iteration": 2}, {"iteration": 6}]
+    assert not {"bestCandidate", "bestReview", "bestIteration"}.intersection(revised)
+
+    process.persist_checkpoint(tmp_path, {"candidate": candidate})
+    persisted = process.load_checkpoint(tmp_path)
+    assert persisted["manualStartIteration"] == 6
+    assert persisted["manualRevision"] == 1
 
 
 def test_exhausted_invalid_patch_paths_trigger_bounded_replan(tmp_path):

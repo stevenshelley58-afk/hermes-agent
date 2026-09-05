@@ -725,6 +725,7 @@ Return JSON only with exactly {output_fields}. scores must contain exactly, in t
 
 PRODUCTION SAFETY: Do not reproduce accidental source clipping, duplicate glyphs, or missing contact text as a requested correction. Match the source structure while keeping customer replacements readable; list unavoidable source defects as warnings, never a reason to damage the production template. Repeated feature wording intentionally present in the source is not itself a stray-glyph defect.
 COORDINATE AND FIT RULES: Feed is exactly 1080x1350; Story is exactly 1080x1920. The original-source comparison image is normalized to its matching canvas without cropping. All geometry targets use those canvas pixels, NEVER thumbnail/display pixels. Preserve the renderer's minimum font sizes: Feed 24px and Story 32px, multiline lineHeight >= 1. Do not request a smaller font; reflow the native adaptation or resize the editable box instead. The comparison source map and render share the same coordinate scale.
+BRAND IDENTITY: Logo layers retain the actual neutral production brand asset, not a source-advertiser crop. Different brand names/marks are intentional. Check the logo footprint, full visibility and aspect ratio; do not request copying advertiser identity or score a neutral mark as missing source artwork.
 
 AVAILABLE BUNDLED FONT FILES: {_safe_json(sorted(AVAILABLE_FONT_FILES))}. Existing declared asset-backed fonts may also be used. Never request a font file that is neither available here nor supplied by the candidate. Record unavoidable differences in fontSubstitution and choose the closest available face, weight and tracking; do not repeatedly demand unavailable proprietary fonts.
 IMAGE ORDER NOTE: Neutral production images follow the three original-source/QA images and precede the original-placement overlay/difference views. Never interpret a difference heatmap as a customer preview.
@@ -1062,7 +1063,7 @@ def build_ephemeral_qa_candidate(
             layer_type = layer.get("type")
             input_key = layer.get("inputKey")
             geometry = layer.get("geometry") if isinstance(layer.get("geometry"), dict) else {}
-            if layer_type in {"image_slot", "logo"} and input_key in original_image_inputs:
+            if layer_type == "image_slot" and input_key in original_image_inputs:
                 crop_width, crop_height = canvas_width, canvas_height
                 if source_only and placement != source_placement:
                     geometry = source_geometries.get(input_key)
@@ -1576,6 +1577,55 @@ def _neutral_candidate_from_iteration(workspace: Path, iteration: int) -> Dict[s
         return None
 
 
+def _recover_checkpoint_best(
+    checkpoint: Mapping[str, Any],
+    iterations: Sequence[Mapping[str, Any]],
+    workspace: Path,
+    emit: Callable[[str, str, Dict[str, Any]], None],
+) -> tuple[Dict[str, Any] | None, Dict[str, Any] | None, int]:
+    """Recover a best candidate only from the active manual revision cycle."""
+    manual_start = max(0, int(checkpoint.get("manualStartIteration") or 0))
+    best_iteration = int(checkpoint.get("bestIteration") or 0)
+    if best_iteration > manual_start:
+        try:
+            if checkpoint.get("bestCandidate") and checkpoint.get("bestReview"):
+                return (
+                    _candidate_envelope(checkpoint["bestCandidate"]),
+                    validate_review(checkpoint["bestReview"]),
+                    best_iteration,
+                )
+        except AdTemplateProcessError:
+            pass
+
+    ranked = []
+    for record in iterations:
+        if (
+            not isinstance(record, Mapping)
+            or not isinstance(record.get("iteration"), int)
+            or record["iteration"] <= manual_start
+        ):
+            continue
+        try:
+            review = validate_review(record.get("comparison"))
+        except AdTemplateProcessError:
+            continue
+        recovered = _neutral_candidate_from_iteration(workspace, record["iteration"])
+        if recovered is not None:
+            ranked.append(
+                (_review_quality(review), record["iteration"], recovered, review)
+            )
+    if not ranked:
+        return None, None, 0
+    _, best_iteration, best_candidate, best_review = max(
+        ranked, key=lambda item: item[:2]
+    )
+    emit("candidate.best-recovered", "build", {
+        "iteration": best_iteration,
+        "score": best_review["scores"]["overall"],
+    })
+    return best_candidate, best_review, best_iteration
+
+
 def persist_checkpoint(
     workspace: Path,
     value: Mapping[str, Any],
@@ -1599,7 +1649,13 @@ def persist_checkpoint(
                 payload[key] = item
     else:
         stable = {}
-        for key in ("comparisonBudgetUsed", "sourceCoordinateMode", "referenceMode"):
+        for key in (
+            "comparisonBudgetUsed",
+            "sourceCoordinateMode",
+            "referenceMode",
+            "manualRevision",
+            "manualStartIteration",
+        ):
             if key not in updates and key in previous:
                 stable[key] = copy.deepcopy(previous[key])
         payload = {**stable, **updates}
@@ -1623,6 +1679,14 @@ def request_checkpoint_revision(workspace: Path, instructions: str) -> Dict[str,
     checkpoint = load_checkpoint(workspace)
     if not checkpoint.get("candidate"):
         raise AdTemplateProcessError("reviewed candidate checkpoint is unavailable")
+    iterations = checkpoint.get("iterations")
+    manual_start_iteration = max(
+        (item.get("iteration", 0) for item in iterations
+         if isinstance(item, Mapping) and isinstance(item.get("iteration"), int)),
+        default=0,
+    ) if isinstance(iterations, list) else 0
+    for key in ("bestCandidate", "bestReview", "bestIteration"):
+        checkpoint.pop(key, None)
     checkpoint.update(
         manualInstructions=instructions.strip(),
         accepted=False,
@@ -1630,6 +1694,7 @@ def request_checkpoint_revision(workspace: Path, instructions: str) -> Dict[str,
         cycleComparisons=0,
         comparisonBudgetUsed=0,
         manualRevision=int(checkpoint.get("manualRevision") or 0) + 1,
+        manualStartIteration=manual_start_iteration,
     )
     persist_checkpoint(workspace, checkpoint)
     return checkpoint
@@ -2085,35 +2150,9 @@ class ExactCloneOrchestrator:
         comparison_budget_used = _comparison_budget_used(checkpoint, iterations)
         manual_instructions = str(checkpoint.get("manualInstructions") or "")
         global_iteration = len(iterations)
-        best_candidate = None
-        best_review = None
-        best_iteration = int(checkpoint.get("bestIteration") or 0)
-        try:
-            if checkpoint.get("bestCandidate") and checkpoint.get("bestReview"):
-                best_candidate = _candidate_envelope(checkpoint["bestCandidate"])
-                best_review = validate_review(checkpoint["bestReview"])
-        except AdTemplateProcessError:
-            best_candidate = None
-            best_review = None
-            best_iteration = 0
-        if best_candidate is None:
-            ranked = []
-            for record in iterations:
-                if not isinstance(record, dict) or not isinstance(record.get("iteration"), int):
-                    continue
-                try:
-                    review = validate_review(record.get("comparison"))
-                except AdTemplateProcessError:
-                    continue
-                recovered = _neutral_candidate_from_iteration(self.workspace, record["iteration"])
-                if recovered is not None:
-                    ranked.append((_review_quality(review), record["iteration"], recovered, review))
-            if ranked:
-                _, best_iteration, best_candidate, best_review = max(ranked, key=lambda item: item[:2])
-                self.emit("candidate.best-recovered", "build", {
-                    "iteration": best_iteration,
-                    "score": best_review["scores"]["overall"],
-                })
+        best_candidate, best_review, best_iteration = _recover_checkpoint_best(
+            checkpoint, iterations, self.workspace, self.emit,
+        )
         if best_candidate is not None and best_review is not None and iterations:
             try:
                 latest_review = validate_review(iterations[-1].get("comparison"))
@@ -2164,6 +2203,10 @@ class ExactCloneOrchestrator:
                 emit=self.emit,
             )
             manual_instructions = ""
+            checkpoint["candidate"] = candidate
+            checkpoint.pop("manualInstructions", None)
+            checkpoint["accepted"] = False
+            persist_checkpoint(self.workspace, checkpoint)
             self.emit("candidate.patch-applied", "build", {"source": "manual-review", "operations": len(patch["operations"])})
 
         accepted_review: Dict[str, Any] | None = None
@@ -2184,7 +2227,7 @@ class ExactCloneOrchestrator:
         while comparison_budget_used < MAX_COMPARISONS:
             self._check_stop()
             global_iteration += 1
-            escalation_iteration = global_iteration > NORMAL_COMPARISONS
+            escalation_iteration = cycle_comparisons + 1 > NORMAL_COMPARISONS
             iteration_root = self.workspace / "iterations" / f"{global_iteration:02d}"
             self.emit("iteration.started", "build", {"iteration": global_iteration, "cycle_iteration": cycle_comparisons + 1})
             contract_repairs = 0
@@ -2406,7 +2449,7 @@ class ExactCloneOrchestrator:
                 candidate = comparator_result["candidate"]
                 patch_source = "iteration-comparator"
             else:
-                revision_route = escalation_route if global_iteration >= NORMAL_COMPARISONS else builder_route
+                revision_route = escalation_route if cycle_comparisons >= NORMAL_COMPARISONS else builder_route
                 self.emit("iteration.revision-requested", "build", {
                     "iteration": global_iteration,
                     "mode": "strong-fallback",
