@@ -72,6 +72,7 @@ def test_all_mounted_ad_db_routes_require_existing_session_boundary():
     ]
     for method, path in paths:
         assert request(method, path).status_code == 401
+    assert request("GET", "/v1/ad-db/ads", headers={"Authorization": "Bearer attacker.jwt"}).status_code == 401
     with patch.object(ad_db_api, "_get", new=AsyncMock(return_value=[])):
         assert request("GET", "/v1/ad-db/ads", headers=AUTH).status_code == 200
     assert request("POST", "/v1/ad-db/runs/scan", headers=AUTH).status_code == 503
