@@ -31,39 +31,37 @@ first pass a small real image plus strict structured-output qualification within
 the approved budget. Until then the audited policy and its defaults remain
 unchanged.
 
-## Current seed-14 process (5 September 2026)
+## Current process (6 September 2026)
 
-The source is durable before renderer preflight. Each run freezes independent routes:
-Contributor for analysis/build/repair, Gemini 3.8 Flash for comparison and final review A, Contributor for final review B, and Muse Image 1.0 for the reciprocal aspect reference and one generated example per eligible photo slot. The lifetime allowance is six comparisons (four normal plus two escalation); automatic retries do not reset it. A manual Frank revision may receive one new bounded allowance.
+Each run freezes its routes independently of the main chat: Meta Direct Muse
+Spark 1.3 Contributor builds/repairs; Concentrate Gemini 3.8 Flash compares;
+one of each performs final review. Muse Image 1.0 generates demo photographs
+only. There is no hidden expensive fallback.
 
-The quality gate is 9.8 across the required likeness dimensions. Targeted JSON patches preserve the best candidate; OCR is source evidence only and never rewrites candidate text. No automatic geometry expansion is performed. Final reviewers inspect both source-filled comparisons and the actual neutral production render. The same run-local demo bytes are used by QA, the final production render and quarantined Blockwise import.
+The original source is the sole design authority. Its matching placement is
+reconstructed as closely as editable layers allow. Vision plans the other native
+aspect directly from that source. No generated whole-ad target is cropped,
+stretched or treated as a second source. Pixel overlays apply only to the matching
+aspect; the native adaptation is reviewed for faithful design preservation.
 
-A passing run stops at Ready for Review. It is not active in Blockwise until Frank approves it.
+Source bytes survive preflight failures/retries. Structured output and Blockwise's
+shared contract catch malformed documents before visual reviews. OCR is evidence,
+not a mechanism for rewriting text. Patches preserve unaffected layers and the
+best candidate. No automatic geometry expansion. Six comparisons are allowed
+across automatic retries; explicit manual revision can start a new bounded cycle.
 
-## Pilot status
+Both placements need the 9.8 gate, no obvious production defects and two accepted
+completion reviews. Final reviewers inspect actual neutral renders. Scores are
+evidence, not proof of pixel identity. Generated photos are reused on retry;
+the same bytes are rendered, reviewed and imported into quarantine. Unknown image
+call outcomes require receipt inspection, not blind repeated charges. Only
+approval in Frank's Ready for Review activates the customer template.
 
-Pilot trun_5ee434b975ac4f188ff0736694f98af7 is running; no pass or completion is claimed. Live Hermes revision is b2775efed9286dc9b7d6325108114a21e796b35a; renderer/Blockwise revision is d39771a94134c28081185bcf93a8d5e1947a39a4.
+## Verification status
 
-## Qualified low-cost profile (5 September 2026)
+Source006 pilot: `trun_5ee434b975ac4f188ff0736694f98af7`. Earlier attempts exposed
+source retry loss, loose layout structure, shortened asset paths and cropped Story
+references. This branch addresses those faults. The pilot is not yet complete.
 
-Seed 14 uses Meta Direct Muse Spark 1.3 Contributor for building and bounded
-repair, Concentrate Gemini 3.8 Flash for comparison, and one of each for the
-two completion reviews. Image references and demonstration photos use Meta
-Direct Muse Image 1.0. These are independent of the main Hermes chat selection.
-Each run freezes its routes; there is no hidden expensive fallback.
-
-Raw image plus strict-JSON probes succeeded on both vision routes. The models
-also identified address overflow, duplicated postcode, missing contacts and
-stray punctuation in a damaged source006 render. Model scores are evidence,
-not proof of pixel identity: renderer checks and manual publication review remain.
-
-QA preserves authored text. OCR provides initial source evidence only; moving
-a text box cannot add words or silently expand its geometry. Final reviewers
-receive the actual neutral production render as well as source comparisons.
-
-After likeness passes, photo-default slots receive run-local generated examples
-once. A persisted plan reuses completed images on retry. The exact same PNG bytes
-go through the shared renderer and quarantined Blockwise import. Logos remain
-editable brand-kit inputs. Unknown interrupted image-call outcomes stop for
-receipt inspection rather than risking duplicate charges. Approval still happens
-in Frank's Ready for Review section before customer gallery activation.
+Focused source-only lifecycle, demo-photo reuse and structured-runtime tests:
+43 passed. Live deployment and the final pilot outcome require separate verification.
