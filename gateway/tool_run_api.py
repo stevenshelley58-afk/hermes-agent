@@ -1938,12 +1938,35 @@ class ToolRunAPIMixin:
                 "required": ["sourcePlacement", "targetPlacement", "canvas", "regions", "preserve"],
                 "additionalProperties": False,
             }
-        return {
-            "type": "object",
-            "properties": {"template": {}, "assets": {"type": "array", "items": {}}},
-            "required": ["template", "assets"],
-            "additionalProperties": False,
-        }
+        # Enforce the renderer's structural envelope at generation time. The
+        # shared renderer still validates layer semantics and cross-references.
+        def object_schema(properties):
+            return {"type": "object", "properties": properties,
+                    "required": list(properties), "additionalProperties": False}
+
+        rect = object_schema({key: {"type": "number"} for key in ("x", "y", "width", "height")})
+        def layout(placement):
+            return object_schema({
+                "placement": {"type": "string", "enum": [placement]},
+                "layers": {"type": "array", "items": {}},
+                "safeZones": {"type": "array", "items": rect},
+            })
+
+        declaration = object_schema({key: {"type": "string"} for key in ("assetKey", "fileName", "mimeType")})
+        template = object_schema({
+            "schema": {"type": "string", "enum": ["blockwise.ad-template"]},
+            "templateId": {"type": "string"},
+            "createdAt": {"type": "string"},
+            "feedLayout": layout("feed"), "storyLayout": layout("story"),
+            "imageInputs": {"type": "array", "items": {}},
+            "textInputs": {"type": "array", "items": {}},
+            "semanticColours": object_schema({key: {"type": "string"} for key in (
+                "background", "primary", "secondary", "accent", "mainText", "inverseText")}),
+            "assets": {},
+            "fonts": {"type": "array", "items": object_schema({"file": {"type": "string"}})},
+            "metadata": {},
+        })
+        return object_schema({"template": template, "assets": {"type": "array", "items": declaration}})
 
     @staticmethod
     def _tool_responses_input(prompt: Any) -> List[Dict[str, Any]]:

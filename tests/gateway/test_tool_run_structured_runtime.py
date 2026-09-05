@@ -25,6 +25,27 @@ def test_roles_use_distinct_strict_response_schemas():
     assert all(item["additionalProperties"] is False for item in (comparator, reviewer, builder))
 
 
+def test_builder_schema_rejects_missing_or_wrong_placement_layout():
+    import jsonschema
+    import pytest
+    schema = ToolRunAPIMixin._tool_role_json_schema("builder-initial")
+    layout = schema["properties"]["template"]["properties"]["feedLayout"]
+    valid = {"placement": "feed", "layers": [], "safeZones": []}
+    jsonschema.validate(valid, layout)
+    for invalid in (
+        {"placement": "4:5", "layers": [], "safeZones": []},
+        {"placement": "feed", "layers": []},
+        {"placement": "feed", "layers": [], "safeZones": {}},
+    ):
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(invalid, layout)
+    story = schema["properties"]["template"]["properties"]["storyLayout"]
+    jsonschema.validate({**valid, "placement": "story"}, story)
+    declaration = schema["properties"]["assets"]["items"]
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"fileName": "photo.png"}, declaration)
+
+
 def test_multimodal_role_input_is_native_responses_shape():
     result = ToolRunAPIMixin._tool_responses_input([
         {"type": "text", "text": "return JSON"},
