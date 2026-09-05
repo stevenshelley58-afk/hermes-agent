@@ -124,6 +124,42 @@ def _candidate_envelope(value: Any) -> Dict[str, Any]:
         raise AdTemplateProcessError("builder template must use blockwise.ad-template")
     if not isinstance(declarations, list):
         raise AdTemplateProcessError("builder assets must be a declaration list")
+    required_template_fields = {
+        "schema", "templateId", "createdAt", "feedLayout", "storyLayout",
+        "imageInputs", "textInputs", "semanticColours", "assets", "fonts",
+        "metadata",
+    }
+    missing = sorted(required_template_fields - set(template))
+    unexpected = sorted(set(template) - required_template_fields)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"missing {', '.join(missing)}")
+        if unexpected:
+            details.append(f"unexpected {', '.join(unexpected)}")
+        raise AdTemplateProcessError(
+            "builder template fields do not match the direct Blockwise contract: "
+            + "; ".join(details)
+        )
+    for field in ("feedLayout", "storyLayout", "semanticColours", "assets", "metadata"):
+        if not isinstance(template.get(field), dict):
+            raise AdTemplateProcessError(f"builder template {field} must be an object")
+    for field in ("imageInputs", "textInputs", "fonts"):
+        if not isinstance(template.get(field), list):
+            raise AdTemplateProcessError(f"builder template {field} must be a list")
+    for placement, field in (("feed", "feedLayout"), ("story", "storyLayout")):
+        layout = template[field]
+        if layout.get("placement") != placement or not isinstance(layout.get("layers"), list) or not isinstance(layout.get("safeZones"), list):
+            raise AdTemplateProcessError(f"builder template {field} must contain placement, layers and safeZones")
+    declared_keys = set()
+    for declaration in declarations:
+        if not isinstance(declaration, dict) or set(declaration) != {"assetKey", "fileName", "mimeType"}:
+            raise AdTemplateProcessError("builder asset declarations must contain exactly assetKey, fileName and mimeType")
+        if any(not isinstance(declaration[key], str) or not declaration[key].strip() for key in declaration):
+            raise AdTemplateProcessError("builder asset declaration values must be non-empty strings")
+        declared_keys.add(declaration["assetKey"])
+    if len(declared_keys) != len(declarations) or declared_keys != set(template["assets"]):
+        raise AdTemplateProcessError("builder asset declarations must exactly match template.assets")
     if any("bytesBase64" in item for item in declarations if isinstance(item, dict)):
         raise AdTemplateProcessError("builder must not return asset bytes")
     _safe_json(value)
@@ -365,7 +401,20 @@ def build_prompt(*, run_id: str, project_id: str, brief: str, placements: Any, r
     catalog = "\n".join(_runtime_catalog().prompt_lines())
     return f"""Build one editable Blockwise template as a near-pixel clone of the attached source. This is reconstruction, not creative work. Preserve exact region geometry, whitespace, hierarchy, typography character, image count/crops, colours, shading, gradients, shadows, transparency, borders, masks, texture, decoration and visual density. Reproduce source effects rather than flattening or omitting them. Feed must clone a Feed source; Story must follow the immutable reciprocal aspect reference below. Neutralize only source advertiser identity, contact details and photographs, while preserving their exact visual footprint as editable inputs and source-free catalog defaults.
 
-Return JSON only with exactly {{"template":{{...}},"assets":[]}}. Use schema blockwise.ad-template and the current Blockwise contract. Declare assets only as {{assetKey,fileName,mimeType}}; never return bytes, hashes, signatures, source paths or a flattened source image. Use only these catalog files:\n{catalog}
+Return JSON only with exactly {{"template":{{...}},"assets":[]}}. The template object must have exactly these keys: schema, templateId, createdAt, feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata. Do not return schemaVersion, fields, placements, name or any legacy pack envelope.
+
+DIRECT BLOCKWISE CONTRACT:
+- schema is "blockwise.ad-template"; templateId is a stable safe ID; createdAt is an ISO-8601 UTC datetime.
+- feedLayout and storyLayout each contain exactly placement, layers, safeZones. Feed canvas is 1080x1350 and Story is 1080x1920. Use absolute pixel geometry {{x,y,width,height}}. The first layer is a protected full-canvas plate. Layer IDs are unique across both placements.
+- Allowed ordered layer types are: plate {{layerId,colourRole,assetKey?,geometry,protected,effects?,fill?,cornerRadius?}}; image_slot {{layerId,inputKey,geometry,mask,minSourceWidth,minSourceHeight,defaultCrop,allowedPlacementOverrides,effects?,cornerRadius?,opacity?}}; overlay_patch {{layerId,geometry,colourRole,opacity,assetKey?,effects?,fill?,cornerRadius?}}; text {{layerId,inputKey,font,fontSize,sizeRatio?,fontFamily?,fontWeight?,italic?,case?,opacity?,effects?,lineHeight,tracking,alignment,maxCharacters,maxLines,colourRole,overflowBehaviour,geometry}}; logo {{layerId,geometry,inputKey,effects?,cornerRadius?,opacity?}}; vector {{layerId,geometry,shape,colourRole,opacity,effects?,fill?,cornerRadius?}}; icon {{layerId,geometry,icon,colourRole,opacity?,effects?}}.
+- colourRole is one of background, primary, secondary, accent, mainText, inverseText. vector shape is rect, rounded, circle, line, pill, notched, wave or ring. icon is arrow, check, tick, phone, mail, globe or location.
+- effects may contain rotationDegrees, blendMode, shadow and stroke. fill may be {{type:"linear_gradient",angleDegrees,stops:[{{offset,colourRole,opacity}},...]}}. Preserve every visible source effect with these fields.
+- imageInputs is a list of {{key,label,required?,acceptedTypes,defaultAssetKey?}}. textInputs is a list of {{key,label,placeholder,maxLength}}. Every image/logo/text layer inputKey is declared. Keep neutral reusable placeholders here; source copy is injected only into ephemeral QA.
+- semanticColours contains exactly background, primary, secondary, accent, mainText, inverseText. assets is an object mapping each assetKey to {{fileName,mimeType}}. fonts is a list of unique {{file}} objects; text layer font.file must be declared. Use matching available font paths such as /fonts/adstudio/poppins-500.woff2, /fonts/adstudio/poppins-700.woff2, /fonts/adstudio/manrope-400.woff2, /fonts/adstudio/manrope-700.woff2, /fonts/adstudio/playfair-display-700.woff2 or /fonts/adstudio/cormorant-garamond-700.woff2.
+- metadata contains exactly title, description, gallerySamples, metaCopyDefaults, aiWritingGuidance, publishRequirements, replacementAssets, realAssetRefs. gallerySamples is {{feed?:{{assetKey?,placement:"feed",purpose}},story?:{{assetKey?,placement:"story",purpose}}}}. metaCopyDefaults is {{primaryText:[],headlines:[],descriptions:[],cta}}. aiWritingGuidance is {{summary,fields}}. publishRequirements is {{objective,specialAdCategory,instantForm:{{required,dependency,defaults?}},destination:{{required,kind,dependency}},fulfilment?,offer?,claims?,requiredCtaTypes}}. replacementAssets is a list of {{inputKey,assetKey,purpose?}}. realAssetRefs is a list of {{inputKey,kind,required}}. Do not create generationReview; the controller adds it after final review.
+- The outer assets list contains exactly one {{assetKey,fileName,mimeType}} declaration for every template.assets entry, with matching values. Never return bytes, hashes, signatures, source paths or a flattened source image.
+
+Use only these catalog files:\n{catalog}
 
 RECIPROCAL ASPECT REFERENCE: {_safe_json(reference)}
 DETERMINISTIC SOURCE MAP (measurements override coordinate guesses): {_safe_json(source_map)}
@@ -864,6 +913,22 @@ def load_checkpoint(workspace: Path) -> Dict[str, Any]:
     return value
 
 
+def _checkpoint_candidate(checkpoint: Dict[str, Any]) -> Dict[str, Any] | None:
+    candidate = checkpoint.get("candidate")
+    if not candidate:
+        return None
+    try:
+        return _candidate_envelope(candidate)
+    except AdTemplateProcessError:
+        # Old/incomplete model envelopes are not valid current candidates.
+        # Preserve expensive deterministic/reference work, but force the
+        # bounded builder role to return the direct Blockwise contract.
+        checkpoint.pop("candidate", None)
+        checkpoint["iterations"] = []
+        checkpoint["cycleComparisons"] = 0
+        return None
+
+
 def persist_checkpoint(workspace: Path, value: Mapping[str, Any]) -> None:
     payload = {"process": PROCESS_ID, **copy.deepcopy(dict(value))}
     target = _checkpoint_path(workspace)
@@ -1267,7 +1332,13 @@ class ExactCloneOrchestrator:
             self.emit("aspect-reference.completed", "aspect-reference", {"source_placement": source_placement, "target_placement": target_placement, "regions": len(reference["regions"])})
             persist_checkpoint(self.workspace, {"reference": reference, "sourceMap": source_map, "targetReferenceMap": target_map, "reciprocalReference": reciprocal_reference, "sourcePlacement": source_placement, "targetPlacement": target_placement, "iterations": [], "cycleComparisons": 0})
 
-        candidate = checkpoint.get("candidate")
+        had_checkpoint_candidate = bool(checkpoint.get("candidate"))
+        candidate = _checkpoint_candidate(checkpoint)
+        if had_checkpoint_candidate and candidate is None:
+            persist_checkpoint(self.workspace, checkpoint)
+            self.emit("candidate.checkpoint-rejected", "build", {
+                "reason": "candidate did not match the direct Blockwise contract",
+            })
         iterations = list(checkpoint.get("iterations") or [])
         cycle_comparisons = int(checkpoint.get("cycleComparisons") or 0)
         manual_instructions = str(checkpoint.get("manualInstructions") or "")

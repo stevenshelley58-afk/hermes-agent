@@ -216,6 +216,34 @@ def test_visual_gate_requires_every_score_and_effect_at_98():
     assert process.validate_review(effect_failure)["decision"] == "revise"
 
 
+def test_invalid_legacy_candidate_is_removed_without_losing_reference_checkpoint():
+    checkpoint = {
+        "sourceMap": {"canvas": {"width": 1080, "height": 1350}},
+        "reciprocalReference": "/run/story-reference.png",
+        "reference": {"regions": [{"regionId": "hero"}]},
+        "targetReferenceMap": {"canvas": {"width": 1080, "height": 1920}},
+        "candidate": {
+            "template": {
+                "schema": "blockwise.ad-template",
+                "schemaVersion": "legacy",
+                "fields": [],
+                "placements": {},
+            },
+            "assets": [],
+        },
+        "iterations": [{"iteration": 1}],
+        "cycleComparisons": 1,
+    }
+
+    assert process._checkpoint_candidate(checkpoint) is None
+    assert "candidate" not in checkpoint
+    assert checkpoint["iterations"] == []
+    assert checkpoint["cycleComparisons"] == 0
+    assert checkpoint["reference"] == {"regions": [{"regionId": "hero"}]}
+    assert checkpoint["sourceMap"]["canvas"]["height"] == 1350
+    assert checkpoint["reciprocalReference"] == "/run/story-reference.png"
+
+
 def test_review_url_is_derived_from_exact_import_route(monkeypatch):
     captured = {}
     monkeypatch.setenv(
