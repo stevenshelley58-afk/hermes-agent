@@ -1,0 +1,7 @@
+name: meta-direct
+version: 1.0.0
+description: "Meta Muse Image API provider (muse-image-1.0) via api.meta.ai."
+author: NousResearch
+kind: backend
+requires_env:
+  - META_MODEL_API_KEY
