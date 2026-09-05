@@ -605,8 +605,10 @@ DIRECT BLOCKWISE CONTRACT:
 - effects may contain rotationDegrees, blendMode, shadow and stroke. fill may be {{type:"linear_gradient",angleDegrees,stops:[{{offset,colourRole,opacity}},...]}}. Preserve every visible source effect with these fields.
 - image_slot mask is rounded_rect, circle or none; defaultCrop is {{x:0,y:0,width:1,height:1}}; allowedPlacementOverrides contains only crop and/or position. Text overflowBehaviour is refuse, truncate or scale_down; alignment is left, center or right; font is {{file:"/fonts/adstudio/...woff2"}}; tracking is absolute pixels from -4 to 4.
 - Renderer text constraints: Feed effective font size must be at least 24px; Story at least 32px. Multiline lineHeight must be at least 1. Preserve source geometry and hierarchy within these constraints; do not let text exceed its box or erase contacts.
+- Brandmarks and wordmarks must use a logo layer, never image_slot: preserve the asset aspect ratio and source footprint so the renderer fits the whole mark without cover-cropping it. If the logo asset already contains its wordmark, do not duplicate that wordmark as text unless the source visibly has a separate text element.
 - imageInputs is a list of {{key,label,required?,acceptedTypes,defaultAssetKey?}}. textInputs is a list of {{key,label,placeholder,maxLength}}. Every image/logo/text layer inputKey is declared. Keep neutral reusable placeholders here with lengths close to the source; QA retains these authored strings and only substitutes source photo crops.
 - semanticColours contains exactly background, primary, secondary, accent, mainText, inverseText. assets is an object mapping each assetKey to {{fileName,mimeType}}. fonts is a list of unique {{file}} objects; text layer font.file must be declared. Use matching available font paths such as /fonts/adstudio/poppins-500.woff2, /fonts/adstudio/poppins-700.woff2, /fonts/adstudio/manrope-400.woff2, /fonts/adstudio/manrope-700.woff2, /fonts/adstudio/playfair-display-700.woff2 or /fonts/adstudio/cormorant-garamond-700.woff2.
+- Generic body-copy placeholders must preserve the source line count, approximate words per line, and overall text density. Neutralize advertiser identity only; do not shorten dense copy into a sparse slogan.
 - metadata contains exactly title, description, gallerySamples, metaCopyDefaults, aiWritingGuidance, publishRequirements, replacementAssets, realAssetRefs. gallerySamples is {{feed?:{{assetKey?,placement:"feed",purpose}},story?:{{assetKey?,placement:"story",purpose}}}}. metaCopyDefaults is {{primaryText:[],headlines:[],descriptions:[],cta}}. aiWritingGuidance is {{summary,fields}}. publishRequirements is {{objective,specialAdCategory,instantForm:{{required,dependency,defaults?}},destination:{{required,kind,dependency}},fulfilment?,offer?,claims?,requiredCtaTypes}}. replacementAssets is a list of {{inputKey,assetKey,purpose?}}. realAssetRefs is a list of {{inputKey,kind,required}}. Do not create generationReview; the controller adds it after final review.
 - The outer assets list contains exactly one {{assetKey,fileName,mimeType}} declaration for every template.assets entry, with matching values. Never return bytes, hashes, signatures, source paths or a flattened source image.
 - Use colourRole (British spelling), never colorRole; vector/icon layers still require their own colourRole even when stroke/effects are present. Do not invent maxSourceWidth/maxSourceHeight; image slots require minSourceWidth, minSourceHeight and allowedPlacementOverrides.
@@ -1350,6 +1352,50 @@ def _vision_paths(source: str, reciprocal_reference: str, rendered: Mapping[str,
         if item.get("kind") in {"overlay", "difference"}
     )
     return list(dict.fromkeys(str(path) for path in paths if path))
+
+
+def _saved_iteration_vision_paths(
+    workspace: Path,
+    iteration: int,
+    records: Sequence[Mapping[str, Any]],
+    source: str,
+    reciprocal_reference: str,
+) -> list[str] | None:
+    """Resolve only the immutable public evidence recorded for one iteration."""
+    record = next(
+        (item for item in records if item.get("iteration") == iteration),
+        None,
+    )
+    if record is None:
+        return None
+    preview_names = {
+        name for name in record.get("previews", [])
+        if isinstance(name, str)
+    }
+    required = [
+        f"iteration-{iteration:02d}-feed.png",
+        f"iteration-{iteration:02d}-story.png",
+    ]
+    if not set(required).issubset(preview_names):
+        return None
+    prefix = f"iteration-{iteration:02d}-"
+    diff_names = [
+        name for name in record.get("diffs", [])
+        if isinstance(name, str)
+        and name.startswith(prefix)
+        and name.endswith(("-overlay.png", "-difference.png"))
+    ]
+    names = [*required, *diff_names]
+    root = (workspace / "previews").resolve()
+    resolved: list[str] = [source, reciprocal_reference]
+    for name in names:
+        if Path(name).name != name:
+            return None
+        path = (root / name).resolve()
+        if path.parent != root or not path.is_file():
+            return None
+        resolved.append(str(path))
+    return list(dict.fromkeys(resolved))
 
 
 def _comparison_metrics(
@@ -2249,6 +2295,7 @@ class ExactCloneOrchestrator:
             }
             iterations.append(record)
             revision_review = review
+            revision_paths = _vision_paths(source, reciprocal_reference, rendered, comparison_views)
             fallback_reason: str | None = comparator_result["patchError"]
             if best_candidate is None or best_review is None:
                 best_candidate = copy.deepcopy(candidate)
@@ -2264,6 +2311,23 @@ class ExactCloneOrchestrator:
                     })
                     candidate = copy.deepcopy(best_candidate)
                     revision_review = copy.deepcopy(best_review)
+                    revision_paths = _saved_iteration_vision_paths(
+                        self.workspace, best_iteration, iterations,
+                        source, reciprocal_reference,
+                    ) or []
+                    if not revision_paths:
+                        restored_qa, restored_overrides = build_ephemeral_qa_candidate(
+                            candidate, source=source, reciprocal_reference=reciprocal_reference,
+                            source_placement=source_placement, source_map=source_map,
+                            target_map=target_map, workspace=iteration_root / "restored-best",
+                        )
+                        restored_rendered = run_renderer(
+                            restored_qa, iteration_root / "restored-best",
+                            asset_overrides={**demo_overrides, **restored_overrides},
+                        )
+                        revision_paths = _vision_paths(
+                            source, reciprocal_reference, restored_rendered, [],
+                        )
                     record["regressed"] = True
                     fallback_reason = "comparison regressed; patch the restored best candidate"
                 elif _review_improved(review, best_review):
@@ -2330,7 +2394,7 @@ class ExactCloneOrchestrator:
                     self.call_agent,
                     instance=f"patch-fallback-{global_iteration}",
                     prompt=patch_prompt(candidate=candidate, issues=revision_review["issues"]),
-                    paths=_vision_paths(source, reciprocal_reference, rendered, comparison_views),
+                    paths=revision_paths,
                     route=revision_route,
                     candidate=candidate,
                     emit=self.emit,

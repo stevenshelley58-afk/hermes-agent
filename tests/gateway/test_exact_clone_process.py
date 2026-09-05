@@ -147,11 +147,21 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     comparison_count = 0
     fallback_patch_count = 0
     contract_repair_count = 0
+    fallback_evidence: list[list[dict]] = []
     renderer_rejected = False
     emitted: list[tuple[str, str, dict]] = []
     final_review_barrier = threading.Barrier(2)
 
     real_source_map = process.build_source_map
+
+    monkeypatch.setattr(
+        process,
+        "vision_message",
+        lambda text, paths, **_kwargs: [
+            {"type": "text", "text": text},
+            {"type": "test_paths", "paths": list(paths)},
+        ],
+    )
 
     def source_map(path: str):
         order.append("source-map")
@@ -191,6 +201,7 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
             }]}
         if instance.startswith("patch-fallback-"):
             fallback_patch_count += 1
+            fallback_evidence.append(copy.deepcopy(prompt))
             return {"operations": [{
                 "op": "replace", "path": "/template/metadata/description",
                 "value": f"fallback-patch-{fallback_patch_count}",
@@ -276,6 +287,15 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     comparator_routes = [route for instance, route in agent_calls if instance.startswith("comparator-")]
     assert comparator_routes[:4] == ["openai-codex/comparator"] * 4
     assert comparator_routes[4:] == ["openai-codex/escalation"] * 2
+    assert len(fallback_evidence) == 1
+    fallback_text = fallback_evidence[0][0]["text"]
+    fallback_paths = fallback_evidence[0][1]["paths"]
+    assert '"description":"comparator-patch-1"' in fallback_text
+    assert any(Path(path).name == "iteration-02-feed.png" for path in fallback_paths)
+    assert any(Path(path).name == "iteration-02-story.png" for path in fallback_paths)
+    assert any(Path(path).name.endswith("-overlay.png") for path in fallback_paths)
+    assert not any(Path(path).name.startswith("iteration-03-") for path in fallback_paths)
+
     assert len([name for name, _ in agent_calls if name.startswith("final-reviewer-")]) == 2
     assert len(agent_calls) == 12
     assert sum(
@@ -300,6 +320,28 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     assert result["metrics"]["story"] == {"mode": "native-reflow", "pixelComparison": False}
     assert all(item["placement"] == "feed" for item in result["diffs"])
     assert any(kind == "reference.source-only" for kind, _, _ in emitted)
+
+
+def test_build_prompt_preserves_logo_fit_and_body_copy_density(monkeypatch):
+    class Catalog:
+        @staticmethod
+        def prompt_lines():
+            return ["logo.png | image/png"]
+
+    monkeypatch.setattr(process, "_runtime_catalog", lambda: Catalog())
+    prompt = process.build_prompt(
+        run_id="run",
+        project_id="blockwise",
+        brief="clone",
+        placements=["feed", "story"],
+        reference={"regions": []},
+        source_map={"ocr": []},
+    )
+    assert "Brandmarks and wordmarks must use a logo layer, never image_slot" in prompt
+    assert "fits the whole mark without cover-cropping it" in prompt
+    assert "do not duplicate that wordmark as text" in prompt
+    assert "preserve the source line count, approximate words per line" in prompt
+    assert "do not shorten dense copy into a sparse slogan" in prompt
 
 
 def test_visual_gate_requires_every_score_and_effect_at_98():
