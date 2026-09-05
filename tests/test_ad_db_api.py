@@ -184,3 +184,37 @@ def test_non_secret_endpoint_and_archive_root_prefer_config_yaml():
         root = ad_db_api._archive_root()
     assert url == "http://configured/rest/v1"
     assert root == Path("/srv/configured-assets")
+
+def test_scoped_read_token_allows_get_and_head_but_never_post_or_bearer(tmp_path):
+    token_header = {"X-Hermes-Ad-Db-Read-Token": "read-token"}
+    env = {"HERMES_AD_DB_READ_TOKEN": "read-token"}
+    with patch.dict(os.environ, env, clear=False), patch.object(ad_db_api, "_get", new=AsyncMock(return_value=[])):
+        assert request("GET", "/v1/ad-db/ads", headers=token_header).status_code == 200
+        assert request("GET", "/v1/ad-db/ads", headers={"X-Hermes-Ad-Db-Read-Token": "wrong"}).status_code == 401
+        assert request("GET", "/v1/ad-db/ads", headers={"Authorization": "Bearer read-token"}).status_code == 401
+        assert request("POST", "/v1/ad-db/runs/scan", headers=token_header).status_code == 401
+
+    digest = hashlib.sha256(b"media").hexdigest()
+    archive = tmp_path / "sha256" / digest
+    archive.parent.mkdir()
+    archive.write_bytes(b"media")
+    record = {
+        "object_key": f"sha256/{digest}",
+        "content_hash": digest,
+        "byte_size": 5,
+        "mime_type": "video/mp4",
+        "verified_at": "2026-09-05T00:00:00Z",
+    }
+    with (
+        patch.dict(os.environ, env, clear=False),
+        patch.object(ad_db_api, "_ROOT", Path(tmp_path)),
+        patch.object(ad_db_api, "_get", new=AsyncMock(return_value=[record])),
+    ):
+        response = request(
+            "HEAD",
+            f"/v1/ad-db/ads/{AD_ID}/media/{ASSET_ID}",
+            headers=token_header,
+        )
+    assert response.status_code == 200
+    assert response.content == b""
+    assert response.headers["content-length"] == "5"

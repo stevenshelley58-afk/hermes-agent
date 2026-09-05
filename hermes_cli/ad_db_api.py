@@ -17,6 +17,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 
 def _require_ad_db_auth(request: Request) -> None:
+    if request.method in {"GET", "HEAD"}:
+        expected = os.environ.get("HERMES_AD_DB_READ_TOKEN", "")
+        presented = request.headers.get("X-Hermes-Ad-Db-Read-Token", "")
+        if expected and presented and hmac.compare_digest(presented, expected):
+            return
     # Runtime import avoids the web_server -> router import cycle.
     from hermes_cli.web_server import _require_token
     _require_token(request)
