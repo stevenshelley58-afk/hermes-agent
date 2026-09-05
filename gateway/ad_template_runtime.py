@@ -6,6 +6,7 @@ import base64
 import io
 import json
 import mimetypes
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, List, Dict
 
@@ -74,17 +75,29 @@ def _bounded_vision_image(path: Path) -> tuple[bytes, str]:
     return encoded, "image/jpeg"
 
 
+@lru_cache(maxsize=64)
+def _bounded_vision_image_cached(path: str, mtime_ns: int, size: int) -> tuple[bytes, str]:
+    """Reuse bounded pixels while the underlying file is unchanged.
+
+    Vision requests commonly compare several iterations against the same
+    source/reference files.  Include stat identity in the key so a renderer
+    overwrite cannot reuse stale evidence; iteration-specific files naturally
+    remain distinct.  The bounded bytes are immutable and safe to share.
+    """
+    return _bounded_vision_image(Path(path))
+
+
 def vision_message(text: str, paths: List[str], *, bounded: bool = False) -> List[Dict[str, Any]]:
     parts: List[Dict[str, Any]] = [{"type": "text", "text": text}]
     for raw in paths:
         path = Path(str(raw)).expanduser().resolve()
         if not path.is_file():
             raise AdTemplateProcessError("vision input image is missing")
-        payload, mime = (
-            _bounded_vision_image(path)
-            if bounded
-            else (path.read_bytes(), mimetypes.guess_type(path.name)[0] or "image/png")
-        )
+        if bounded:
+            stat = path.stat()
+            payload, mime = _bounded_vision_image_cached(str(path), stat.st_mtime_ns, stat.st_size)
+        else:
+            payload, mime = path.read_bytes(), mimetypes.guess_type(path.name)[0] or "image/png"
         parts.append({
             "type": "image_url",
             "image_url": {"url": f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"},

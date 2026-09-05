@@ -7,8 +7,28 @@ from pathlib import Path
 from PIL import Image
 
 import gateway.exact_clone_process as process
+import gateway.ad_template_runtime as runtime
 from gateway.tool_runs import TOOL_RUN_COMMAND_SCHEMA, ToolRunError, ToolRunStore
 import pytest
+
+
+def test_bounded_vision_payload_reuses_unchanged_image_encoding(tmp_path, monkeypatch):
+    image_path = tmp_path / "source.png"
+    Image.new("RGB", (32, 32), (12, 34, 56)).save(image_path)
+    runtime._bounded_vision_image_cached.cache_clear()
+    calls = 0
+    original = runtime._bounded_vision_image
+
+    def counted(path):
+        nonlocal calls
+        calls += 1
+        return original(path)
+
+    monkeypatch.setattr(runtime, "_bounded_vision_image", counted)
+    first = runtime.vision_message("inspect", [str(image_path)], bounded=True)
+    second = runtime.vision_message("inspect", [str(image_path)], bounded=True)
+    assert first[1] == second[1]
+    assert calls == 1
 
 
 def _template() -> dict:
