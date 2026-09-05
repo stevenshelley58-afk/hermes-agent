@@ -85,6 +85,7 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     patch_count = 0
     contract_repair_count = 0
     renderer_rejected = False
+    emitted: list[tuple[str, str, dict]] = []
 
     real_source_map = process.build_source_map
 
@@ -132,7 +133,10 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
             }]}
         if instance.startswith("comparator-"):
             comparison_count += 1
-            return _review(accept=comparison_count == 6)
+            result = _review(accept=comparison_count == 6)
+            if comparison_count == 3:
+                result["scores"] = {key: 7.1 for key in result["scores"]}
+            return result
         if instance.startswith("final-reviewer-"):
             return _review(accept=True)
         raise AssertionError(instance)
@@ -186,7 +190,7 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
         workspace=tmp_path / "run",
         run_id="trun_test",
         project_id="blockwise",
-        emit=lambda *_args: None,
+        emit=lambda kind, node, data: emitted.append((kind, node, data)),
     ).run(source=str(source), brief="clone", placements=["feed", "story"], routes=routes)
 
     assert order[:2] == ["source-map", "image-model"]
@@ -194,6 +198,11 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     assert comparison_count == process.MAX_COMPARISONS == 6
     assert patch_count == 5
     assert contract_repair_count == 1
+    regression = next(data for kind, _, data in emitted if kind == "regression.reverted")
+    assert regression == {
+        "from_iteration": 3, "from_score": 7.1,
+        "to_iteration": 1, "to_score": 9.2,
+    }
     patch_routes = [route for instance, route in agent_calls if instance.startswith("patch-")]
     assert patch_routes[:3] == ["openai-codex/builder"] * 3
     assert patch_routes[3:] == ["openai-codex/escalation"] * 2
@@ -242,6 +251,12 @@ def test_visual_gate_derives_decision_from_evidence_not_model_label():
     failing["decision"] = "accept"
     assert process.validate_review(failing)["decision"] == "revise"
 
+    best = process.validate_review(_review(accept=False))
+    regressed = copy.deepcopy(best)
+    regressed["scores"] = {key: 7.1 for key in regressed["scores"]}
+    assert process._review_regressed(regressed, best)
+    assert not process._review_regressed(best, best)
+
 
 def test_invalid_legacy_candidate_is_removed_without_losing_reference_checkpoint():
     checkpoint = {
@@ -284,6 +299,35 @@ def test_near_complete_candidate_with_missing_layer_types_is_preserved_for_bound
     assert "/template/feedLayout/layers/0/type" in message
     assert "/template/storyLayout/layers/0/type" in message
     assert process.MAX_CONTRACT_REPAIRS == 6
+
+
+def test_best_candidate_can_be_recovered_without_ephemeral_qa_inputs(tmp_path):
+    template = _template()
+    template["imageInputs"].append({
+        "key": "qa_feed_1_hero", "label": "Hero", "acceptedTypes": ["image/png"],
+        "defaultAssetKey": "qa-feed-1",
+    })
+    template["feedLayout"]["layers"][1]["inputKey"] = "qa_feed_1_hero"
+    template["assets"]["qa-feed-1"] = {"fileName": "qa/feed-1.png", "mimeType": "image/png"}
+    artifact = tmp_path / "iterations" / "02" / "artifact.json"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(
+        process._safe_json({
+            "template": template,
+            "assets": [{
+                "assetKey": "qa-feed-1", "fileName": "qa/feed-1.png",
+                "mimeType": "image/png", "bytesBase64": "source-derived",
+            }],
+        }),
+        encoding="utf-8",
+    )
+
+    recovered = process._neutral_candidate_from_iteration(tmp_path, 2)
+    assert recovered is not None
+    assert recovered["template"]["feedLayout"]["layers"][1]["inputKey"] == "hero"
+    assert all(not item["key"].startswith("qa_") for item in recovered["template"]["imageInputs"])
+    assert recovered["template"]["assets"] == {}
+    assert recovered["assets"] == []
 
 
 def test_review_url_is_derived_from_exact_import_route(monkeypatch):

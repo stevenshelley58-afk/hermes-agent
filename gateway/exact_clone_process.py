@@ -54,6 +54,7 @@ MAX_OUTPUT_RETRIES = 1
 MAX_PATCH_OPERATIONS = 64
 MAX_PATCH_BYTES = 32_000
 MAX_CONTRACT_REPAIRS = 6
+REGRESSION_EPSILON = 0.05
 STAGES = (
     "source",
     "aspect-reference",
@@ -975,6 +976,78 @@ def _checkpoint_candidate(checkpoint: Dict[str, Any]) -> Dict[str, Any] | None:
         return None
 
 
+def _review_quality(review: Mapping[str, Any]) -> tuple[float, float]:
+    scores = review.get("scores") if isinstance(review.get("scores"), Mapping) else {}
+    values = [float(scores.get(field, 0.0)) for field in SCORE_FIELDS]
+    return (float(scores.get("overall", 0.0)), min(values, default=0.0))
+
+
+def _review_regressed(current: Mapping[str, Any], best: Mapping[str, Any]) -> bool:
+    current_quality = _review_quality(current)
+    best_quality = _review_quality(best)
+    return (
+        current_quality[0] < best_quality[0] - REGRESSION_EPSILON
+        or (
+            abs(current_quality[0] - best_quality[0]) <= REGRESSION_EPSILON
+            and current_quality[1] < best_quality[1] - REGRESSION_EPSILON
+        )
+    )
+
+
+def _review_improved(current: Mapping[str, Any], best: Mapping[str, Any]) -> bool:
+    current_quality = _review_quality(current)
+    best_quality = _review_quality(best)
+    return (
+        current_quality[0] > best_quality[0] + REGRESSION_EPSILON
+        or (
+            abs(current_quality[0] - best_quality[0]) <= REGRESSION_EPSILON
+            and current_quality[1] > best_quality[1] + REGRESSION_EPSILON
+        )
+    )
+
+
+def _neutral_candidate_from_iteration(workspace: Path, iteration: int) -> Dict[str, Any] | None:
+    """Recover the neutral candidate from a persisted QA renderer input."""
+    artifact = workspace / "iterations" / f"{iteration:02d}" / "artifact.json"
+    try:
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    template = payload.get("template") if isinstance(payload, dict) else None
+    if not isinstance(template, dict):
+        return None
+    template = copy.deepcopy(template)
+    template["imageInputs"] = [
+        item for item in template.get("imageInputs", [])
+        if isinstance(item, dict) and not str(item.get("key") or "").startswith("qa_")
+    ]
+    template["textInputs"] = [
+        item for item in template.get("textInputs", [])
+        if isinstance(item, dict) and not str(item.get("key") or "").startswith("qa_")
+    ]
+    template["assets"] = {
+        key: value for key, value in (template.get("assets") or {}).items()
+        if not str(key).startswith("qa-")
+    }
+    for layout_key in ("feedLayout", "storyLayout"):
+        for layer in (template.get(layout_key) or {}).get("layers", []):
+            if not isinstance(layer, dict):
+                continue
+            input_key = str(layer.get("inputKey") or "")
+            match = re.match(r"^qa_(?:feed|story)_\d+_(.+)$", input_key)
+            if match:
+                layer["inputKey"] = match.group(1)
+    declarations = [
+        {"assetKey": key, "fileName": value["fileName"], "mimeType": value["mimeType"]}
+        for key, value in template["assets"].items()
+        if isinstance(value, dict) and set(value) == {"fileName", "mimeType"}
+    ]
+    try:
+        return _candidate_envelope({"template": template, "assets": declarations})
+    except AdTemplateProcessError:
+        return None
+
+
 def persist_checkpoint(workspace: Path, value: Mapping[str, Any]) -> None:
     payload = {"process": PROCESS_ID, **copy.deepcopy(dict(value))}
     target = _checkpoint_path(workspace)
@@ -1389,6 +1462,59 @@ class ExactCloneOrchestrator:
         cycle_comparisons = int(checkpoint.get("cycleComparisons") or 0)
         manual_instructions = str(checkpoint.get("manualInstructions") or "")
         global_iteration = len(iterations)
+        best_candidate = None
+        best_review = None
+        best_iteration = int(checkpoint.get("bestIteration") or 0)
+        try:
+            if checkpoint.get("bestCandidate") and checkpoint.get("bestReview"):
+                best_candidate = _candidate_envelope(checkpoint["bestCandidate"])
+                best_review = validate_review(checkpoint["bestReview"])
+        except AdTemplateProcessError:
+            best_candidate = None
+            best_review = None
+            best_iteration = 0
+        if best_candidate is None:
+            ranked = []
+            for record in iterations:
+                if not isinstance(record, dict) or not isinstance(record.get("iteration"), int):
+                    continue
+                try:
+                    review = validate_review(record.get("comparison"))
+                except AdTemplateProcessError:
+                    continue
+                recovered = _neutral_candidate_from_iteration(self.workspace, record["iteration"])
+                if recovered is not None:
+                    ranked.append((_review_quality(review), record["iteration"], recovered, review))
+            if ranked:
+                _, best_iteration, best_candidate, best_review = max(ranked, key=lambda item: item[:2])
+                self.emit("candidate.best-recovered", "build", {
+                    "iteration": best_iteration,
+                    "score": best_review["scores"]["overall"],
+                })
+        if best_candidate is not None and best_review is not None and iterations:
+            try:
+                latest_review = validate_review(iterations[-1].get("comparison"))
+            except (AdTemplateProcessError, AttributeError):
+                latest_review = None
+            if (
+                latest_review is not None
+                and _review_regressed(latest_review, best_review)
+                and _safe_json(candidate) != _safe_json(best_candidate)
+            ):
+                self.emit("regression.reverted", "compare", {
+                    "from_iteration": iterations[-1].get("iteration"),
+                    "from_score": latest_review["scores"]["overall"],
+                    "to_iteration": best_iteration,
+                    "to_score": best_review["scores"]["overall"],
+                })
+                candidate = copy.deepcopy(best_candidate)
+                checkpoint.update(
+                    candidate=candidate,
+                    bestCandidate=best_candidate,
+                    bestReview=best_review,
+                    bestIteration=best_iteration,
+                )
+                persist_checkpoint(self.workspace, checkpoint)
         if not candidate:
             self._check_stop()
             self.emit("candidate.build-started", "build", {"mode": "initial"})
@@ -1480,6 +1606,9 @@ class ExactCloneOrchestrator:
                         "iterations": iterations,
                         "cycleComparisons": cycle_comparisons,
                         "accepted": False,
+                        "bestCandidate": best_candidate,
+                        "bestReview": best_review,
+                        "bestIteration": best_iteration,
                     })
             cycle_comparisons += 1
             comparison_views = _comparison_views(source, reciprocal_reference, rendered, self.workspace, global_iteration, source_placement, target_placement)
@@ -1514,6 +1643,26 @@ class ExactCloneOrchestrator:
                 "metrics": metrics,
             }
             iterations.append(record)
+            revision_review = review
+            if best_candidate is None or best_review is None:
+                best_candidate = copy.deepcopy(candidate)
+                best_review = copy.deepcopy(review)
+                best_iteration = global_iteration
+            else:
+                if _review_regressed(review, best_review):
+                    self.emit("regression.reverted", "compare", {
+                        "from_iteration": global_iteration,
+                        "from_score": review["scores"]["overall"],
+                        "to_iteration": best_iteration,
+                        "to_score": best_review["scores"]["overall"],
+                    })
+                    candidate = copy.deepcopy(best_candidate)
+                    revision_review = copy.deepcopy(best_review)
+                    record["regressed"] = True
+                elif _review_improved(review, best_review):
+                    best_candidate = copy.deepcopy(candidate)
+                    best_review = copy.deepcopy(review)
+                    best_iteration = global_iteration
             self.emit("iteration.compared", "compare", {
                 "iteration": global_iteration,
                 "cycle_iteration": cycle_comparisons,
@@ -1535,6 +1684,9 @@ class ExactCloneOrchestrator:
                 "iterations": iterations,
                 "cycleComparisons": cycle_comparisons,
                 "accepted": review["decision"] == "accept",
+                "bestCandidate": best_candidate,
+                "bestReview": best_review,
+                "bestIteration": best_iteration,
             })
             if review["decision"] == "accept":
                 accepted_review = review
@@ -1548,12 +1700,12 @@ class ExactCloneOrchestrator:
             self.emit("iteration.revision-requested", "build", {
                 "iteration": global_iteration,
                 "mode": "normal" if revision_route is builder_route else "escalation",
-                "issues": review["issues"],
+                "issues": revision_review["issues"],
             })
             patch = _call_json(
                 self.call_agent,
                 instance=f"patch-{global_iteration}",
-                prompt=patch_prompt(candidate=candidate, issues=review["issues"]),
+                prompt=patch_prompt(candidate=candidate, issues=revision_review["issues"]),
                 paths=_vision_paths(source, reciprocal_reference, rendered, comparison_views),
                 route=revision_route,
                 validate=validate_patch,
@@ -1572,6 +1724,9 @@ class ExactCloneOrchestrator:
                 "iterations": iterations,
                 "cycleComparisons": cycle_comparisons,
                 "accepted": False,
+                "bestCandidate": best_candidate,
+                "bestReview": best_review,
+                "bestIteration": best_iteration,
             })
 
         if accepted_review is None or final_rendered is None:
@@ -1739,6 +1894,9 @@ class ExactCloneOrchestrator:
             "cycleComparisons": cycle_comparisons,
             "accepted": True,
             "finalReview": final_review,
+            "bestCandidate": best_candidate,
+            "bestReview": best_review,
+            "bestIteration": best_iteration,
             "import": imported,
             "smokeTest": smoke,
         })
