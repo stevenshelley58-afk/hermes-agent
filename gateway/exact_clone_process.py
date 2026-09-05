@@ -2096,7 +2096,7 @@ class ExactCloneOrchestrator:
                 break
             if cycle_comparisons >= MAX_COMPARISONS:
                 break
-            revision_route = escalation_route if escalation_iteration else builder_route
+            revision_route = escalation_route if global_iteration >= NORMAL_COMPARISONS else builder_route
             self.emit("iteration.revision-requested", "build", {
                 "iteration": global_iteration,
                 "mode": "normal" if revision_route is builder_route else "escalation",
