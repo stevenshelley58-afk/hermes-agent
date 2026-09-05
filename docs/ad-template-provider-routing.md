@@ -59,9 +59,15 @@ approval in Frank's Ready for Review activates the customer template.
 
 ## Verification status
 
-Source006 pilot: `trun_5ee434b975ac4f188ff0736694f98af7`. Earlier attempts exposed
-source retry loss, loose layout structure, shortened asset paths and cropped Story
-references. This branch addresses those faults. The pilot is not yet complete.
+Source006 current pilot: `trun_f2b0848ec6a14308a4c08cd513422d8c`. The source is
+mapped, without cropping, onto the matching output canvas before OCR/comparison,
+so model coordinates and editable layer coordinates use the same pixel units.
+The first render measured 95.46% pixel similarity, but this is not a likeness
+approval: its best visual score was 9.2 and the six-comparison cycle failed.
+No template from this pilot was activated.
 
-Focused source-only lifecycle, demo-photo reuse and structured-runtime tests:
-43 passed. Live deployment and the final pilot outcome require separate verification.
+Restart checkpoint modes and lifetime budget now survive fresh stage snapshots.
+Fallback patch calls use the operations schema, not the full builder schema.
+Focused checkpoint tests: 34 passed; structured-runtime tests: 9 passed.
+Runtime import root must contain both template and Mini policy code; the gateway
+working directory must not shadow that immutable release with an old checkout.
