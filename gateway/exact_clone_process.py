@@ -2067,12 +2067,24 @@ class ExactCloneOrchestrator:
                         "bestIteration": best_iteration,
                     })
             cycle_comparisons += 1
-            comparison_views = _comparison_views(source, reciprocal_reference, rendered, self.workspace, global_iteration, source_placement, target_placement)
-            metrics = _comparison_metrics(
-                source=source, reciprocal_reference=reciprocal_reference,
-                source_placement=source_placement, target_placement=target_placement,
-                rendered=rendered,
-            )
+            # These deterministic QA products are independent after rendering:
+            # comparison views write disjoint named files while metrics only
+            # reads images.  Keep result collection ordered so artifacts and
+            # subsequent events remain byte-for-byte/order stable.
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ad-template-qa") as executor:
+                views_future = executor.submit(
+                    _comparison_views,
+                    source, reciprocal_reference, rendered, self.workspace,
+                    global_iteration, source_placement, target_placement,
+                )
+                metrics_future = executor.submit(
+                    _comparison_metrics,
+                    source=source, reciprocal_reference=reciprocal_reference,
+                    source_placement=source_placement, target_placement=target_placement,
+                    rendered=rendered,
+                )
+                comparison_views = views_future.result()
+                metrics = metrics_future.result()
             self.emit("iteration.rendered", "render", {
                 "iteration": global_iteration,
                 "previews": [item["name"] for item in rendered["previews"]],
