@@ -45,6 +45,7 @@ from gateway.ad_template_runtime import (
 from gateway.exact_clone_layer_refinement import (
     _candidate_layers,
     build_refinement_batch_contract,
+    build_refinement_contract,
     find_candidate_render,
     refinement_prompt,
     validate_refinement_patch,
@@ -3117,15 +3118,25 @@ class ExactCloneOrchestrator:
             merged_issues = [issue for reviewer in reviewers for issue in reviewer["issues"]]
             if not merged_issues:
                 raise AdTemplateProcessError("final reviewers requested revision without actionable issues")
-            patch, candidate = _call_applied_patch(
+            # Repair through the refinement contract so every explicitly
+            # measured reviewer target is locked and validated; the generic
+            # patch prompt let group shifts be approximated or skipped.
+            repair_contract = build_refinement_contract(
+                candidate,
+                merged_issues,
+                source_placement=source_placement,
+                available_fonts=sorted(AVAILABLE_FONT_FILES),
+            )
+            repair_result = _call_json(
                 self.call_agent,
                 instance="final-merged-patch",
-                prompt=patch_prompt(candidate=candidate, issues=merged_issues),
+                prompt=refinement_prompt(repair_contract),
                 paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
                 route=escalation_route,
-                candidate=candidate,
+                validate=lambda value: validate_refinement_patch(value, contract=repair_contract),
                 emit=self.emit,
             )
+            candidate = apply_patch(candidate, repair_result)
             global_iteration += 1
             iteration_root = self.workspace / "iterations" / f"{global_iteration:02d}"
             qa_candidate, qa_asset_overrides = build_ephemeral_qa_candidate(
