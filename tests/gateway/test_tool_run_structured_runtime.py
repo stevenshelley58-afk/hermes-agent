@@ -196,6 +196,64 @@ def test_multimodal_role_input_is_native_responses_shape():
     assert "ROLE CONTRACT" in result[0]["content"][0]["text"]
 
 
+def test_openai_codex_tool_role_uses_canonical_unbilled_request_shape():
+    from agent.auxiliary_client import CodexAuxiliaryClient
+
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            output=[SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(
+                    type="output_text", text='{"operations":[]}',
+                )],
+            )],
+            usage=SimpleNamespace(
+                input_tokens=17, output_tokens=5, total_tokens=22,
+            ),
+        )
+
+    raw_client = SimpleNamespace(
+        api_key="unbilled-test",
+        base_url="https://chatgpt.com/backend-api/codex",
+        responses=SimpleNamespace(create=create),
+        close=lambda: None,
+    )
+    client = CodexAuxiliaryClient(raw_client, "gpt-5.6-sol")
+    response = ToolRunAPIMixin._tool_codex_response(
+        client,
+        model="gpt-5.6-sol",
+        prompt=[
+            {"type": "text", "text": "return JSON"},
+            {"type": "image_url", "image_url": {
+                "url": "data:image/png;base64,AA==",
+            }},
+        ],
+        role_kind="patch",
+    )
+
+    assert len(calls) == 1
+    request = calls[0]
+    assert request["model"] == "gpt-5.6-sol"
+    assert request["instructions"] == ToolRunAPIMixin._isolated_tool_role_prompt()
+    assert request["store"] is False
+    assert request["stream"] is True
+    assert request["reasoning"]["effort"] == "low"
+    assert request["include"] == ["reasoning.encrypted_content"]
+    assert "max_output_tokens" not in request
+    assert "text" not in request
+    assert "response_format" not in request
+    assert request["input"][0]["role"] == "user"
+    assert [part["type"] for part in request["input"][0]["content"]] == [
+        "input_text", "input_image",
+    ]
+    assert "ROLE CONTRACT" in request["input"][0]["content"][0]["text"]
+    assert ToolRunAPIMixin._tool_response_text(response) == '{"operations":[]}'
+    assert response.usage.total_tokens == 22
+
+
 def test_meta_contributor_usage_has_audited_cost():
     result = ToolRunAPIMixin._tool_response_usage(
         SimpleNamespace(usage=_usage(1_000, 100, 200)),

@@ -1175,7 +1175,7 @@ class ToolRunAPIMixin:
                             durable_before, run_cost_limit, before_call=True,
                         )
                     call_id = f"{run_id}:{instance_id}:{uuid.uuid4().hex}"
-                    from agent.auxiliary_client import OpenAI
+                    from agent.auxiliary_client import CodexAuxiliaryClient, OpenAI
                     from gateway.platforms.api_server import _resolve_request_runtime_agent_kwargs
 
                     runtime = _resolve_request_runtime_agent_kwargs(provider, target_model=model)
@@ -1188,10 +1188,15 @@ class ToolRunAPIMixin:
                     if not api_key or not base_url:
                         raise AdTemplateTransportError("frozen structured role credentials are unavailable")
                     role_kind = self._tool_role_kind(instance_id)
-                    client = OpenAI(
+                    raw_client = OpenAI(
                         api_key=api_key, base_url=base_url,
                         timeout=_AD_TEMPLATE_GENERATOR_RESPONSES_TIMEOUT_SECONDS,
                         max_retries=0,
+                    )
+                    client = (
+                        CodexAuxiliaryClient(raw_client, model)
+                        if provider == "openai-codex"
+                        else raw_client
                     )
                     started_at = time.monotonic()
                     outcome = "error"
@@ -1206,6 +1211,13 @@ class ToolRunAPIMixin:
                         schema_name = "ad_template_generator_" + role_kind.replace("-", "_")
 
                         def create_response():
+                            if provider == "openai-codex":
+                                return self._tool_codex_response(
+                                    client,
+                                    model=model,
+                                    prompt=prompt,
+                                    role_kind=role_kind,
+                                )
                             return client.responses.create(
                                 model=model,
                                 input=self._tool_responses_input(prompt),
@@ -2161,7 +2173,51 @@ class ToolRunAPIMixin:
         return [{"role": "user", "content": content}]
 
     @staticmethod
+    def _tool_codex_messages(prompt: Any) -> List[Dict[str, Any]]:
+        responses_input = ToolRunAPIMixin._tool_responses_input(prompt)
+        isolated_prompt = ToolRunAPIMixin._isolated_tool_role_prompt()
+        content: List[Dict[str, Any]] = []
+        for part in responses_input[0]["content"]:
+            if part["type"] == "input_text":
+                text = part["text"]
+                prefix = isolated_prompt + "\n\n"
+                if text.startswith(prefix):
+                    text = text[len(prefix):]
+                content.append({"type": "text", "text": text})
+            else:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": part["image_url"]},
+                })
+        return [
+            {"role": "system", "content": isolated_prompt},
+            {"role": "user", "content": content},
+        ]
+
+    @staticmethod
+    def _tool_codex_response(
+        client: Any, *, model: str, prompt: Any, role_kind: str,
+    ) -> Any:
+        # The canonical Codex adapter owns the backend-specific Responses shape:
+        # store=false, streaming, no unsupported output cap, and minimal->low.
+        return client.chat.completions.create(
+            model=model,
+            messages=ToolRunAPIMixin._tool_codex_messages(prompt),
+            timeout=_AD_TEMPLATE_GENERATOR_RESPONSES_TIMEOUT_SECONDS,
+            extra_body={"reasoning": {
+                "enabled": True,
+                "effort": "high" if role_kind == "diagnosis" else "minimal",
+            }},
+        )
+
+    @staticmethod
     def _tool_response_text(response: Any) -> str:
+        choices = getattr(response, "choices", None) or []
+        if choices:
+            message = getattr(choices[0], "message", None)
+            content = getattr(message, "content", None)
+            if isinstance(content, str) and content.strip():
+                return content
         output_text = getattr(response, "output_text", None)
         if isinstance(output_text, str) and output_text.strip():
             return output_text
