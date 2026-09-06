@@ -66,6 +66,82 @@ def test_qa_projects_photos_but_keeps_complete_production_logo(tmp_path):
     assert qa["template"]["assets"]["brand"] == template["assets"]["brand"]
 
 
+def _generator_asset_candidate():
+    candidate = {"template": _template(), "assets": []}
+    template = candidate["template"]
+    template["imageInputs"].append({
+        "key": "brand",
+        "label": "Brand",
+        "acceptedTypes": ["image/png"],
+    })
+    for placement in ("feed", "story"):
+        template[f"{placement}Layout"]["layers"].append({
+            "type": "logo",
+            "layerId": f"{placement}-logo",
+            "inputKey": "brand",
+            "geometry": {"x": 80, "y": 80, "width": 240, "height": 120},
+        })
+    declarations = {
+        "hero-default": {
+            "fileName": "exterior/modern-dusk.webp",
+            "mimeType": "image/webp",
+        },
+        "brand-default": {
+            "fileName": "brand/neutral-multi-gable.png",
+            "mimeType": "image/png",
+        },
+    }
+    template["assets"] = copy.deepcopy(declarations)
+    candidate["assets"] = [
+        {"assetKey": key, **value} for key, value in declarations.items()
+    ]
+    template["metadata"]["replacementAssets"] = [
+        {"inputKey": "hero", "assetKey": "hero-default"},
+        {"inputKey": "brand", "assetKey": "brand-default"},
+    ]
+    return candidate
+
+
+def test_demo_assets_adopt_replacement_bindings_and_generate_photo(tmp_path):
+    source = tmp_path / "source.png"
+    Image.new("RGB", (1080, 1350), "white").save(source)
+    generated = tmp_path / "generated.png"
+    Image.new("RGB", (320, 240), "green").save(generated)
+    calls = []
+
+    document, overrides = process.prepare_demo_assets(
+        _generator_asset_candidate(),
+        source=str(source),
+        source_placement="feed",
+        workspace=tmp_path / "run",
+        route={"provider": "test", "model": "image"},
+        call_image_model=lambda *args: calls.append(args) or str(generated),
+        emit=lambda *_args: None,
+    )
+
+    inputs = {
+        item["key"]: item for item in document["template"]["imageInputs"]
+    }
+    assert inputs["hero"]["defaultAssetKey"] == "hero-default"
+    assert inputs["brand"]["defaultAssetKey"] == "brand-default"
+    assert set(overrides) == {"hero-default"}
+    assert len(overrides["hero-default"]) > 100
+    assert len(calls) == 1
+    assert document["template"]["assets"]["brand-default"]["fileName"] == (
+        "brand/neutral-multi-gable.png"
+    )
+
+
+def test_generator_asset_binding_rejects_conflicting_default():
+    candidate = _generator_asset_candidate()
+    candidate["template"]["imageInputs"][0]["defaultAssetKey"] = "brand-default"
+
+    with pytest.raises(
+        process.AdTemplateProcessError, match="conflicts with replacementAssets"
+    ):
+        process._normalize_generator_asset_bindings(candidate)
+
+
 def test_bounded_vision_payload_reuses_unchanged_image_encoding(tmp_path, monkeypatch):
     image_path = tmp_path / "source.png"
     Image.new("RGB", (32, 32), (12, 34, 56)).save(image_path)
@@ -287,6 +363,11 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
         }
 
     monkeypatch.setattr(process, "run_renderer", render)
+    monkeypatch.setattr(
+        process,
+        "prepare_demo_assets",
+        lambda candidate, **_kwargs: (candidate, {}),
+    )
 
     def import_template(output, **_kwargs):
         imported.update(copy.deepcopy(output))

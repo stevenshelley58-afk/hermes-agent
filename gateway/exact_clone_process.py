@@ -1140,9 +1140,129 @@ def build_ephemeral_qa_candidate(
     return _candidate_envelope(qa), override_bytes
 
 
+def _normalize_generator_asset_bindings(
+    candidate: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Bind generator defaults from its declared replacement-asset contract."""
+    document = copy.deepcopy(dict(candidate))
+    template = document.get("template")
+    if not isinstance(template, dict):
+        raise AdTemplateProcessError("generator candidate template is missing")
+    image_inputs = template.get("imageInputs")
+    metadata = template.get("metadata")
+    template_assets = template.get("assets")
+    declarations = document.get("assets")
+    if (
+        not isinstance(image_inputs, list)
+        or not isinstance(metadata, dict)
+        or not isinstance(template_assets, dict)
+        or not isinstance(declarations, list)
+    ):
+        raise AdTemplateProcessError("generator asset bindings are incomplete")
+
+    inputs = {
+        item.get("key"): item
+        for item in image_inputs
+        if isinstance(item, dict) and isinstance(item.get("key"), str)
+    }
+    declared = {
+        item.get("assetKey"): item
+        for item in declarations
+        if isinstance(item, dict) and isinstance(item.get("assetKey"), str)
+    }
+    replacements = metadata.get("replacementAssets")
+    if replacements is None:
+        replacements = []
+    if not isinstance(replacements, list):
+        raise AdTemplateProcessError("replacementAssets must be a list")
+    replacement_by_input: Dict[str, str] = {}
+    for replacement in replacements:
+        if not isinstance(replacement, dict):
+            raise AdTemplateProcessError("replacementAssets entry is invalid")
+        input_key = replacement.get("inputKey")
+        asset_key = replacement.get("assetKey")
+        if (
+            not isinstance(input_key, str)
+            or not input_key
+            or not isinstance(asset_key, str)
+            or not asset_key
+        ):
+            raise AdTemplateProcessError(
+                "replacementAssets requires inputKey and assetKey"
+            )
+        if input_key in replacement_by_input:
+            raise AdTemplateProcessError(
+                f"replacementAssets conflicts for input {input_key}"
+            )
+        if input_key not in inputs or asset_key not in template_assets or asset_key not in declared:
+            raise AdTemplateProcessError(
+                f"replacementAssets binding is undeclared for input {input_key}"
+            )
+        replacement_by_input[input_key] = asset_key
+
+    referenced_types: Dict[str, set[str]] = {}
+    for layout_key in ("feedLayout", "storyLayout"):
+        layout = template.get(layout_key)
+        layers = layout.get("layers") if isinstance(layout, dict) else None
+        if not isinstance(layers, list):
+            continue
+        for layer in layers:
+            if not isinstance(layer, dict) or layer.get("type") not in {"image_slot", "logo"}:
+                continue
+            input_key = layer.get("inputKey")
+            if isinstance(input_key, str):
+                referenced_types.setdefault(input_key, set()).add(layer["type"])
+
+    catalog = _runtime_catalog()
+    for input_key, layer_types in referenced_types.items():
+        input_item = inputs.get(input_key)
+        if not isinstance(input_item, dict):
+            raise AdTemplateProcessError(
+                f"generator layer input {input_key} is undeclared"
+            )
+        mapped_key = replacement_by_input.get(input_key)
+        default_key = input_item.get("defaultAssetKey")
+        if mapped_key is not None and default_key not in {None, mapped_key}:
+            raise AdTemplateProcessError(
+                f"defaultAssetKey conflicts with replacementAssets for input {input_key}"
+            )
+        if default_key is None:
+            default_key = mapped_key
+            if default_key is not None:
+                input_item["defaultAssetKey"] = default_key
+        declaration = declared.get(default_key)
+        template_declaration = template_assets.get(default_key)
+        if not isinstance(declaration, dict) or not isinstance(template_declaration, dict):
+            raise AdTemplateProcessError(
+                f"generator input {input_key} requires a declared default asset"
+            )
+        if (
+            declaration.get("fileName") != template_declaration.get("fileName")
+            or declaration.get("mimeType") != template_declaration.get("mimeType")
+        ):
+            raise AdTemplateProcessError(
+                f"default asset declarations conflict for input {input_key}"
+            )
+        asset = catalog.assets.get(declaration.get("fileName"))
+        if asset is None:
+            raise AdTemplateProcessError(
+                f"generator input {input_key} default is outside the safe catalog"
+            )
+        roles = set(getattr(asset, "roles", ()) or ())
+        if "image_slot" in layer_types and asset.usage != "photo-default":
+            raise AdTemplateProcessError(
+                f"generator photo input {input_key} requires a photo-default asset"
+            )
+        if "logo" in layer_types and not roles.intersection({"logo", "brand_mark"}):
+            raise AdTemplateProcessError(
+                f"generator logo input {input_key} requires a logo asset"
+            )
+    return document
+
+
 def prepare_demo_assets(candidate, *, source, source_placement, workspace, route, call_image_model, emit):
     """Generate photo defaults once; preserve a per-run plan across retries."""
-    document = copy.deepcopy(candidate)
+    document = _normalize_generator_asset_bindings(candidate)
     template = document["template"]
     root = (workspace / "demo-assets").resolve()
     root.mkdir(parents=True, exist_ok=True)
