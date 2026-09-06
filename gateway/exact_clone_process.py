@@ -733,6 +733,25 @@ def _validate_issue(value: Any) -> Dict[str, Any]:
     return copy.deepcopy(value)
 
 
+def _same_font_substitution(reviewer_value: Any, comparator_value: Any) -> bool:
+    """Compare substitution identity without brittle free-text equality.
+
+    When the accepted comparator review documented a substitution, every
+    final reviewer must document the same source/used font pair.  A
+    reviewer that documents a substitution while the comparator matched
+    the source font directly is a reporting difference, not a quality
+    defect; the comparator's stricter typography floor still applies.
+    """
+    if comparator_value is None:
+        return True
+    if not isinstance(reviewer_value, dict):
+        return False
+    return (
+        str(reviewer_value.get("source")) == str(comparator_value.get("source"))
+        and str(reviewer_value.get("used")) == str(comparator_value.get("used"))
+    )
+
+
 def validate_review(value: Any) -> Dict[str, Any]:
     required = {"decision", "scores", "issues", "warnings", "effects", "fontSubstitution"}
     if (
@@ -2952,9 +2971,15 @@ class ExactCloneOrchestrator:
                 for kind, node, data in buffered_events:
                     self.emit(kind, node, data)
                 reviewers.append(reviewer)
+            comparator_font_floor = (
+                TYPOGRAPHY_SUBSTITUTION_THRESHOLD
+                if accepted_review.get("fontSubstitution")
+                else LIKENESS_THRESHOLD
+            )
             accepted = all(
                 item["decision"] == "accept"
-                and item.get("fontSubstitution") == accepted_review.get("fontSubstitution")
+                and item["scores"]["typography"] >= comparator_font_floor
+                and _same_font_substitution(item.get("fontSubstitution"), accepted_review.get("fontSubstitution"))
                 for item in reviewers
             )
             final_review = {"decision": "accepted" if accepted else "revise", "threshold": LIKENESS_THRESHOLD, "round": final_round, "reviewers": reviewers}
