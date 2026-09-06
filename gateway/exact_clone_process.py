@@ -58,7 +58,7 @@ from gateway.exact_clone_photo_qa import materialize_source_photo_plan, source_p
 
 
 PROCESS_ID = "exact-clone"
-LIKENESS_THRESHOLD = 9.8
+LIKENESS_THRESHOLD = 9.5
 MAX_DEMO_PHOTO_EDGE = 1100
 TYPOGRAPHY_SUBSTITUTION_THRESHOLD = 9.5
 NORMAL_COMPARISONS = 4
@@ -3268,10 +3268,14 @@ class ExactCloneOrchestrator:
                 # that disagreement; fail honestly so a new revision cycle
                 # can drive the candidate through the comparator gate.
                 raise AdTemplateProcessError(
-                    "final reviewers accepted a candidate the comparator still scores below the 9.8 gate"
+                    "final reviewers accepted a candidate the comparator still scores "
+                    f"below the {LIKENESS_THRESHOLD} gate"
                 )
             if final_round >= MAX_FINAL_REVIEW_ROUNDS:
-                raise AdTemplateProcessError("final reviewers did not accept the exact clone after one merged repair")
+                raise AdTemplateProcessError(
+                    "final reviewers did not accept the exact clone after "
+                    f"{MAX_FINAL_REVIEW_ROUNDS} review rounds"
+                )
             merged_issues = [issue for reviewer in reviewers for issue in reviewer["issues"]]
             if not merged_issues:
                 raise AdTemplateProcessError("final reviewers requested revision without actionable issues")

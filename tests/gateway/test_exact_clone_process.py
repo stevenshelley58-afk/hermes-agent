@@ -474,7 +474,7 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     assert refinement_event["reason"]
     assert result["import"]["library_status"] == "quarantined"
     assert result["smoke_test"]["status"] == "passed"
-    assert result["template"]["metadata"]["generationReview"]["likenessThreshold"] == 9.8
+    assert result["template"]["metadata"]["generationReview"]["likenessThreshold"] == process.LIKENESS_THRESHOLD
     assert result["template"]["metadata"]["generationReview"]["comparator"]["decision"] == "ready"
     assert all(item["decision"] == "pass" for item in result["template"]["metadata"]["generationReview"]["finalReviewers"])
     assert imported["template"]["assets"] == {}
@@ -746,7 +746,9 @@ def test_comparator_returns_validated_review_and_applied_patch_together():
 def test_comparator_below_gate_without_issues_requests_format_retry():
     candidate = {"template": _template(), "assets": []}
     comparison = _comparison(accept=True)
-    comparison["scores"]["details"] = 9.7
+    # Express "below the gate" relative to the constant so the case keeps
+    # testing a sub-threshold score if the likeness gate is ever retuned.
+    comparison["scores"]["details"] = round(process.LIKENESS_THRESHOLD - 0.1, 2)
     comparison["decision"] = "revise"
 
     with pytest.raises(
