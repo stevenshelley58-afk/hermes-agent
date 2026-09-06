@@ -43,3 +43,19 @@ def test_failed_run_retains_ordered_previews_and_comparator_reasons():
     assert records[0]["comparison"]["reason"] == "Wrong font"
     assert records[1]["previews"] == ["iteration-02-feed.png"]
     assert original["output"] is None
+
+
+def test_ready_run_exposes_final_scores_and_preview_contract():
+    api = ToolRunAPIMixin()
+    api._tool_run_store = SimpleNamespace(provider_usage_totals=lambda run_id: {"api_call_count": 0})
+    original = {"run_id": "run-test", "status": "ready_for_review", "output": {
+        "iterations": [{"iteration": 1, "comparison": {"scores": {"overall": 9.8}, "reason": "Matched"},
+                        "previews": ["iteration-01-feed.png", "iteration-01-story.png"]}],
+    }}
+    record = api._tool_run_monitor_view(original)["output"]["iterations"][0]
+    assert record["comparison"]["score"] == 9.8
+    assert record["candidate"]["previews"] == [
+        {"name": "iteration-01-feed.png", "placement": "feed"},
+        {"name": "iteration-01-story.png", "placement": "story"},
+    ]
+    assert "candidate" not in original["output"]["iterations"][0]

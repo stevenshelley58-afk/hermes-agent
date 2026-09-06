@@ -1533,6 +1533,25 @@ class ToolRunAPIMixin:
                 output = dict(view.get("output") or {})
                 output["iterations"] = [records[key] for key in sorted(records)[-30:]]
                 view["output"] = output
+        output = view.get("output")
+        if isinstance(output, dict) and isinstance(output.get("iterations"), list):
+            normalized = []
+            for raw in output["iterations"][-30:]:
+                if not isinstance(raw, dict):
+                    continue
+                record = dict(raw)
+                comparison = dict(record.get("comparison") or {})
+                if comparison.get("score") is None:
+                    comparison["score"] = (comparison.get("scores") or {}).get("overall")
+                record["comparison"] = comparison
+                previews = []
+                for item in record.get("previews") or []:
+                    name = item.get("name") if isinstance(item, dict) else item
+                    if isinstance(name, str) and re.fullmatch(r"iteration-[0-9]{2}-(feed|story)[.]png", name):
+                        previews.append({"name": name, "placement": self._preview_placement(name)})
+                record["candidate"] = {"previews": previews}
+                normalized.append(record)
+            view["output"] = {**output, "iterations": normalized}
         return view
 
     async def _handle_list_tool_runs(self, request: web.Request) -> web.Response:
