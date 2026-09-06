@@ -871,7 +871,7 @@ def _layer_pointer_map(candidate: Mapping[str, Any]) -> Dict[str, str]:
 
 
 def patch_prompt(*, candidate: Mapping[str, Any], issues: Sequence[Mapping[str, Any]], manual_instructions: str = "") -> str:
-    return f"""Apply only the listed exact-clone corrections to the current valid Blockwise candidate. Do not redesign, regenerate or replace the document. Preserve every field and layer not named by the corrections. Return a bounded JSON patch only: {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}}. Use the exact JSON Pointer map below. For a layer type change, replace the whole layer at its mapped pointer. When changing to a font not already declared, also add its {{"file":"..."}} declaration at /template/fonts/-. Append list items with /- or the current list length; remove multiple list items in descending index order. Do not change schema, templateId, createdAt, asset declarations or source-free asset assignments. Maximum {MAX_PATCH_OPERATIONS} operations. A remove operation omits value; add/replace requires value. Return JSON only.
+    return f"""Apply only the listed exact-clone corrections to the current valid Blockwise candidate. Do not redesign, regenerate or replace the document. Preserve every field and layer not named by the corrections. Return a bounded JSON patch only: {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}}. Use the exact JSON Pointer map below. For a layer type change, replace the whole layer at its mapped pointer. When changing to a font not already declared, also add its {{"file":"..."}} declaration at /template/fonts/-. Append list items with /- or the current list length, EXCEPT full-canvas background frames or plates: insert those at index 1, directly above the plate layer, never on top of the content (a covering background layer blanks the render). Remove multiple list items in descending index order. Do not change schema, templateId, createdAt, asset declarations or source-free asset assignments. Maximum {MAX_PATCH_OPERATIONS} operations. A remove operation omits value; add/replace requires value. Return JSON only.
 
 LAYER POINTERS: {_safe_json(_layer_pointer_map(candidate), max_bytes=40_000)}
 CURRENT CANDIDATE: {_safe_json(candidate)}
@@ -919,9 +919,41 @@ def validate_patch(value: Any) -> Dict[str, Any]:
     return {"operations": normalized}
 
 
+def _reject_covering_overlays(before: Mapping[str, Any], after: Mapping[str, Any]) -> None:
+    """Reject patches that append a full-canvas opaque layer on top.
+
+    The renderer paints layer lists in order and a background-role vector
+    covering the whole canvas silently whites out every layer above its
+    insertion point (exit 0, no warning).  Frames belong directly above
+    the plate layer, like the builder's own feed frame.
+    """
+    for layout_name in ("feedLayout", "storyLayout"):
+        before_layers = ((before.get("template") or {}).get(layout_name) or {}).get("layers") or []
+        after_layers = ((after.get("template") or {}).get(layout_name) or {}).get("layers") or []
+        if len(after_layers) <= len(before_layers):
+            continue
+        before_json = {_safe_json(layer) for layer in before_layers}
+        for index, layer in enumerate(after_layers):
+            if index < 2 or _safe_json(layer) in before_json:
+                continue
+            geometry = layer.get("geometry") or {}
+            width, height = geometry.get("width"), geometry.get("height")
+            if (
+                isinstance(width, (int, float)) and isinstance(height, (int, float))
+                and width >= 900 and height >= 1250
+                and layer.get("colourRole") == "background"
+                and not layer.get("effects", {}).get("fill")
+            ):
+                raise AdTemplateProcessError(
+                    f"revision added full-canvas {layout_name} layer {layer.get('layerId')!r} at z-index {index}; "
+                    "insert it directly above the plate layer (index 1) so it does not cover the content"
+                )
+
+
 def apply_patch(candidate: Mapping[str, Any], value: Any, *, strict: bool = True) -> Dict[str, Any]:
     patch = validate_patch(value)
     result = copy.deepcopy(dict(candidate))
+    before_candidate = copy.deepcopy(result)
     before = _safe_json(result)
     immutable = {
         "schema": result.get("template", {}).get("schema"),
@@ -984,6 +1016,7 @@ def apply_patch(candidate: Mapping[str, Any], value: Any, *, strict: bool = True
         "declarations": result.get("assets"),
     } != immutable:
         raise AdTemplateProcessError("revision patch changed immutable template identity or assets")
+    _reject_covering_overlays(before_candidate, result)
     return _candidate_envelope(result) if strict else _candidate_structure(result)
 
 

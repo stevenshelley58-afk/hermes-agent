@@ -525,6 +525,32 @@ def test_patch_prompt_supplies_exact_layer_pointers_and_array_rules():
 
 
 
+def test_patch_rejects_full_canvas_background_layer_on_top_of_content():
+    candidate = {"template": _template(), "assets": []}
+    covering = {
+        "type": "vector", "layerId": "story_frame", "shape": "rect",
+        "colourRole": "background", "opacity": 1, "cornerRadius": 40,
+        "geometry": {"x": 20, "y": 20, "width": 1040, "height": 1880},
+        "effects": {"stroke": {"colourRole": "secondary", "opacity": 1, "width": 4}},
+    }
+    appended = {
+        "operations": [{"op": "add",
+                        "path": "/template/storyLayout/layers/-",
+                        "value": covering}],
+    }
+    with pytest.raises(process.AdTemplateProcessError, match="full-canvas"):
+        process.apply_patch(candidate, appended)
+
+    inserted = {
+        "operations": [{"op": "add",
+                        "path": "/template/storyLayout/layers/1",
+                        "value": covering}],
+    }
+    patched = process.apply_patch(candidate, inserted)
+    layers = patched["template"]["storyLayout"]["layers"]
+    assert layers[1]["layerId"] == "story_frame"
+
+
 def test_below_gate_review_without_issues_is_rejected_for_repair():
     base = _review(accept=False)
     gate_failure = copy.deepcopy(base)
