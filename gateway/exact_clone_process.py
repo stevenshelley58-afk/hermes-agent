@@ -708,27 +708,9 @@ def _validate_issue(value: Any) -> Dict[str, Any]:
         raise AdTemplateProcessError(
             "review issue instruction requires an actionable numeric, colour, crop or font target"
         )
-    # Measured targets must be renderable, otherwise the bounded refinement
-    # contract becomes impossible to satisfy (the numeric-target lock and the
-    # renderer bound would contradict each other).  Use the same absolute
-    # target pattern as the refinement contract's numeric-target extraction.
-    for match in re.finditer(
-        rf"\b({fields})\b\s*(?:to|=|at|:)\s*(-?\d+(?:\.\d+)?)",
-        instruction,
-        flags=re.IGNORECASE,
-    ):
-        field_name = match.group(1).lower()
-        target = float(match.group(2))
-        if field_name == "tracking" and not -4 <= target <= 4:
-            raise AdTemplateProcessError("review issue tracking target must be between -4 and 4")
-        if field_name == "lineheight" and target < 1:
-            raise AdTemplateProcessError("review issue lineHeight target must be at least 1")
-        if field_name == "fontsize" and target < (32 if placement in {"story", "both"} else 24):
-            raise AdTemplateProcessError("review issue fontSize target is below the placement minimum")
-        if field_name in {"width", "height"} and target <= 0:
-            raise AdTemplateProcessError("review issue size target must be positive")
-        if field_name in {"x", "y"} and target < 0:
-            raise AdTemplateProcessError("review issue position target must be non-negative")
+    # Measured targets are clamped to renderer bounds at refinement-contract
+    # build time, so an out-of-range phrasing converges on the nearest
+    # renderable value instead of creating an impossible contract.
     if value.get("severity") not in {"blocker", "material", "minor"}:
         raise AdTemplateProcessError("review issue severity is invalid")
     return copy.deepcopy(value)

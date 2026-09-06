@@ -139,6 +139,19 @@ def _numeric_targets(
         property_path = _FIELD_PATHS.get(token)
         if property_path and property_path not in targets:
             targets[property_path] = float(match.group(2))
+    # Comparator targets must stay renderable.  Clamp to the renderer
+    # bounds instead of failing: the nearest renderable value preserves
+    # the measured direction of the correction.
+    if "tracking" in targets:
+        targets["tracking"] = max(-4.0, min(4.0, targets["tracking"]))
+    if "lineHeight" in targets:
+        targets["lineHeight"] = max(1.0, targets["lineHeight"])
+    for field in ("geometry/width", "geometry/height"):
+        if field in targets:
+            targets[field] = max(1.0, targets[field])
+    for field in ("geometry/x", "geometry/y"):
+        if field in targets:
+            targets[field] = max(0.0, targets[field])
     delta = re.compile(
         rf"\b({fields})\b[^.;]{{0,24}}?([+-]\d+(?:\.\d+)?)\s*(?:px)?\s*delta",
         flags=re.IGNORECASE,
@@ -237,10 +250,16 @@ def build_refinement_contract(
         ]
         target_values: dict[str, float] = {}
         properties: set[str] = set()
+        placement = layers[layer_id]["placement"]
         for issue in related:
             issue_targets = _numeric_targets(
                 issue, layers[layer_id]["layer"], layer_id
             )
+            if "fontSize" in issue_targets:
+                issue_targets["fontSize"] = max(
+                    32.0 if placement in {"story", "both"} else 24.0,
+                    issue_targets["fontSize"],
+                )
             target_values.update(issue_targets)
             properties.update(_explicit_properties(issue, issue_targets))
         locks[layer_id] = sorted(properties)

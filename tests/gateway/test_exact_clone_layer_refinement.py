@@ -165,6 +165,25 @@ def test_contract_drops_unpatchable_issue_and_keeps_scored_evidence():
     assert contract["unpatchableLayerIds"] == ["story-features"]
 
 
+def test_contract_clamps_out_of_range_measured_targets_to_renderer_bounds():
+    issue = {
+        "placement": "feed",
+        "layerIds": ["feed-features"],
+        "category": "typography",
+        "instruction": "Set tracking to 6 and fontSize to 20 for the features block.",
+        "severity": "material",
+    }
+    contract = build_refinement_contract(
+        _candidate(),
+        [issue],
+        source_placement="feed",
+        available_fonts=[],
+    )
+    targets = contract["layers"]["feed-features"]["numericTargets"]
+    assert targets["tracking"] == 4.0
+    assert targets["fontSize"] == 24.0
+
+
 def test_contract_still_raises_when_no_issue_has_a_structured_target():
     vague = {
         "placement": "feed",

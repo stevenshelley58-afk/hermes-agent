@@ -571,14 +571,14 @@ def test_final_review_font_substitution_uses_identity_not_free_text():
     assert process._same_font_substitution(different_font, comparator_font) is False
 
 
-def test_issue_targets_must_stay_within_renderer_bounds():
+def test_out_of_range_measured_targets_are_clamped_not_fatal():
     base = _review(accept=False)
     issue = copy.deepcopy(base["issues"][0])
     issue["instruction"] = "Set tracking to 6 so the headline matches the source."
     out_of_range = copy.deepcopy(base)
     out_of_range["issues"] = [issue]
-    with pytest.raises(process.AdTemplateProcessError, match="tracking target"):
-        process.validate_review(out_of_range)
+    validated = process.validate_review(out_of_range)
+    assert validated["issues"][0]["instruction"] == issue["instruction"]
 
     vague = copy.deepcopy(base)
     vague_issue = copy.deepcopy(issue)
@@ -594,8 +594,7 @@ def test_issue_targets_must_stay_within_renderer_bounds():
         instruction="Set fontSize to 20 for the story headline to match the source.",
     )
     story_font["issues"] = [font_issue]
-    with pytest.raises(process.AdTemplateProcessError, match="fontSize target"):
-        process.validate_review(story_font)
+    assert process.validate_review(story_font)["decision"] == "revise"
 
     valid = copy.deepcopy(base)
     valid_issue = copy.deepcopy(issue)
