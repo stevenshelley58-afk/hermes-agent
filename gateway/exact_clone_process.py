@@ -1083,12 +1083,19 @@ def apply_patch(candidate: Mapping[str, Any], value: Any, *, strict: bool = True
     return _candidate_envelope(result) if strict else _candidate_structure(result)
 
 
-def validate_comparator_result(value: Any, *, candidate: Mapping[str, Any]) -> Dict[str, Any]:
+def validate_comparator_result(
+    value: Any, *, candidate: Mapping[str, Any], strict_issues: bool = True,
+) -> Dict[str, Any]:
     """Keep valid visual evidence even when a cheap model proposes a bad patch.
 
     A malformed review still receives the existing bounded format retry.  A
     semantically invalid patch does not: the controller can retain the scored
     evidence and route only the correction step to the strong fallback model.
+
+    With ``strict_issues=False`` (the final-repair gate, where issues are
+    informational and the next reviewer round generates its own), vague or
+    unknown-layer issues are dropped into warnings instead of failing the
+    gate; the decision and scores stay fully validated either way.
     """
     review_fields = {
         "decision", "scores", "issues", "warnings", "effects",
@@ -1096,15 +1103,30 @@ def validate_comparator_result(value: Any, *, candidate: Mapping[str, Any]) -> D
     }
     if not isinstance(value, dict) or not review_fields.issubset(value) or not set(value).issubset(review_fields | {"patch"}):
         raise AdTemplateProcessError("comparator result has an invalid shape")
-    review = validate_review({field: value[field] for field in review_fields})
-    if review["decision"] == "revise" and not review["issues"]:
+    review = validate_review(
+        {field: value[field] for field in review_fields},
+        require_actionable_targets=strict_issues,
+    )
+    if not strict_issues:
+        known_layer_ids = set(_candidate_layers(candidate))
+        kept_issues = []
+        for issue in review["issues"]:
+            if all(layer_id in known_layer_ids for layer_id in issue.get("layerIds", [])):
+                kept_issues.append(issue)
+            else:
+                review["warnings"] = list(review.get("warnings") or []) + [
+                    f"comparator issue dropped: unknown layerIds {issue.get('layerIds')}"
+                ]
+        review["issues"] = kept_issues
+    if strict_issues and review["decision"] == "revise" and not review["issues"]:
         raise AdTemplateProcessError(
             "comparison below the 9.8 gate requires actionable issues"
         )
     # Issues drive the layer-refinement contract, so a hallucinated layer ID
     # must be rejected here where the bounded comparator retry can correct
     # it, not later in contract construction where it would discard the
-    # whole comparison.
+    # whole comparison. The final-repair gate drops instead: its issues are
+    # informational and the next reviewer round generates its own.
     known_layer_ids = set(_candidate_layers(candidate))
     unknown_layer_ids = sorted({
         layer_id
@@ -1112,7 +1134,7 @@ def validate_comparator_result(value: Any, *, candidate: Mapping[str, Any]) -> D
         for layer_id in issue.get("layerIds", [])
         if layer_id not in known_layer_ids
     })
-    if unknown_layer_ids:
+    if unknown_layer_ids and strict_issues:
         raise AdTemplateProcessError(
             "review issues reference unknown layer IDs: " + ", ".join(unknown_layer_ids)
         )
@@ -3239,7 +3261,7 @@ class ExactCloneOrchestrator:
                 prompt=review_prompt(final=False, candidate=candidate, reference=reference, metrics=final_metrics),
                 paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
                 route=comparator_route,
-                validate=lambda value: validate_comparator_result(value, candidate=candidate),
+                validate=lambda value: validate_comparator_result(value, candidate=candidate, strict_issues=False),
                 emit=self.emit,
             )
             accepted_review = final_comparator_result["review"]
@@ -3363,7 +3385,14 @@ def validate_exact_clone_output(value: Any, *, require_import: bool) -> Dict[str
     iterations = value.get("iterations")
     if not isinstance(iterations, list) or not iterations:
         raise AdTemplateProcessError("exact-clone output requires comparison history")
-    accepted = validate_review(iterations[-1]["comparison"])
+    # Final-repair comparator records keep informational issues that the
+    # strict compare-loop validation would reject; the accepted 9.8 decision
+    # and scores remain fully validated either way.
+    last_record = iterations[-1]
+    accepted = validate_review(
+        last_record["comparison"],
+        require_actionable_targets=last_record.get("mode") != "final-repair",
+    )
     if accepted["decision"] != "accept":
         raise AdTemplateProcessError("last comparator did not pass the 9.8 gate")
     final = value.get("final_review")
