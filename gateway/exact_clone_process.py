@@ -901,6 +901,45 @@ def validate_patch(value: Any) -> Dict[str, Any]:
     return {"operations": normalized}
 
 
+def _reject_unrenderable_field_values(after: Mapping[str, Any]) -> None:
+    """Enforce the renderer's numeric field bounds on patched templates.
+
+    Blockwise's artifact validation rejects out-of-range values at import
+    time; catching them here routes the patch back through the bounded
+    replan with an explicit reason instead of failing the final import.
+    """
+    for layout_name in ("feedLayout", "storyLayout"):
+        layers = ((after.get("template") or {}).get(layout_name) or {}).get("layers") or []
+        for layer in layers:
+            layer_id = layer.get("layerId")
+            tracking = layer.get("tracking")
+            if isinstance(tracking, (int, float)) and not isinstance(tracking, bool) and not -4 <= float(tracking) <= 4:
+                raise AdTemplateProcessError(
+                    f"{layout_name} layer {layer_id!r} tracking must be between -4 and 4"
+                )
+            line_height = layer.get("lineHeight")
+            if (
+                isinstance(line_height, (int, float)) and not isinstance(line_height, bool)
+                and float(line_height) < 1
+            ):
+                raise AdTemplateProcessError(
+                    f"{layout_name} layer {layer_id!r} lineHeight must be at least 1"
+                )
+            geometry = layer.get("geometry") or {}
+            for field in ("width", "height"):
+                value = geometry.get(field)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and float(value) <= 0:
+                    raise AdTemplateProcessError(
+                        f"{layout_name} layer {layer_id!r} geometry {field} must be positive"
+                    )
+            for field in ("x", "y"):
+                value = geometry.get(field)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and float(value) < 0:
+                    raise AdTemplateProcessError(
+                        f"{layout_name} layer {layer_id!r} geometry {field} must be non-negative"
+                    )
+
+
 def _reject_covering_overlays(before: Mapping[str, Any], after: Mapping[str, Any]) -> None:
     """Reject patches that append a full-canvas opaque layer on top.
 
@@ -998,6 +1037,7 @@ def apply_patch(candidate: Mapping[str, Any], value: Any, *, strict: bool = True
         "declarations": result.get("assets"),
     } != immutable:
         raise AdTemplateProcessError("revision patch changed immutable template identity or assets")
+    _reject_unrenderable_field_values(result)
     _reject_covering_overlays(before_candidate, result)
     return _candidate_envelope(result) if strict else _candidate_structure(result)
 

@@ -525,6 +525,17 @@ def test_patch_prompt_supplies_exact_layer_pointers_and_array_rules():
 
 
 
+def test_patch_rejects_unrenderable_tracking_value_for_replan():
+    candidate = {"template": _template(), "assets": []}
+    out_of_range = {
+        "operations": [{"op": "add",
+                        "path": "/template/feedLayout/layers/1/tracking",
+                        "value": 6}],
+    }
+    with pytest.raises(process.AdTemplateProcessError, match="tracking"):
+        process.apply_patch(candidate, out_of_range)
+
+
 def test_patch_rejects_full_canvas_background_layer_on_top_of_content():
     candidate = {"template": _template(), "assets": []}
     covering = {
