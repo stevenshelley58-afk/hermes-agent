@@ -680,11 +680,32 @@ def _validate_issue(value: Any) -> Dict[str, Any]:
         raise AdTemplateProcessError(
             "review issue instruction requires a concrete field and numeric, colour, crop or font target"
         )
+    # The target must also be actionable by the refinement contract: the
+    # numeric-target extraction ("field to N" / "field ±N px delta"), a font
+    # file, an alignment keyword, a semantic colour hex, or an explicit
+    # effect object.  A vague mention like "tracking tighter than the
+    # current 2 units" extracts zero targets and would leave the bounded
+    # refinement contract nothing to lock.
+    fields = "x|y|width|height|fontSize|lineHeight|tracking|opacity|cornerRadius|rotationDegrees|maxLines|maxCharacters"
+    actionable_target = (
+        re.search(rf"\b({fields})\b\s*(?:to|=|at|:)\s*[-+]?\d", instruction, flags=re.IGNORECASE)
+        or re.search(
+            rf"\b({fields})\b[^.;]{{0,24}}?[+-]\d+(?:\.\d+)?\s*(?:px)?\s*delta",
+            instruction, flags=re.IGNORECASE,
+        )
+        or re.search(r"/fonts/[^\s,]+\.woff2", instruction, re.IGNORECASE)
+        or re.search(r"\balign(?:ment)?\b\s*(?:to|=|at|:)\s*(?:left|center|right)\b", instruction, re.IGNORECASE)
+        or re.search(r"#[0-9a-f]{3,8}\b", instruction, re.IGNORECASE)
+        or re.search(r"\b(?:crop|stroke|shadow|mask|effects?|fill|blendMode)\b", instruction, re.IGNORECASE)
+    )
+    if not actionable_target:
+        raise AdTemplateProcessError(
+            "review issue instruction requires an actionable numeric, colour, crop or font target"
+        )
     # Measured targets must be renderable, otherwise the bounded refinement
     # contract becomes impossible to satisfy (the numeric-target lock and the
     # renderer bound would contradict each other).  Use the same absolute
     # target pattern as the refinement contract's numeric-target extraction.
-    fields = "x|y|width|height|fontSize|lineHeight|tracking|opacity|cornerRadius|rotationDegrees|maxLines|maxCharacters"
     for match in re.finditer(
         rf"\b({fields})\b\s*(?:to|=|at|:)\s*(-?\d+(?:\.\d+)?)",
         instruction,

@@ -534,6 +534,13 @@ def test_issue_targets_must_stay_within_renderer_bounds():
     with pytest.raises(process.AdTemplateProcessError, match="tracking target"):
         process.validate_review(out_of_range)
 
+    vague = copy.deepcopy(base)
+    vague_issue = copy.deepcopy(issue)
+    vague_issue["instruction"] = "Set tracking tighter than the current 2 units to match the source."
+    vague["issues"] = [vague_issue]
+    with pytest.raises(process.AdTemplateProcessError, match="actionable"):
+        process.validate_review(vague)
+
     story_font = copy.deepcopy(base)
     font_issue = copy.deepcopy(issue)
     font_issue.update(
