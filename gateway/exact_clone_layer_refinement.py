@@ -338,14 +338,38 @@ def build_refinement_contract(
         for path in extra_allowed_paths
         if path.startswith("/template/semanticColours/")
     }
-    empty = sorted(
-        layer_id for layer_id, properties in locks.items()
-        if not properties
-        and layers[layer_id]["layer"].get("colourRole") not in extra_roles
-    )
-    if empty:
+    # A selected layer without any structured property target cannot be
+    # patched by the bounded refinement contract.  Drop it (and any issue
+    # that exclusively referenced such layers) while keeping the valid
+    # scored evidence, instead of discarding the whole comparison.
+    dropped_layer_ids: set[str] = set()
+    while True:
+        empty = sorted(
+            layer_id for layer_id, properties in locks.items()
+            if layer_id in selected_ids
+            and not properties
+            and layers[layer_id]["layer"].get("colourRole") not in extra_roles
+        )
+        if not empty:
+            break
+        dropped_layer_ids.update(empty)
+        selected_ids = [
+            layer_id for layer_id in selected_ids
+            if layer_id not in dropped_layer_ids
+        ]
+        surviving = [
+            issue for issue in selected_issues
+            if any(layer_id in selected_ids for layer_id in issue["layerIds"])
+        ]
+        if not surviving or not selected_ids:
+            break
+        selected_issues = surviving
+    if not selected_issues or not selected_ids:
         raise AdTemplateProcessError(
-            "review issue has no structured property target for: " + ", ".join(empty)
+            "review issue has no structured property target for: "
+            + ", ".join(sorted(dropped_layer_ids) or sorted(
+                layer_id for issue in selected_issues for layer_id in issue["layerIds"]
+            ))
         )
 
     declared_fonts = sorted({
@@ -372,6 +396,7 @@ def build_refinement_contract(
         "availableFonts": sorted(set(available_fonts) | set(declared_fonts)),
         "extraAllowedPaths": sorted(set(extra_allowed_paths)),
         "suggestedOperations": suggested_operations,
+        "unpatchableLayerIds": sorted(dropped_layer_ids),
     }
 
 

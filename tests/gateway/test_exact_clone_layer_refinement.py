@@ -103,6 +103,42 @@ def test_contract_rejects_review_invented_layer_id():
         )
 
 
+def test_contract_drops_unpatchable_issue_and_keeps_scored_evidence():
+    patchable, unpatchable = _issues()[0], {
+        "placement": "story",
+        "layerIds": ["story-features"],
+        "category": "details",
+        "instruction": "The story features block should sit better within the card.",
+        "severity": "minor",
+    }
+    contract = build_refinement_contract(
+        _candidate(),
+        [unpatchable, patchable],
+        source_placement="feed",
+        available_fonts=[],
+    )
+    assert contract["issues"] == [patchable]
+    assert contract["layerIds"] == ["feed-features"]
+    assert contract["unpatchableLayerIds"] == ["story-features"]
+
+
+def test_contract_still_raises_when_no_issue_has_a_structured_target():
+    vague = {
+        "placement": "feed",
+        "layerIds": ["feed-features"],
+        "category": "details",
+        "instruction": "The features block should sit better within the card.",
+        "severity": "minor",
+    }
+    with pytest.raises(AdTemplateProcessError, match="no structured property target"):
+        build_refinement_contract(
+            _candidate(),
+            [vague],
+            source_placement="feed",
+            available_fonts=[],
+        )
+
+
 def test_patch_enforces_property_targets_and_freezes_other_layers():
     contract = build_refinement_contract(
         _candidate(),
