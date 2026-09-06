@@ -2911,7 +2911,9 @@ class ExactCloneOrchestrator:
             raise AdTemplateProcessError(f"exact-clone quality loop exhausted {MAX_COMPARISONS} comparisons below 9.8")
         if final_rendered is None:
             # Resumed directly onto an accepted candidate: re-render it so
-            # the final review evidence matches the accepted state.
+            # the final review evidence matches the accepted state, and
+            # record the restored acceptance as the last comparator state.
+            global_iteration += 1
             iteration_root = self.workspace / "iterations" / f"{global_iteration:02d}"
             qa_candidate, qa_asset_overrides = build_ephemeral_qa_candidate(
                 candidate, source=source, reciprocal_reference=reciprocal_reference,
@@ -2931,6 +2933,42 @@ class ExactCloneOrchestrator:
                 source_placement=source_placement, target_placement=target_placement,
                 rendered=final_rendered,
             )
+            iterations.append({
+                "iteration": global_iteration,
+                "cycle_iteration": cycle_comparisons,
+                "mode": "accepted-restored",
+                "decision": "accepted",
+                "comparison": accepted_review,
+                "previews": [item["name"] for item in final_rendered["previews"]],
+                "diffs": [item["name"] for item in final_comparison_views],
+                "metrics": final_metrics,
+                "qaProjectionVersion": QA_PROJECTION_VERSION,
+            })
+            persist_checkpoint(self.workspace, {
+                "reference": reference,
+                "sourceMap": source_map,
+                "targetReferenceMap": target_map,
+                "reciprocalReference": reciprocal_reference,
+                "sourcePlacement": source_placement,
+                "targetPlacement": target_placement,
+                "candidate": candidate,
+                "iterations": iterations,
+                "cycleComparisons": cycle_comparisons,
+                "comparisonBudgetUsed": comparison_budget_used,
+                "accepted": True,
+                "bestCandidate": best_candidate,
+                "bestReview": best_review,
+                "bestIteration": best_iteration,
+            })
+            self.emit("iteration.compared", "compare", {
+                "iteration": global_iteration,
+                "mode": "accepted-restored",
+                "decision": "accept",
+                "score": accepted_review["scores"]["overall"],
+                "scores": accepted_review["scores"],
+                "effects": accepted_review["effects"],
+                "issues": [],
+            })
 
         final_review: Dict[str, Any] | None = None
         candidate, demo_overrides = prepare_demo_assets(
