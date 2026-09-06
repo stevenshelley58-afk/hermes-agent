@@ -3118,6 +3118,11 @@ class ExactCloneOrchestrator:
             candidate, source=source, source_placement=source_placement, workspace=self.workspace,
             route=image_route, call_image_model=self.call_image_model, emit=self.emit,
         )
+        # Best comparator-accepted evidence chain. Repairs advance it when the
+        # comparator accepts and roll back to it when a repair regresses, so a
+        # regressed candidate is never the one the next reviewer round sees.
+        comparator_accepted_candidate = candidate
+        comparator_accepted_review = accepted_review
         production_rendered = run_renderer(
             candidate, self.workspace / f"final-review-production-{global_iteration:02d}",
             asset_overrides=demo_overrides,
@@ -3180,6 +3185,7 @@ class ExactCloneOrchestrator:
             merged_issues = [issue for reviewer in reviewers for issue in reviewer["issues"]]
             if not merged_issues:
                 raise AdTemplateProcessError("final reviewers requested revision without actionable issues")
+            pre_repair_candidate = candidate
             repair_contract = None
             known_layer_ids = set(_candidate_layers(candidate))
             references_unknown_layer = any(
@@ -3287,10 +3293,28 @@ class ExactCloneOrchestrator:
                 "issues": [] if comparator_state_accepted else accepted_review["issues"],
             })
             if not comparator_state_accepted:
+                pre_score = float(comparator_accepted_review["scores"]["overall"])
+                post_score = float(accepted_review["scores"]["overall"])
+                if post_score < pre_score:
+                    # The merged repair regressed the best comparator-accepted
+                    # state; roll back so the next bounded round reviews the
+                    # strongest evidence instead of the regression.
+                    candidate = comparator_accepted_candidate
+                    accepted_review = comparator_accepted_review
+                    comparator_state_accepted = True
+                    self.emit("regression.reverted", "final-check", {
+                        "iteration": global_iteration,
+                        "mode": "final-repair",
+                        "keptScore": pre_score,
+                        "rejectedScore": post_score,
+                    })
+                    continue
                 # The merged repair did not reach the comparator gate yet;
                 # the next bounded round reviews the repaired candidate
                 # instead of discarding the progress.
                 continue
+            comparator_accepted_candidate = candidate
+            comparator_accepted_review = accepted_review
 
         assert final_review is not None
         template = copy.deepcopy(candidate["template"])
