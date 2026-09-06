@@ -1698,6 +1698,32 @@ def test_comparison_budget_is_lifetime_and_manual_revision_is_explicit_reset():
     assert process._comparison_budget_used(explicit_revision, explicit_revision["iterations"]) == 0
 
 
+def test_candidate_envelope_reports_all_undeclared_fonts_for_one_retry():
+    candidate = {"template": _template(), "assets": []}
+    declared = "/fonts/adstudio/poppins-700.woff2"
+    candidate["template"]["fonts"] = [{"file": declared}]
+    candidate["template"]["feedLayout"]["layers"].append({
+        "type": "text", "layerId": "feed-missing-font",
+        "font": {"file": "/fonts/adstudio/didot.woff2"},
+    })
+    candidate["template"]["storyLayout"]["layers"].append({
+        "type": "text", "layerId": "story-invalid-font",
+        "font": {"family": "Manrope"},
+    })
+
+    with pytest.raises(process.AdTemplateRendererRejection) as rejected:
+        process._candidate_envelope(candidate)
+
+    reasons = list(rejected.value.reasons)
+    assert len(reasons) == 2
+    assert "feed-missing-font" in reasons[0]
+    assert "'/fonts/adstudio/didot.woff2'" in reasons[0]
+    assert "story-invalid-font" in reasons[1]
+    assert "None" in reasons[1]
+    assert all("font must be an object with file" in reason for reason in reasons)
+    assert all(f"Current declarations: ['{declared}']" in reason for reason in reasons)
+
+
 def test_font_target_must_be_declared_and_unavailable_targets_are_rejected():
     candidate = {"template": _template(), "assets": []}
     candidate["template"]["fonts"] = [{"file": "/fonts/adstudio/poppins-700.woff2"}]

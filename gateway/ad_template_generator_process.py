@@ -240,7 +240,12 @@ def _candidate_envelope(value: Any) -> Dict[str, Any]:
                 font = layer.get("font")
                 file = font.get("file") if isinstance(font, dict) else None
                 if not isinstance(file, str) or not file.strip() or file not in declared_fonts:
-                    raise AdTemplateProcessError(f"text layer {layer.get('layerId')} requests an undeclared font")
+                    violations.append(
+                        f"text layer {layer.get('layerId')} requests undeclared font {file!r}; "
+                        "font must be an object with file set to an installed catalog font path, "
+                        "and template.fonts must include the identical one-field font declaration. "
+                        f"Current declarations: {sorted(str(value) for value in declared_fonts)}"
+                    )
     if violations:
         raise AdTemplateRendererRejection(violations)
     return candidate
