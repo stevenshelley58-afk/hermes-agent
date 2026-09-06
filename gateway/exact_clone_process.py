@@ -2405,7 +2405,8 @@ class ExactCloneOrchestrator:
             )
             self.emit("candidate.built", "build", {"mode": "initial"})
             persist_checkpoint(self.workspace, {"reference": reference, "sourceMap": source_map, "targetReferenceMap": target_map, "reciprocalReference": reciprocal_reference, "sourcePlacement": source_placement, "targetPlacement": target_placement, "candidate": candidate, "iterations": iterations, "cycleComparisons": cycle_comparisons})
-        elif manual_instructions:
+        manual_revision_pending = bool(manual_instructions)
+        if manual_instructions:
             manual_issue = [{"placement": "both", "layerIds": ["operator-selected"], "category": "details", "instruction": manual_instructions, "severity": "material"}]
             patch, candidate = _call_applied_patch(
                 self.call_agent,
@@ -2424,6 +2425,20 @@ class ExactCloneOrchestrator:
             self.emit("candidate.patch-applied", "build", {"source": "manual-review", "operations": len(patch["operations"])})
 
         accepted_review: Dict[str, Any] | None = None
+        if (
+            best_candidate is not None and best_review is not None
+            and best_review["decision"] == "accept"
+            and not manual_revision_pending
+        ):
+            # The active cycle already produced an accepted candidate before
+            # the last interruption; continue to final review instead of
+            # spending another comparison on the same candidate.
+            accepted_review = best_review
+            candidate = copy.deepcopy(best_candidate)
+            self.emit("iteration.accepted-restored", "compare", {
+                "iteration": best_iteration,
+                "score": best_review["scores"]["overall"],
+            })
         normalized_candidate = _canonical_catalog_paths(candidate)
         if normalized_candidate != candidate:
             candidate = normalized_candidate
@@ -2449,7 +2464,7 @@ class ExactCloneOrchestrator:
             candidate, source=source, source_placement=source_placement, workspace=self.workspace,
             route=image_route, call_image_model=self.call_image_model, emit=self.emit,
         )
-        while comparison_budget_used < MAX_COMPARISONS:
+        while comparison_budget_used < MAX_COMPARISONS and accepted_review is None:
             self._check_stop()
             global_iteration += 1
             escalation_iteration = cycle_comparisons + 1 > NORMAL_COMPARISONS
@@ -2873,8 +2888,30 @@ class ExactCloneOrchestrator:
                 "bestIteration": best_iteration,
             })
 
-        if accepted_review is None or final_rendered is None:
+        if accepted_review is None:
             raise AdTemplateProcessError(f"exact-clone quality loop exhausted {MAX_COMPARISONS} comparisons below 9.8")
+        if final_rendered is None:
+            # Resumed directly onto an accepted candidate: re-render it so
+            # the final review evidence matches the accepted state.
+            iteration_root = self.workspace / "iterations" / f"{global_iteration:02d}"
+            qa_candidate, qa_asset_overrides = build_ephemeral_qa_candidate(
+                candidate, source=source, reciprocal_reference=reciprocal_reference,
+                source_placement=source_placement, source_map=source_map,
+                target_map=target_map, workspace=iteration_root,
+            )
+            final_rendered = _copy_public_previews(
+                run_renderer(qa_candidate, iteration_root, asset_overrides={**demo_overrides, **qa_asset_overrides}),
+                self.workspace, global_iteration,
+            )
+            final_comparison_views = _comparison_views(
+                source, reciprocal_reference, final_rendered, self.workspace,
+                global_iteration, source_placement, target_placement,
+            )
+            final_metrics = _comparison_metrics(
+                source=source, reciprocal_reference=reciprocal_reference,
+                source_placement=source_placement, target_placement=target_placement,
+                rendered=final_rendered,
+            )
 
         final_review: Dict[str, Any] | None = None
         candidate, demo_overrides = prepare_demo_assets(
@@ -2980,6 +3017,7 @@ class ExactCloneOrchestrator:
                 "previews": [item["name"] for item in final_rendered["previews"]],
                 "diffs": [item["name"] for item in final_comparison_views],
                 "metrics": final_metrics,
+                "qaProjectionVersion": QA_PROJECTION_VERSION,
             })
             self.emit("iteration.compared", "compare", {
                 "iteration": global_iteration,
