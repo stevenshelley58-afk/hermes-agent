@@ -921,7 +921,11 @@ def _reject_unrenderable_field_values(after: Mapping[str, Any]) -> None:
     """
     for layout_name in ("feedLayout", "storyLayout"):
         layers = ((after.get("template") or {}).get(layout_name) or {}).get("layers") or []
-        for layer in layers:
+        for index, layer in enumerate(layers):
+            if not isinstance(layer, dict):
+                raise AdTemplateProcessError(
+                    f"{layout_name} layer at index {index} must be an object"
+                )
             layer_id = layer.get("layerId")
             tracking = layer.get("tracking")
             if isinstance(tracking, (int, float)) and not isinstance(tracking, bool) and not -4 <= float(tracking) <= 4:
@@ -968,6 +972,10 @@ def _reject_covering_overlays(before: Mapping[str, Any], after: Mapping[str, Any
         for index, layer in enumerate(after_layers):
             if index < 2 or _safe_json(layer) in before_json:
                 continue
+            if not isinstance(layer, dict):
+                raise AdTemplateProcessError(
+                    f"{layout_name} layer at index {index} must be an object"
+                )
             geometry = layer.get("geometry") or {}
             width, height = geometry.get("width"), geometry.get("height")
             if (

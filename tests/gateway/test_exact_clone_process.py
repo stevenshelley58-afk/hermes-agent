@@ -536,6 +536,17 @@ def test_patch_rejects_unrenderable_tracking_value_for_replan():
         process.apply_patch(candidate, out_of_range)
 
 
+def test_patch_rejects_non_object_layer_for_replan():
+    candidate = {"template": _template(), "assets": []}
+    flattened = {
+        "operations": [{"op": "replace",
+                        "path": "/template/feedLayout/layers/1",
+                        "value": "feed_hero"}],
+    }
+    with pytest.raises(process.AdTemplateProcessError, match="must be an object"):
+        process.apply_patch(candidate, flattened)
+
+
 def test_patch_rejects_full_canvas_background_layer_on_top_of_content():
     candidate = {"template": _template(), "assets": []}
     covering = {
