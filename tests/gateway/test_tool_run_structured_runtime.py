@@ -56,7 +56,13 @@ def test_roles_use_distinct_strict_response_schemas():
 def test_patch_fallback_uses_operations_schema_not_full_builder_envelope():
     import jsonschema
     import pytest
-    for role in ("patch-fallback-2", "contract-repair-1-1", "manual-revision-1"):
+    for role in (
+        "patch-fallback-2",
+        "contract-repair-1-1",
+        "manual-revision-1",
+        "layer-refinement-2",
+        "layer-refinement-2-format-retry",
+    ):
         schema = ToolRunAPIMixin._tool_role_json_schema(role)
         assert schema["required"] == ["operations"]
         jsonschema.validate({"operations": [{"op": "replace", "path": "/template/feedLayout/layers/0/geometry/y", "value": 48}]}, schema)

@@ -249,9 +249,15 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
                 value=f"comparator-patch-{comparison_count}",
             )
             if not result["decision"] == "accept":
+                target_width = 1080 - comparison_count
                 result["issues"][0]["instruction"] = (
-                    f"Set width to {1080 - comparison_count}px."
+                    f"Set width to {target_width}px."
                 )
+                result["patch"] = {"operations": [{
+                    "op": "replace",
+                    "path": "/template/feedLayout/layers/1/geometry/width",
+                    "value": target_width,
+                }]}
             score = {1: 9.0, 2: 9.2, 3: 7.1, 4: 9.4, 5: 9.6, 6: 9.8}[comparison_count]
             result["scores"] = {key: score for key in result["scores"]}
             return result
@@ -317,7 +323,7 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     assert comparison_count == process.MAX_COMPARISONS == 6
     assert fallback_patch_count == 0
     assert contract_repair_count == 1
-    assert layer_refinement_count == 5
+    assert layer_refinement_count == 1
     regression = next(data for kind, _, data in emitted if kind == "regression.reverted")
     assert regression == {
         "from_iteration": 3, "from_score": 7.1,
@@ -327,25 +333,33 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
         route for instance, route in agent_calls
         if instance.startswith("layer-refinement-")
     ]
-    assert refinement_routes[:3] == ["openai-codex/builder"] * 3
-    assert refinement_routes[3:] == ["openai-codex/escalation"] * 2
+    assert refinement_routes == ["openai-codex/builder"]
     comparator_routes = [route for instance, route in agent_calls if instance.startswith("comparator-")]
     assert comparator_routes[:4] == ["openai-codex/comparator"] * 4
     assert comparator_routes[4:] == ["openai-codex/escalation"] * 2
-    assert len(refinement_evidence) == 5
+    assert len(refinement_evidence) == 1
     refinement_text = refinement_evidence[0][0]["text"]
     refinement_paths = refinement_evidence[0][1]["paths"]
     assert "property from the contract" in refinement_text
     assert Path(refinement_paths[0]).name == "source-crop.png"
     assert Path(refinement_paths[1]).name == "candidate-crop.png"
-    assert any(Path(path).name == "iteration-01-feed.png" for path in refinement_paths)
+    assert any(
+        Path(path).name.startswith("iteration-")
+        and Path(path).name.endswith("-feed.png")
+        for path in refinement_paths
+    )
 
     assert len([name for name, _ in agent_calls if name.startswith("final-reviewer-")]) == 2
-    assert len(agent_calls) == 16
+    assert len(agent_calls) == 12
+    patch_events = [
+        data for kind, _, data in emitted if kind == "candidate.patch-applied"
+    ]
+    assert sum(data.get("source") == "layer-refinement" for data in patch_events) == 1
+    assert sum(data.get("source") == "iteration-comparator" for data in patch_events) == 4
     assert sum(
-        data.get("source") == "layer-refinement"
-        for kind, _, data in emitted if kind == "candidate.patch-applied"
-    ) == 5
+        data.get("mode") == "comparator-patch-validated"
+        for kind, _, data in emitted if kind == "iteration.revision-requested"
+    ) == 4
     refinement_event = next(
         data for kind, _, data in emitted
         if kind == "iteration.revision-requested"

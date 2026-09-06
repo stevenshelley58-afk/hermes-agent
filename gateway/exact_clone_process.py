@@ -2485,10 +2485,6 @@ class ExactCloneOrchestrator:
                 break
             if comparison_budget_used >= MAX_COMPARISONS:
                 break
-            if layer_refinement_budget_used >= MAX_COMPARISONS:
-                raise AdTemplateProcessError(
-                    f"exact-clone layer refinement exhausted {MAX_COMPARISONS} bounded calls"
-                )
             contract = build_refinement_batch_contract(
                 candidate,
                 revision_review["issues"],
@@ -2528,35 +2524,11 @@ class ExactCloneOrchestrator:
                     "crop": crop_box,
                     "index": group_index,
                 })
-            layer_refinement_budget_used += 1
-            persist_checkpoint(
-                self.workspace,
-                {"layerRefinementBudgetUsed": layer_refinement_budget_used},
-                merge=True,
-            )
             revision_route = (
                 escalation_route
                 if cycle_comparisons >= NORMAL_COMPARISONS
                 else builder_route
             )
-            self.emit("iteration.revision-requested", "build", {
-                "iteration": global_iteration,
-                "mode": "layer-refinement",
-                "route": f"{revision_route.get('provider')}/{revision_route.get('model')}",
-                "reason": fallback_reason or revision_review["reason"],
-                "issues": contract["issues"],
-                "group": [
-                    item["placement"] for item in group_evidence
-                ],
-                "groupCount": len(group_evidence),
-                "remainingIssueCount": contract["remainingIssueCount"],
-                "layerIds": contract["layerIds"],
-                "propertyLocks": {
-                    layer_id: item["allowedProperties"]
-                    for layer_id, item in contract["layers"].items()
-                },
-                "crop": [item["crop"] for item in group_evidence],
-            })
 
             def validate_refined_candidate(value: Any) -> Dict[str, Any]:
                 validated_patch = validate_refinement_patch(
@@ -2604,18 +2576,79 @@ class ExactCloneOrchestrator:
                     "inkChecks": ink_checks,
                 }
 
-            refined = _call_json(
-                self.call_agent,
-                instance=f"layer-refinement-{global_iteration}",
-                prompt=refinement_prompt(contract),
-                paths=[*crop_paths, *revision_paths],
-                route=revision_route,
-                validate=validate_refined_candidate,
-                emit=self.emit,
-            )
+            direct_patch = {
+                "operations": copy.deepcopy(contract["suggestedOperations"])
+            }
+            refined: Dict[str, Any] | None = None
+            direct_error: str | None = None
+            if direct_patch["operations"]:
+                try:
+                    refined = validate_refined_candidate(direct_patch)
+                except (AdTemplateProcessError, AdTemplateStructuredOutputError) as exc:
+                    direct_error = str(exc)
+
+            revision_event = {
+                "iteration": global_iteration,
+                "reason": fallback_reason or revision_review["reason"],
+                "issues": contract["issues"],
+                "group": [
+                    item["placement"] for item in group_evidence
+                ],
+                "groupCount": len(group_evidence),
+                "remainingIssueCount": contract["remainingIssueCount"],
+                "layerIds": contract["layerIds"],
+                "propertyLocks": {
+                    layer_id: item["allowedProperties"]
+                    for layer_id, item in contract["layers"].items()
+                },
+                "crop": [item["crop"] for item in group_evidence],
+            }
+            if refined is not None:
+                patch_source = "iteration-comparator"
+                revision_event["mode"] = "comparator-patch-validated"
+            else:
+                if layer_refinement_budget_used >= MAX_COMPARISONS:
+                    raise AdTemplateProcessError(
+                        "exact-clone layer refinement exhausted "
+                        f"{MAX_COMPARISONS} bounded calls"
+                    )
+                layer_refinement_budget_used += 1
+                persist_checkpoint(
+                    self.workspace,
+                    {"layerRefinementBudgetUsed": layer_refinement_budget_used},
+                    merge=True,
+                )
+                revision_event.update({
+                    "mode": "layer-refinement",
+                    "route": (
+                        f"{revision_route.get('provider')}/"
+                        f"{revision_route.get('model')}"
+                    ),
+                })
+                if direct_error:
+                    revision_event["reason"] = (
+                        "bounded comparator patch failed validation: "
+                        + direct_error
+                    )
+                self.emit(
+                    "iteration.revision-requested", "build", revision_event
+                )
+                refined = _call_json(
+                    self.call_agent,
+                    instance=f"layer-refinement-{global_iteration}",
+                    prompt=refinement_prompt(contract),
+                    paths=[*crop_paths, *revision_paths],
+                    route=revision_route,
+                    validate=validate_refined_candidate,
+                    emit=self.emit,
+                )
+                patch_source = "layer-refinement"
+            if patch_source == "iteration-comparator":
+                self.emit(
+                    "iteration.revision-requested", "build", revision_event
+                )
             patch = refined["patch"]
             candidate = refined["candidate"]
-            patch_source = "layer-refinement"
             record["refinement"] = {
                 "groups": [
                     {
