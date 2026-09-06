@@ -31,6 +31,19 @@ def fixture(tmp_path, monkeypatch):
     return candidate, generated, arguments
 
 
+def test_demo_photos_are_capped_to_the_import_safe_resolution(tmp_path):
+    big = tmp_path / "photo.png"
+    Image.new("RGB", (2400, 1600), "white").save(big, format="PNG")
+    process._normalize_demo_photo(big)
+    with Image.open(big) as capped:
+        assert max(capped.width, capped.height) == process.MAX_DEMO_PHOTO_EDGE
+    small = tmp_path / "small.png"
+    Image.new("RGB", (900, 600), "white").save(small, format="PNG")
+    before = small.read_bytes()
+    process._normalize_demo_photo(small)
+    assert small.read_bytes() == before
+
+
 def test_demo_assets_resume_once_and_do_not_mutate_candidate(tmp_path, monkeypatch):
     candidate, generated, args = fixture(tmp_path, monkeypatch)
     original = copy.deepcopy(candidate)

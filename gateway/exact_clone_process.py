@@ -58,6 +58,7 @@ from gateway.exact_clone_photo_qa import materialize_source_photo_plan, source_p
 
 PROCESS_ID = "exact-clone"
 LIKENESS_THRESHOLD = 9.8
+MAX_DEMO_PHOTO_EDGE = 1100
 TYPOGRAPHY_SUBSTITUTION_THRESHOLD = 9.5
 NORMAL_COMPARISONS = 4
 ESCALATION_COMPARISONS = 2
@@ -1317,6 +1318,27 @@ def _normalize_generator_asset_bindings(
     return document
 
 
+def _normalize_demo_photo(path: Path) -> None:
+    """Cap generated photo resolution so run payloads stay importable.
+
+    Four full-resolution generated PNGs exceed Blockwise's 10MB request
+    body limit once base64-encoded.  The renderer canvas is 1080px wide
+    and no demo slot is larger, so capping the longest edge loses no
+    rendered detail."""
+    with Image.open(path) as photo:
+        photo.load()
+        if max(photo.width, photo.height) <= MAX_DEMO_PHOTO_EDGE:
+            return
+        scale = MAX_DEMO_PHOTO_EDGE / max(photo.width, photo.height)
+        resized = photo.resize(
+            (max(1, round(photo.width * scale)), max(1, round(photo.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+    temporary = path.with_suffix(".tmp")
+    resized.convert("RGB").save(temporary, format="PNG", optimize=True)
+    os.replace(temporary, path)
+
+
 def prepare_demo_assets(candidate, *, source, source_placement, workspace, route, call_image_model, emit):
     """Generate photo defaults once; preserve a per-run plan across retries."""
     root = (workspace / "demo-assets").resolve()
@@ -1402,9 +1424,11 @@ def prepare_demo_assets(candidate, *, source, source_placement, workspace, route
                 ImageOps.exif_transpose(generated).convert("RGB").save(temporary, format="PNG", optimize=True)
                 os.replace(temporary, target)
             pending.unlink()
+            _normalize_demo_photo(target)
             emit("asset.generated", "build", {"assetKey": key, "fileName": item["file"]})
         with Image.open(target) as verified:
             verified.verify()
+        _normalize_demo_photo(target)
         overrides[key] = target.read_bytes()
         declaration = {"fileName": f"demo/{item['file']}", "mimeType": "image/png"}
         template["assets"][key] = declaration
