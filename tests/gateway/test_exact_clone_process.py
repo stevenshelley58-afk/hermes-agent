@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import re
 import threading
 from pathlib import Path
 
@@ -117,7 +118,7 @@ def _review(*, accept: bool) -> dict:
     score = 9.8 if accept else 9.2
     issue = [] if accept else [{
         "placement": "feed",
-        "layerIds": ["feed-title"],
+        "layerIds": ["feed-hero"],
         "category": "geometry",
         "instruction": "Set x to 102px (a +2px delta)",
         "severity": "material",
@@ -168,7 +169,8 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     comparison_count = 0
     fallback_patch_count = 0
     contract_repair_count = 0
-    fallback_evidence: list[list[dict]] = []
+    layer_refinement_count = 0
+    refinement_evidence: list[list[dict]] = []
     renderer_rejected = False
     emitted: list[tuple[str, str, dict]] = []
     final_review_barrier = threading.Barrier(2)
@@ -198,7 +200,7 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
         return str(target)
 
     def call_agent(instance, prompt, route):
-        nonlocal comparison_count, fallback_patch_count, contract_repair_count
+        nonlocal comparison_count, fallback_patch_count, contract_repair_count, layer_refinement_count
         agent_calls.append((instance, route))
         if instance.startswith("aspect-reference"):
             return {
@@ -227,12 +229,29 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
                 "op": "replace", "path": "/template/metadata/description",
                 "value": f"fallback-patch-{fallback_patch_count}",
             }]}
+        if instance.startswith("layer-refinement-"):
+            layer_refinement_count += 1
+            refinement_evidence.append(copy.deepcopy(prompt))
+            target = re.search(
+                r'"numericTargets":\{"geometry/width":(\d+(?:\.\d+)?)',
+                prompt[0]["text"],
+            )
+            assert target is not None
+            return {"operations": [{
+                "op": "replace",
+                "path": "/template/feedLayout/layers/1/geometry/width",
+                "value": float(target.group(1)),
+            }]}
         if instance.startswith("comparator-"):
             comparison_count += 1
             result = _comparison(
                 accept=comparison_count == 6,
                 value=f"comparator-patch-{comparison_count}",
             )
+            if not result["decision"] == "accept":
+                result["issues"][0]["instruction"] = (
+                    f"Set width to {1080 - comparison_count}px."
+                )
             score = {1: 9.0, 2: 9.2, 3: 7.1, 4: 9.4, 5: 9.6, 6: 9.8}[comparison_count]
             result["scores"] = {key: score for key in result["scores"]}
             return result
@@ -296,33 +315,47 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     assert order == ["source-map"]
     assert image_calls == []  # Image models are reserved for photo assets.
     assert comparison_count == process.MAX_COMPARISONS == 6
-    assert fallback_patch_count == 1
+    assert fallback_patch_count == 0
     assert contract_repair_count == 1
+    assert layer_refinement_count == 5
     regression = next(data for kind, _, data in emitted if kind == "regression.reverted")
     assert regression == {
         "from_iteration": 3, "from_score": 7.1,
         "to_iteration": 2, "to_score": 9.2,
     }
-    patch_routes = [route for instance, route in agent_calls if instance.startswith("patch-fallback-")]
-    assert patch_routes == ["openai-codex/builder"]
+    refinement_routes = [
+        route for instance, route in agent_calls
+        if instance.startswith("layer-refinement-")
+    ]
+    assert refinement_routes[:3] == ["openai-codex/builder"] * 3
+    assert refinement_routes[3:] == ["openai-codex/escalation"] * 2
     comparator_routes = [route for instance, route in agent_calls if instance.startswith("comparator-")]
     assert comparator_routes[:4] == ["openai-codex/comparator"] * 4
     assert comparator_routes[4:] == ["openai-codex/escalation"] * 2
-    assert len(fallback_evidence) == 1
-    fallback_text = fallback_evidence[0][0]["text"]
-    fallback_paths = fallback_evidence[0][1]["paths"]
-    assert '"description":"comparator-patch-1"' in fallback_text
-    assert any(Path(path).name == "iteration-02-feed.png" for path in fallback_paths)
-    assert any(Path(path).name == "iteration-02-story.png" for path in fallback_paths)
-    assert any(Path(path).name.endswith("-overlay.png") for path in fallback_paths)
-    assert not any(Path(path).name.startswith("iteration-03-") for path in fallback_paths)
+    assert len(refinement_evidence) == 5
+    refinement_text = refinement_evidence[0][0]["text"]
+    refinement_paths = refinement_evidence[0][1]["paths"]
+    assert "property from the contract" in refinement_text
+    assert Path(refinement_paths[0]).name == "source-crop.png"
+    assert Path(refinement_paths[1]).name == "candidate-crop.png"
+    assert any(Path(path).name == "iteration-01-feed.png" for path in refinement_paths)
 
     assert len([name for name, _ in agent_calls if name.startswith("final-reviewer-")]) == 2
-    assert len(agent_calls) == 12
+    assert len(agent_calls) == 16
     assert sum(
-        data.get("source") == "iteration-comparator"
+        data.get("source") == "layer-refinement"
         for kind, _, data in emitted if kind == "candidate.patch-applied"
-    ) == 4
+    ) == 5
+    refinement_event = next(
+        data for kind, _, data in emitted
+        if kind == "iteration.revision-requested"
+        and data.get("mode") == "layer-refinement"
+    )
+    assert refinement_event["layerIds"] == ["feed-hero"]
+    assert refinement_event["propertyLocks"] == {
+        "feed-hero": ["geometry/width"]
+    }
+    assert refinement_event["reason"]
     assert result["import"]["library_status"] == "quarantined"
     assert result["smoke_test"]["status"] == "passed"
     assert result["template"]["metadata"]["generationReview"]["likenessThreshold"] == 9.8
@@ -427,6 +460,33 @@ def test_comparator_returns_validated_review_and_applied_patch_together():
     assert result["patch"]["operations"][0]["path"] == "/template/metadata/description"
     assert result["candidate"]["template"]["metadata"]["description"] == "one-call-revision"
     assert candidate["template"]["metadata"]["description"] == "initial"
+
+
+def test_comparator_below_gate_without_issues_requests_format_retry():
+    candidate = {"template": _template(), "assets": []}
+    comparison = _comparison(accept=True)
+    comparison["scores"]["details"] = 9.7
+    comparison["decision"] = "revise"
+
+    with pytest.raises(
+        process.AdTemplateProcessError, match="requires actionable issues"
+    ):
+        process.validate_comparator_result(comparison, candidate=candidate)
+
+
+def test_review_accepts_concrete_effect_and_mask_targets():
+    for instruction in (
+        "Set shadow blur to 8.",
+        "Set mask to rounded_rect.",
+        "Set blendMode to multiply.",
+        "Set opacity to 0.8.",
+    ):
+        review = _review(accept=False)
+        review["issues"][0].update(
+            category="colourEffects",
+            instruction=instruction,
+        )
+        assert process.validate_review(review)["decision"] == "revise"
 
 
 def test_iteration_comparator_and_final_reviewer_have_distinct_output_contracts():
@@ -541,6 +601,7 @@ def test_partial_checkpoint_update_retains_restart_state_and_explicit_removal(tm
         "reference": reference,
         "iterations": iterations,
         "comparisonBudgetUsed": 4,
+        "layerRefinementBudgetUsed": 3,
         "candidate": {"revision": "before"},
     })
 
@@ -554,6 +615,7 @@ def test_partial_checkpoint_update_retains_restart_state_and_explicit_removal(tm
     assert checkpoint["reference"] == reference
     assert checkpoint["iterations"] == iterations
     assert checkpoint["comparisonBudgetUsed"] == 4
+    assert checkpoint["layerRefinementBudgetUsed"] == 3
     assert checkpoint["candidate"] == {"revision": "canonical"}
 
     process.persist_checkpoint(
@@ -691,6 +753,7 @@ def test_request_manual_revision_invalidates_historical_best_and_persists_bounda
     assert revised["manualStartIteration"] == 6
     assert revised["manualRevision"] == 1
     assert revised["comparisonBudgetUsed"] == 0
+    assert revised["layerRefinementBudgetUsed"] == 0
     assert revised["iterations"] == [{"iteration": 2}, {"iteration": 6}]
     assert not {"bestCandidate", "bestReview", "bestIteration"}.intersection(revised)
 

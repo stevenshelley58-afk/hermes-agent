@@ -42,6 +42,15 @@ from gateway.ad_template_runtime import (
     AdTemplateTransportError,
     vision_message,
 )
+from gateway.exact_clone_layer_refinement import (
+    build_refinement_batch_contract,
+    find_candidate_render,
+    refinement_prompt,
+    validate_refinement_patch,
+    validate_text_ink_regression,
+    write_fixed_crop,
+    write_matching_crops,
+)
 
 
 PROCESS_ID = "exact-clone"
@@ -65,6 +74,7 @@ AVAILABLE_FONT_FILES = frozenset({
     "/fonts/adstudio/manrope-700.woff2",
     "/fonts/adstudio/playfair-display-700.woff2",
     "/fonts/adstudio/cormorant-garamond-700.woff2",
+    "/fonts/adstudio/bodoni-moda-400.woff2",
 })
 SOURCE_MAP_VERSION = 2
 QA_PROJECTION_VERSION = 4
@@ -607,7 +617,7 @@ DIRECT BLOCKWISE CONTRACT:
 - Renderer text constraints: Feed effective font size must be at least 24px; Story at least 32px. Multiline lineHeight must be at least 1. Preserve source geometry and hierarchy within these constraints; do not let text exceed its box or erase contacts.
 - Brandmarks and wordmarks must use a logo layer, never image_slot: preserve the asset aspect ratio and source footprint so the renderer fits the whole mark without cover-cropping it. If the logo asset already contains its wordmark, do not duplicate that wordmark as text unless the source visibly has a separate text element.
 - imageInputs is a list of {{key,label,required?,acceptedTypes,defaultAssetKey?}}. textInputs is a list of {{key,label,placeholder,maxLength}}. Every image/logo/text layer inputKey is declared. Keep neutral reusable placeholders here with lengths close to the source; QA retains these authored strings and only substitutes source photo crops.
-- semanticColours contains exactly background, primary, secondary, accent, mainText, inverseText. assets is an object mapping each assetKey to {{fileName,mimeType}}. fonts is a list of unique {{file}} objects; text layer font.file must be declared. Use matching available font paths such as /fonts/adstudio/poppins-500.woff2, /fonts/adstudio/poppins-700.woff2, /fonts/adstudio/manrope-400.woff2, /fonts/adstudio/manrope-700.woff2, /fonts/adstudio/playfair-display-700.woff2 or /fonts/adstudio/cormorant-garamond-700.woff2.
+- semanticColours contains exactly background, primary, secondary, accent, mainText, inverseText. assets is an object mapping each assetKey to {{fileName,mimeType}}. fonts is a list of unique {{file}} objects; text layer font.file must be declared. Use matching available font paths such as /fonts/adstudio/poppins-500.woff2, /fonts/adstudio/poppins-700.woff2, /fonts/adstudio/manrope-400.woff2, /fonts/adstudio/manrope-700.woff2, /fonts/adstudio/playfair-display-700.woff2, /fonts/adstudio/cormorant-garamond-700.woff2 or /fonts/adstudio/bodoni-moda-400.woff2.
 - Generic body-copy placeholders must preserve the source line count, approximate words per line, and overall text density. Neutralize advertiser identity only; do not shorten dense copy into a sparse slogan.
 - metadata contains exactly title, description, gallerySamples, metaCopyDefaults, aiWritingGuidance, publishRequirements, replacementAssets, realAssetRefs. gallerySamples is {{feed?:{{assetKey?,placement:"feed",purpose}},story?:{{assetKey?,placement:"story",purpose}}}}. metaCopyDefaults is {{primaryText:[],headlines:[],descriptions:[],cta}}. aiWritingGuidance is {{summary,fields}}. publishRequirements is {{objective,specialAdCategory,instantForm:{{required,dependency,defaults?}},destination:{{required,kind,dependency}},fulfilment?,offer?,claims?,requiredCtaTypes}}. replacementAssets is a list of {{inputKey,assetKey,purpose?}}. realAssetRefs is a list of {{inputKey,kind,required}}. Do not create generationReview; the controller adds it after final review.
 - The outer assets list contains exactly one {{assetKey,fileName,mimeType}} declaration for every template.assets entry, with matching values. Never return bytes, hashes, signatures, source paths or a flattened source image.
@@ -638,11 +648,24 @@ def _validate_issue(value: Any) -> Dict[str, Any]:
     if not isinstance(instruction, str) or not instruction.strip() or len(instruction) > 1200:
         raise AdTemplateProcessError("review issue instruction is invalid")
     target_field = re.search(
-        r"\b(?:x|y|width|height|font|fontSize|fontFamily|fontWeight|lineHeight|tracking|colour|color|crop)\b",
+        (
+            r"\b(?:x|y|width|height|font|fontSize|fontFamily|fontWeight|"
+            r"lineHeight|tracking|colour|color|crop|opacity|stroke|shadow|"
+            r"mask|effects?|fill|cornerRadius|rotationDegrees|blendMode|"
+            r"maxLines|maxCharacters|alignment)\b"
+        ),
         instruction,
         flags=re.IGNORECASE,
     )
-    target_value = re.search(r"(?:#[0-9a-f]{3,8}\b|[-+]?\d+(?:\.\d+)?(?:px|%)?|/fonts/\S+)", instruction, flags=re.IGNORECASE)
+    target_value = re.search(
+        (
+            r"(?:#[0-9a-f]{3,8}\b|[-+]?\d+(?:\.\d+)?(?:px|%)?|"
+            r"/fonts/\S+|\b(?:rounded_rect|circle|none|linear_gradient|"
+            r"normal|multiply|screen|overlay|left|center|right)\b)"
+        ),
+        instruction,
+        flags=re.IGNORECASE,
+    )
     if not target_field or not target_value:
         raise AdTemplateProcessError(
             "review issue instruction requires a concrete field and numeric, colour, crop or font target"
@@ -654,7 +677,11 @@ def _validate_issue(value: Any) -> Dict[str, Any]:
 
 def validate_review(value: Any) -> Dict[str, Any]:
     required = {"decision", "scores", "issues", "warnings", "effects", "fontSubstitution"}
-    if not isinstance(value, dict) or set(value) != required:
+    if (
+        not isinstance(value, dict)
+        or not required.issubset(value)
+        or set(value) - required - {"reason"}
+    ):
         raise AdTemplateProcessError("visual review has an invalid shape")
     scores = value.get("scores")
     if not isinstance(scores, dict) or set(scores) != set(SCORE_FIELDS):
@@ -700,8 +727,15 @@ def validate_review(value: Any) -> Dict[str, Any]:
     # The model reports evidence; the controller owns the gate decision.
     # A contradictory label must never fail or accidentally pass a run.
     expected = "accept" if passed else "revise"
+    reason = (
+        "All exact-clone evidence met the 9.8 gate."
+        if passed
+        else "; ".join(issue["instruction"] for issue in normalized_issues[:3])
+        or "One or more exact-clone score/effect gates remain below 9.8."
+    )
     return {
         "decision": expected,
+        "reason": reason,
         "scores": normalized_scores,
         "issues": normalized_issues,
         "warnings": list(warnings),
@@ -883,6 +917,10 @@ def validate_comparator_result(value: Any, *, candidate: Mapping[str, Any]) -> D
     if not isinstance(value, dict) or not review_fields.issubset(value) or not set(value).issubset(review_fields | {"patch"}):
         raise AdTemplateProcessError("comparator result has an invalid shape")
     review = validate_review({field: value[field] for field in review_fields})
+    if review["decision"] == "revise" and not review["issues"]:
+        raise AdTemplateProcessError(
+            "comparison below the 9.8 gate requires actionable issues"
+        )
     raw_patch = value.get("patch")
     if review["decision"] == "accept":
         return {
@@ -1651,6 +1689,7 @@ def persist_checkpoint(
         stable = {}
         for key in (
             "comparisonBudgetUsed",
+            "layerRefinementBudgetUsed",
             "sourceCoordinateMode",
             "referenceMode",
             "manualRevision",
@@ -1693,6 +1732,7 @@ def request_checkpoint_revision(workspace: Path, instructions: str) -> Dict[str,
         finalReview=None,
         cycleComparisons=0,
         comparisonBudgetUsed=0,
+        layerRefinementBudgetUsed=0,
         manualRevision=int(checkpoint.get("manualRevision") or 0) + 1,
         manualStartIteration=manual_start_iteration,
     )
@@ -2148,6 +2188,9 @@ class ExactCloneOrchestrator:
         iterations = list(checkpoint.get("iterations") or [])
         cycle_comparisons = int(checkpoint.get("cycleComparisons") or 0)
         comparison_budget_used = _comparison_budget_used(checkpoint, iterations)
+        layer_refinement_budget_used = max(
+            0, int(checkpoint.get("layerRefinementBudgetUsed") or 0)
+        )
         manual_instructions = str(checkpoint.get("manualInstructions") or "")
         global_iteration = len(iterations)
         best_candidate, best_review, best_iteration = _recover_checkpoint_best(
@@ -2363,6 +2406,7 @@ class ExactCloneOrchestrator:
             iterations.append(record)
             revision_review = review
             revision_paths = _vision_paths(source, reciprocal_reference, rendered, comparison_views)
+            suggested_refinement_patch = comparator_result["patch"]
             fallback_reason: str | None = comparator_result["patchError"]
             if best_candidate is None or best_review is None:
                 best_candidate = copy.deepcopy(candidate)
@@ -2396,6 +2440,7 @@ class ExactCloneOrchestrator:
                             source, reciprocal_reference, restored_rendered, [],
                         )
                     record["regressed"] = True
+                    suggested_refinement_patch = None
                     fallback_reason = "comparison regressed; patch the restored best candidate"
                 elif _review_improved(review, best_review):
                     best_candidate = copy.deepcopy(candidate)
@@ -2403,6 +2448,7 @@ class ExactCloneOrchestrator:
                     best_iteration = global_iteration
                 else:
                     record["plateaued"] = True
+                    suggested_refinement_patch = None
                     fallback_reason = "comparison plateaued; route correction to the strong model"
             self.emit("iteration.compared", "compare", {
                 "iteration": global_iteration,
@@ -2413,6 +2459,7 @@ class ExactCloneOrchestrator:
                 "scores": review["scores"],
                 "effects": review["effects"],
                 "issues": review["issues"],
+                "reason": review["reason"],
             })
             persist_checkpoint(self.workspace, {
                 "reference": reference,
@@ -2438,35 +2485,155 @@ class ExactCloneOrchestrator:
                 break
             if comparison_budget_used >= MAX_COMPARISONS:
                 break
-            comparator_patch = comparator_result["patch"]
-            if fallback_reason is None and comparator_patch is not None:
-                self.emit("iteration.revision-requested", "build", {
-                    "iteration": global_iteration,
-                    "mode": "comparator-patch",
-                    "issues": revision_review["issues"],
-                })
-                patch = comparator_patch
-                candidate = comparator_result["candidate"]
-                patch_source = "iteration-comparator"
-            else:
-                revision_route = escalation_route if cycle_comparisons >= NORMAL_COMPARISONS else builder_route
-                self.emit("iteration.revision-requested", "build", {
-                    "iteration": global_iteration,
-                    "mode": "strong-fallback",
-                    "route": f"{revision_route.get('provider')}/{revision_route.get('model')}",
-                    "reason": fallback_reason or "comparator patch was unavailable",
-                    "issues": revision_review["issues"],
-                })
-                patch, candidate = _call_applied_patch(
-                    self.call_agent,
-                    instance=f"patch-fallback-{global_iteration}",
-                    prompt=patch_prompt(candidate=candidate, issues=revision_review["issues"]),
-                    paths=revision_paths,
-                    route=revision_route,
-                    candidate=candidate,
-                    emit=self.emit,
+            if layer_refinement_budget_used >= MAX_COMPARISONS:
+                raise AdTemplateProcessError(
+                    f"exact-clone layer refinement exhausted {MAX_COMPARISONS} bounded calls"
                 )
-                patch_source = "strong-fallback"
+            contract = build_refinement_batch_contract(
+                candidate,
+                revision_review["issues"],
+                source_placement=source_placement,
+                available_fonts=sorted(AVAILABLE_FONT_FILES),
+                suggested_patch=suggested_refinement_patch,
+            )
+            refinement_root = (
+                self.workspace / "iterations" / f"{global_iteration:02d}"
+                / "layer-refinement"
+            )
+            group_evidence: list[Dict[str, Any]] = []
+            crop_paths: list[str] = []
+            for group_index, group_contract in enumerate(
+                contract["groups"], 1
+            ):
+                group_placement = group_contract["primaryPlacement"]
+                reference_path = (
+                    source
+                    if group_placement == source_placement
+                    else reciprocal_reference
+                )
+                candidate_render = find_candidate_render(
+                    revision_paths, group_placement
+                )
+                group_paths, crop_box = write_matching_crops(
+                    group_contract,
+                    reference_path=reference_path,
+                    candidate_path=candidate_render,
+                    workspace=refinement_root / f"group-{group_index}",
+                )
+                crop_paths.extend(group_paths)
+                group_evidence.append({
+                    "contract": group_contract,
+                    "placement": group_placement,
+                    "paths": group_paths,
+                    "crop": crop_box,
+                    "index": group_index,
+                })
+            layer_refinement_budget_used += 1
+            persist_checkpoint(
+                self.workspace,
+                {"layerRefinementBudgetUsed": layer_refinement_budget_used},
+                merge=True,
+            )
+            revision_route = (
+                escalation_route
+                if cycle_comparisons >= NORMAL_COMPARISONS
+                else builder_route
+            )
+            self.emit("iteration.revision-requested", "build", {
+                "iteration": global_iteration,
+                "mode": "layer-refinement",
+                "route": f"{revision_route.get('provider')}/{revision_route.get('model')}",
+                "reason": fallback_reason or revision_review["reason"],
+                "issues": contract["issues"],
+                "group": [
+                    item["placement"] for item in group_evidence
+                ],
+                "groupCount": len(group_evidence),
+                "remainingIssueCount": contract["remainingIssueCount"],
+                "layerIds": contract["layerIds"],
+                "propertyLocks": {
+                    layer_id: item["allowedProperties"]
+                    for layer_id, item in contract["layers"].items()
+                },
+                "crop": [item["crop"] for item in group_evidence],
+            })
+
+            def validate_refined_candidate(value: Any) -> Dict[str, Any]:
+                validated_patch = validate_refinement_patch(
+                    value, contract=contract
+                )
+                updated_candidate = apply_patch(candidate, validated_patch)
+                verification_root = refinement_root / "verification"
+                verification_qa, verification_overrides = build_ephemeral_qa_candidate(
+                    updated_candidate,
+                    source=source,
+                    reciprocal_reference=reciprocal_reference,
+                    source_placement=source_placement,
+                    source_map=source_map,
+                    target_map=target_map,
+                    workspace=verification_root,
+                )
+                verification_rendered = run_renderer(
+                    verification_qa,
+                    verification_root,
+                    asset_overrides={
+                        **demo_overrides, **verification_overrides
+                    },
+                )
+                ink_checks = []
+                for evidence in group_evidence:
+                    after_crop = write_fixed_crop(
+                        verification_rendered["render"][evidence["placement"]],
+                        placement=evidence["placement"],
+                        box=evidence["crop"],
+                        target=(
+                            refinement_root
+                            / f"group-{evidence['index']}"
+                            / "after-crop.png"
+                        ),
+                    )
+                    ink_checks.append(validate_text_ink_regression(
+                        evidence["contract"],
+                        source_crop=evidence["paths"][0],
+                        before_crop=evidence["paths"][1],
+                        after_crop=after_crop,
+                    ))
+                return {
+                    "patch": validated_patch,
+                    "candidate": updated_candidate,
+                    "inkChecks": ink_checks,
+                }
+
+            refined = _call_json(
+                self.call_agent,
+                instance=f"layer-refinement-{global_iteration}",
+                prompt=refinement_prompt(contract),
+                paths=[*crop_paths, *revision_paths],
+                route=revision_route,
+                validate=validate_refined_candidate,
+                emit=self.emit,
+            )
+            patch = refined["patch"]
+            candidate = refined["candidate"]
+            patch_source = "layer-refinement"
+            record["refinement"] = {
+                "groups": [
+                    {
+                        "placement": item["placement"],
+                        "layerIds": item["contract"]["layerIds"],
+                        "crop": item["crop"],
+                    }
+                    for item in group_evidence
+                ],
+                "remainingIssueCount": contract["remainingIssueCount"],
+                "layerIds": contract["layerIds"],
+                "propertyLocks": {
+                    layer_id: item["allowedProperties"]
+                    for layer_id, item in contract["layers"].items()
+                },
+                "budgetUsed": layer_refinement_budget_used,
+                "inkChecks": refined["inkChecks"],
+            }
             self.emit("candidate.patch-applied", "build", {
                 "iteration": global_iteration,
                 "source": patch_source,
@@ -2482,6 +2649,8 @@ class ExactCloneOrchestrator:
                 "candidate": candidate,
                 "iterations": iterations,
                 "cycleComparisons": cycle_comparisons,
+                "comparisonBudgetUsed": comparison_budget_used,
+                "layerRefinementBudgetUsed": layer_refinement_budget_used,
                 "accepted": False,
                 "bestCandidate": best_candidate,
                 "bestReview": best_review,
