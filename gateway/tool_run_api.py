@@ -73,12 +73,16 @@ _AD_TEMPLATE_ROLE_OUTPUT_TOKENS = {
     "comparator": 8_192,
     "review": 4_096,
     "aspect-reference": 4_096,
+    "diagnosis": 8_192,
 }
 
 # Meta's audited contributor price for the new 1.3 id until models.dev catches up.
 _AD_TEMPLATE_DIRECT_PRICING_PER_MILLION = {
     ("meta-direct", "muse-spark-1.3-contributor"): (0.10, 0.002, 0.20),
     ("concentrate", "gemini-3.8-flash"): (0.75, 0.75, 3.75),
+    # Published standard rates verified 2026-09-06; Concentrate has no token markup.
+    # Estimated fallback only: live endpoint pricing takes precedence.
+    ("concentrate", "gpt-6-astra"): (10.0, 1.0, 50.0),
 }
 
 
@@ -776,6 +780,8 @@ class ToolRunAPIMixin:
     @staticmethod
     def _tool_role_kind(instance_id: str) -> str:
         name = str(instance_id or "").lower()
+        if name.startswith("diagnosis-stall"):
+            return "diagnosis"
         if name.startswith("aspect-reference"):
             return "aspect-reference"
         if name.startswith("comparator"):
@@ -864,6 +870,11 @@ class ToolRunAPIMixin:
         }
         required = ["decision", "scores", "issues", "warnings", "effects", "fontSubstitution"]
         if comparator:
+            properties["comparisonToBest"] = {
+                "type": "string",
+                "enum": ["better", "same", "worse", "not_applicable"],
+            }
+            required.append("comparisonToBest")
             properties["patch"] = {"anyOf": [{"type": "null"}, ToolRunAPIMixin._tool_patch_schema()]}
             required.append("patch")
         return {"type": "object", "properties": properties, "required": required, "additionalProperties": False}
@@ -1152,7 +1163,7 @@ class ToolRunAPIMixin:
                                 "strict": True,
                                 "schema": self._tool_role_json_schema(instance_id),
                             }},
-                            reasoning={"effort": "minimal"},
+                            reasoning={"effort": "high" if role_kind == "diagnosis" else "minimal"},
                             max_output_tokens=_AD_TEMPLATE_ROLE_OUTPUT_TOKENS[role_kind],
                         )
                         mark_activity()
@@ -1971,6 +1982,17 @@ class ToolRunAPIMixin:
     @staticmethod
     def _tool_role_json_schema(instance_id: str) -> Dict[str, Any]:
         kind = ToolRunAPIMixin._tool_role_kind(instance_id)
+        if kind == "diagnosis":
+            return {
+                "type": "object",
+                "properties": {
+                    "diagnosis": {"type": "string"},
+                    "nextChanges": {"type": "array", "items": {"type": "string"}},
+                    "capabilityBlockers": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["diagnosis", "nextChanges", "capabilityBlockers"],
+                "additionalProperties": False,
+            }
         if kind == "patch":
             return ToolRunAPIMixin._tool_patch_schema()
         if kind in {"review", "comparator"}:

@@ -138,6 +138,7 @@ def test_comparator_validation_rejects_invented_layer_id_for_bounded_retry():
     from tests.gateway.test_exact_clone_process import _review
     candidate = _candidate()
     review = _review(accept=False)
+    review["comparisonToBest"] = "not_applicable"
     review["issues"] = [{
         "placement": "feed", "layerIds": ["story_frame"], "category": "geometry",
         "instruction": "Set y to 695 for the features block.", "severity": "material",

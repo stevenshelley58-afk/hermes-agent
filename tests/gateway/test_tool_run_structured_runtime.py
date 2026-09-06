@@ -8,6 +8,45 @@ from types import SimpleNamespace
 from gateway.tool_run_api import ToolRunAPIMixin
 
 
+def test_frontier_diagnosis_cost_remains_accounted_when_catalog_lags(monkeypatch):
+    from agent import usage_pricing
+    monkeypatch.setattr(
+        usage_pricing, "estimate_usage_cost",
+        lambda *args, **kwargs: SimpleNamespace(amount_usd=None, status="unknown"),
+    )
+    result = ToolRunAPIMixin._tool_response_usage(
+        SimpleNamespace(usage=_usage(1592, 86)),
+        provider="concentrate", model="gpt-6-astra",
+        base_url="https://api.concentrate.ai/v1", api_key=None,
+    )
+    assert result["cost_status"] == "estimated"
+    assert abs(result["estimated_cost_usd"] - 0.02022) < 1e-9
+    assert result["total_tokens"] == 1678
+
+
+def test_stall_diagnosis_is_strict_advice_not_an_edit_or_review():
+    import jsonschema
+    import pytest
+    from gateway.tool_run_api import _AD_TEMPLATE_ROLE_OUTPUT_TOKENS
+
+    for instance in ("diagnosis-stall", "diagnosis-stall-format-retry"):
+        assert ToolRunAPIMixin._tool_role_kind(instance) == "diagnosis"
+        schema = ToolRunAPIMixin._tool_role_json_schema(instance)
+        jsonschema.validate({
+            "diagnosis": "The requested font is unavailable.",
+            "nextChanges": ["Use an available font with matching proportions."],
+            "capabilityBlockers": ["Missing font"],
+        }, schema)
+        for invalid in (
+            {"operations": []},
+            {"diagnosis": "Incomplete"},
+            {"diagnosis": "x", "nextChanges": [], "capabilityBlockers": [], "template": {}},
+        ):
+            with pytest.raises(jsonschema.ValidationError):
+                jsonschema.validate(invalid, schema)
+    assert _AD_TEMPLATE_ROLE_OUTPUT_TOKENS["diagnosis"] >= 4096
+
+
 def test_comparator_budget_covers_review_plus_patch_without_retry_truncation():
     from gateway.tool_run_api import _AD_TEMPLATE_ROLE_OUTPUT_TOKENS
     assert _AD_TEMPLATE_ROLE_OUTPUT_TOKENS["comparator"] >= _AD_TEMPLATE_ROLE_OUTPUT_TOKENS["patch"]
@@ -48,6 +87,9 @@ def test_roles_use_distinct_strict_response_schemas():
     reviewer = ToolRunAPIMixin._tool_role_json_schema("final-reviewer-a-run-1")
     builder = ToolRunAPIMixin._tool_role_json_schema("builder-initial")
     assert "patch" in comparator["required"]
+    assert "comparisonToBest" in comparator["required"]
+    assert "comparisonToBest" not in reviewer["properties"]
+    assert set(comparator["properties"]["comparisonToBest"]["enum"]) == {"better", "same", "worse", "not_applicable"}
     assert "patch" not in reviewer["properties"]
     assert builder["required"] == ["template", "assets"]
     assert all(item["additionalProperties"] is False for item in (comparator, reviewer, builder))

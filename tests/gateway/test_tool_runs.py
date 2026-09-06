@@ -220,7 +220,7 @@ def test_ad_studio_profile_picker_changes_only_new_runs_and_persists_exact_snaps
         "comparator": {"provider": "concentrate", "model": "gemini-3.8-flash"},
         "final-review-a": {"provider": "concentrate", "model": "gemini-3.8-flash"},
         "final-review-b": {"provider": "meta-direct", "model": "muse-spark-1.3-contributor"},
-        "fallback": {"provider": "meta-direct", "model": "muse-spark-1.3-contributor"},
+        "fallback": {key: selected["stages"][AD_TEMPLATE_OPTIONAL_ROUTE]["primary"][key] for key in ("provider", "model")},
     }
     with pytest.raises(ToolRunError, match="immutable after submission"):
         store.replace_remaining_policy(first["run_id"], selected)
@@ -234,9 +234,9 @@ def test_builtin_policy_uses_only_audited_native_vision_roles():
         "compare": ("concentrate", "gemini-3.8-flash"),
         "final-review-a": ("concentrate", "gemini-3.8-flash"),
         "final-review-b": ("meta-direct", "muse-spark-1.3-contributor"),
-        "quality-escalation": ("meta-direct", "muse-spark-1.3-contributor"),
+        "quality-escalation": ("concentrate", "gpt-6-astra"),
     }
-    assert policy["seed_revision"] == 14
+    assert policy["stages"]["quality-escalation"]["primary"] != policy["stages"]["analyse"]["primary"]
     assert AD_TEMPLATE_ROUTE_ORDER == tuple(expected)[:-1]
     assert AD_TEMPLATE_OPTIONAL_ROUTE == "quality-escalation"
     for stage_id, route in expected.items():
@@ -337,7 +337,7 @@ def test_stale_sole_revisions_one_to_ten_are_preserved_and_revision_eleven_selec
     assert migrated.get_policy("ad-template-generator", 10)["policy"] == stale
     current = migrated.get_policy("ad-template-generator")
     assert current["revision"] == 11
-    assert current["policy"]["seed_revision"] == 14
+    assert current["policy"]["seed_revision"] == default_ad_template_policy()["seed_revision"]
     assert current["policy"]["stages"]["final-review-b"]["primary"] == {
         "provider": "meta-direct",
         "model": "muse-spark-1.3-contributor",
@@ -347,7 +347,7 @@ def test_stale_sole_revisions_one_to_ten_are_preserved_and_revision_eleven_selec
         "supports_tools": True,
     }
     assert current["policy"]["stages"]["analyse"]["primary"]["model"] == "muse-spark-1.3-contributor"
-    assert current["policy"]["stages"]["quality-escalation"]["primary"]["model"] == "muse-spark-1.3-contributor"
+    assert current["policy"]["stages"]["quality-escalation"] == default_ad_template_policy()["stages"]["quality-escalation"]
     pinned, _ = migrated.create_run(command(
         request_id="req-stale",
         idempotency_key="stale-policy-pin",
@@ -386,7 +386,7 @@ def test_stale_builtin_project_default_is_superseded_without_touching_history(tm
     assert historical["policy"] == stale
     assert current["revision"] > stale_record["revision"]
     assert current["project_id"] == "blockwise"
-    assert current["policy"]["seed_revision"] == 14
+    assert current["policy"]["seed_revision"] == default_ad_template_policy()["seed_revision"]
     assert current["policy"]["stages"]["final-review-b"]["primary"]["provider"] == "meta-direct"
     assert current["policy"]["stages"]["final-review-b"]["primary"]["model"] == "muse-spark-1.3-contributor"
 

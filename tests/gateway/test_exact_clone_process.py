@@ -244,8 +244,12 @@ def _review(*, accept: bool) -> dict:
     }
 
 
-def _comparison(*, accept: bool, value: str = "comparator-patch") -> dict:
+def _comparison(
+    *, accept: bool, value: str = "comparator-patch",
+    comparison_to_best: str = "not_applicable",
+) -> dict:
     result = _review(accept=accept)
+    result["comparisonToBest"] = comparison_to_best
     result["patch"] = None if accept else {"operations": [{
         "op": "replace",
         "path": "/template/metadata/description",
@@ -343,6 +347,11 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
             result = _comparison(
                 accept=comparison_count == 6,
                 value=f"comparator-patch-{comparison_count}",
+                comparison_to_best=(
+                    "not_applicable" if comparison_count == 1
+                    else "worse" if comparison_count == 3
+                    else "better"
+                ),
             )
             if not result["decision"] == "accept":
                 target_width = 1080 - comparison_count
@@ -422,7 +431,7 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
 
     assert order == ["source-map"]
     assert image_calls == []  # Image models are reserved for photo assets.
-    assert comparison_count == process.MAX_COMPARISONS == 6
+    assert comparison_count == 6
     assert fallback_patch_count == 0
     assert contract_repair_count == 1
     assert layer_refinement_count == 1
@@ -437,8 +446,7 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     ]
     assert refinement_routes == ["openai-codex/builder"]
     comparator_routes = [route for instance, route in agent_calls if instance.startswith("comparator-")]
-    assert comparator_routes[:4] == ["openai-codex/comparator"] * 4
-    assert comparator_routes[4:] == ["openai-codex/escalation"] * 2
+    assert comparator_routes == ["openai-codex/comparator"] * 6
     assert len(refinement_evidence) == 1
     refinement_text = refinement_evidence[0][0]["text"]
     refinement_paths = refinement_evidence[0][1]["paths"]
@@ -494,6 +502,194 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     # Demo-photo binding runs before the comparison loop even when the run
     # has no demo-assets plan yet, so photo slots never render blank.
     assert demo_prepare_calls
+
+
+@pytest.mark.parametrize(("diagnosis_value", "expect_guidance"), [
+    ({
+        "diagnosis": "Repeated edits are not changing the scored geometry.",
+        "nextChanges": ["Apply the measured x target from immutable BEST."],
+        "capabilityBlockers": [],
+    }, True),
+    ({"diagnosis": "Malformed response deliberately omits lists."}, False),
+])
+def test_five_non_improvements_trigger_one_frontier_diagnosis_then_resume_from_best(
+    monkeypatch, tmp_path, diagnosis_value, expect_guidance,
+):
+    source = tmp_path / "source.png"
+    Image.new("RGB", (800, 1000), "white").save(source)
+    comparison_count = 0
+    layer_prompts: list[list[dict]] = []
+    diagnosis_calls: list[tuple[list[dict], str]] = []
+    rendered_x: list[float] = []
+    events: list[tuple[str, str, dict]] = []
+    interrupt_once = True
+
+    monkeypatch.setattr(
+        process,
+        "vision_message",
+        lambda text, paths, **_kwargs: [
+            {"type": "text", "text": text},
+            {"type": "test_paths", "paths": list(paths)},
+        ],
+    )
+
+    def call_agent(instance, prompt, route):
+        nonlocal comparison_count, interrupt_once
+        if instance.startswith("aspect-reference"):
+            return {
+                "sourcePlacement": "feed",
+                "targetPlacement": "story",
+                "canvas": {"width": 1080, "height": 1920},
+                "regions": [{
+                    "regionId": "main",
+                    "sourceRole": "main",
+                    "target": {
+                        "x": 0, "y": 0, "width": 1080, "height": 1920,
+                    },
+                    "zIndex": 0,
+                }],
+                "preserve": ["all visible geometry and effects"],
+            }
+        if instance == "builder-initial":
+            template = _template()
+            template["feedLayout"]["layers"][1]["geometry"]["width"] = 900
+            return {"template": template, "assets": []}
+        if instance.startswith("comparator-"):
+            comparison_count += 1
+            accepted = comparison_count == 8
+            result = _comparison(
+                accept=accepted,
+                comparison_to_best=(
+                    "not_applicable" if comparison_count == 1
+                    else "better" if accepted
+                    else "same"
+                ),
+            )
+            result["patch"] = None
+            score = 9.8 if accepted else 9.2
+            result["scores"] = {key: score for key in result["scores"]}
+            return result
+        if instance.startswith("layer-refinement-"):
+            layer_prompts.append(copy.deepcopy(prompt))
+            if diagnosis_calls and interrupt_once:
+                interrupt_once = False
+                raise RuntimeError("simulated process interruption")
+            return {"operations": [{
+                "op": "replace",
+                "path": "/template/feedLayout/layers/1/geometry/x",
+                "value": 102,
+            }]}
+        if instance == "diagnosis-stall":
+            diagnosis_calls.append((copy.deepcopy(prompt), route))
+            return copy.deepcopy(diagnosis_value)
+        if instance.startswith("final-reviewer-"):
+            return _review(accept=True)
+        raise AssertionError(instance)
+
+    def render(candidate, workspace, *, asset_overrides=None):
+        del asset_overrides
+        rendered_x.append(
+            float(candidate["template"]["feedLayout"]["layers"][1]["geometry"]["x"])
+        )
+        workspace.mkdir(parents=True, exist_ok=True)
+        artifact = workspace / "artifact.json"
+        artifact.write_text(process._safe_json(candidate), encoding="utf-8")
+        output = workspace / "rendered"
+        output.mkdir(exist_ok=True)
+        feed = output / "feed.png"
+        story = output / "story.png"
+        Image.new("RGB", (1080, 1350), "white").save(feed)
+        Image.new("RGB", (1080, 1920), "white").save(story)
+        return {
+            "render": {"feed": str(feed), "story": str(story)},
+            "previews": [],
+            "review_previews": [],
+            "template_path": str(artifact),
+        }
+
+    monkeypatch.setattr(process, "run_renderer", render)
+    monkeypatch.setattr(
+        process, "prepare_demo_assets",
+        lambda candidate, **_kwargs: (candidate, {}),
+    )
+    monkeypatch.setattr(process, "import_template", lambda output, **_kwargs: {
+        "template_id": output["template"]["templateId"],
+        "status": "imported",
+        "asset_count": 0,
+        "replayed": False,
+        "library_status": "quarantined",
+        "run_id": "trun_stall",
+    })
+    monkeypatch.setattr(process, "review_template_action", lambda **kwargs: {
+        "templateId": kwargs["template_id"], "status": "passed",
+    })
+
+    routes = [
+        {"provider": "openai-codex", "model": "image"},
+        {"provider": "openai-codex", "model": "builder"},
+        {"provider": "openai-codex", "model": "comparator"},
+        {"provider": "openai-codex", "model": "final-a"},
+        {"provider": "deepseek", "model": "final-b"},
+        {"provider": "concentrate", "model": "gpt-6-astra"},
+    ]
+    workspace = tmp_path / "run"
+
+    def orchestrator():
+        return process.ExactCloneOrchestrator(
+            call_agent=call_agent,
+            call_image_model=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("image model must not be used")
+            ),
+            workspace=workspace,
+            run_id="trun_stall",
+            project_id="blockwise",
+            emit=lambda kind, node, data: events.append((kind, node, data)),
+        )
+
+    with pytest.raises(RuntimeError, match="simulated process interruption"):
+        orchestrator().run(
+            source=str(source), brief="clone",
+            placements=["feed", "story"], routes=routes,
+        )
+    interrupted = process.load_checkpoint(workspace)
+    assert interrupted["stallDiagnosisRequested"] is True
+    result = orchestrator().run(
+        source=str(source), brief="clone",
+        placements=["feed", "story"], routes=routes,
+    )
+
+    assert comparison_count == 8
+    assert len(diagnosis_calls) == 1
+    diagnosis_prompt, diagnosis_route = diagnosis_calls[0]
+    assert diagnosis_route == "concentrate/gpt-6-astra"
+    assert "RECENT REJECTED ATTEMPTS" in diagnosis_prompt[0]["text"]
+    assert "attemptOperations" in diagnosis_prompt[0]["text"]
+    assert [Path(path).name for path in diagnosis_prompt[1]["paths"][1:]] == [
+        "iteration-01-feed.png", "iteration-01-story.png",
+    ]
+    assert len(layer_prompts) == 7
+    assert (
+        "STALL DIAGNOSIS GUIDANCE" in layer_prompts[-1][0]["text"]
+    ) is expect_guidance
+    assert all(
+        "BEST EDITABLE TEMPLATE" in prompt[0]["text"]
+        for prompt in layer_prompts
+    )
+    # Every rejected equal attempt is rebuilt from x=0 BEST. If the loop kept
+    # the equal x=102 candidate, the next identical patch would be a no-op.
+    assert rendered_x.count(0.0) >= 2
+    assert set(rendered_x) == {0.0, 102.0}
+    checkpoint = process.load_checkpoint(workspace)
+    assert checkpoint["stallDiagnosisRequested"] is True
+    assert checkpoint["stallDiagnosisStatus"] == (
+        "completed" if expect_guidance else "failed"
+    )
+    if expect_guidance:
+        assert checkpoint["stallDiagnosis"]["nextChanges"]
+    else:
+        assert checkpoint.get("stallDiagnosis") is None
+        assert sum(kind == "stall.diagnosis-failed" for kind, _, _ in events) == 1
+    assert result["import"]["library_status"] == "quarantined"
 
 
 def test_build_prompt_preserves_logo_fit_and_body_copy_density(monkeypatch):
@@ -781,9 +977,30 @@ def test_iteration_comparator_and_final_reviewer_have_distinct_output_contracts(
         final=True, candidate=candidate, reference={"sourcePlacement": "feed"}, metrics={},
     )
 
-    assert "fontSubstitution, patch" in iteration_prompt
+    assert "fontSubstitution, comparisonToBest, patch" in iteration_prompt
+    assert "better, same, worse, or not_applicable" in iteration_prompt
     assert "patch must be null" in iteration_prompt
-    assert "fontSubstitution, patch" not in final_prompt
+    assert "comparisonToBest" not in final_prompt
+
+
+def test_stall_diagnosis_contract_is_exact_and_bounded():
+    valid = {
+        "diagnosis": "  Repeated width changes miss the measured edge.  ",
+        "nextChanges": ["  Change the grouped width and x together.  "],
+        "capabilityBlockers": [],
+    }
+    assert process.validate_stall_diagnosis(valid) == {
+        "diagnosis": "Repeated width changes miss the measured edge.",
+        "nextChanges": ["Change the grouped width and x together."],
+        "capabilityBlockers": [],
+    }
+    with pytest.raises(process.AdTemplateProcessError, match="exactly"):
+        process.validate_stall_diagnosis({**valid, "patch": {}})
+    with pytest.raises(process.AdTemplateProcessError, match="nextChanges"):
+        process.validate_stall_diagnosis({
+            **valid,
+            "nextChanges": [""],
+        })
 
 
 def test_invalid_comparator_patch_preserves_score_for_strong_fallback():
@@ -885,6 +1102,11 @@ def test_partial_checkpoint_update_retains_restart_state_and_explicit_removal(tm
         "iterations": iterations,
         "comparisonBudgetUsed": 4,
         "layerRefinementBudgetUsed": 3,
+        "consecutiveNonImproving": 5,
+        "recentRejects": [{"iteration": 9, "disposition": "equal"}],
+        "stallDiagnosisRequested": True,
+        "stallDiagnosisStatus": "completed",
+        "stallDiagnosis": {"diagnosis": "stalled", "nextChanges": [], "capabilityBlockers": []},
         "candidate": {"revision": "before"},
     })
 
@@ -899,6 +1121,11 @@ def test_partial_checkpoint_update_retains_restart_state_and_explicit_removal(tm
     assert checkpoint["iterations"] == iterations
     assert checkpoint["comparisonBudgetUsed"] == 4
     assert checkpoint["layerRefinementBudgetUsed"] == 3
+    assert checkpoint["consecutiveNonImproving"] == 5
+    assert checkpoint["recentRejects"][0]["iteration"] == 9
+    assert checkpoint["stallDiagnosisRequested"] is True
+    assert checkpoint["stallDiagnosisStatus"] == "completed"
+    assert checkpoint["stallDiagnosis"]["diagnosis"] == "stalled"
     assert checkpoint["candidate"] == {"revision": "canonical"}
 
     process.persist_checkpoint(
@@ -975,10 +1202,15 @@ def test_manual_revision_starts_new_best_candidate_scope(monkeypatch, tmp_path):
     new_review["scores"] = {key: 8.0 for key in new_review["scores"]}
     regressed_review = _review(accept=False)
     regressed_review["scores"] = {key: 7.0 for key in regressed_review["scores"]}
+    discarded_review = _review(accept=True)
+    discarded_review["scores"] = {
+        key: 9.9 for key in discarded_review["scores"]
+    }
     iterations = [
         {"iteration": 2, "comparison": old_review, "qaProjectionVersion": process.QA_PROJECTION_VERSION},
         {"iteration": 7, "comparison": new_review, "qaProjectionVersion": process.QA_PROJECTION_VERSION},
         {"iteration": 8, "comparison": regressed_review, "qaProjectionVersion": process.QA_PROJECTION_VERSION},
+        {"iteration": 9, "comparison": discarded_review, "comparisonToBest": "same", "discarded": True, "qaProjectionVersion": process.QA_PROJECTION_VERSION},
     ]
     by_iteration = {
         2: historical,
@@ -1038,6 +1270,48 @@ def test_recovery_ignores_comparisons_from_an_older_projection_method(monkeypatc
     assert candidate is None
     assert review is None
     assert iteration == 0
+
+
+def test_manual_render_evidence_must_match_the_active_candidate(monkeypatch, tmp_path):
+    active = {"template": _template(), "assets": []}
+    active["template"]["metadata"]["description"] = "restored-best"
+    discarded = copy.deepcopy(active)
+    discarded["template"]["metadata"]["description"] = "discarded-repair"
+    records = [
+        {"iteration": 4, "previews": [
+            "iteration-04-feed.png", "iteration-04-story.png",
+        ]},
+        {"iteration": 5, "previews": [
+            "iteration-05-feed.png", "iteration-05-story.png",
+        ]},
+    ]
+    preview_root = tmp_path / "previews"
+    preview_root.mkdir()
+    for iteration in (4, 5):
+        for placement in ("feed", "story"):
+            (preview_root / f"iteration-{iteration:02d}-{placement}.png").write_bytes(b"png")
+    candidates = {4: active, 5: discarded}
+    monkeypatch.setattr(
+        process,
+        "_neutral_candidate_from_iteration",
+        lambda _workspace, iteration: copy.deepcopy(candidates[iteration]),
+    )
+
+    iteration, paths = process._matching_saved_candidate_render_paths(
+        tmp_path, records, active, at_or_before=5,
+    )
+
+    assert iteration == 4
+    assert [Path(path).name for path in paths] == [
+        "iteration-04-feed.png", "iteration-04-story.png",
+    ]
+
+    candidates[4] = discarded
+    iteration, paths = process._matching_saved_candidate_render_paths(
+        tmp_path, records, active, at_or_before=5,
+    )
+    assert iteration == 0
+    assert paths == []
 
 
 def test_request_manual_revision_invalidates_historical_best_and_persists_boundary(tmp_path):

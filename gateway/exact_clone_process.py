@@ -62,8 +62,9 @@ LIKENESS_THRESHOLD = 9.5
 MAX_DEMO_PHOTO_EDGE = 1100
 TYPOGRAPHY_SUBSTITUTION_THRESHOLD = 9.5
 NORMAL_COMPARISONS = 4
-ESCALATION_COMPARISONS = 2
-MAX_COMPARISONS = NORMAL_COMPARISONS + ESCALATION_COMPARISONS
+MAX_COMPARISONS = 16
+STALL_DIAGNOSIS_THRESHOLD = 5
+MAX_RECENT_REJECTS = 5
 MAX_FINAL_REVIEW_ROUNDS = 3
 MAX_OUTPUT_RETRIES = 1
 MAX_PATCH_REPLANS = 2
@@ -782,10 +783,10 @@ def validate_review(value: Any, *, require_actionable_targets: bool = True) -> D
             "below-gate review requires actionable issues for the failed scores"
         )
     reason = (
-        "All exact-clone evidence met the 9.8 gate."
+        f"All exact-clone evidence met the {LIKENESS_THRESHOLD} gate."
         if passed
         else "; ".join(issue["instruction"] for issue in normalized_issues[:3])
-        or "One or more exact-clone score/effect gates remain below 9.8."
+        or f"One or more exact-clone score/effect gates remain below {LIKENESS_THRESHOLD}."
     )
     return {
         "decision": expected,
@@ -803,11 +804,11 @@ def review_prompt(*, final: bool, candidate: Mapping[str, Any], reference: Mappi
     output_fields = (
         "decision, scores, issues, warnings, effects, fontSubstitution"
         if final else
-        "decision, scores, issues, warnings, effects, fontSubstitution, patch"
+        "decision, scores, issues, warnings, effects, fontSubstitution, comparisonToBest, patch"
     )
     patch_contract = "" if final else f"""
-When revision is required, return the exact correction as patch in this same response. patch must be {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}} with no more than {MAX_PATCH_OPERATIONS} operations and no more than {MAX_PATCH_BYTES} encoded bytes. A remove operation omits value; add/replace requires value. Every operation must directly implement a listed issue against the current candidate using an existing JSON Pointer path (add may create only an allowed missing field). Do not change schema, templateId, createdAt, asset declarations or source-free asset assignments. When the evidence passes the 9.8 gate, issues must be [] and patch must be null. Do not return a full replacement template."""
-    return f"""You are one {role} for an exact-clone template. Attached images are ordered: original source, Feed comparison render, Story comparison render, then (for final review) neutral production Feed and Story renders, followed by the original-placement overlay and difference views. The original source is the ONLY design authority. Source placement is {reference["sourcePlacement"]}; it must match the source as close to pixel-for-pixel as editable reconstruction permits. The other placement is a native aspect adaptation using the measured layout plan below: preserve the source design, hierarchy, effects and image roles without stretching or cropping the whole ad. There is no separate generated-ad target and no pixel-similarity score for that different aspect ratio. Score its composition, source-design preservation and production correctness visually. Both placements must pass the same 9.8 quality gate. Comparison renders use only frozen text-free source photo regions when independently validated; other slots retain neutral catalog/generated photographs. Never treat a different property, room, sky or brand identity as a likeness defect. Compare those slots by boundaries, crop framing, hierarchy and source-design roles, not photo-content pixels. The original source remains the layout authority. Editable text must match its footprint/density but cannot be copied from baked photo text. Raw pixel/edge metrics and difference heatmaps include intentional photograph differences and are diagnostics only, NEVER an acceptance score. Separate source-layout likeness from production correctness. Before scoring, check the whole frame for overlapping elements, clipped or missing text, stray glyphs, illegible text and missing media. Any such defect blocks acceptance regardless of average score. Do not reward creative redesign. Missing shading, gradients, shadows, transparency, borders, masks, texture or decorative details are material defects.
+When revision is required, return the exact correction as patch in this same response. patch must be {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}} with no more than {MAX_PATCH_OPERATIONS} operations and no more than {MAX_PATCH_BYTES} encoded bytes. A remove operation omits value; add/replace requires value. Every operation must directly implement a listed issue against the current candidate using an existing JSON Pointer path (add may create only an allowed missing field). Do not change schema, templateId, createdAt, asset declarations or source-free asset assignments. comparisonToBest must be better, same, worse, or not_applicable; use not_applicable only when no BEST pair is attached. When the evidence passes the {LIKENESS_THRESHOLD} gate, issues must be [] and patch must be null. Do not return a full replacement template."""
+    return f"""You are one {role} for an exact-clone template. Attached images are ordered: original source, Feed comparison render, Story comparison render, then (for final review) neutral production Feed and Story renders, followed by the original-placement overlay and difference views. The original source is the ONLY design authority. Source placement is {reference["sourcePlacement"]}; it must match the source as close to pixel-for-pixel as editable reconstruction permits. The other placement is a native aspect adaptation using the measured layout plan below: preserve the source design, hierarchy, effects and image roles without stretching or cropping the whole ad. There is no separate generated-ad target and no pixel-similarity score for that different aspect ratio. Score its composition, source-design preservation and production correctness visually. Both placements must pass the same {LIKENESS_THRESHOLD} quality gate. Comparison renders use only frozen text-free source photo regions when independently validated; other slots retain neutral catalog/generated photographs. Never treat a different property, room, sky or brand identity as a likeness defect. Compare those slots by boundaries, crop framing, hierarchy and source-design roles, not photo-content pixels. The original source remains the layout authority. Editable text must match its footprint/density but cannot be copied from baked photo text. Raw pixel/edge metrics and difference heatmaps include intentional photograph differences and are diagnostics only, NEVER an acceptance score. Separate source-layout likeness from production correctness. Before scoring, check the whole frame for overlapping elements, clipped or missing text, stray glyphs, illegible text and missing media. Any such defect blocks acceptance regardless of average score. Do not reward creative redesign. Missing shading, gradients, shadows, transparency, borders, masks, texture or decorative details are material defects.
 
 Return JSON only with exactly {output_fields}. scores must contain exactly, in this order: overall, geometry, typography, colourEffects, imageCrop, details. effects must contain exactly, in this order: shading, gradients, shadows, transparency, borders, masks, texture; each is match, not_present, or mismatch. issues is a list of objects with exactly placement (feed|story|both), layerIds (real candidate layer IDs), category (geometry|typography|colourEffects|imageCrop|details), instruction, severity (blocker|material|minor). Every issue instruction must be directly patchable: name at least one exact target field (x, y, width, height, font/fontSize/fontFamily/fontWeight, lineHeight, tracking, colour, or crop) and give its measured numeric/hex/font-file target or delta from the attached overlay. Vague phrases such as "match the source", "align", or "fix spacing" without target values are invalid. Every visible discrepancy is an issue; acceptance requires issues=[] and every effect matched or genuinely absent. decision is evidence only; the controller derives accept/revise from scores, issues, effects and the font rule. An obvious defect blocks acceptance regardless of average. fontSubstitution is null or exactly {{source,used,reason}}.{patch_contract} Return no prose.
 
@@ -821,6 +822,104 @@ IMAGE ORDER NOTE: Neutral production images follow the three original-source/QA 
 RECIPROCAL ASPECT REFERENCE: {_safe_json(reference)}
 DETERMINISTIC PIXEL/EDGE/COLOUR DIAGNOSTICS: {_safe_json(metrics)}. These are diagnostic differences from the comparison renders, including intentional neutral-photo differences; assess layout fidelity visually.
 CANDIDATE CONTRACT: {_safe_json(candidate)}"""
+
+
+def _pairwise_review_context(
+    *, best_iteration: int, best_candidate: Mapping[str, Any] | None,
+) -> str:
+    if best_iteration <= 0 or best_candidate is None:
+        return ""
+    return f"""
+
+PAIRWISE BEST-SO-FAR CONTEXT: Two additional images are attached after the
+current candidate evidence: BEST Feed render, then BEST Story render, from
+iteration {best_iteration}. Score the CURRENT candidate against the source,
+but use BEST only as the improvement baseline. Do not recommend or reward a
+change that is equal to or worse than BEST. The returned patch still targets
+the CURRENT candidate. BEST EDITABLE TEMPLATE: {_safe_json(best_candidate)}"""
+
+
+def validate_stall_diagnosis(value: Any) -> Dict[str, Any]:
+    required = {"diagnosis", "nextChanges", "capabilityBlockers"}
+    if not isinstance(value, dict) or set(value) != required:
+        raise AdTemplateProcessError(
+            "stall diagnosis must return exactly diagnosis, nextChanges and capabilityBlockers"
+        )
+    diagnosis = value.get("diagnosis")
+    next_changes = value.get("nextChanges")
+    blockers = value.get("capabilityBlockers")
+    if not isinstance(diagnosis, str) or not diagnosis.strip() or len(diagnosis) > 8000:
+        raise AdTemplateProcessError("stall diagnosis text is invalid")
+    for label, items in (("nextChanges", next_changes), ("capabilityBlockers", blockers)):
+        if (
+            not isinstance(items, list)
+            or len(items) > 16
+            or any(not isinstance(item, str) or not item.strip() or len(item) > 2000 for item in items)
+        ):
+            raise AdTemplateProcessError(f"stall diagnosis {label} is invalid")
+    return {
+        "diagnosis": diagnosis.strip(),
+        "nextChanges": [item.strip() for item in next_changes],
+        "capabilityBlockers": [item.strip() for item in blockers],
+    }
+
+
+def stall_diagnosis_prompt(
+    *, best_candidate: Mapping[str, Any], best_review: Mapping[str, Any],
+    best_iteration: int, recent_rejects: Sequence[Mapping[str, Any]],
+) -> str:
+    capabilities = {
+        "editable": True,
+        "patchFormat": "bounded RFC-6902-style JSON operations",
+        "placements": {"feed": [1080, 1350], "story": [1080, 1920]},
+        "availableFonts": sorted(AVAILABLE_FONT_FILES),
+        "constraints": [
+            "preserve accepted layers and all unlisted fields",
+            "no full-document regeneration after initial build",
+            "customer-editable text, images, colours and fonts remain editable",
+            "Feed minimum font size 24px; Story minimum font size 32px",
+            "the ordinary builder, not this diagnosis role, applies the next patch",
+        ],
+    }
+    return f"""You are the one-shot frontier diagnosis role for a stalled exact-clone
+refinement run. Attached images are ordered: original source, BEST Feed render,
+BEST Story render. Diagnose why five consecutive attempts failed to improve the
+immutable best. Do not return a patch or replacement template. Give concrete,
+ordered guidance that the ordinary bounded builder can apply from BEST while
+preserving every accepted layer.
+
+Return JSON only with exactly diagnosis, nextChanges, capabilityBlockers.
+diagnosis is one bounded non-empty string. nextChanges and capabilityBlockers
+are bounded lists of strings; use [] when there are no capability blockers.
+
+BEST ITERATION: {best_iteration}
+BEST REVIEW: {_safe_json(best_review, max_bytes=80_000)}
+BEST EDITABLE TEMPLATE: {_safe_json(best_candidate)}
+RECENT REJECTED ATTEMPTS: {_safe_json(list(recent_rejects), max_bytes=120_000)}
+AVAILABLE CAPABILITIES AND CONSTRAINTS: {_safe_json(capabilities, max_bytes=40_000)}"""
+
+
+def _best_repair_context(
+    *, best_candidate: Mapping[str, Any], best_iteration: int,
+    diagnosis: Mapping[str, Any] | None, renders_attached: bool = True,
+) -> str:
+    guidance = ""
+    if diagnosis:
+        guidance = f"\nSTALL DIAGNOSIS GUIDANCE: {_safe_json(diagnosis, max_bytes=40_000)}"
+    render_context = (
+        "The whole-frame images attached after any crop pairs are ordered "
+        "original source, BEST Feed render, BEST Story render."
+        if renders_attached else
+        "No saved renders were proven to match this BEST candidate, so no "
+        "historical render is attached; use the source and editable BEST only."
+    )
+    return f"""
+
+IMMUTABLE BEST CONTEXT: {render_context} Begin from
+this exact editable
+BEST candidate from iteration {best_iteration}. Preserve every unlisted field
+and accepted layer; never revive a discarded equal or worse attempt.
+BEST EDITABLE TEMPLATE: {_safe_json(best_candidate)}{guidance}"""
 
 
 def _layer_pointer_map(candidate: Mapping[str, Any]) -> Dict[str, str]:
@@ -1127,6 +1226,7 @@ def apply_patch(candidate: Mapping[str, Any], value: Any, *, strict: bool = True
 
 def validate_comparator_result(
     value: Any, *, candidate: Mapping[str, Any], strict_issues: bool = True,
+    best_available: bool = False,
 ) -> Dict[str, Any]:
     """Keep valid visual evidence even when a cheap model proposes a bad patch.
 
@@ -1143,8 +1243,18 @@ def validate_comparator_result(
         "decision", "scores", "issues", "warnings", "effects",
         "fontSubstitution",
     }
-    if not isinstance(value, dict) or not review_fields.issubset(value) or not set(value).issubset(review_fields | {"patch"}):
+    allowed_fields = review_fields | {"patch", "comparisonToBest"}
+    if not isinstance(value, dict) or not review_fields.issubset(value) or not set(value).issubset(allowed_fields):
         raise AdTemplateProcessError("comparator result has an invalid shape")
+    comparison_to_best = value.get("comparisonToBest")
+    allowed_comparisons = (
+        {"better", "same", "worse"} if best_available else {"not_applicable"}
+    )
+    if comparison_to_best not in allowed_comparisons:
+        expected = "better, same or worse" if best_available else "not_applicable"
+        raise AdTemplateProcessError(
+            f"comparisonToBest must be {expected} for the attached evidence"
+        )
     review = validate_review(
         {field: value[field] for field in review_fields},
         require_actionable_targets=strict_issues,
@@ -1162,7 +1272,7 @@ def validate_comparator_result(
         review["issues"] = kept_issues
     if strict_issues and review["decision"] == "revise" and not review["issues"]:
         raise AdTemplateProcessError(
-            "comparison below the 9.8 gate requires actionable issues"
+            f"comparison below the {LIKENESS_THRESHOLD} gate requires actionable issues"
         )
     # Issues drive the layer-refinement contract, so a hallucinated layer ID
     # must be rejected here where the bounded comparator retry can correct
@@ -1184,6 +1294,7 @@ def validate_comparator_result(
     if review["decision"] == "accept":
         return {
             "review": review,
+            "comparisonToBest": comparison_to_best,
             "patch": None,
             "candidate": copy.deepcopy(dict(candidate)),
             "patchError": None if raw_patch is None else "accepted comparison must return patch null",
@@ -1192,6 +1303,7 @@ def validate_comparator_result(
     if raw_patch is None:
         return {
             "review": review,
+            "comparisonToBest": comparison_to_best,
             "patch": None,
             "candidate": copy.deepcopy(dict(candidate)),
             "patchError": "revising comparison omitted its bounded patch",
@@ -1202,12 +1314,14 @@ def validate_comparator_result(
     except (AdTemplateProcessError, AdTemplateStructuredOutputError) as exc:
         return {
             "review": review,
+            "comparisonToBest": comparison_to_best,
             "patch": None,
             "candidate": copy.deepcopy(dict(candidate)),
             "patchError": str(exc),
         }
     return {
         "review": review,
+        "comparisonToBest": comparison_to_best,
         "patch": patch,
         "candidate": updated,
         "patchError": None,
@@ -1822,6 +1936,62 @@ def _saved_iteration_vision_paths(
     return list(dict.fromkeys(resolved))
 
 
+def _saved_iteration_render_paths(
+    workspace: Path,
+    iteration: int,
+    records: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Resolve the immutable Feed/Story renders for a scored iteration."""
+    record = next(
+        (item for item in records if item.get("iteration") == iteration),
+        None,
+    )
+    if record is None:
+        return []
+    preview_names = {
+        name for name in record.get("previews", [])
+        if isinstance(name, str)
+    }
+    root = (workspace / "previews").resolve()
+    resolved = []
+    for placement in ("feed", "story"):
+        name = f"iteration-{iteration:02d}-{placement}.png"
+        path = (root / name).resolve()
+        if name not in preview_names or path.parent != root or not path.is_file():
+            return []
+        resolved.append(str(path))
+    return resolved
+
+
+def _matching_saved_candidate_render_paths(
+    workspace: Path,
+    records: Sequence[Mapping[str, Any]],
+    candidate: Mapping[str, Any],
+    *,
+    at_or_before: int,
+) -> tuple[int, list[str]]:
+    """Find immutable renders only when their artifact is the active candidate."""
+    eligible = sorted(
+        (
+            int(record["iteration"])
+            for record in records
+            if isinstance(record, Mapping)
+            and isinstance(record.get("iteration"), int)
+            and int(record["iteration"]) <= at_or_before
+        ),
+        reverse=True,
+    )
+    candidate_json = _safe_json(candidate)
+    for iteration in eligible:
+        recovered = _neutral_candidate_from_iteration(workspace, iteration)
+        if recovered is None or _safe_json(recovered) != candidate_json:
+            continue
+        paths = _saved_iteration_render_paths(workspace, iteration, records)
+        if paths:
+            return iteration, paths
+    return 0, []
+
+
 def _comparison_metrics(
     *, source: str, reciprocal_reference: str, source_placement: str,
     target_placement: str, rendered: Mapping[str, Any],
@@ -2008,6 +2178,10 @@ def _recover_checkpoint_best(
             not isinstance(record, Mapping)
             or not isinstance(record.get("iteration"), int)
             or record["iteration"] <= manual_start
+            or bool(record.get("discarded"))
+            or bool(record.get("regressed"))
+            or bool(record.get("plateaued"))
+            or record.get("comparisonToBest") in {"same", "worse"}
             # Comparisons produced under an older projection method are not a
             # valid baseline for the current comparison renderer.
             or record.get("qaProjectionVersion") != QA_PROJECTION_VERSION
@@ -2064,6 +2238,11 @@ def persist_checkpoint(
             "referenceMode",
             "manualRevision",
             "manualStartIteration",
+            "consecutiveNonImproving",
+            "recentRejects",
+            "stallDiagnosisRequested",
+            "stallDiagnosisStatus",
+            "stallDiagnosis",
         ):
             if key not in updates and key in previous:
                 stable[key] = copy.deepcopy(previous[key])
@@ -2105,6 +2284,9 @@ def request_checkpoint_revision(workspace: Path, instructions: str) -> Dict[str,
         layerRefinementBudgetUsed=0,
         manualRevision=int(checkpoint.get("manualRevision") or 0) + 1,
         manualStartIteration=manual_start_iteration,
+        consecutiveNonImproving=0,
+        recentRejects=[],
+        stallDiagnosis=None,
     )
     persist_checkpoint(workspace, checkpoint)
     return checkpoint
@@ -2501,7 +2683,7 @@ class ExactCloneOrchestrator:
         if len(routes) < 5:
             raise AdTemplateProcessError("reference-image, builder, comparator and two final reviewers are required")
         image_route, builder_route, comparator_route, final_a_route, final_b_route = routes[:5]
-        escalation_route = routes[5] if len(routes) > 5 else builder_route
+        diagnosis_route = routes[5] if len(routes) > 5 else None
         if (final_a_route.get("provider"), final_a_route.get("model")) == (final_b_route.get("provider"), final_b_route.get("model")):
             raise AdTemplateProcessError("final reviewers must use independent routes")
         started = time.time()
@@ -2614,6 +2796,17 @@ class ExactCloneOrchestrator:
             0, int(checkpoint.get("layerRefinementBudgetUsed") or 0)
         )
         manual_instructions = str(checkpoint.get("manualInstructions") or "")
+        consecutive_non_improving = max(
+            0, int(checkpoint.get("consecutiveNonImproving") or 0)
+        )
+        recent_rejects = [
+            copy.deepcopy(item) for item in checkpoint.get("recentRejects", [])
+            if isinstance(item, Mapping)
+        ][-MAX_RECENT_REJECTS:]
+        stall_diagnosis_requested = bool(checkpoint.get("stallDiagnosisRequested"))
+        stall_diagnosis = checkpoint.get("stallDiagnosis")
+        if not isinstance(stall_diagnosis, Mapping):
+            stall_diagnosis = None
         global_iteration = len(iterations)
         best_candidate, best_review, best_iteration = _recover_checkpoint_best(
             checkpoint, iterations, self.workspace, self.emit,
@@ -2659,12 +2852,34 @@ class ExactCloneOrchestrator:
         manual_revision_pending = bool(manual_instructions)
         if manual_instructions:
             manual_issue = [{"placement": "both", "layerIds": ["operator-selected"], "category": "details", "instruction": manual_instructions, "severity": "material"}]
+            manual_boundary_iteration = int(
+                checkpoint.get("manualStartIteration") or 0
+            )
+            manual_best_iteration, manual_best_frames = (
+                _matching_saved_candidate_render_paths(
+                    self.workspace, iterations, candidate,
+                    at_or_before=manual_boundary_iteration,
+                )
+            )
             patch, candidate = _call_applied_patch(
                 self.call_agent,
                 instance=f"manual-revision-{int(checkpoint.get('manualRevision') or 1)}",
-                prompt=patch_prompt(candidate=candidate, issues=manual_issue, manual_instructions=manual_instructions),
-                paths=[source, reciprocal_reference],
-                route=escalation_route,
+                prompt=(
+                    patch_prompt(
+                        candidate=candidate, issues=manual_issue,
+                        manual_instructions=manual_instructions,
+                    )
+                    + _best_repair_context(
+                        best_candidate=candidate,
+                        best_iteration=(
+                            manual_best_iteration or manual_boundary_iteration
+                        ),
+                        diagnosis=None,
+                        renders_attached=bool(manual_best_frames),
+                    )
+                ),
+                paths=[source, *manual_best_frames],
+                route=builder_route,
                 candidate=candidate,
                 emit=self.emit,
             )
@@ -2715,10 +2930,119 @@ class ExactCloneOrchestrator:
             candidate, source=source, source_placement=source_placement, workspace=self.workspace,
             route=image_route, call_image_model=self.call_image_model, emit=self.emit,
         )
+
+        def best_whole_frame_paths() -> list[str]:
+            paths = _saved_iteration_render_paths(
+                self.workspace, best_iteration, iterations,
+            )
+            if paths or best_candidate is None:
+                return paths
+            evidence_root = self.workspace / "stall-diagnosis-evidence"
+            qa_best, best_overrides = build_ephemeral_qa_candidate(
+                best_candidate,
+                source=source,
+                reciprocal_reference=reciprocal_reference,
+                source_placement=source_placement,
+                source_map=source_map,
+                target_map=target_map,
+                workspace=evidence_root,
+            )
+            rendered_best = run_renderer(
+                qa_best, evidence_root,
+                asset_overrides={**demo_overrides, **best_overrides},
+            )
+            return [
+                rendered_best["render"]["feed"],
+                rendered_best["render"]["story"],
+            ]
+
+        def ensure_stall_diagnosis() -> None:
+            nonlocal stall_diagnosis_requested, stall_diagnosis
+            if (
+                consecutive_non_improving < STALL_DIAGNOSIS_THRESHOLD
+                or stall_diagnosis_requested
+                or best_candidate is None
+                or best_review is None
+            ):
+                return
+            if (
+                diagnosis_route is None
+                or not str(diagnosis_route.get("provider") or "").strip()
+                or not str(diagnosis_route.get("model") or "").strip()
+            ):
+                checkpoint["stallDiagnosisStatus"] = "route-missing"
+                persist_checkpoint(self.workspace, {
+                    "consecutiveNonImproving": consecutive_non_improving,
+                    "recentRejects": recent_rejects,
+                    "stallDiagnosisRequested": False,
+                    "stallDiagnosisStatus": "route-missing",
+                    "stallDiagnosis": None,
+                }, merge=True)
+                self.emit("stall.diagnosis-blocked", "build", {
+                    "consecutive_non_improving": consecutive_non_improving,
+                    "reason": "frontier diagnosis route is not configured",
+                })
+                raise AdTemplateProcessError(
+                    f"exact-clone stalled after {STALL_DIAGNOSIS_THRESHOLD} "
+                    "non-improving attempts; a frontier diagnosis route is "
+                    "required"
+                )
+            self._check_stop()
+            stall_diagnosis_requested = True
+            checkpoint["stallDiagnosisStatus"] = "requested"
+            persist_checkpoint(self.workspace, {
+                "consecutiveNonImproving": consecutive_non_improving,
+                "recentRejects": recent_rejects,
+                "stallDiagnosisRequested": True,
+                "stallDiagnosisStatus": "requested",
+            }, merge=True)
+            self.emit("stall.diagnosis-requested", "build", {
+                "consecutive_non_improving": consecutive_non_improving,
+                "best_iteration": best_iteration,
+            })
+            try:
+                raw_diagnosis = self.call_agent(
+                    "diagnosis-stall",
+                    vision_message(
+                        stall_diagnosis_prompt(
+                            best_candidate=best_candidate,
+                            best_review=best_review,
+                            best_iteration=best_iteration,
+                            recent_rejects=recent_rejects,
+                        ),
+                        [source, *best_whole_frame_paths()],
+                        bounded=True,
+                    ),
+                    f"{diagnosis_route.get('provider')}/{diagnosis_route.get('model')}",
+                )
+                stall_diagnosis = validate_stall_diagnosis(raw_diagnosis)
+            except Exception as exc:
+                checkpoint["stallDiagnosisStatus"] = "failed"
+                persist_checkpoint(self.workspace, {
+                    "stallDiagnosisStatus": "failed",
+                    "stallDiagnosis": None,
+                }, merge=True)
+                self.emit("stall.diagnosis-failed", "build", {
+                    "reason": str(exc)[:2000],
+                    "continuing_from_best": True,
+                })
+                return
+            checkpoint["stallDiagnosisStatus"] = "completed"
+            persist_checkpoint(self.workspace, {
+                "stallDiagnosisStatus": "completed",
+                "stallDiagnosis": stall_diagnosis,
+            }, merge=True)
+            self.emit("stall.diagnosis-completed", "build", {
+                "best_iteration": best_iteration,
+                "next_changes": stall_diagnosis["nextChanges"],
+                "capability_blockers": stall_diagnosis["capabilityBlockers"],
+            })
+
+        ensure_stall_diagnosis()
         while comparison_budget_used < MAX_COMPARISONS and accepted_review is None:
             self._check_stop()
             global_iteration += 1
-            escalation_iteration = cycle_comparisons + 1 > NORMAL_COMPARISONS
+            extended_iteration = cycle_comparisons + 1 > NORMAL_COMPARISONS
             iteration_root = self.workspace / "iterations" / f"{global_iteration:02d}"
             self.emit("iteration.started", "build", {"iteration": global_iteration, "cycle_iteration": cycle_comparisons + 1})
             contract_repairs = 0
@@ -2773,7 +3097,7 @@ class ExactCloneOrchestrator:
                             "bestIteration": best_iteration,
                         })
                         continue
-                    repair_route = builder_route if contract_repairs == 1 else escalation_route
+                    repair_route = builder_route
                     repair, candidate = _call_applied_patch(
                         self.call_agent,
                         instance=f"contract-repair-{global_iteration}-{contract_repairs}",
@@ -2830,13 +3154,32 @@ class ExactCloneOrchestrator:
                 "diffs": [item["name"] for item in comparison_views],
                 "metrics": metrics,
             })
+            current_vision_paths = _vision_paths(
+                source, reciprocal_reference, rendered, comparison_views,
+            )
+            best_render_paths = (
+                best_whole_frame_paths()
+                if best_candidate is not None else []
+            )
+            best_available = len(best_render_paths) == 2
             comparator_result = _call_json(
                 self.call_agent,
                 instance=f"comparator-{global_iteration}",
-                prompt=review_prompt(final=False, candidate=candidate, reference=reference, metrics=metrics),
-                paths=_vision_paths(source, reciprocal_reference, rendered, comparison_views),
-                route=escalation_route if escalation_iteration else comparator_route,
-                validate=lambda value: validate_comparator_result(value, candidate=candidate),
+                prompt=(
+                    review_prompt(
+                        final=False, candidate=candidate,
+                        reference=reference, metrics=metrics,
+                    )
+                    + _pairwise_review_context(
+                        best_iteration=best_iteration,
+                        best_candidate=best_candidate if best_available else None,
+                    )
+                ),
+                paths=[*current_vision_paths, *best_render_paths],
+                route=comparator_route,
+                validate=lambda value: validate_comparator_result(
+                    value, candidate=candidate, best_available=best_available,
+                ),
                 emit=self.emit,
             )
             review = comparator_result["review"]
@@ -2844,8 +3187,9 @@ class ExactCloneOrchestrator:
             record = {
                 "iteration": global_iteration,
                 "cycle_iteration": cycle_comparisons,
-                "mode": "escalation" if escalation_iteration else "normal",
+                "mode": "extended" if extended_iteration else "normal",
                 "decision": "accepted" if review["decision"] == "accept" else "revise",
+                "comparisonToBest": comparator_result["comparisonToBest"],
                 "comparison": review,
                 "previews": [item["name"] for item in rendered["previews"]],
                 "diffs": [item["name"] for item in comparison_views],
@@ -2854,51 +3198,95 @@ class ExactCloneOrchestrator:
             }
             iterations.append(record)
             revision_review = review
-            revision_paths = _vision_paths(source, reciprocal_reference, rendered, comparison_views)
+            revision_paths = current_vision_paths
             suggested_refinement_patch = comparator_result["patch"]
             fallback_reason: str | None = comparator_result["patchError"]
             if best_candidate is None or best_review is None:
                 best_candidate = copy.deepcopy(candidate)
                 best_review = copy.deepcopy(review)
                 best_iteration = global_iteration
+                consecutive_non_improving = 0
+                recent_rejects = []
+            elif (
+                comparator_result["comparisonToBest"] == "better"
+                and _review_improved(review, best_review)
+            ):
+                best_candidate = copy.deepcopy(candidate)
+                best_review = copy.deepcopy(review)
+                best_iteration = global_iteration
+                consecutive_non_improving = 0
+                recent_rejects = []
             else:
-                if _review_regressed(review, best_review):
+                numeric_regression = _review_regressed(review, best_review)
+                disposition = (
+                    "worse"
+                    if comparator_result["comparisonToBest"] == "worse"
+                    or numeric_regression
+                    else "equal"
+                )
+                record["regressed" if disposition == "worse" else "plateaued"] = True
+                record["discarded"] = True
+                consecutive_non_improving += 1
+                previous_refinement = (
+                    iterations[-2].get("refinement")
+                    if len(iterations) > 1
+                    and isinstance(iterations[-2], Mapping)
+                    else None
+                )
+                recent_rejects.append({
+                    "iteration": global_iteration,
+                    "disposition": disposition,
+                    "comparisonToBest": comparator_result["comparisonToBest"],
+                    "score": review["scores"]["overall"],
+                    "minimumScore": min(review["scores"].values()),
+                    "reason": review["reason"],
+                    "issues": copy.deepcopy(review["issues"]),
+                    "attemptOperations": copy.deepcopy(
+                        previous_refinement.get("operations", [])
+                        if isinstance(previous_refinement, Mapping)
+                        else []
+                    )[:32],
+                    "candidateDigest": hashlib.sha256(
+                        _safe_json(candidate).encode("utf-8")
+                    ).hexdigest(),
+                })
+                recent_rejects = recent_rejects[-MAX_RECENT_REJECTS:]
+                if numeric_regression:
                     self.emit("regression.reverted", "compare", {
                         "from_iteration": global_iteration,
                         "from_score": review["scores"]["overall"],
                         "to_iteration": best_iteration,
                         "to_score": best_review["scores"]["overall"],
                     })
-                    candidate = copy.deepcopy(best_candidate)
-                    revision_review = copy.deepcopy(best_review)
-                    revision_paths = _saved_iteration_vision_paths(
-                        self.workspace, best_iteration, iterations,
-                        source, reciprocal_reference,
-                    ) or []
-                    if not revision_paths:
-                        restored_qa, restored_overrides = build_ephemeral_qa_candidate(
-                            candidate, source=source, reciprocal_reference=reciprocal_reference,
-                            source_placement=source_placement, source_map=source_map,
-                            target_map=target_map, workspace=iteration_root / "restored-best",
-                        )
-                        restored_rendered = run_renderer(
-                            restored_qa, iteration_root / "restored-best",
-                            asset_overrides={**demo_overrides, **restored_overrides},
-                        )
-                        revision_paths = _vision_paths(
-                            source, reciprocal_reference, restored_rendered, [],
-                        )
-                    record["regressed"] = True
-                    suggested_refinement_patch = None
-                    fallback_reason = "comparison regressed; patch the restored best candidate"
-                elif _review_improved(review, best_review):
-                    best_candidate = copy.deepcopy(candidate)
-                    best_review = copy.deepcopy(review)
-                    best_iteration = global_iteration
                 else:
-                    record["plateaued"] = True
-                    suggested_refinement_patch = None
-                    fallback_reason = "comparison plateaued; route correction to the strong model"
+                    self.emit("plateau.reverted", "compare", {
+                        "from_iteration": global_iteration,
+                        "to_iteration": best_iteration,
+                        "score": review["scores"]["overall"],
+                    })
+                candidate = copy.deepcopy(best_candidate)
+                revision_review = copy.deepcopy(best_review)
+                revision_paths = _saved_iteration_vision_paths(
+                    self.workspace, best_iteration, iterations,
+                    source, reciprocal_reference,
+                ) or []
+                if not revision_paths:
+                    restored_qa, restored_overrides = build_ephemeral_qa_candidate(
+                        candidate, source=source, reciprocal_reference=reciprocal_reference,
+                        source_placement=source_placement, source_map=source_map,
+                        target_map=target_map, workspace=iteration_root / "restored-best",
+                    )
+                    restored_rendered = run_renderer(
+                        restored_qa, iteration_root / "restored-best",
+                        asset_overrides={**demo_overrides, **restored_overrides},
+                    )
+                    revision_paths = _vision_paths(
+                        source, reciprocal_reference, restored_rendered, [],
+                    )
+                suggested_refinement_patch = None
+                fallback_reason = (
+                    f"comparison {disposition}; patch the restored immutable best candidate"
+                )
             self.emit("iteration.compared", "compare", {
                 "iteration": global_iteration,
                 "cycle_iteration": cycle_comparisons,
@@ -2921,12 +3309,19 @@ class ExactCloneOrchestrator:
                 "iterations": iterations,
                 "cycleComparisons": cycle_comparisons,
                 "comparisonBudgetUsed": comparison_budget_used,
-                "accepted": review["decision"] == "accept",
+                "accepted": review["decision"] == "accept" and not record.get("discarded"),
                 "bestCandidate": best_candidate,
                 "bestReview": best_review,
                 "bestIteration": best_iteration,
+                "consecutiveNonImproving": consecutive_non_improving,
+                "recentRejects": recent_rejects,
+                "stallDiagnosisRequested": stall_diagnosis_requested,
+                "stallDiagnosisStatus": checkpoint.get("stallDiagnosisStatus"),
+                "stallDiagnosis": stall_diagnosis,
             })
-            if review["decision"] == "accept":
+            ensure_stall_diagnosis()
+            self._check_stop()
+            if review["decision"] == "accept" and not record.get("discarded"):
                 accepted_review = review
                 final_rendered = rendered
                 final_comparison_views = comparison_views
@@ -2973,11 +3368,7 @@ class ExactCloneOrchestrator:
                     "crop": crop_box,
                     "index": group_index,
                 })
-            revision_route = (
-                escalation_route
-                if cycle_comparisons >= NORMAL_COMPARISONS
-                else builder_route
-            )
+            revision_route = builder_route
 
             def validate_refined_candidate(value: Any) -> Dict[str, Any]:
                 validated_patch = validate_refinement_patch(
@@ -3082,11 +3473,23 @@ class ExactCloneOrchestrator:
                 self.emit(
                     "iteration.revision-requested", "build", revision_event
                 )
+                repair_best_frames = best_whole_frame_paths()
                 refined = _call_json(
                     self.call_agent,
                     instance=f"layer-refinement-{global_iteration}",
-                    prompt=refinement_prompt(contract),
-                    paths=[*crop_paths, *revision_paths],
+                    prompt=(
+                        refinement_prompt(contract)
+                        + _best_repair_context(
+                            best_candidate=best_candidate,
+                            best_iteration=best_iteration,
+                            diagnosis=stall_diagnosis,
+                        )
+                    ),
+                    paths=[
+                        *crop_paths[:6],
+                        source,
+                        *repair_best_frames,
+                    ],
                     route=revision_route,
                     validate=validate_refined_candidate,
                     emit=self.emit,
@@ -3099,6 +3502,7 @@ class ExactCloneOrchestrator:
             patch = refined["patch"]
             candidate = refined["candidate"]
             record["refinement"] = {
+                "operations": copy.deepcopy(patch["operations"]),
                 "groups": [
                     {
                         "placement": item["placement"],
@@ -3140,7 +3544,10 @@ class ExactCloneOrchestrator:
             })
 
         if accepted_review is None:
-            raise AdTemplateProcessError(f"exact-clone quality loop exhausted {MAX_COMPARISONS} comparisons below 9.8")
+            raise AdTemplateProcessError(
+                f"exact-clone quality loop exhausted {MAX_COMPARISONS} comparisons "
+                f"below {LIKENESS_THRESHOLD}"
+            )
         if final_rendered is None:
             # Resumed directly onto an accepted candidate: re-render it so
             # the final review evidence matches the accepted state, and
@@ -3279,7 +3686,12 @@ class ExactCloneOrchestrator:
             merged_issues = [issue for reviewer in reviewers for issue in reviewer["issues"]]
             if not merged_issues:
                 raise AdTemplateProcessError("final reviewers requested revision without actionable issues")
-            pre_repair_candidate = candidate
+            pre_repair_candidate = copy.deepcopy(candidate)
+            pre_repair_review = copy.deepcopy(accepted_review)
+            pre_repair_frames = [
+                final_rendered["render"]["feed"],
+                final_rendered["render"]["story"],
+            ]
             repair_contract = None
             known_layer_ids = set(_candidate_layers(candidate))
             references_unknown_layer = any(
@@ -3313,9 +3725,16 @@ class ExactCloneOrchestrator:
                 repair_result = _call_json(
                     self.call_agent,
                     instance="final-merged-patch",
-                    prompt=refinement_prompt(repair_contract),
+                    prompt=(
+                        refinement_prompt(repair_contract)
+                        + _best_repair_context(
+                            best_candidate=pre_repair_candidate,
+                            best_iteration=global_iteration,
+                            diagnosis=None,
+                        )
+                    ),
                     paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
-                    route=escalation_route,
+                    route=builder_route,
                     validate=lambda value: validate_refinement_patch(value, contract=repair_contract),
                     emit=self.emit,
                 )
@@ -3328,9 +3747,16 @@ class ExactCloneOrchestrator:
                 _, candidate = _call_applied_patch(
                     self.call_agent,
                     instance="final-merged-patch",
-                    prompt=patch_prompt(candidate=candidate, issues=merged_issues),
+                    prompt=(
+                        patch_prompt(candidate=candidate, issues=merged_issues)
+                        + _best_repair_context(
+                            best_candidate=pre_repair_candidate,
+                            best_iteration=global_iteration,
+                            diagnosis=None,
+                        )
+                    ),
                     paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
-                    route=escalation_route,
+                    route=builder_route,
                     candidate=candidate,
                     emit=self.emit,
                 )
@@ -3355,22 +3781,47 @@ class ExactCloneOrchestrator:
                 source_placement=source_placement, target_placement=target_placement,
                 rendered=final_rendered,
             )
+            final_current_paths = _vision_paths(
+                source, reciprocal_reference, final_rendered,
+                final_comparison_views, production_rendered,
+            )
             final_comparator_result = _call_json(
                 self.call_agent,
                 instance="comparator-final-repair",
-                prompt=review_prompt(final=False, candidate=candidate, reference=reference, metrics=final_metrics),
-                paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
+                prompt=(
+                    review_prompt(
+                        final=False, candidate=candidate,
+                        reference=reference, metrics=final_metrics,
+                    )
+                    + _pairwise_review_context(
+                        best_iteration=global_iteration - 1,
+                        best_candidate=pre_repair_candidate,
+                    )
+                ),
+                paths=[*final_current_paths, *pre_repair_frames],
                 route=comparator_route,
-                validate=lambda value: validate_comparator_result(value, candidate=candidate, strict_issues=False),
+                validate=lambda value: validate_comparator_result(
+                    value, candidate=candidate, strict_issues=False,
+                    best_available=True,
+                ),
                 emit=self.emit,
             )
             accepted_review = final_comparator_result["review"]
-            comparator_state_accepted = accepted_review["decision"] == "accept"
+            final_repair_improved = (
+                final_comparator_result["comparisonToBest"] == "better"
+                and _review_improved(accepted_review, pre_repair_review)
+            )
+            comparator_state_accepted = (
+                accepted_review["decision"] == "accept"
+                and final_repair_improved
+            )
             iterations.append({
                 "iteration": global_iteration,
                 "cycle_iteration": cycle_comparisons,
                 "mode": "final-repair",
                 "decision": "accepted" if comparator_state_accepted else "revise",
+                "comparisonToBest": final_comparator_result["comparisonToBest"],
+                "discarded": not final_repair_improved,
                 "comparison": accepted_review,
                 "previews": [item["name"] for item in final_rendered["previews"]],
                 "diffs": [item["name"] for item in final_comparison_views],
@@ -3389,13 +3840,13 @@ class ExactCloneOrchestrator:
             if not comparator_state_accepted:
                 pre_score = float(comparator_accepted_review["scores"]["overall"])
                 post_score = float(accepted_review["scores"]["overall"])
-                if post_score < pre_score:
+                if not final_repair_improved or post_score < pre_score:
                     # The merged repair regressed the best comparator-accepted
                     # state; roll back so the next bounded round reviews the
                     # strongest evidence instead of the regression.
                     candidate = comparator_accepted_candidate
                     accepted_review = comparator_accepted_review
-                    comparator_state_accepted = True
+                    comparator_state_accepted = accepted_review["decision"] == "accept"
                     # Refresh the reviewer evidence: without this, the next
                     # round would inspect the rejected repair's renders while
                     # the shipped candidate is the restored one.
@@ -3444,6 +3895,8 @@ class ExactCloneOrchestrator:
                 # The merged repair did not reach the comparator gate yet;
                 # the next bounded round reviews the repaired candidate
                 # instead of discarding the progress.
+                comparator_accepted_candidate = candidate
+                comparator_accepted_review = accepted_review
                 continue
             comparator_accepted_candidate = candidate
             comparator_accepted_review = accepted_review
@@ -3550,7 +4003,7 @@ def validate_exact_clone_output(value: Any, *, require_import: bool) -> Dict[str
         require_actionable_targets=last_record.get("mode") not in {"final-repair", "accepted-restored"},
     )
     if accepted["decision"] != "accept":
-        raise AdTemplateProcessError("last comparator did not pass the 9.8 gate")
+        raise AdTemplateProcessError(f"last comparator did not pass the {LIKENESS_THRESHOLD} gate")
     final = value.get("final_review")
     if not isinstance(final, dict) or final.get("decision") != "accepted" or len(final.get("reviewers") or []) != 2:
         raise AdTemplateProcessError("two accepted final reviewers are required")
@@ -3561,7 +4014,7 @@ def validate_exact_clone_output(value: Any, *, require_import: bool) -> Dict[str
             require_actionable_targets=False,
         )
         if evidence["decision"] != "accept":
-            raise AdTemplateProcessError("final reviewer did not pass the 9.8 gate")
+            raise AdTemplateProcessError(f"final reviewer did not pass the {LIKENESS_THRESHOLD} gate")
         route = reviewer.get("route")
         if not isinstance(route, str) or not route:
             raise AdTemplateProcessError("final reviewer route is missing")
