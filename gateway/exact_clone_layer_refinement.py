@@ -149,16 +149,28 @@ def build_refinement_contract(
     if not issues:
         raise AdTemplateProcessError("layer refinement requires review issues")
     layers = _candidate_layers(candidate)
-    unknown = sorted({
-        layer_id
-        for issue in issues
-        for layer_id in issue.get("layerIds", [])
-        if layer_id not in layers
-    })
-    if unknown:
+    # Comparator validation already rejects unknown layer IDs with a bounded
+    # retry; this net drops any residual hallucinated references so one bad
+    # issue cannot discard the whole comparison.
+    actionable_issues = []
+    for issue in issues:
+        known_ids = [
+            layer_id for layer_id in issue.get("layerIds", [])
+            if layer_id in layers
+        ]
+        if known_ids:
+            if len(known_ids) != len(issue.get("layerIds", [])):
+                issue = {**copy.deepcopy(dict(issue)), "layerIds": known_ids}
+            actionable_issues.append(issue)
+    if not actionable_issues:
         raise AdTemplateProcessError(
-            "review issues reference unknown layer IDs: " + ", ".join(unknown)
+            "review issues reference unknown layer IDs: "
+            + ", ".join(sorted({
+                layer_id for issue in issues for layer_id in issue.get("layerIds", [])
+                if layer_id not in layers
+            }))
         )
+    issues = actionable_issues
 
     preferred = [
         issue for issue in issues

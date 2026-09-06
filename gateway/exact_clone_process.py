@@ -43,6 +43,7 @@ from gateway.ad_template_runtime import (
     vision_message,
 )
 from gateway.exact_clone_layer_refinement import (
+    _candidate_layers,
     build_refinement_batch_contract,
     find_candidate_render,
     refinement_prompt,
@@ -951,6 +952,21 @@ def validate_comparator_result(value: Any, *, candidate: Mapping[str, Any]) -> D
     if review["decision"] == "revise" and not review["issues"]:
         raise AdTemplateProcessError(
             "comparison below the 9.8 gate requires actionable issues"
+        )
+    # Issues drive the layer-refinement contract, so a hallucinated layer ID
+    # must be rejected here where the bounded comparator retry can correct
+    # it, not later in contract construction where it would discard the
+    # whole comparison.
+    known_layer_ids = set(_candidate_layers(candidate))
+    unknown_layer_ids = sorted({
+        layer_id
+        for issue in review["issues"]
+        for layer_id in issue.get("layerIds", [])
+        if layer_id not in known_layer_ids
+    })
+    if unknown_layer_ids:
+        raise AdTemplateProcessError(
+            "review issues reference unknown layer IDs: " + ", ".join(unknown_layer_ids)
         )
     raw_patch = value.get("patch")
     if review["decision"] == "accept":
