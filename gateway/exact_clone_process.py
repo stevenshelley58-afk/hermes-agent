@@ -2214,11 +2214,25 @@ def import_template(output: Mapping[str, Any], *, run_id: str, project_id: str, 
     _normalize_publish_objective(template)
     candidate = _candidate_envelope({"template": template, "assets": declarations})
     resolved = _resolve_runtime_assets(candidate, asset_overrides)
-    result = _post_blockwise(
-        url,
-        {"template": candidate["template"], "assets": resolved},
-        scope="adstudio.templates",
-    )
+    payload = {"template": candidate["template"], "assets": resolved}
+    try:
+        result = _post_blockwise(url, payload, scope="adstudio.templates")
+    except AdTemplateProcessError as exc:
+        # A quarantined artifact stored by an earlier attempt of this run
+        # blocks re-import of corrected content (e.g. after the publish
+        # objective normalization). Discard the stale quarantined copy -
+        # the review endpoint refuses to discard active or customer-owned
+        # templates - and re-import once.
+        if "409: template_artifact_conflict" not in str(exc):
+            raise
+        template_id = str(candidate["template"].get("templateId") or "")
+        if not template_id:
+            raise
+        review_template_action(
+            template_id=template_id, run_id=run_id, action="discard",
+            reason="stale quarantined artifact superseded by corrected re-import",
+        )
+        result = _post_blockwise(url, payload, scope="adstudio.templates")
     expected_id = str(candidate["template"].get("templateId") or "")
     if str(result.get("templateId") or "") != expected_id:
         raise AdTemplateProcessError("Blockwise import templateId mismatch")
