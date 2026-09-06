@@ -72,6 +72,26 @@ def test_patch_fallback_uses_operations_schema_not_full_builder_envelope():
 
 
 
+def test_aspect_reference_schema_accepts_declared_source_image_regions():
+    import jsonschema
+    import pytest
+    schema = ToolRunAPIMixin._tool_role_json_schema("aspect-reference")
+    valid = {
+        "sourcePlacement": "feed", "targetPlacement": "story",
+        "canvas": {"width": 1080, "height": 1920},
+        "regions": [{"regionId": "r1", "sourceRole": "main",
+                     "target": {"x": 0, "y": 0, "width": 1080, "height": 600}, "zIndex": 1}],
+        "preserve": ["borders"],
+        "sourceImageRegions": [{"sourceRole": "main",
+                                "bounds": {"x": 0, "y": 0, "width": 60, "height": 50},
+                                "confidence": 0.99, "textFree": True}],
+    }
+    jsonschema.validate(valid, schema)
+    jsonschema.validate({**valid, "sourceImageRegions": []}, schema)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({key: value for key, value in valid.items() if key != "sourceImageRegions"}, schema)
+
+
 def test_builder_schema_rejects_missing_or_wrong_placement_layout():
     import jsonschema
     import pytest

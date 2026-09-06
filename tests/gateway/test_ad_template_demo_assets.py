@@ -15,6 +15,7 @@ def fixture(tmp_path, monkeypatch):
     candidate = {"template": {
         "templateId": "test",
         "imageInputs": [{"key": "hero", "label": "Exterior", "defaultAssetKey": "photo"}],
+        "metadata": {"replacementAssets": []},
         "assets": {"photo": {"fileName": "source.png", "mimeType": "image/png"}},
         "feedLayout": {"layers": [{
             "type": "image_slot", "inputKey": "hero",

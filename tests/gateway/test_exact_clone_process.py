@@ -28,24 +28,22 @@ def test_source_canvas_reference_preserves_edges_and_original(tmp_path):
     assert source.read_bytes() == original
     assert process.source_canvas_reference(str(source), tmp_path / "run", "feed") == target
 
-def test_source_only_qa_uses_original_slot_not_reflowed_coordinates(tmp_path):
-    import io
+def test_qa_without_verified_photo_plan_keeps_neutral_defaults(tmp_path):
     source = tmp_path / "source.png"
-    im = Image.new("RGB", (100, 100), "blue")
-    im.paste("red", (0, 0, 50, 100))
-    im.save(source)
+    Image.new("RGB", (1080, 1350), "blue").save(source)
     candidate = {"template": _template(), "assets": []}
-    candidate["template"]["feedLayout"]["layers"][1]["geometry"] = {"x": 0, "y": 0, "width": 540, "height": 1350}
-    candidate["template"]["storyLayout"]["layers"][1]["geometry"] = {"x": 540, "y": 0, "width": 540, "height": 1920}
     qa, overrides = process.build_ephemeral_qa_candidate(
         candidate, source=str(source), reciprocal_reference=str(source), source_placement="feed",
         source_map={}, target_map={}, workspace=tmp_path / "qa")
-    for placement in ("feed", "story"):
-        with Image.open(io.BytesIO(overrides[f"qa-{placement}-1"])) as crop:
-            assert crop.getpixel((crop.width // 2, crop.height // 2)) == (255, 0, 0)
+    assert overrides == {}
+    assert qa["template"]["feedLayout"]["layers"][1]["inputKey"] == "hero"
+    assert qa["template"]["storyLayout"]["layers"][1]["inputKey"] == "hero"
     assert candidate["template"]["storyLayout"]["layers"][1]["inputKey"] == "hero"
 
-def test_qa_projects_photos_but_keeps_complete_production_logo(tmp_path):
+def test_qa_uses_verified_source_photos_but_keeps_production_logo(tmp_path):
+    import hashlib
+    import io
+    import json
     source = tmp_path / "source.png"
     Image.new("RGB", (1080, 1350), "red").save(source)
     candidate = {"template": _template(), "assets": []}
@@ -55,13 +53,27 @@ def test_qa_projects_photos_but_keeps_complete_production_logo(tmp_path):
     candidate["assets"].append({"assetKey": "brand", "fileName": "brand.png", "mimeType": "image/png"})
     for placement in ("feed", "story"):
         template[placement + "Layout"]["layers"].append({"type": "logo", "layerId": placement + "-logo", "inputKey": "brand", "geometry": {"x": 100, "y": 100, "width": 240, "height": 145}})
+    plan_root = tmp_path / "plan"
+    plan_root.mkdir()
+    buffer = io.BytesIO()
+    Image.new("RGB", (64, 64), (255, 0, 0)).save(buffer, format="PNG")
+    payload = buffer.getvalue()
+    (plan_root / "000-hero.png").write_bytes(payload)
+    plan = {"version": 1, "bindings": {"hero": {
+        "kind": "source-photo", "cropFile": "000-hero.png",
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "sourceBounds": {"x": 0, "y": 0, "width": 64, "height": 64},
+        "sourceRole": "main",
+    }}}
+    (plan_root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
     qa, overrides = process.build_ephemeral_qa_candidate(
         candidate, source=str(source), reciprocal_reference=str(source), source_placement="feed",
-        source_map={}, target_map={}, workspace=tmp_path / "qa")
+        source_map={"photoQaPlanPath": str(plan_root / "plan.json")}, target_map={}, workspace=tmp_path / "qa")
     for placement in ("feed", "story"):
         assert qa["template"][placement + "Layout"]["layers"][-1] == template[placement + "Layout"]["layers"][-1]
         assert f"qa-{placement}-1" in overrides
         assert f"qa-{placement}-2" not in overrides
+        assert qa["template"][placement + "Layout"]["layers"][1]["inputKey"] != "hero"
     assert "brand" not in overrides
     assert qa["template"]["assets"]["brand"] == template["assets"]["brand"]
 
@@ -459,11 +471,12 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     assert imported["template"]["assets"] == {}
     assert imported["assets"] == []
     assert all(not key.startswith("qa-") for key in imported["template"]["assets"])
-    assert any(
-        any(str(key).startswith("qa-") for key in item["template"]["assets"])
-        for item in rendered_candidates[:-1]
+    # No verified photo plan exists in this test, so no QA render substitutes
+    # source photos: qa- asset keys must never appear in any render.
+    assert all(
+        not any(str(key).startswith("qa-") for key in item["template"]["assets"])
+        for item in rendered_candidates
     )
-    assert all(not str(key).startswith("qa-") for key in rendered_candidates[-1]["template"]["assets"])
     assert result["previews"] and all(item["kind"] == "final-neutral-shippable" for item in result["previews"])
     assert not any(item.get("kind") == "reciprocal-image-reference" for item in result["references"])
     assert result["metrics"]["story"] == {"mode": "native-reflow", "pixelComparison": False}
@@ -788,9 +801,9 @@ def test_manual_revision_starts_new_best_candidate_scope(monkeypatch, tmp_path):
     regressed_review = _review(accept=False)
     regressed_review["scores"] = {key: 7.0 for key in regressed_review["scores"]}
     iterations = [
-        {"iteration": 2, "comparison": old_review},
-        {"iteration": 7, "comparison": new_review},
-        {"iteration": 8, "comparison": regressed_review},
+        {"iteration": 2, "comparison": old_review, "qaProjectionVersion": process.QA_PROJECTION_VERSION},
+        {"iteration": 7, "comparison": new_review, "qaProjectionVersion": process.QA_PROJECTION_VERSION},
+        {"iteration": 8, "comparison": regressed_review, "qaProjectionVersion": process.QA_PROJECTION_VERSION},
     ]
     by_iteration = {
         2: historical,
@@ -832,6 +845,24 @@ def test_manual_revision_starts_new_best_candidate_scope(monkeypatch, tmp_path):
     assert iteration == 7
     assert candidate["template"]["metadata"]["description"] == "manual-cycle-best"
     assert review["scores"]["overall"] == 8.0
+
+
+def test_recovery_ignores_comparisons_from_an_older_projection_method(monkeypatch, tmp_path):
+    stale_review = _review(accept=False)
+    stale_review["scores"] = {key: 9.9 for key in stale_review["scores"]}
+    iterations = [{"iteration": 1, "comparison": stale_review}]
+    monkeypatch.setattr(
+        process,
+        "_neutral_candidate_from_iteration",
+        lambda _workspace, _iteration: (_ for _ in ()).throw(
+            AssertionError("old-method comparisons must not be recovered")),
+    )
+    candidate, review, iteration = process._recover_checkpoint_best(
+        {"manualStartIteration": 0}, iterations, tmp_path, lambda *_args: None,
+    )
+    assert candidate is None
+    assert review is None
+    assert iteration == 0
 
 
 def test_request_manual_revision_invalidates_historical_best_and_persists_boundary(tmp_path):

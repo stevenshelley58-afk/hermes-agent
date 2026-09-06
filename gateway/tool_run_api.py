@@ -2001,9 +2001,20 @@ class ToolRunAPIMixin:
                         "required": ["regionId", "sourceRole", "target", "zIndex"],
                         "additionalProperties": False,
                     }},
+                    "sourceImageRegions": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "sourceRole": {"type": "string"},
+                            "bounds": geometry,
+                            "confidence": {"type": "number"},
+                            "textFree": {"type": "boolean"},
+                        },
+                        "required": ["sourceRole", "bounds", "confidence", "textFree"],
+                        "additionalProperties": False,
+                    }},
                     "preserve": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["sourcePlacement", "targetPlacement", "canvas", "regions", "preserve"],
+                "required": ["sourcePlacement", "targetPlacement", "canvas", "regions", "preserve", "sourceImageRegions"],
                 "additionalProperties": False,
             }
         # Enforce the renderer's structural envelope at generation time. The

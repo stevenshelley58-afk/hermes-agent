@@ -52,6 +52,8 @@ from gateway.exact_clone_layer_refinement import (
     write_matching_crops,
 )
 
+from gateway.exact_clone_photo_qa import materialize_source_photo_plan, source_photo_overrides
+
 
 PROCESS_ID = "exact-clone"
 LIKENESS_THRESHOLD = 9.8
@@ -77,8 +79,8 @@ AVAILABLE_FONT_FILES = frozenset({
     "/fonts/adstudio/bodoni-moda-400.woff2",
 })
 SOURCE_MAP_VERSION = 2
-QA_PROJECTION_VERSION = 4
-EVALUATION_POLICY_VERSION = 4
+QA_PROJECTION_VERSION = 5
+EVALUATION_POLICY_VERSION = 5
 STAGES = (
     "source",
     "aspect-reference",
@@ -559,7 +561,7 @@ def _validate_aspect_reference(
     value: Any, *, source_placement: str, target_placement: str, canvas: Mapping[str, int],
 ) -> Dict[str, Any]:
     required = {"sourcePlacement", "targetPlacement", "canvas", "regions", "preserve"}
-    if not isinstance(value, dict) or set(value) != required:
+    if not isinstance(value, dict) or not required.issubset(value) or set(value) - required - {"sourceImageRegions"}:
         raise AdTemplateProcessError("aspect reference has an invalid shape")
     if value["sourcePlacement"] != source_placement or value["targetPlacement"] != target_placement:
         raise AdTemplateProcessError("aspect reference placements do not match the source")
@@ -589,6 +591,9 @@ def _validate_aspect_reference(
             raise AdTemplateProcessError("aspect reference target must have positive size")
         if target["x"] < 0 or target["y"] < 0 or target["x"] + target["width"] > canvas["width"] or target["y"] + target["height"] > canvas["height"]:
             raise AdTemplateProcessError("aspect reference target must remain on canvas")
+    photo_regions = value.get("sourceImageRegions", [])
+    if not isinstance(photo_regions, list) or len(photo_regions) > 16:
+        raise AdTemplateProcessError("source image regions must be a bounded list")
     preserve = value["preserve"]
     if not isinstance(preserve, list) or not preserve or len(preserve) > 64 or any(not isinstance(item, str) or not item.strip() for item in preserve):
         raise AdTemplateProcessError("aspect reference preserve list is invalid")
@@ -596,10 +601,14 @@ def _validate_aspect_reference(
 
 
 def aspect_reference_prompt(*, source_placement: str, target_placement: str, canvas: Mapping[str, int], brief: str) -> str:
-    return f"""You are the aspect-reference role for an exact-clone ad-template compiler. Inspect the attached source pixels. Do not redesign, simplify, improve, or invent. Describe how the same source composition must be reflowed into the reciprocal {target_placement} canvas while preserving every visible region, hierarchy, spacing relationship, shading, gradient, shadow, transparency, border, mask, texture, image crop role, and editable text/logo role.
-
-Return one JSON object with exactly sourcePlacement, targetPlacement, canvas, regions, preserve. sourcePlacement must be {source_placement}; targetPlacement must be {target_placement}; canvas must be {json.dumps(dict(canvas), separators=(',', ':'))}. regions is an ordered list of objects with exactly regionId, sourceRole, target and zIndex. target has exactly numeric x,y,width,height inside the canvas. preserve is a non-empty list of concrete source-visible properties that must not change. This is measurement and reflow only, never creative direction. Return JSON only. Brief: {brief[:2000]}"""
-
+    source_height = 1350 if source_placement == "feed" else 1920
+    return f"""Inspect the attached original ad. This is measurement and faithful reconstruction, not redesign.
+Return exactly sourcePlacement, targetPlacement, canvas, regions, preserve, sourceImageRegions.
+sourcePlacement={source_placement}; targetPlacement={target_placement}; canvas={json.dumps(dict(canvas))}.
+regions describes the native {target_placement} adaptation: each object has regionId, sourceRole, target={{x,y,width,height}}, zIndex. Preserve every region, hierarchy, spacing relationship, typography, shading, gradients, borders, masks and texture.
+preserve is a non-empty list of concrete source-visible properties.
+sourceImageRegions is a list of ORIGINAL SOURCE photo-only rectangles, in original normalized canvas coordinates 1080x{source_height}, NOT target-layout coordinates. Each has sourceRole, bounds={{x,y,width,height}}, confidence (0..1), textFree (boolean). Exclude brandmarks and panels. Measure actual photo edges, not the approximate future image slot. If text, price, a logo or an overlay is baked over a photo, set textFree=false; never pretend a composite is a clean photo. Omit uncertain regions or use low confidence. OCR overlap is independently rejected. This optional QA evidence never changes the original source or the customer template. Return JSON only.
+Brief: {brief[:2000]}"""
 
 def build_prompt(*, run_id: str, project_id: str, brief: str, placements: Any, reference: Mapping[str, Any], source_map: Mapping[str, Any]) -> str:
     catalog = "\n".join(_runtime_catalog().prompt_lines())
@@ -753,7 +762,7 @@ def review_prompt(*, final: bool, candidate: Mapping[str, Any], reference: Mappi
     )
     patch_contract = "" if final else f"""
 When revision is required, return the exact correction as patch in this same response. patch must be {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}} with no more than {MAX_PATCH_OPERATIONS} operations and no more than {MAX_PATCH_BYTES} encoded bytes. A remove operation omits value; add/replace requires value. Every operation must directly implement a listed issue against the current candidate using an existing JSON Pointer path (add may create only an allowed missing field). Do not change schema, templateId, createdAt, asset declarations or source-free asset assignments. When the evidence passes the 9.8 gate, issues must be [] and patch must be null. Do not return a full replacement template."""
-    return f"""You are one {role} for an exact-clone template. Attached images are ordered: original source, source-photo-filled Feed QA render, source-photo-filled Story QA render, then (for final review) neutral production Feed and Story renders, followed by the original-placement overlay and difference views. The original source is the ONLY design authority. Source placement is {reference["sourcePlacement"]}; it must match the source as close to pixel-for-pixel as editable reconstruction permits. The other placement is a native aspect adaptation using the measured layout plan below: preserve the source design, hierarchy, effects and image roles without stretching or cropping the whole ad. There is no separate generated-ad target and no pixel-similarity score for that different aspect ratio. Score its composition, source-design preservation and production correctness visually. Both placements must pass the same 9.8 quality gate. QA substitutes source photo crops but retains authored neutral text. Separate source likeness from production correctness. Before scoring, check the whole frame for overlapping elements, clipped or missing text, stray glyphs, illegible text and missing media. Any such defect blocks acceptance regardless of average score. Do not reward creative redesign. Missing shading, gradients, shadows, transparency, borders, masks, texture or decorative details are material defects.
+    return f"""You are one {role} for an exact-clone template. Attached images are ordered: original source, Feed comparison render, Story comparison render, then (for final review) neutral production Feed and Story renders, followed by the original-placement overlay and difference views. The original source is the ONLY design authority. Source placement is {reference["sourcePlacement"]}; it must match the source as close to pixel-for-pixel as editable reconstruction permits. The other placement is a native aspect adaptation using the measured layout plan below: preserve the source design, hierarchy, effects and image roles without stretching or cropping the whole ad. There is no separate generated-ad target and no pixel-similarity score for that different aspect ratio. Score its composition, source-design preservation and production correctness visually. Both placements must pass the same 9.8 quality gate. Comparison renders use only frozen text-free source photo regions when independently validated; other slots retain neutral catalog/generated photographs. Never treat a different property, room, sky or brand identity as a likeness defect. Compare those slots by boundaries, crop framing, hierarchy and source-design roles, not photo-content pixels. The original source remains the layout authority. Editable text must match its footprint/density but cannot be copied from baked photo text. Raw pixel/edge metrics and difference heatmaps include intentional photograph differences and are diagnostics only, NEVER an acceptance score. Separate source-layout likeness from production correctness. Before scoring, check the whole frame for overlapping elements, clipped or missing text, stray glyphs, illegible text and missing media. Any such defect blocks acceptance regardless of average score. Do not reward creative redesign. Missing shading, gradients, shadows, transparency, borders, masks, texture or decorative details are material defects.
 
 Return JSON only with exactly {output_fields}. scores must contain exactly, in this order: overall, geometry, typography, colourEffects, imageCrop, details. effects must contain exactly, in this order: shading, gradients, shadows, transparency, borders, masks, texture; each is match, not_present, or mismatch. issues is a list of objects with exactly placement (feed|story|both), layerIds (real candidate layer IDs), category (geometry|typography|colourEffects|imageCrop|details), instruction, severity (blocker|material|minor). Every issue instruction must be directly patchable: name at least one exact target field (x, y, width, height, font/fontSize/fontFamily/fontWeight, lineHeight, tracking, colour, or crop) and give its measured numeric/hex/font-file target or delta from the attached overlay. Vague phrases such as "match the source", "align", or "fix spacing" without target values are invalid. Every visible discrepancy is an issue; acceptance requires issues=[] and every effect matched or genuinely absent. decision is evidence only; the controller derives accept/revise from scores, issues, effects and the font rule. An obvious defect blocks acceptance regardless of average. fontSubstitution is null or exactly {{source,used,reason}}.{patch_contract} Return no prose.
 
@@ -765,7 +774,7 @@ AVAILABLE BUNDLED FONT FILES: {_safe_json(sorted(AVAILABLE_FONT_FILES))}. Existi
 IMAGE ORDER NOTE: Neutral production images follow the three original-source/QA images and precede the original-placement overlay/difference views. Never interpret a difference heatmap as a customer preview.
 
 RECIPROCAL ASPECT REFERENCE: {_safe_json(reference)}
-DETERMINISTIC PIXEL/EDGE/COLOUR DIAGNOSTICS: {_safe_json(metrics)}. These are measured from the source-filled QA renders; vision remains the fidelity judge.
+DETERMINISTIC PIXEL/EDGE/COLOUR DIAGNOSTICS: {_safe_json(metrics)}. These are diagnostic differences from the comparison renders, including intentional neutral-photo differences; assess layout fidelity visually.
 CANDIDATE CONTRACT: {_safe_json(candidate)}"""
 
 
@@ -1065,83 +1074,34 @@ def build_ephemeral_qa_candidate(
     source_placement: str, source_map: Mapping[str, Any], target_map: Mapping[str, Any],
     workspace: Path,
 ) -> tuple[Dict[str, Any], Dict[str, bytes]]:
-    """Fill QA-only layers from references without changing the shippable candidate."""
+    """Use only frozen, verified clean source photos; otherwise keep neutral defaults."""
     qa = copy.deepcopy(_candidate_envelope(candidate))
     template = qa["template"]
-    image_inputs = template.get("imageInputs")
-    template_assets = template.get("assets")
-    if not isinstance(image_inputs, list) or not isinstance(template_assets, dict):
-        raise AdTemplateProcessError("template inputs and assets are required for QA projection")
-    original_image_inputs = {item.get("key"): item for item in image_inputs if isinstance(item, dict)}
-    override_bytes: Dict[str, bytes] = {}
-    qa_root = workspace / "qa-source-overrides"
-    qa_root.mkdir(parents=True, exist_ok=True)
-    target_placement = "story" if source_placement == "feed" else "feed"
-    placement_data = {
-        source_placement: (source, source_map),
-        target_placement: (reciprocal_reference, target_map),
-    }
-    source_only = Path(source).resolve() == Path(reciprocal_reference).resolve()
-    source_layout = template["feedLayout" if source_placement == "feed" else "storyLayout"]
-    source_geometries = {layer.get("inputKey"): copy.deepcopy(layer.get("geometry"))
-                         for layer in source_layout["layers"]
-                         if layer.get("type") in {"image_slot", "logo"}}
-
+    image_inputs = template["imageInputs"]
+    original_inputs = {item["key"]: item for item in image_inputs}
+    plan_path = source_map.get("photoQaPlanPath")
+    clean_photos = source_photo_overrides(plan_path) if plan_path else {}
+    overrides: Dict[str, bytes] = {}
     for placement, layout_key in (("feed", "feedLayout"), ("story", "storyLayout")):
-        layout = template.get(layout_key)
-        if not isinstance(layout, dict) or not isinstance(layout.get("layers"), list):
-            raise AdTemplateProcessError("template layout is invalid for QA projection")
-        reference_path, placement_map = placement_data[placement]
-        with Image.open(reference_path) as opened:
-            reference_image = ImageOps.exif_transpose(opened).convert("RGB")
-        canvas_width, canvas_height = (1080, 1350 if placement == "feed" else 1920)
-        for index, layer in enumerate(layout["layers"]):
-            if not isinstance(layer, dict):
-                continue
-            layer_type = layer.get("type")
+        for index, layer in enumerate(template[layout_key]["layers"]):
             input_key = layer.get("inputKey")
-            geometry = layer.get("geometry") if isinstance(layer.get("geometry"), dict) else {}
-            if layer_type == "image_slot" and input_key in original_image_inputs:
-                crop_width, crop_height = canvas_width, canvas_height
-                if source_only and placement != source_placement:
-                    geometry = source_geometries.get(input_key)
-                    if not isinstance(geometry, dict):
-                        continue
-                    crop_height = 1350 if source_placement == "feed" else 1920
-                geometry = dict(geometry)
-                try:
-                    if all(abs(float(geometry.get(key, 2))) <= 1.001 for key in ("x", "y", "width", "height")):
-                        for key in ("x", "width"): geometry[key] *= crop_width
-                        for key in ("y", "height"): geometry[key] *= crop_height
-                    left = max(0, round(float(geometry["x"]) * reference_image.width / crop_width))
-                    top = max(0, round(float(geometry["y"]) * reference_image.height / crop_height))
-                    right = min(reference_image.width, round((float(geometry["x"]) + float(geometry["width"])) * reference_image.width / crop_width))
-                    bottom = min(reference_image.height, round((float(geometry["y"]) + float(geometry["height"])) * reference_image.height / crop_height))
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if right <= left or bottom <= top:
-                    continue
-                crop = reference_image.crop((left, top, right, bottom))
-                buffer = io.BytesIO()
-                crop.save(buffer, format="PNG", optimize=True)
-                asset_key = f"qa-{placement}-{index}"
-                file_name = f"qa/{placement}-{index}.png"
-                input_clone = copy.deepcopy(original_image_inputs[input_key])
-                qa_input_key = f"qa_{placement}_{index}_{input_key}"[:120]
-                input_clone["key"] = qa_input_key
-                input_clone["defaultAssetKey"] = asset_key
-                image_inputs.append(input_clone)
-                layer["inputKey"] = qa_input_key
-                template_assets[asset_key] = {"fileName": file_name, "mimeType": "image/png"}
-                qa["assets"].append({"assetKey": asset_key, "fileName": file_name, "mimeType": "image/png"})
-                override_bytes[asset_key] = buffer.getvalue()
-            # OCR remains source-map evidence only. Keep candidate-authored
-            # neutral text in QA so words cannot merge or mutate layout.
-    return _candidate_envelope(qa), override_bytes
+            if layer.get("type") != "image_slot" or input_key not in clean_photos:
+                continue
+            asset_key = f"qa-{placement}-{index}"
+            file_name = f"qa/{placement}-{index}.png"
+            qa_input_key = f"qa_{placement}_{index}_{input_key}"[:120]
+            item = copy.deepcopy(original_inputs[input_key])
+            item.update(key=qa_input_key, defaultAssetKey=asset_key)
+            image_inputs.append(item)
+            layer["inputKey"] = qa_input_key
+            template["assets"][asset_key] = {"fileName": file_name, "mimeType": "image/png"}
+            qa["assets"].append({"assetKey": asset_key, "fileName": file_name, "mimeType": "image/png"})
+            overrides[asset_key] = clean_photos[input_key]
+    return _candidate_envelope(qa), overrides
 
 
 def _normalize_generator_asset_bindings(
-    candidate: Mapping[str, Any],
+    candidate: Mapping[str, Any], *, allow_generated: bool = False,
 ) -> Dict[str, Any]:
     """Bind generator defaults from its declared replacement-asset contract."""
     document = copy.deepcopy(dict(candidate))
@@ -1245,9 +1205,17 @@ def _normalize_generator_asset_bindings(
             )
         asset = catalog.assets.get(declaration.get("fileName"))
         if asset is None:
-            raise AdTemplateProcessError(
-                f"generator input {input_key} default is outside the safe catalog"
-            )
+            file_name = declaration.get("fileName")
+            if not (
+                allow_generated
+                and isinstance(file_name, str)
+                and file_name.startswith("demo/")
+                and file_name == template_declaration.get("fileName")
+            ):
+                raise AdTemplateProcessError(
+                    f"generator input {input_key} default is outside the safe catalog"
+                )
+            continue
         roles = set(getattr(asset, "roles", ()) or ())
         if "image_slot" in layer_types and asset.usage != "photo-default":
             raise AdTemplateProcessError(
@@ -1262,20 +1230,21 @@ def _normalize_generator_asset_bindings(
 
 def prepare_demo_assets(candidate, *, source, source_placement, workspace, route, call_image_model, emit):
     """Generate photo defaults once; preserve a per-run plan across retries."""
-    document = _normalize_generator_asset_bindings(candidate)
-    template = document["template"]
     root = (workspace / "demo-assets").resolve()
     root.mkdir(parents=True, exist_ok=True)
     plan_path = root / "plan.json"
     if plan_path.exists():
+        # Resume: the document already carries this run's generated demo assets.
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
         if not isinstance(plan, dict) or not isinstance(plan.get("assets"), list):
             raise AdTemplateProcessError("demo asset plan is invalid")
+        document = _normalize_generator_asset_bindings(candidate, allow_generated=True)
     else:
-        inputs = {item["key"]: item for item in template["imageInputs"]}
+        document = _normalize_generator_asset_bindings(candidate)
+        inputs = {item["key"]: item for item in document["template"]["imageInputs"]}
         declarations = {item["assetKey"]: item for item in document["assets"]}
         catalog = _runtime_catalog()
-        layout = template["feedLayout" if source_placement == "feed" else "storyLayout"]
+        layout = document["template"]["feedLayout" if source_placement == "feed" else "storyLayout"]
         planned = {}
         for layer in layout["layers"]:
             if layer.get("type") != "image_slot":
@@ -1297,6 +1266,7 @@ def prepare_demo_assets(candidate, *, source, source_placement, workspace, route
         temporary = plan_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(plan), encoding="utf-8")
         os.replace(temporary, plan_path)
+    template = document["template"]
     if plan.get("route") != dict(route):
         raise AdTemplateProcessError("demo photo route changed; resume with the original model")
     declarations = {item["assetKey"]: item for item in document["assets"]}
@@ -1589,7 +1559,11 @@ def _comparison_metrics(
     if not isinstance(source_render, str) or not isinstance(target_render, str):
         raise AdTemplateProcessError("native placement renders are unavailable for comparison")
     return {
-        source_placement: deterministic_pixel_metrics(source, source_render),
+        source_placement: {
+            **deterministic_pixel_metrics(source, source_render),
+            "photoIdentityComparable": False,
+            "scope": "Diagnostic only: neutral photograph identity may differ; compare layer geometry, not raw photo pixels.",
+        },
         target_placement: ({"mode": "native-reflow", "pixelComparison": False}
                            if Path(source).resolve() == Path(reciprocal_reference).resolve()
                            else deterministic_pixel_metrics(reciprocal_reference, target_render)),
@@ -1761,6 +1735,9 @@ def _recover_checkpoint_best(
             not isinstance(record, Mapping)
             or not isinstance(record.get("iteration"), int)
             or record["iteration"] <= manual_start
+            # Comparisons produced under an older projection method are not a
+            # valid baseline for the current comparison renderer.
+            or record.get("qaProjectionVersion") != QA_PROJECTION_VERSION
         ):
             continue
         try:
@@ -2213,11 +2190,15 @@ class ExactCloneOrchestrator:
             previous_version = checkpoint.get("qaProjectionVersion")
             checkpoint["accepted"] = False
             checkpoint.pop("finalReview", None)
+            # Old photo-composite evidence is not a valid regression baseline.
+            for key in ("bestCandidate", "bestReview", "bestIteration"):
+                checkpoint.pop(key, None)
             checkpoint_policy_events.append(("qa-projection.updated", {
                 "from_version": previous_version,
                 "to_version": QA_PROJECTION_VERSION,
                 "preserved_iterations": len(checkpoint.get("iterations") or []),
             }))
+            checkpoint["qaProjectionVersion"] = QA_PROJECTION_VERSION
         if checkpoint and checkpoint.get("evaluationPolicyVersion") != EVALUATION_POLICY_VERSION:
             previous_version = checkpoint.get("evaluationPolicyVersion")
             checkpoint["accepted"] = False
@@ -2378,6 +2359,14 @@ class ExactCloneOrchestrator:
             candidate = normalized_candidate
             persist_checkpoint(self.workspace, {"candidate": candidate}, merge=True)
 
+        source_layers = candidate["template"]["feedLayout" if source_placement == "feed" else "storyLayout"]["layers"]
+        photo_plan = materialize_source_photo_plan(
+            source=source, source_map=source_map,
+            source_regions=reference.get("sourceImageRegions", []),
+            source_layers=[layer for layer in source_layers if layer.get("type") == "image_slot"],
+            workspace=self.workspace,
+        )
+        source_map = {**source_map, "photoQaPlanPath": str(photo_plan)}
         final_rendered: Dict[str, Any] | None = None
         final_comparison_views: list[dict[str, str]] = []
         final_metrics: Dict[str, Any] = {}
@@ -2522,6 +2511,7 @@ class ExactCloneOrchestrator:
                 "previews": [item["name"] for item in rendered["previews"]],
                 "diffs": [item["name"] for item in comparison_views],
                 "metrics": metrics,
+                "qaProjectionVersion": QA_PROJECTION_VERSION,
             }
             iterations.append(record)
             revision_review = review
