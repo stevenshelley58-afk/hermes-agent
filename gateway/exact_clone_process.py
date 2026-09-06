@@ -3392,6 +3392,44 @@ class ExactCloneOrchestrator:
                     candidate = comparator_accepted_candidate
                     accepted_review = comparator_accepted_review
                     comparator_state_accepted = True
+                    # Refresh the reviewer evidence: without this, the next
+                    # round would inspect the rejected repair's renders while
+                    # the shipped candidate is the restored one.
+                    global_iteration += 1
+                    iteration_root = self.workspace / "iterations" / f"{global_iteration:02d}"
+                    qa_candidate, qa_asset_overrides = build_ephemeral_qa_candidate(
+                        candidate, source=source, reciprocal_reference=reciprocal_reference,
+                        source_placement=source_placement, source_map=source_map,
+                        target_map=target_map, workspace=iteration_root,
+                    )
+                    final_rendered = _copy_public_previews(
+                        run_renderer(qa_candidate, iteration_root, asset_overrides={**demo_overrides, **qa_asset_overrides}),
+                        self.workspace, global_iteration, kind="accepted-restored",
+                    )
+                    production_rendered = run_renderer(
+                        candidate, self.workspace / f"final-review-production-{global_iteration:02d}",
+                        asset_overrides=demo_overrides,
+                    )
+                    final_comparison_views = _comparison_views(
+                        source, reciprocal_reference, final_rendered, self.workspace,
+                        global_iteration, source_placement, target_placement,
+                    )
+                    final_metrics = _comparison_metrics(
+                        source=source, reciprocal_reference=reciprocal_reference,
+                        source_placement=source_placement, target_placement=target_placement,
+                        rendered=final_rendered,
+                    )
+                    iterations.append({
+                        "iteration": global_iteration,
+                        "cycle_iteration": cycle_comparisons,
+                        "mode": "accepted-restored",
+                        "decision": "accepted",
+                        "comparison": accepted_review,
+                        "previews": [item["name"] for item in final_rendered["previews"]],
+                        "diffs": [item["name"] for item in final_comparison_views],
+                        "metrics": final_metrics,
+                        "qaProjectionVersion": QA_PROJECTION_VERSION,
+                    })
                     self.emit("regression.reverted", "final-check", {
                         "iteration": global_iteration,
                         "mode": "final-repair",
@@ -3505,7 +3543,7 @@ def validate_exact_clone_output(value: Any, *, require_import: bool) -> Dict[str
     last_record = iterations[-1]
     accepted = validate_review(
         last_record["comparison"],
-        require_actionable_targets=last_record.get("mode") != "final-repair",
+        require_actionable_targets=last_record.get("mode") not in {"final-repair", "accepted-restored"},
     )
     if accepted["decision"] != "accept":
         raise AdTemplateProcessError("last comparator did not pass the 9.8 gate")
