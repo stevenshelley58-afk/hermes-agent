@@ -785,6 +785,12 @@ def validate_review(value: Any) -> Dict[str, Any]:
     # The model reports evidence; the controller owns the gate decision.
     # A contradictory label must never fail or accidentally pass a run.
     expected = "accept" if passed else "revise"
+    if expected == "revise" and not normalized_issues:
+        # A below-gate review that names nothing actionable cannot drive the
+        # bounded repair loop; force the reviewer to state the defects.
+        raise AdTemplateProcessError(
+            "below-gate review requires actionable issues for the failed scores"
+        )
     reason = (
         "All exact-clone evidence met the 9.8 gate."
         if passed

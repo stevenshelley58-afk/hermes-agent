@@ -525,6 +525,15 @@ def test_patch_prompt_supplies_exact_layer_pointers_and_array_rules():
 
 
 
+def test_below_gate_review_without_issues_is_rejected_for_repair():
+    base = _review(accept=False)
+    gate_failure = copy.deepcopy(base)
+    gate_failure["issues"] = []
+    gate_failure["scores"] = {key: (9.8 if key == "imageCrop" else 9.4) for key in base["scores"]}
+    with pytest.raises(process.AdTemplateProcessError, match="actionable issues"):
+        process.validate_review(gate_failure)
+
+
 def test_issue_targets_must_stay_within_renderer_bounds():
     base = _review(accept=False)
     issue = copy.deepcopy(base["issues"][0])
@@ -561,13 +570,22 @@ def test_issue_targets_must_stay_within_renderer_bounds():
 def test_visual_gate_requires_every_score_and_effect_at_98():
     passing = _review(accept=True)
     assert process.validate_review(passing)["decision"] == "accept"
+    below_gate_issue = {
+        "placement": "feed",
+        "layerIds": ["feed-hero"],
+        "category": "details",
+        "instruction": "Set fontSize to 54 so the headline matches the source.",
+        "severity": "material",
+    }
     failing = copy.deepcopy(passing)
     failing["scores"]["details"] = 9.79
     failing["decision"] = "revise"
+    failing["issues"] = [below_gate_issue]
     assert process.validate_review(failing)["decision"] == "revise"
     effect_failure = copy.deepcopy(passing)
     effect_failure["effects"]["shadows"] = "mismatch"
     effect_failure["decision"] = "revise"
+    effect_failure["issues"] = [below_gate_issue]
     assert process.validate_review(effect_failure)["decision"] == "revise"
 
 
