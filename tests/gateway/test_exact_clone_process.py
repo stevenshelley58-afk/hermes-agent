@@ -525,6 +525,32 @@ def test_patch_prompt_supplies_exact_layer_pointers_and_array_rules():
 
 
 
+def test_issue_targets_must_stay_within_renderer_bounds():
+    base = _review(accept=False)
+    issue = copy.deepcopy(base["issues"][0])
+    issue["instruction"] = "Set tracking to 6 so the headline matches the source."
+    out_of_range = copy.deepcopy(base)
+    out_of_range["issues"] = [issue]
+    with pytest.raises(process.AdTemplateProcessError, match="tracking target"):
+        process.validate_review(out_of_range)
+
+    story_font = copy.deepcopy(base)
+    font_issue = copy.deepcopy(issue)
+    font_issue.update(
+        placement="story",
+        instruction="Set fontSize to 20 for the story headline to match the source.",
+    )
+    story_font["issues"] = [font_issue]
+    with pytest.raises(process.AdTemplateProcessError, match="fontSize target"):
+        process.validate_review(story_font)
+
+    valid = copy.deepcopy(base)
+    valid_issue = copy.deepcopy(issue)
+    valid_issue["instruction"] = "Set tracking to 3 and fontSize to 54 to match the source."
+    valid["issues"] = [valid_issue]
+    assert process.validate_review(valid)["decision"] == "revise"
+
+
 def test_visual_gate_requires_every_score_and_effect_at_98():
     passing = _review(accept=True)
     assert process.validate_review(passing)["decision"] == "accept"
