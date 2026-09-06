@@ -3137,7 +3137,16 @@ class ExactCloneOrchestrator:
             if not merged_issues:
                 raise AdTemplateProcessError("final reviewers requested revision without actionable issues")
             repair_contract = None
-            if all(_instruction_has_actionable_target(str(issue.get("instruction") or "")) for issue in merged_issues):
+            known_layer_ids = set(_candidate_layers(candidate))
+            references_unknown_layer = any(
+                layer_id not in known_layer_ids
+                for issue in merged_issues
+                for layer_id in (issue.get("layerIds") or [])
+            )
+            if (
+                not references_unknown_layer
+                and all(_instruction_has_actionable_target(str(issue.get("instruction") or "")) for issue in merged_issues)
+            ):
                 try:
                     # Repair through the refinement contract so every explicitly
                     # measured reviewer target is locked and validated; the
@@ -3168,8 +3177,10 @@ class ExactCloneOrchestrator:
                 )
                 candidate = apply_patch(candidate, repair_result)
             else:
-                # Qualitative reviewer guidance has no lockable targets;
-                # route it through the generic bounded patch path.
+                # Qualitative reviewer guidance has no lockable targets, and
+                # add-a-layer requests cannot be expressed as property
+                # pointers; both route through the generic bounded patch
+                # path, which stays bounds-checked.
                 _, candidate = _call_applied_patch(
                     self.call_agent,
                     instance="final-merged-patch",
