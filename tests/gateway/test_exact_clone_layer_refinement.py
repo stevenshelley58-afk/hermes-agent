@@ -184,6 +184,28 @@ def test_contract_clamps_out_of_range_measured_targets_to_renderer_bounds():
     assert targets["fontSize"] == 24.0
 
 
+def test_contract_clamps_geometry_targets_to_the_placement_canvas():
+    issue = {
+        "placement": "feed",
+        "layerIds": ["feed-features"],
+        "category": "geometry",
+        "instruction": (
+            "Move and resize the features block to the story frame footprint: "
+            "set y to 20 and height to 1880."
+        ),
+        "severity": "material",
+    }
+    contract = build_refinement_contract(
+        _candidate(),
+        [issue],
+        source_placement="feed",
+        available_fonts=[],
+    )
+    targets = contract["layers"]["feed-features"]["numericTargets"]
+    assert targets["geometry/y"] == 20.0
+    assert targets["geometry/height"] == 1350.0 - 20.0
+
+
 def test_contract_still_raises_when_no_issue_has_a_structured_target():
     vague = {
         "placement": "feed",

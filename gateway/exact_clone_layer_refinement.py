@@ -262,6 +262,29 @@ def build_refinement_contract(
                 )
             target_values.update(issue_targets)
             properties.update(_explicit_properties(issue, issue_targets))
+        # Keep combined geometry inside the placement canvas so an
+        # out-of-canvas reviewer phrasing converges on the nearest
+        # renderable rectangle instead of creating an impossible contract
+        # that every bounded retry would fail.
+        canvas_width, canvas_height = _CANVAS[placement]
+        if any(field in target_values for field in ("geometry/x", "geometry/y", "geometry/width", "geometry/height")):
+            current_geometry = layers[layer_id]["layer"].get("geometry") or {}
+            x = float(target_values.get("geometry/x", current_geometry.get("x") or 0))
+            y = float(target_values.get("geometry/y", current_geometry.get("y") or 0))
+            width = float(target_values.get("geometry/width", current_geometry.get("width") or 1))
+            height = float(target_values.get("geometry/height", current_geometry.get("height") or 1))
+            x = max(0.0, min(x, canvas_width - 1.0))
+            y = max(0.0, min(y, canvas_height - 1.0))
+            width = max(1.0, min(width, canvas_width - x))
+            height = max(1.0, min(height, canvas_height - y))
+            if "geometry/x" in target_values:
+                target_values["geometry/x"] = x
+            if "geometry/y" in target_values:
+                target_values["geometry/y"] = y
+            if "geometry/width" in target_values:
+                target_values["geometry/width"] = width
+            if "geometry/height" in target_values:
+                target_values["geometry/height"] = height
         locks[layer_id] = sorted(properties)
         targets[layer_id] = target_values
 
