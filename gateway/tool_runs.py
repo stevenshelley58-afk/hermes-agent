@@ -68,6 +68,7 @@ def ad_template_generator_model_catalog() -> List[Dict[str, Any]]:
         {
             "provider": provider,
             "model": model,
+            "capability_verified": True,
             "capabilities": ["vision_structured"],
             "supports_vision": True,
             "supports_tools": True,
@@ -78,6 +79,7 @@ def ad_template_generator_model_catalog() -> List[Dict[str, Any]]:
         {
             "provider": provider,
             "model": model,
+            "capability_verified": True,
             "capabilities": ["reference_image_edit"] if provider == "meta-direct" else ["masked_image_edit"],
             "supports_vision": True,
             "supports_tools": False,

@@ -80,6 +80,25 @@ async def test_model_catalog_exposes_canonical_capabilities_with_legacy_alias(
         result["ad_studio_capabilities"]
         == result["ad_template_generator_capabilities"]
     )
+    capabilities = result["ad_template_generator_capabilities"]
+    by_route = {(item["provider"], item["model"]): item for item in capabilities}
+    assert by_route[("meta-direct", "muse-image-1.0")][
+        "capability_verified"
+    ] is True
+    assert by_route[("meta-direct", "muse-image-1.0")]["supports_vision"] is True
+    assert by_route[("meta-direct", "muse-image-1.0")]["supports_tools"] is False
+    assert by_route[("concentrate", "gemini-3.8-flash")][
+        "capability_verified"
+    ] is True
+    assert by_route[("openai-codex", "gpt-image-2-high")][
+        "capability_verified"
+    ] is True
+    for route in (
+        ("gemini", "gemini-3.1-flash-image"),
+        ("gemini", "gemini-3-pro-image"),
+        ("openai-api", "gpt-image-2"),
+    ):
+        assert by_route[route]["capability_verified"] is False
 
 
 @pytest.mark.asyncio

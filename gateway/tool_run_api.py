@@ -1727,7 +1727,10 @@ class ToolRunAPIMixin:
                 return {
                     "provider": provider,
                     "model": model,
+                    "capability_verified": False,
                     "capabilities": [name],
+                    "supports_vision": True,
+                    "supports_tools": False,
                     "available": readiness.get(provider, False),
                     "credential_ready": readiness.get(provider, False),
                     "estimated_price": None,
