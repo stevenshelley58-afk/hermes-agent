@@ -643,7 +643,7 @@ DETERMINISTIC SOURCE MAP (measurements override coordinate guesses): {_safe_json
 Run {run_id}; project {project_id}; placements {json.dumps(placements)}; brief {brief[:3000]}."""
 
 
-def _validate_issue(value: Any) -> Dict[str, Any]:
+def _validate_issue(value: Any, *, require_actionable_target: bool = True) -> Dict[str, Any]:
     required = {"placement", "layerIds", "category", "instruction", "severity"}
     if not isinstance(value, dict) or set(value) != required:
         raise AdTemplateProcessError("review issue has an invalid shape")
@@ -687,25 +687,9 @@ def _validate_issue(value: Any) -> Dict[str, Any]:
     # file, an alignment keyword, a semantic colour hex, or an explicit
     # effect object.  A vague mention like "tracking tighter than the
     # current 2 units" extracts zero targets and would leave the bounded
-    # refinement contract nothing to lock.
-    fields = "x|y|width|height|fontSize|lineHeight|tracking|opacity|cornerRadius|rotationDegrees|maxLines|maxCharacters"
-    actionable_target = (
-        re.search(rf"\b({fields})\b\s*(?:to|=|at|:)\s*[-+]?\d", instruction, flags=re.IGNORECASE)
-        or re.search(
-            rf"\b({fields})\b\s+from\s+[-+]?\d+(?:\.\d+)?\s*to\s+[-+]?\d",
-            instruction, flags=re.IGNORECASE,
-        )
-        or re.search(rf"\b({fields})\b\s+[-+]?\d+(?:\.\d+)?", instruction, flags=re.IGNORECASE)
-        or re.search(
-            rf"\b({fields})\b[^.;]{{0,24}}?[+-]\d+(?:\.\d+)?\s*(?:px)?\s*delta",
-            instruction, flags=re.IGNORECASE,
-        )
-        or re.search(r"/fonts/[^\s,]+\.woff2", instruction, re.IGNORECASE)
-        or re.search(r"\balign(?:ment)?\b\s*(?:to|=|at|:)\s*(?:left|center|right)\b", instruction, re.IGNORECASE)
-        or re.search(r"#[0-9a-f]{3,8}\b", instruction, re.IGNORECASE)
-        or re.search(r"\b(?:crop|stroke|shadow|mask|effects?|fill|blendMode)\b", instruction, re.IGNORECASE)
-    )
-    if not actionable_target:
+    # refinement contract nothing to lock.  Final reviewers may report
+    # qualitative guidance, so the check only applies to comparator issues.
+    if require_actionable_target and not _instruction_has_actionable_target(instruction):
         raise AdTemplateProcessError(
             "review issue instruction requires an actionable numeric, colour, crop or font target"
         )
@@ -736,7 +720,7 @@ def _same_font_substitution(reviewer_value: Any, comparator_value: Any) -> bool:
     )
 
 
-def validate_review(value: Any) -> Dict[str, Any]:
+def validate_review(value: Any, *, require_actionable_targets: bool = True) -> Dict[str, Any]:
     required = {"decision", "scores", "issues", "warnings", "effects", "fontSubstitution"}
     if (
         not isinstance(value, dict)
@@ -766,7 +750,10 @@ def validate_review(value: Any) -> Dict[str, Any]:
     issues = value.get("issues")
     if not isinstance(issues, list) or len(issues) > 64:
         raise AdTemplateProcessError("visual review issues are invalid")
-    normalized_issues = [_validate_issue(item) for item in issues]
+    normalized_issues = [
+        _validate_issue(item, require_actionable_target=require_actionable_targets)
+        for item in issues
+    ]
     warnings = value.get("warnings")
     if not isinstance(warnings, list) or len(warnings) > 32 or any(not isinstance(item, str) or len(item) > 1000 for item in warnings):
         raise AdTemplateProcessError("visual review warnings are invalid")
@@ -851,6 +838,29 @@ def _layer_pointer_map(candidate: Mapping[str, Any]) -> Dict[str, str]:
             if isinstance(layer_id, str) and layer_id:
                 pointers[layer_id] = f"/template/{layout_key}/layers/{index}"
     return pointers
+
+
+def _instruction_has_actionable_target(instruction: str) -> bool:
+    """True when the instruction carries a target the refinement contract
+    can lock: a numeric direct/from-to/bare/delta target, a font file, an
+    alignment keyword, a semantic colour hex, or an explicit effect object."""
+    fields = "x|y|width|height|fontSize|lineHeight|tracking|opacity|cornerRadius|rotationDegrees|maxLines|maxCharacters"
+    return bool(
+        re.search(rf"\b({fields})\b\s*(?:to|=|at|:)\s*[-+]?\d", instruction, flags=re.IGNORECASE)
+        or re.search(
+            rf"\b({fields})\b\s+from\s+[-+]?\d+(?:\.\d+)?\s*to\s+[-+]?\d",
+            instruction, flags=re.IGNORECASE,
+        )
+        or re.search(rf"\b({fields})\b\s+[-+]?\d+(?:\.\d+)?", instruction, flags=re.IGNORECASE)
+        or re.search(
+            rf"\b({fields})\b[^.;]{{0,24}}?[+-]\d+(?:\.\d+)?\s*(?:px)?\s*delta",
+            instruction, flags=re.IGNORECASE,
+        )
+        or re.search(r"/fonts/[^\s,]+\.woff2", instruction, re.IGNORECASE)
+        or re.search(r"\balign(?:ment)?\b\s*(?:to|=|at|:)\s*(?:left|center|right)\b", instruction, re.IGNORECASE)
+        or re.search(r"#[0-9a-f]{3,8}\b", instruction, re.IGNORECASE)
+        or re.search(r"\b(?:crop|stroke|shadow|mask|effects?|fill|blendMode)\b", instruction, re.IGNORECASE)
+    )
 
 
 def patch_prompt(*, candidate: Mapping[str, Any], issues: Sequence[Mapping[str, Any]], manual_instructions: str = "") -> str:
@@ -3076,7 +3086,7 @@ class ExactCloneOrchestrator:
                     prompt=review_prompt(final=True, candidate=candidate, reference=reference, metrics=final_metrics),
                     paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
                     route=route,
-                    validate=validate_review,
+                    validate=lambda value: validate_review(value, require_actionable_targets=False),
                     emit=lambda kind, node, data: buffered_events.append((kind, node, data)),
                 )
                 return ({"id": identity, "route": f"{route.get('provider')}/{route.get('model')}", **result}, buffered_events)
@@ -3118,25 +3128,39 @@ class ExactCloneOrchestrator:
             merged_issues = [issue for reviewer in reviewers for issue in reviewer["issues"]]
             if not merged_issues:
                 raise AdTemplateProcessError("final reviewers requested revision without actionable issues")
-            # Repair through the refinement contract so every explicitly
-            # measured reviewer target is locked and validated; the generic
-            # patch prompt let group shifts be approximated or skipped.
-            repair_contract = build_refinement_contract(
-                candidate,
-                merged_issues,
-                source_placement=source_placement,
-                available_fonts=sorted(AVAILABLE_FONT_FILES),
-            )
-            repair_result = _call_json(
-                self.call_agent,
-                instance="final-merged-patch",
-                prompt=refinement_prompt(repair_contract),
-                paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
-                route=escalation_route,
-                validate=lambda value: validate_refinement_patch(value, contract=repair_contract),
-                emit=self.emit,
-            )
-            candidate = apply_patch(candidate, repair_result)
+            if all(_instruction_has_actionable_target(str(issue.get("instruction") or "")) for issue in merged_issues):
+                # Repair through the refinement contract so every explicitly
+                # measured reviewer target is locked and validated; the
+                # generic patch prompt let group shifts be approximated or
+                # skipped.
+                repair_contract = build_refinement_contract(
+                    candidate,
+                    merged_issues,
+                    source_placement=source_placement,
+                    available_fonts=sorted(AVAILABLE_FONT_FILES),
+                )
+                repair_result = _call_json(
+                    self.call_agent,
+                    instance="final-merged-patch",
+                    prompt=refinement_prompt(repair_contract),
+                    paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
+                    route=escalation_route,
+                    validate=lambda value: validate_refinement_patch(value, contract=repair_contract),
+                    emit=self.emit,
+                )
+                candidate = apply_patch(candidate, repair_result)
+            else:
+                # Qualitative reviewer guidance has no lockable targets;
+                # route it through the generic bounded patch path.
+                _, candidate = _call_applied_patch(
+                    self.call_agent,
+                    instance="final-merged-patch",
+                    prompt=patch_prompt(candidate=candidate, issues=merged_issues),
+                    paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
+                    route=escalation_route,
+                    candidate=candidate,
+                    emit=self.emit,
+                )
             global_iteration += 1
             iteration_root = self.workspace / "iterations" / f"{global_iteration:02d}"
             qa_candidate, qa_asset_overrides = build_ephemeral_qa_candidate(
