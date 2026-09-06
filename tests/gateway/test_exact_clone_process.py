@@ -201,7 +201,12 @@ def _template() -> dict:
         "semanticColours": {},
         "assets": {},
         "fonts": [],
-        "metadata": {"title": "Exact clone", "description": "initial"},
+        "metadata": {"title": "Exact clone", "description": "initial",
+                     "publishRequirements": {"objective": "leads",
+                                            "specialAdCategory": "housing",
+                                            "instantForm": {"required": False, "dependency": None},
+                                            "destination": {"required": False, "kind": "website", "dependency": None},
+                                            "requiredCtaTypes": ["learn_more"]}},
     }
 
 

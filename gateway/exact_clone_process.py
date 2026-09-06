@@ -2171,6 +2171,39 @@ def _post_blockwise(url: str, payload: Mapping[str, Any], *, scope: str) -> Dict
     return value
 
 
+_CURRENT_PUBLISH_OBJECTIVES = {
+    "awareness": "OUTCOME_AWARENESS",
+    "traffic": "OUTCOME_TRAFFIC",
+    "engagement": "OUTCOME_ENGAGEMENT",
+    "leads": "OUTCOME_LEADS",
+    "app_promotion": "OUTCOME_APP_PROMOTION",
+    "sales": "OUTCOME_SALES",
+}
+
+
+def _normalize_publish_objective(template: Dict[str, Any]) -> None:
+    """Map loose build-side objective wording to Blockwise's current naming.
+
+    The publication smoke test accepts only the OUTCOME_* objectives; the
+    builder contract leaves the value unconstrained, so normalize at the
+    import boundary instead of failing the smoke test after a paid run.
+    """
+    metadata = template.get("metadata")
+    publish = metadata.get("publishRequirements") if isinstance(metadata, dict) else None
+    if not isinstance(publish, dict) or not isinstance(publish.get("objective"), str):
+        raise AdTemplateProcessError("template publishRequirements.objective is required")
+    objective = publish["objective"].strip()
+    if objective.startswith("OUTCOME_"):
+        publish["objective"] = objective
+        return
+    normalized = _CURRENT_PUBLISH_OBJECTIVES.get(objective.lower().replace("-", "_"))
+    if normalized is None:
+        raise AdTemplateProcessError(
+            f"template publish objective {objective!r} is not a supported campaign objective"
+        )
+    publish["objective"] = normalized
+
+
 def import_template(output: Mapping[str, Any], *, run_id: str, project_id: str, asset_overrides: Mapping[str, bytes] | None = None) -> Dict[str, Any]:
     del project_id
     url = os.environ.get("BLOCKWISE_TEMPLATE_IMPORT_URL", "").strip()
@@ -2178,6 +2211,7 @@ def import_template(output: Mapping[str, Any], *, run_id: str, project_id: str, 
         raise AdTemplateProcessError("BLOCKWISE_TEMPLATE_IMPORT_URL is required")
     template = output.get("template")
     declarations = output.get("assets")
+    _normalize_publish_objective(template)
     candidate = _candidate_envelope({"template": template, "assets": declarations})
     resolved = _resolve_runtime_assets(candidate, asset_overrides)
     result = _post_blockwise(
