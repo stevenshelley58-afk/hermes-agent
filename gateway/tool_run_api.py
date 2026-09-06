@@ -1503,6 +1503,36 @@ class ToolRunAPIMixin:
             cost["estimated_usd"] = usage["estimated_cost_usd"]
             output["cost"] = cost
             view["output"] = output
+        # Partial runs project the same durable ledger as completed output.
+        if run.get("status") not in {"completed", "ready_for_review", "approved"}:
+            records = {}
+            events = self._tool_run_store.events(
+                run["run_id"], limit=1000, newest_first=True,
+            )
+            for event in reversed(events):
+                kind = event.get("kind")
+                data = event.get("data") or {}
+                iteration = data.get("iteration")
+                if kind not in {"iteration.rendered", "iteration.compared"} or not isinstance(iteration, int):
+                    continue
+                record = records.setdefault(iteration, {
+                    "iteration": iteration, "decision": "revise",
+                    "comparison": {}, "previews": [],
+                })
+                if kind == "iteration.rendered":
+                    record["previews"] = data.get("previews") or []
+                    record["diffs"] = data.get("diffs") or []
+                else:
+                    record["decision"] = "accepted" if data.get("decision") == "accept" else "revise"
+                    record["comparison"] = {
+                        "score": data.get("score"),
+                        "scores": data.get("scores") or {},
+                        "reason": data.get("reason") or "",
+                    }
+            if records:
+                output = dict(view.get("output") or {})
+                output["iterations"] = [records[key] for key in sorted(records)[-30:]]
+                view["output"] = output
         return view
 
     async def _handle_list_tool_runs(self, request: web.Request) -> web.Response:
