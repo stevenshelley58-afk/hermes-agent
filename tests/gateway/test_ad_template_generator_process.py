@@ -1161,14 +1161,16 @@ def test_patch_application_error_is_fed_back_for_one_bounded_retry(tmp_path):
     source = tmp_path / "source.png"
     Image.new("RGB", (20, 20), "white").save(source)
     calls: list[str] = []
+    prompts: list[str] = []
     events: list[tuple[str, dict]] = []
 
-    def call_agent(instance, _prompt, _route):
+    def call_agent(instance, prompt, _route):
         calls.append(instance)
+        prompts.append(prompt[0]["text"])
         if len(calls) == 1:
             return {"operations": [{
                 "op": "replace", "path": "/template/metadata/missing",
-                "value": "invalid",
+                "value": "preserve-this-value",
             }]}
         return {"operations": [{
             "op": "replace", "path": "/template/metadata/description",
@@ -1182,6 +1184,10 @@ def test_patch_application_error_is_fed_back_for_one_bounded_retry(tmp_path):
         emit=lambda kind, _node, data: events.append((kind, data)),
     )
     assert calls == ["patch-semantic", "patch-semantic-format-retry"]
+    assert "PREVIOUS REJECTED RESPONSE:" not in prompts[0]
+    assert "PREVIOUS REJECTED RESPONSE:" in prompts[1]
+    assert "/template/metadata/missing" in prompts[1]
+    assert "preserve-this-value" in prompts[1]
     assert patch["operations"][0]["path"] == "/template/metadata/description"
     assert candidate["template"]["metadata"]["description"] == "corrected"
     assert events[0][0] == "role.output-retried"
