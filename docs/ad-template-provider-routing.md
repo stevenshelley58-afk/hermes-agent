@@ -81,3 +81,39 @@ as a successful edit. Logo layers retain their neutral production asset during
 QA, avoiding false clipping introduced by source-advertiser crops. Restored best
 candidates receive matching saved visual evidence. The pilot still requires
 visual acceptance; deployment of these fixes does not approve a template.
+
+## Current process (6 September 2026, release 8871e1e7ab)
+
+Deployed from `/opt/releases/hermes-template-8871e1e7ab`
+(branch `fix/template-provider-loop-20260905`). The frozen model policy
+revision 43 is unchanged: Muse Spark 1.3 Contributor builds/repairs,
+Gemini 3.8 Flash compares, one Gemini plus one Contributor final reviewer,
+Muse Image 1.0 for demo photographs only.
+
+Final-check repairs now behave as a bounded evidence chain:
+
+- Source-photo comparison crops are declared once as `sourceImageRegions`,
+  frozen independently of candidate geometry, and fall back to the neutral
+  photo default when no verified clean crop exists. They are comparison-only
+  and never published as demo assets.
+- Final reviewers may report fully qualitative issues; the actionable-target
+  rule applies to comparator issues only.
+- Merged reviewer repairs take the locked refinement contract when every
+  issue has a lockable numeric target on a known layer; qualitative sets,
+  add-a-layer requests and unresolvable targets use the generic bounded
+  patch path. Both stay bounds-checked.
+- Patch application enforces the renderer's per-type required fields
+  (image-slot crop metadata, vector/patch opacity, text metrics, 24px feed /
+  32px story font minimums, tracking range) and rolls a layer back into its
+  placement canvas, so a bad repair hits the bounded replan instead of the
+  shared renderer.
+- The final-repair comparator gate keeps its accepted evidence chain: repairs
+  that regress the best comparator-accepted candidate are rolled back, and a
+  unanimous reviewer acceptance only ships when the candidate's comparator
+  verdict is also at or above the 9.8 gate.
+- Import normalizes the publish objective to Blockwise's current
+  `OUTCOME_*` naming before the signed quarantined-import request.
+
+Checkpoint QA/evaluation versions are bumped to 5; restored runs from older
+checkpoints re-derive their comparison evidence rather than trusting a
+baseline produced by the faulty comparison method.
