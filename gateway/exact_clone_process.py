@@ -3136,17 +3136,27 @@ class ExactCloneOrchestrator:
             merged_issues = [issue for reviewer in reviewers for issue in reviewer["issues"]]
             if not merged_issues:
                 raise AdTemplateProcessError("final reviewers requested revision without actionable issues")
+            repair_contract = None
             if all(_instruction_has_actionable_target(str(issue.get("instruction") or "")) for issue in merged_issues):
-                # Repair through the refinement contract so every explicitly
-                # measured reviewer target is locked and validated; the
-                # generic patch prompt let group shifts be approximated or
-                # skipped.
-                repair_contract = build_refinement_contract(
-                    candidate,
-                    merged_issues,
-                    source_placement=source_placement,
-                    available_fonts=sorted(AVAILABLE_FONT_FILES),
-                )
+                try:
+                    # Repair through the refinement contract so every explicitly
+                    # measured reviewer target is locked and validated; the
+                    # generic patch prompt let group shifts be approximated or
+                    # skipped.
+                    repair_contract = build_refinement_contract(
+                        candidate,
+                        merged_issues,
+                        source_placement=source_placement,
+                        available_fonts=sorted(AVAILABLE_FONT_FILES),
+                    )
+                except AdTemplateProcessError:
+                    # The actionable-target pre-check is a heuristic; when the
+                    # contract still cannot lock a structured target for any
+                    # issue, the merged set is qualitative in substance and
+                    # takes the generic bounded patch path instead of failing
+                    # the run outside any bounded retry.
+                    repair_contract = None
+            if repair_contract is not None:
                 repair_result = _call_json(
                     self.call_agent,
                     instance="final-merged-patch",
