@@ -678,7 +678,7 @@ def _validate_issue(value: Any, *, require_actionable_target: bool = True) -> Di
         instruction,
         flags=re.IGNORECASE,
     )
-    if not target_field or not target_value:
+    if require_actionable_target and (not target_field or not target_value):
         raise AdTemplateProcessError(
             "review issue instruction requires a concrete field and numeric, colour, crop or font target"
         )
@@ -3320,7 +3320,10 @@ def validate_exact_clone_output(value: Any, *, require_import: bool) -> Dict[str
         raise AdTemplateProcessError("two accepted final reviewers are required")
     routes = set()
     for reviewer in final["reviewers"]:
-        evidence = validate_review({key: reviewer[key] for key in ("decision", "scores", "issues", "warnings", "effects", "fontSubstitution")})
+        evidence = validate_review(
+            {key: reviewer[key] for key in ("decision", "scores", "issues", "warnings", "effects", "fontSubstitution")},
+            require_actionable_targets=False,
+        )
         if evidence["decision"] != "accept":
             raise AdTemplateProcessError("final reviewer did not pass the 9.8 gate")
         route = reviewer.get("route")

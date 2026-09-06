@@ -614,6 +614,24 @@ def test_out_of_range_measured_targets_are_clamped_not_fatal():
     assert process.validate_review(valid)["decision"] == "revise"
 
 
+def test_final_reviewers_may_report_fully_qualitative_issues():
+    base = _review(accept=False)
+    qualitative = copy.deepcopy(base)
+    qualitative["issues"] = [
+        {
+            "placement": "feed",
+            "layerIds": ["feed_headline"],
+            "category": "typography",
+            "instruction": "Soften the headline presence so it sits lighter against the sidebar panel.",
+            "severity": "minor",
+        }
+    ]
+    with pytest.raises(process.AdTemplateProcessError, match="concrete field"):
+        process.validate_review(qualitative)
+    validated = process.validate_review(qualitative, require_actionable_targets=False)
+    assert validated["issues"][0]["instruction"] == qualitative["issues"][0]["instruction"]
+
+
 def test_visual_gate_requires_every_score_and_effect_at_98():
     passing = _review(accept=True)
     assert process.validate_review(passing)["decision"] == "accept"
