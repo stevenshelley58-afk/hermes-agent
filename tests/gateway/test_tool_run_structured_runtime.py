@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import inspect
+import threading
 from types import SimpleNamespace
 
-from gateway.tool_run_api import ToolRunAPIMixin
+from gateway.ad_template_runtime import AdTemplateTransportError
+from gateway.tool_run_api import (
+    ToolRunAPIMixin,
+    _call_stall_diagnosis_with_deadline,
+)
 
 
 def test_frontier_diagnosis_cost_remains_accounted_when_catalog_lags(monkeypatch):
@@ -45,6 +50,33 @@ def test_stall_diagnosis_is_strict_advice_not_an_edit_or_review():
             with pytest.raises(jsonschema.ValidationError):
                 jsonschema.validate(invalid, schema)
     assert _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS["diagnosis"] >= 4096
+
+
+def test_stall_diagnosis_wall_timeout_cancels_one_call_without_retry():
+    import pytest
+
+    release = threading.Event()
+    calls = []
+    cancellations = []
+
+    def stalled_call():
+        calls.append("diagnosis")
+        release.wait(1.0)
+        return {"diagnosis": "late"}
+
+    def cancel():
+        cancellations.append("cancel")
+        release.set()
+
+    with pytest.raises(
+        AdTemplateTransportError, match="wall-clock timeout"
+    ):
+        _call_stall_diagnosis_with_deadline(
+            stalled_call, timeout_seconds=0.01, cancel=cancel,
+        )
+
+    assert calls == ["diagnosis"]
+    assert cancellations == ["cancel"]
 
 
 def test_comparator_budget_covers_review_plus_patch_without_retry_truncation():

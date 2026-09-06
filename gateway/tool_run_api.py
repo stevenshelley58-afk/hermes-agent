@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Mapping
+from typing import Any, Callable, Dict, List, Mapping
 
 from aiohttp import web
 
@@ -59,6 +59,7 @@ logger = logging.getLogger(__name__)
 # evaluated again whenever the process changes role/stage so future role floors
 # can diverge without changing the watchdog contract.
 AD_TEMPLATE_GENERATOR_MIN_INACTIVITY_SECONDS = 180.0
+_AD_TEMPLATE_GENERATOR_RESPONSES_TIMEOUT_SECONDS = 150.0
 AD_TEMPLATE_GENERATOR_STAGE_INACTIVITY_MULTIPLIERS = {
     "build": 1.0,
     "render": 1.0,
@@ -94,6 +95,40 @@ def _ad_template_generator_inactivity_timeout(
         AD_TEMPLATE_GENERATOR_STAGE_INACTIVITY_MULTIPLIERS.get(str(stage or ""), 1.0)
     )
     return max(configured, stage_floor)
+
+
+def _call_stall_diagnosis_with_deadline(
+    call: Callable[[], Any],
+    *,
+    timeout_seconds: float,
+    cancel: Callable[[], None],
+) -> Any:
+    """Apply one wall-clock deadline to the optional diagnosis provider call."""
+    result: List[Any] = []
+    errors: List[BaseException] = []
+    done = threading.Event()
+
+    def invoke() -> None:
+        try:
+            result.append(call())
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    threading.Thread(
+        target=invoke,
+        name="ad-template-stall-diagnosis",
+        daemon=True,
+    ).start()
+    if not done.wait(max(0.001, float(timeout_seconds))):
+        cancel()
+        raise AdTemplateTransportError(
+            "stall diagnosis exceeded its wall-clock timeout"
+        )
+    if errors:
+        raise errors[0]
+    return result[0]
 
 
 def _error(message: str, code: str) -> Dict[str, Any]:
@@ -1111,6 +1146,16 @@ class ToolRunAPIMixin:
                 usage_lock = threading.Lock()
                 run_cost_limit = float(os.environ.get("AD_TEMPLATE_MAX_RUN_COST_USD", "10.0"))
                 assert_run_usage_accounted(usage, run_cost_limit, before_call=True)
+                diagnosis_stage = route_plan.get(AD_TEMPLATE_GENERATOR_OPTIONAL_ROUTE)
+                diagnosis_settings = diagnosis_stage[1] if diagnosis_stage else {}
+                configured_diagnosis_timeout = float(
+                    diagnosis_settings.get("timeout_seconds")
+                    or _AD_TEMPLATE_GENERATOR_RESPONSES_TIMEOUT_SECONDS
+                )
+                diagnosis_timeout_seconds = min(
+                    _AD_TEMPLATE_GENERATOR_RESPONSES_TIMEOUT_SECONDS,
+                    max(1.0, configured_diagnosis_timeout),
+                )
 
                 def should_stop() -> bool:
                     if stop_event.is_set():
@@ -1142,7 +1187,12 @@ class ToolRunAPIMixin:
                     base_url = str(runtime.get("base_url") or "").rstrip("/")
                     if not api_key or not base_url:
                         raise AdTemplateTransportError("frozen structured role credentials are unavailable")
-                    client = OpenAI(api_key=api_key, base_url=base_url, timeout=150.0, max_retries=0)
+                    role_kind = self._tool_role_kind(instance_id)
+                    client = OpenAI(
+                        api_key=api_key, base_url=base_url,
+                        timeout=_AD_TEMPLATE_GENERATOR_RESPONSES_TIMEOUT_SECONDS,
+                        max_retries=0,
+                    )
                     started_at = time.monotonic()
                     outcome = "error"
                     usage_snapshot = {
@@ -1153,19 +1203,32 @@ class ToolRunAPIMixin:
                     active = self._tool_run_agents.setdefault(run_id, {})
                     active[instance_id] = client
                     try:
-                        role_kind = self._tool_role_kind(instance_id)
-                        response = client.responses.create(
-                            model=model,
-                            input=self._tool_responses_input(prompt),
-                            text={"format": {
-                                "type": "json_schema",
-                                "name": f"ad_template_generator_{role_kind.replace('-', '_')}",
-                                "strict": True,
-                                "schema": self._tool_role_json_schema(instance_id),
-                            }},
-                            reasoning={"effort": "high" if role_kind == "diagnosis" else "minimal"},
-                            max_output_tokens=_AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS[role_kind],
-                        )
+                        schema_name = "ad_template_generator_" + role_kind.replace("-", "_")
+
+                        def create_response():
+                            return client.responses.create(
+                                model=model,
+                                input=self._tool_responses_input(prompt),
+                                text={"format": {
+                                    "type": "json_schema",
+                                    "name": schema_name,
+                                    "strict": True,
+                                    "schema": self._tool_role_json_schema(instance_id),
+                                }},
+                                reasoning={"effort": "high" if role_kind == "diagnosis" else "minimal"},
+                                max_output_tokens=_AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS[role_kind],
+                            )
+
+                        if role_kind == "diagnosis":
+                            response = _call_stall_diagnosis_with_deadline(
+                                create_response,
+                                timeout_seconds=diagnosis_timeout_seconds,
+                                cancel=lambda: self._stop_tool_role_runtime(
+                                    client, "ad_template_stall_diagnosis_timeout",
+                                ),
+                            )
+                        else:
+                            response = create_response()
                         mark_activity()
                         usage_snapshot = self._tool_response_usage(
                             response, provider=provider, model=model,

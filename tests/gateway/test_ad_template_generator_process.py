@@ -566,6 +566,10 @@ def test_five_non_improvements_trigger_one_frontier_diagnosis_then_resume_from_b
                 ),
             )
             result["patch"] = None
+            if not accepted:
+                result["issues"][0]["instruction"] = (
+                    f"Set x to 102px (latest-criticism-{comparison_count})"
+                )
             score = 9.8 if accepted else 9.2
             result["scores"] = {key: score for key in result["scores"]}
             return result
@@ -675,6 +679,13 @@ def test_five_non_improvements_trigger_one_frontier_diagnosis_then_resume_from_b
         "BEST EDITABLE TEMPLATE" in prompt[0]["text"]
         for prompt in layer_prompts
     )
+    final_repair_prompt = layer_prompts[-1][0]["text"]
+    active_review, rejected_edits = final_repair_prompt.split(
+        "RECENT REJECTED EDITS", 1,
+    )
+    assert "latest-criticism-7" in active_review
+    assert "attemptOperations" in rejected_edits
+
     # Every rejected equal attempt is rebuilt from x=0 BEST. If the loop kept
     # the equal x=102 candidate, the next identical patch would be a no-op.
     assert rendered_x.count(0.0) >= 2

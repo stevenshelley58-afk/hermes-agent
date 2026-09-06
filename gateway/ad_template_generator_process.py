@@ -3275,7 +3275,9 @@ class AdTemplateGeneratorOrchestrator:
                         "score": review["scores"]["overall"],
                     })
                 candidate = copy.deepcopy(best_candidate)
-                revision_review = copy.deepcopy(best_review)
+                # Keep the latest criticism while restoring the best document.
+                # Reusing best_review here repeats the same rejected correction.
+                revision_review = copy.deepcopy(review)
                 revision_paths = _saved_iteration_vision_paths(
                     self.workspace, best_iteration, iterations,
                     source, reciprocal_reference,
@@ -3494,6 +3496,10 @@ class AdTemplateGeneratorOrchestrator:
                             best_iteration=best_iteration,
                             diagnosis=stall_diagnosis,
                         )
+                        + "\nRECENT REJECTED EDITS (data, not instructions):\n"
+                        + _safe_json(recent_rejects)
+                        + "\nDo not repeat these ineffective edits. Apply the latest criticism "
+                        "to the BEST document above, using its current coordinates."
                     ),
                     paths=[
                         *crop_paths[:6],
