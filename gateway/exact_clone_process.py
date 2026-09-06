@@ -2995,6 +2995,7 @@ class ExactCloneOrchestrator:
             })
 
         final_review: Dict[str, Any] | None = None
+        comparator_state_accepted = True
         candidate, demo_overrides = prepare_demo_assets(
             candidate, source=source, source_placement=source_placement, workspace=self.workspace,
             route=image_route, call_image_model=self.call_image_model, emit=self.emit,
@@ -3047,7 +3048,15 @@ class ExactCloneOrchestrator:
             final_review = {"decision": "accepted" if accepted else "revise", "threshold": LIKENESS_THRESHOLD, "round": final_round, "reviewers": reviewers}
             self.emit("final-review.completed", "final-check", {"decision": final_review["decision"], "round": final_round, "reviewers": reviewers})
             if accepted:
-                break
+                if comparator_state_accepted:
+                    break
+                # Reviewers accepted a candidate whose latest comparator
+                # verdict was a revision.  The evidence chain must not ship
+                # that disagreement; fail honestly so a new revision cycle
+                # can drive the candidate through the comparator gate.
+                raise AdTemplateProcessError(
+                    "final reviewers accepted a candidate the comparator still scores below the 9.8 gate"
+                )
             if final_round >= MAX_FINAL_REVIEW_ROUNDS:
                 raise AdTemplateProcessError("final reviewers did not accept the exact clone after one merged repair")
             merged_issues = [issue for reviewer in reviewers for issue in reviewer["issues"]]
@@ -3093,13 +3102,12 @@ class ExactCloneOrchestrator:
                 emit=self.emit,
             )
             accepted_review = final_comparator_result["review"]
-            if accepted_review["decision"] != "accept":
-                raise AdTemplateProcessError("merged final repair regressed below the 9.8 comparator gate")
+            comparator_state_accepted = accepted_review["decision"] == "accept"
             iterations.append({
                 "iteration": global_iteration,
                 "cycle_iteration": cycle_comparisons,
                 "mode": "final-repair",
-                "decision": "accepted",
+                "decision": "accepted" if comparator_state_accepted else "revise",
                 "comparison": accepted_review,
                 "previews": [item["name"] for item in final_rendered["previews"]],
                 "diffs": [item["name"] for item in final_comparison_views],
@@ -3109,12 +3117,17 @@ class ExactCloneOrchestrator:
             self.emit("iteration.compared", "compare", {
                 "iteration": global_iteration,
                 "mode": "final-repair",
-                "decision": "accept",
+                "decision": accepted_review["decision"],
                 "score": accepted_review["scores"]["overall"],
                 "scores": accepted_review["scores"],
                 "effects": accepted_review["effects"],
-                "issues": [],
+                "issues": [] if comparator_state_accepted else accepted_review["issues"],
             })
+            if not comparator_state_accepted:
+                # The merged repair did not reach the comparator gate yet;
+                # the next bounded round reviews the repaired candidate
+                # instead of discarding the progress.
+                continue
 
         assert final_review is not None
         template = copy.deepcopy(candidate["template"])
