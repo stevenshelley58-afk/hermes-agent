@@ -2370,12 +2370,15 @@ class ExactCloneOrchestrator:
         final_rendered: Dict[str, Any] | None = None
         final_comparison_views: list[dict[str, str]] = []
         final_metrics: Dict[str, Any] = {}
-        demo_overrides: Dict[str, bytes] = {}
-        if (self.workspace / "demo-assets" / "plan.json").exists():
-            candidate, demo_overrides = prepare_demo_assets(
-                candidate, source=source, source_placement=source_placement, workspace=self.workspace,
-                route=image_route, call_image_model=self.call_image_model, emit=self.emit,
-            )
+        # Bind declared replacement-asset defaults and materialize demo photos
+        # before the loop. prepare_demo_assets is idempotent: an existing plan
+        # resumes it, so retries never regenerate or re-bill photo calls, and
+        # candidates restored from older checkpoints get bound instead of
+        # rendering blank photo slots.
+        candidate, demo_overrides = prepare_demo_assets(
+            candidate, source=source, source_placement=source_placement, workspace=self.workspace,
+            route=image_route, call_image_model=self.call_image_model, emit=self.emit,
+        )
         while comparison_budget_used < MAX_COMPARISONS:
             self._check_stop()
             global_iteration += 1

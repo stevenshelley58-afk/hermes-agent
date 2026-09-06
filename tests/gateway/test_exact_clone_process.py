@@ -375,10 +375,11 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
         }
 
     monkeypatch.setattr(process, "run_renderer", render)
+    demo_prepare_calls = []
     monkeypatch.setattr(
         process,
         "prepare_demo_assets",
-        lambda candidate, **_kwargs: (candidate, {}),
+        lambda candidate, **_kwargs: demo_prepare_calls.append(1) or (candidate, {}),
     )
 
     def import_template(output, **_kwargs):
@@ -482,6 +483,9 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
     assert result["metrics"]["story"] == {"mode": "native-reflow", "pixelComparison": False}
     assert all(item["placement"] == "feed" for item in result["diffs"])
     assert any(kind == "reference.source-only" for kind, _, _ in emitted)
+    # Demo-photo binding runs before the comparison loop even when the run
+    # has no demo-assets plan yet, so photo slots never render blank.
+    assert demo_prepare_calls
 
 
 def test_build_prompt_preserves_logo_fit_and_body_copy_density(monkeypatch):
