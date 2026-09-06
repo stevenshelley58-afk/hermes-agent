@@ -947,6 +947,13 @@ def _reject_unrenderable_field_values(after: Mapping[str, Any]) -> None:
                 raise AdTemplateProcessError(
                     f"{layout_name} layer {layer_id!r} tracking must be between -4 and 4"
                 )
+            font_size = layer.get("fontSize")
+            if isinstance(font_size, (int, float)) and not isinstance(font_size, bool):
+                font_minimum = 24 if layout_name == "feedLayout" else 32
+                if float(font_size) < font_minimum:
+                    raise AdTemplateProcessError(
+                        f"{layout_name} layer {layer_id!r} fontSize must be at least {font_minimum}"
+                    )
             line_height = layer.get("lineHeight")
             if (
                 isinstance(line_height, (int, float)) and not isinstance(line_height, bool)

@@ -562,6 +562,25 @@ def test_patch_rejects_layer_missing_required_fields_for_replan():
         process.apply_patch(candidate, incomplete)
 
 
+def test_patch_rejects_feed_text_below_the_24px_minimum_for_replan():
+    candidate = {"template": _template(), "assets": []}
+    tiny = {
+        "operations": [{"op": "add",
+                        "path": "/template/feedLayout/layers/-",
+                        "value": {
+                            "type": "text", "layerId": "feed_cta",
+                            "inputKey": "cta", "colourRole": "mainText",
+                            "font": {"file": "/fonts/adstudio/manrope-400.woff2"},
+                            "fontSize": 18, "lineHeight": 1.2, "tracking": 0,
+                            "alignment": "left", "maxCharacters": 60, "maxLines": 2,
+                            "overflowBehaviour": "truncate",
+                            "geometry": {"x": 80, "y": 1175, "width": 400, "height": 60},
+                        }}],
+    }
+    with pytest.raises(process.AdTemplateProcessError, match="at least 24"):
+        process.apply_patch(candidate, tiny)
+
+
 def test_patch_rejects_full_canvas_background_layer_on_top_of_content():
     candidate = {"template": _template(), "assets": []}
     covering = {
