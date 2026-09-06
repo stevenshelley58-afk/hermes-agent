@@ -37,15 +37,17 @@ _USAGE_COST_STATUSES = frozenset({"actual", "estimated", "included", "unknown"})
 _USAGE_OUTCOMES = frozenset({"ok", "error", "cancelled"})
 _MAX_JSON_BYTES = 512 * 1024
 _KNOWN_IMAGE_ONLY = frozenset({"gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2"})
-_AD_TEMPLATE_POLICY_SEED_REVISION = 15
-AD_TEMPLATE_ROUTE_ORDER = (
+_AD_TEMPLATE_GENERATOR_POLICY_SEED_REVISION = 15
+AD_TEMPLATE_GENERATOR_POLICY_NAME = "Ad Template Generator"
+_LEGACY_AD_TEMPLATE_GENERATOR_POLICY_NAMES = frozenset({"Sole ad-template process"})
+AD_TEMPLATE_GENERATOR_ROUTE_ORDER = (
     "aspect-reference-image",
     "analyse",
     "compare",
     "final-review-a",
     "final-review-b",
 )
-AD_TEMPLATE_OPTIONAL_ROUTE = "quality-escalation"
+AD_TEMPLATE_GENERATOR_OPTIONAL_ROUTE = "quality-escalation"
 _AUDITED_NATIVE_VISION_MODELS = frozenset({
     ("concentrate", "gemini-3.8-flash"),
     ("concentrate", "gpt-6-astra"),
@@ -60,7 +62,7 @@ _AUDITED_IMAGE_EDIT_MODELS = frozenset({
 })
 
 
-def ad_template_model_catalog() -> List[Dict[str, Any]]:
+def ad_template_generator_model_catalog() -> List[Dict[str, Any]]:
     """Return the same audited capability catalogue used by policy validation."""
     structured = [
         {
@@ -85,7 +87,7 @@ def ad_template_model_catalog() -> List[Dict[str, Any]]:
     return structured + image_edits
 
 
-def ad_template_profile_snapshot(policy: Mapping[str, Any], *, revision: int) -> Dict[str, Any]:
+def ad_template_generator_profile_snapshot(policy: Mapping[str, Any], *, revision: int) -> Dict[str, Any]:
     stages = policy.get("stages") if isinstance(policy.get("stages"), dict) else {}
     aliases = {
         "aspect-reference": "aspect-reference-image",
@@ -185,12 +187,12 @@ def _audited_image_edit_candidate(provider: str, model: str) -> Dict[str, Any]:
     }
 
 
-def default_ad_template_policy() -> Dict[str, Any]:
-    """Bounded audited routes for the sole autonomous generator process."""
+def default_ad_template_generator_policy() -> Dict[str, Any]:
+    """Bounded audited routes for the Ad Template Generator."""
     return {
         "schema": TOOL_MODEL_POLICY_SCHEMA, "tool_id": "ad-template-generator",
-        "name": "Sole ad-template process", "preset": "cheap-quality",
-        "seed_revision": _AD_TEMPLATE_POLICY_SEED_REVISION,
+        "name": AD_TEMPLATE_GENERATOR_POLICY_NAME, "preset": "cheap-quality",
+        "seed_revision": _AD_TEMPLATE_GENERATOR_POLICY_SEED_REVISION,
         "stages": {
             "aspect-reference-image": {"capability": "reference_image_edit", "primary": _audited_image_edit_candidate("meta-direct", "muse-image-1.0"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 180, "max_cost_usd": 0.35},
             "analyse": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("meta-direct", "muse-spark-1.3-contributor"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
@@ -207,19 +209,26 @@ def default_ad_template_policy() -> Dict[str, Any]:
 
 
 def _is_legacy_seed_policy(policy: Any) -> bool:
-    if not isinstance(policy, dict) or policy.get("name") != "Sole ad-template process":
+    seed_names = {
+        AD_TEMPLATE_GENERATOR_POLICY_NAME,
+        *_LEGACY_AD_TEMPLATE_GENERATOR_POLICY_NAMES,
+    }
+    if not isinstance(policy, dict) or policy.get("name") not in seed_names:
         return True
     revision = policy.get("seed_revision")
-    return not isinstance(revision, int) or revision < _AD_TEMPLATE_POLICY_SEED_REVISION
+    return not isinstance(revision, int) or revision < _AD_TEMPLATE_GENERATOR_POLICY_SEED_REVISION
 
 
-def _is_stale_audited_ad_template_policy(policy: Any) -> bool:
-    """Identify a previously audited sole-process seed without blessing corrupt policy data."""
+def _is_stale_audited_ad_template_generator_policy(policy: Any) -> bool:
+    """Identify a previously audited Ad Template Generator seed without blessing corrupt policy data."""
     return (
         isinstance(policy, dict)
-        and policy.get("name") == "Sole ad-template process"
+        and policy.get("name") in {
+            AD_TEMPLATE_GENERATOR_POLICY_NAME,
+            *_LEGACY_AD_TEMPLATE_GENERATOR_POLICY_NAMES,
+        }
         and isinstance(policy.get("seed_revision"), int)
-        and policy["seed_revision"] < _AD_TEMPLATE_POLICY_SEED_REVISION
+        and policy["seed_revision"] < _AD_TEMPLATE_GENERATOR_POLICY_SEED_REVISION
     )
 
 
@@ -281,11 +290,11 @@ def validate_model_policy(policy: Any, *, tool_id: Optional[str] = None) -> Dict
             if value is not None and (not isinstance(value, (int, float)) or value < 0):
                 raise ToolRunError(f"model policy stage {stage_id}.{numeric} is invalid")
     if policy_tool == "ad-template-generator":
-        if not set(AD_TEMPLATE_ROUTE_ORDER).issubset(stages) or set(stages) - (
-            set(AD_TEMPLATE_ROUTE_ORDER) | {AD_TEMPLATE_OPTIONAL_ROUTE}
+        if not set(AD_TEMPLATE_GENERATOR_ROUTE_ORDER).issubset(stages) or set(stages) - (
+            set(AD_TEMPLATE_GENERATOR_ROUTE_ORDER) | {AD_TEMPLATE_GENERATOR_OPTIONAL_ROUTE}
         ):
             raise ToolRunError(
-                "ad-template policy requires builder, comparator, and two final-review roles, plus optional fallback"
+                "ad-template policy requires builder, comparator, two final-review roles, and optional stall diagnosis"
             )
         for stage_id in stages:
             stage = stages[stage_id]
@@ -391,7 +400,7 @@ class ToolRunStore:
             self._conn.execute("PRAGMA journal_mode=WAL")
         self._create_schema()
         self._tighten_permissions()
-        self.ensure_default_policy("ad-template-generator", default_ad_template_policy())
+        self.ensure_default_policy("ad-template-generator", default_ad_template_generator_policy())
 
     def _create_schema(self) -> None:
         with self._lock:
@@ -512,7 +521,7 @@ class ToolRunStore:
                 ).fetchall()
                 migrated_scoped = False
                 for scoped in scoped_defaults:
-                    if not _is_stale_audited_ad_template_policy(
+                    if not _is_stale_audited_ad_template_generator_policy(
                         _loads(scoped["policy_json"], {})
                     ):
                         continue
@@ -639,7 +648,7 @@ class ToolRunStore:
             self._conn.commit()
         self.append_event(run_id, "command.accepted", status="queued", node_id="source", data={
             "policy_revision": policy_record["revision"],
-            "model_profile": ad_template_profile_snapshot(
+            "model_profile": ad_template_generator_profile_snapshot(
                 policy_record["policy"], revision=policy_record["revision"]
             )
             if tool_id == "ad-template-generator" else None,
@@ -1227,3 +1236,12 @@ class ToolRunStore:
             )
             recovered.append(self.get_run(row["run_id"]))
         return recovered
+
+
+# Source compatibility for extensions that imported pre-canonical names.
+# Active Hermes code uses the Ad Template Generator identifiers above.
+AD_TEMPLATE_ROUTE_ORDER = AD_TEMPLATE_GENERATOR_ROUTE_ORDER
+AD_TEMPLATE_OPTIONAL_ROUTE = AD_TEMPLATE_GENERATOR_OPTIONAL_ROUTE
+ad_template_model_catalog = ad_template_generator_model_catalog
+ad_template_profile_snapshot = ad_template_generator_profile_snapshot
+default_ad_template_policy = default_ad_template_generator_policy

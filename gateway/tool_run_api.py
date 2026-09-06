@@ -29,20 +29,20 @@ from gateway.ad_template_runtime import (
     AdTemplateStructuredOutputError,
     AdTemplateTransportError,
 )
-from gateway.exact_clone_process import (
-    ExactCloneOrchestrator,
+from gateway.ad_template_generator_process import (
+    AdTemplateGeneratorOrchestrator,
     bounded_review_output,
     request_checkpoint_revision,
     review_template_action,
-    validate_exact_clone_output,
+    validate_ad_template_generator_output,
 )
 from gateway.tool_runs import (
-    AD_TEMPLATE_ROUTE_ORDER,
-    AD_TEMPLATE_OPTIONAL_ROUTE,
+    AD_TEMPLATE_GENERATOR_ROUTE_ORDER,
+    AD_TEMPLATE_GENERATOR_OPTIONAL_ROUTE,
     TOOL_MODEL_POLICY_SCHEMA,
     ToolRunError,
-    ad_template_profile_snapshot,
-    ad_template_model_catalog,
+    ad_template_generator_profile_snapshot,
+    ad_template_generator_model_catalog,
     validate_model_policy,
 )
 from gateway.tool_run_usage import assert_run_usage_accounted
@@ -58,8 +58,8 @@ logger = logging.getLogger(__name__)
 # role-owned Sol fallback to run instead of waiting five minutes.  The helper is
 # evaluated again whenever the process changes role/stage so future role floors
 # can diverge without changing the watchdog contract.
-AD_TEMPLATE_MIN_INACTIVITY_SECONDS = 180.0
-AD_TEMPLATE_STAGE_INACTIVITY_MULTIPLIERS = {
+AD_TEMPLATE_GENERATOR_MIN_INACTIVITY_SECONDS = 180.0
+AD_TEMPLATE_GENERATOR_STAGE_INACTIVITY_MULTIPLIERS = {
     "build": 1.0,
     "render": 1.0,
     "compare": 1.0,
@@ -67,7 +67,7 @@ AD_TEMPLATE_STAGE_INACTIVITY_MULTIPLIERS = {
     "live": 1.0,
 }
 
-_AD_TEMPLATE_ROLE_OUTPUT_TOKENS = {
+_AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS = {
     "builder": 32_768,
     "patch": 8_192,
     "comparator": 8_192,
@@ -77,7 +77,7 @@ _AD_TEMPLATE_ROLE_OUTPUT_TOKENS = {
 }
 
 # Meta's audited contributor price for the new 1.3 id until models.dev catches up.
-_AD_TEMPLATE_DIRECT_PRICING_PER_MILLION = {
+_AD_TEMPLATE_GENERATOR_DIRECT_PRICING_PER_MILLION = {
     ("meta-direct", "muse-spark-1.3-contributor"): (0.10, 0.002, 0.20),
     ("concentrate", "gemini-3.8-flash"): (0.75, 0.75, 3.75),
     # Published standard rates verified 2026-09-06; Concentrate has no token markup.
@@ -86,12 +86,12 @@ _AD_TEMPLATE_DIRECT_PRICING_PER_MILLION = {
 }
 
 
-def _ad_template_inactivity_timeout(
+def _ad_template_generator_inactivity_timeout(
     route_settings: Dict[str, Any], *, stage: str | None = None,
 ) -> float:
     configured = max(1.0, float(route_settings.get("timeout_seconds") or 120))
-    stage_floor = AD_TEMPLATE_MIN_INACTIVITY_SECONDS * (
-        AD_TEMPLATE_STAGE_INACTIVITY_MULTIPLIERS.get(str(stage or ""), 1.0)
+    stage_floor = AD_TEMPLATE_GENERATOR_MIN_INACTIVITY_SECONDS * (
+        AD_TEMPLATE_GENERATOR_STAGE_INACTIVITY_MULTIPLIERS.get(str(stage or ""), 1.0)
     )
     return max(configured, stage_floor)
 
@@ -119,7 +119,7 @@ class ToolRunAPIMixin:
     def _isolated_tool_role_prompt() -> str:
         return (
             "You are one isolated builder, comparator, or final-review role in "
-            "Hermes' sole ad-template process. The user message contains the "
+            "Hermes' Ad Template Generator. The user message contains the "
             "complete role contract and every required image input; reason only "
             "from that prompt and those attached images. Do not inspect, list, "
             "search, discover, or read repositories or the filesystem, and do not "
@@ -379,7 +379,7 @@ class ToolRunAPIMixin:
         }
 
     @staticmethod
-    def _load_ad_template_iteration_candidate(
+    def _load_ad_template_generator_iteration_candidate(
         workspace: Path, iteration: int
     ) -> Dict[str, Any]:
         workspace_root = workspace.resolve()
@@ -421,7 +421,7 @@ class ToolRunAPIMixin:
             raise RuntimeError("persisted iteration candidate is unavailable") from exc
         return candidate
 
-    def _ad_template_iteration_checkpoint(
+    def _ad_template_generator_iteration_checkpoint(
         self, run_id: str, workspace: Path, current_stage: str
     ) -> Dict[str, Any] | None:
         """Load the last complete append-only boundary for restart continuation."""
@@ -461,7 +461,7 @@ class ToolRunAPIMixin:
         best_iteration = int(state.get("best_iteration") or 0)
         if not 1 <= best_iteration <= len(history):
             raise RuntimeError("persisted best iteration is invalid")
-        candidate = self._load_ad_template_iteration_candidate(workspace, best_iteration)
+        candidate = self._load_ad_template_generator_iteration_candidate(workspace, best_iteration)
         last = history[-1]
         resume_final_check = (
             last["decision"] == "accepted" and not last.get("final_review_failed")
@@ -683,7 +683,7 @@ class ToolRunAPIMixin:
         if isinstance(expected_size, int) and expected_size >= 0 and source.stat().st_size != expected_size:
             raise ToolRunError("persisted source contract does not match the submitted source")
         try:
-            checkpoint = self._ad_template_iteration_checkpoint(
+            checkpoint = self._ad_template_generator_iteration_checkpoint(
                 str(run["run_id"]), workspace, "retry-validation"
             )
         except (AdTemplateProcessError, OSError, RuntimeError, ValueError) as exc:
@@ -740,7 +740,7 @@ class ToolRunAPIMixin:
         if process_result:
             if not isinstance(value, dict) or value.get("process") != "exact-clone":
                 raise RuntimeError("Exact-clone process returned an invalid result")
-            return validate_exact_clone_output(value, require_import=True)
+            return validate_ad_template_generator_output(value, require_import=True)
         text = ""
         if isinstance(value, dict):
             text = str(value.get("final_response") or value.get("output") or "")
@@ -935,10 +935,10 @@ class ToolRunAPIMixin:
         self, run: Dict[str, Any]
     ) -> Dict[str, tuple[List[Dict[str, str]], Dict[str, Any]]]:
         """Snapshot and preflight every route that this run can execute."""
-        roles = list(AD_TEMPLATE_ROUTE_ORDER)
+        roles = list(AD_TEMPLATE_GENERATOR_ROUTE_ORDER)
         stages = (run.get("model_policy") or {}).get("stages") or {}
-        if AD_TEMPLATE_OPTIONAL_ROUTE in stages:
-            roles.append(AD_TEMPLATE_OPTIONAL_ROUTE)
+        if AD_TEMPLATE_GENERATOR_OPTIONAL_ROUTE in stages:
+            roles.append(AD_TEMPLATE_GENERATOR_OPTIONAL_ROUTE)
         plan: Dict[str, tuple[List[Dict[str, str]], Dict[str, Any]]] = {}
         role_pairs: Dict[tuple[str, str], List[str]] = {}
         for role in roles:
@@ -1047,7 +1047,7 @@ class ToolRunAPIMixin:
             )
             self._tool_run_store.append_event(
                 run_id, "stage.started", status="running", node_id=current_stage,
-                data={"summary": "Starting sole ad-template process"},
+                data={"summary": "Starting Ad Template Generator"},
             )
             route_stage = "analyse"
             candidates, route_settings = route_plan[route_stage]
@@ -1159,12 +1159,12 @@ class ToolRunAPIMixin:
                             input=self._tool_responses_input(prompt),
                             text={"format": {
                                 "type": "json_schema",
-                                "name": f"ad_template_{role_kind.replace('-', '_')}",
+                                "name": f"ad_template_generator_{role_kind.replace('-', '_')}",
                                 "strict": True,
                                 "schema": self._tool_role_json_schema(instance_id),
                             }},
                             reasoning={"effort": "high" if role_kind == "diagnosis" else "minimal"},
-                            max_output_tokens=_AD_TEMPLATE_ROLE_OUTPUT_TOKENS[role_kind],
+                            max_output_tokens=_AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS[role_kind],
                         )
                         mark_activity()
                         usage_snapshot = self._tool_response_usage(
@@ -1292,14 +1292,14 @@ class ToolRunAPIMixin:
                                 usage, run_cost_limit, before_call=False,
                             )
                 routes = [
-                    dict(route_plan[role][0][0]) for role in AD_TEMPLATE_ROUTE_ORDER
+                    dict(route_plan[role][0][0]) for role in AD_TEMPLATE_GENERATOR_ROUTE_ORDER
                 ]
                 # A configured analyse fallback must actually replace the
                 # builder route on retry; the previous implementation ignored
                 # ``_candidate`` and silently repeated the failed primary.
-                routes[AD_TEMPLATE_ROUTE_ORDER.index("analyse")] = dict(_candidate)
-                if AD_TEMPLATE_OPTIONAL_ROUTE in route_plan:
-                    routes.append(dict(route_plan[AD_TEMPLATE_OPTIONAL_ROUTE][0][0]))
+                routes[AD_TEMPLATE_GENERATOR_ROUTE_ORDER.index("analyse")] = dict(_candidate)
+                if AD_TEMPLATE_GENERATOR_OPTIONAL_ROUTE in route_plan:
+                    routes.append(dict(route_plan[AD_TEMPLATE_GENERATOR_OPTIONAL_ROUTE][0][0]))
                 def emit(kind: str, node: str, data: Dict[str, Any]):
                     nonlocal current_stage
                     event_stage = self._tool_stage_from_process_event(kind, node)
@@ -1322,7 +1322,7 @@ class ToolRunAPIMixin:
                 if not source:
                     raise RuntimeError("source image is missing")
                 source = str(self._durable_tool_source(workspace, source))
-                result = ExactCloneOrchestrator(
+                result = AdTemplateGeneratorOrchestrator(
                     call_agent=call_agent, call_image_model=call_image_model,
                     workspace=workspace, run_id=run_id,
                     project_id=str((run.get("scope") or {}).get("project_id") or ""), emit=emit,
@@ -1338,7 +1338,7 @@ class ToolRunAPIMixin:
             configured_timeout = max(
                 1.0, float(route_settings.get("timeout_seconds") or 120)
             )
-            timeout = _ad_template_inactivity_timeout(
+            timeout = _ad_template_generator_inactivity_timeout(
                 route_settings, stage=current_stage
             )
             for attempt, candidate in enumerate(candidates, start=1):
@@ -1364,7 +1364,7 @@ class ToolRunAPIMixin:
                     while True:
                         if activity_sequence != observed_activity:
                             observed_activity = activity_sequence
-                            timeout = _ad_template_inactivity_timeout(
+                            timeout = _ad_template_generator_inactivity_timeout(
                                 route_settings, stage=current_stage
                             )
                             deadline = last_activity_at + timeout
@@ -1414,7 +1414,7 @@ class ToolRunAPIMixin:
                         )
             if result is None:
                 raise RuntimeError(
-                    f"Sole ad-template process failed during {current_stage}: "
+                    f"Ad Template Generator failed during {current_stage}: "
                     f"{'; '.join(failures)}"
                 )
             refreshed = self._tool_run_store.get_run(run_id)
@@ -1431,7 +1431,7 @@ class ToolRunAPIMixin:
             output["cost"]["reported_usd"] = usage.get("estimated_cost_usd") or reported_cost
             output["cost"]["estimated_usd"] = usage.get("estimated_cost_usd", 0.0)
             output["model_policy_revision"] = refreshed["model_policy_revision"]
-            output["model_profile"] = ad_template_profile_snapshot(
+            output["model_profile"] = ad_template_generator_profile_snapshot(
                 refreshed["model_policy"], revision=refreshed["model_policy_revision"],
             )
             output = self._prepare_candidate_output(run_id, output)
@@ -1735,7 +1735,7 @@ class ToolRunAPIMixin:
                     "pricing_stale": True,
                 }
 
-            payload["ad_studio_capabilities"] = [
+            generator_capabilities = [
                 {
                     **item,
                     "available": readiness.get(str(item["provider"]), False),
@@ -1744,12 +1744,14 @@ class ToolRunAPIMixin:
                     "price_checked_at": checked_at,
                     "pricing_stale": True,
                 }
-                for item in ad_template_model_catalog()
+                for item in ad_template_generator_model_catalog()
             ] + [
                 capability("gemini", "gemini-3.1-flash-image", "masked_image_edit"),
                 capability("gemini", "gemini-3-pro-image", "masked_image_edit"),
                 capability("openai-api", "gpt-image-2", "masked_image_edit"),
             ]
+            payload["ad_template_generator_capabilities"] = generator_capabilities
+            payload["ad_studio_capabilities"] = generator_capabilities
             return web.json_response(payload)
         except Exception:
             logger.exception("failed to list Tool models")
@@ -2118,7 +2120,7 @@ class ToolRunAPIMixin:
         cost = estimate_usage_cost(model, canonical, provider=pricing_provider, base_url=base_url, api_key=api_key)
         amount = float(cost.amount_usd) if cost.amount_usd is not None else None
         status = cost.status
-        direct_price = _AD_TEMPLATE_DIRECT_PRICING_PER_MILLION.get((provider, model))
+        direct_price = _AD_TEMPLATE_GENERATOR_DIRECT_PRICING_PER_MILLION.get((provider, model))
         if amount is None and direct_price is not None:
             input_rate, cache_rate, output_rate = direct_price
             amount = (

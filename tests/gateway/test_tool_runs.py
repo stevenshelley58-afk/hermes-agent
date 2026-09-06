@@ -4,13 +4,13 @@ import sqlite3
 import pytest
 
 from gateway.tool_runs import (
-    AD_TEMPLATE_ROUTE_ORDER,
-    AD_TEMPLATE_OPTIONAL_ROUTE,
+    AD_TEMPLATE_GENERATOR_ROUTE_ORDER,
+    AD_TEMPLATE_GENERATOR_OPTIONAL_ROUTE,
     TOOL_MODEL_POLICY_SCHEMA,
     TOOL_RUN_COMMAND_SCHEMA,
     ToolRunError,
     ToolRunStore,
-    default_ad_template_policy,
+    default_ad_template_generator_policy,
     validate_model_policy,
 )
 
@@ -178,7 +178,7 @@ def test_model_policy_revisions_are_immutable_and_run_pinned(tmp_path):
     store = ToolRunStore(str(tmp_path / "policy.db"))
     base = store.get_policy("ad-template-generator")
     assert base["revision"] == 1
-    changed = default_ad_template_policy()
+    changed = default_ad_template_generator_policy()
     changed["name"] = "Cheaper current models"
     changed["stages"]["analyse"]["timeout_seconds"] = 90
     revision = store.create_policy("ad-template-generator", changed)
@@ -186,17 +186,17 @@ def test_model_policy_revisions_are_immutable_and_run_pinned(tmp_path):
     run, _ = store.create_run(command(model_policy_revision=2))
     assert run["model_policy_revision"] == 2
     assert run["model_policy"]["stages"]["analyse"]["timeout_seconds"] == 90
-    assert store.get_policy("ad-template-generator", 1)["policy"]["name"] == "Sole ad-template process"
+    assert store.get_policy("ad-template-generator", 1)["policy"]["name"] == "Ad Template Generator"
 
 
-def test_ad_studio_profile_picker_changes_only_new_runs_and_persists_exact_snapshot(tmp_path):
+def test_ad_template_generator_profile_picker_changes_only_new_runs_and_persists_exact_snapshot(tmp_path):
     store = ToolRunStore(str(tmp_path / "ad-profile.db"))
     first_command = command(idempotency_key="profile-first")
     first_command.pop("model_policy_revision")
     first, _ = store.create_run(first_command)
 
-    selected = default_ad_template_policy()
-    selected["name"] = "Operator-selected Ad Studio profile"
+    selected = default_ad_template_generator_policy()
+    selected["name"] = "Operator-selected Ad Template Generator profile"
     selected["stages"]["analyse"]["primary"] = dict(
         selected["stages"]["compare"]["primary"]
     )
@@ -220,14 +220,14 @@ def test_ad_studio_profile_picker_changes_only_new_runs_and_persists_exact_snaps
         "comparator": {"provider": "concentrate", "model": "gemini-3.8-flash"},
         "final-review-a": {"provider": "concentrate", "model": "gemini-3.8-flash"},
         "final-review-b": {"provider": "meta-direct", "model": "muse-spark-1.3-contributor"},
-        "fallback": {key: selected["stages"][AD_TEMPLATE_OPTIONAL_ROUTE]["primary"][key] for key in ("provider", "model")},
+        "fallback": {key: selected["stages"][AD_TEMPLATE_GENERATOR_OPTIONAL_ROUTE]["primary"][key] for key in ("provider", "model")},
     }
     with pytest.raises(ToolRunError, match="immutable after submission"):
         store.replace_remaining_policy(first["run_id"], selected)
 
 
 def test_builtin_policy_uses_only_audited_native_vision_roles():
-    policy = default_ad_template_policy()
+    policy = default_ad_template_generator_policy()
     expected = {
         "aspect-reference-image": ("meta-direct", "muse-image-1.0"),
         "analyse": ("meta-direct", "muse-spark-1.3-contributor"),
@@ -237,8 +237,8 @@ def test_builtin_policy_uses_only_audited_native_vision_roles():
         "quality-escalation": ("concentrate", "gpt-6-astra"),
     }
     assert policy["stages"]["quality-escalation"]["primary"] != policy["stages"]["analyse"]["primary"]
-    assert AD_TEMPLATE_ROUTE_ORDER == tuple(expected)[:-1]
-    assert AD_TEMPLATE_OPTIONAL_ROUTE == "quality-escalation"
+    assert AD_TEMPLATE_GENERATOR_ROUTE_ORDER == tuple(expected)[:-1]
+    assert AD_TEMPLATE_GENERATOR_OPTIONAL_ROUTE == "quality-escalation"
     for stage_id, route in expected.items():
         stage = policy["stages"][stage_id]
         candidate = stage["primary"]
@@ -257,31 +257,31 @@ def test_builtin_policy_uses_only_audited_native_vision_roles():
     assert validate_model_policy(policy) == policy
 
 
-def test_ad_template_policy_contract_rejects_missing_swapped_or_fallback_roles():
-    missing = default_ad_template_policy()
+def test_ad_template_generator_policy_rejects_missing_swapped_or_stall_diagnosis_roles():
+    missing = default_ad_template_generator_policy()
     missing["stages"].pop("compare")
-    with pytest.raises(ToolRunError, match="requires builder, comparator, and two final-review roles"):
+    with pytest.raises(ToolRunError, match="requires builder, comparator, two final-review roles, and optional stall diagnosis"):
         validate_model_policy(missing)
 
-    wrong_capability = default_ad_template_policy()
+    wrong_capability = default_ad_template_generator_policy()
     wrong_capability["stages"]["analyse"]["capability"] = "text"
     with pytest.raises(ToolRunError, match="requires audited structured vision"):
         validate_model_policy(wrong_capability)
 
-    selected = default_ad_template_policy()
+    selected = default_ad_template_generator_policy()
     selected["stages"]["analyse"]["primary"] = dict(
         selected["stages"]["final-review-a"]["primary"]
     )
     assert validate_model_policy(selected) == selected
 
-    fallback = default_ad_template_policy()
+    fallback = default_ad_template_generator_policy()
     fallback["stages"]["analyse"]["fallbacks"] = [
         dict(fallback["stages"]["analyse"]["primary"])
     ]
     with pytest.raises(ToolRunError, match="cannot declare fallback models"):
         validate_model_policy(fallback)
 
-    retries = default_ad_template_policy()
+    retries = default_ad_template_generator_policy()
     retries["stages"]["analyse"]["max_attempts"] = 2
     with pytest.raises(ToolRunError, match="requires exactly one model attempt"):
         validate_model_policy(retries)
@@ -289,7 +289,7 @@ def test_ad_template_policy_contract_rejects_missing_swapped_or_fallback_roles()
 
 @pytest.mark.parametrize("model", ["deepseek-v4-flash", "deepseek-v4-pro"])
 def test_text_only_deepseek_routes_fail_closed_even_when_self_declared(model):
-    policy = default_ad_template_policy()
+    policy = default_ad_template_generator_policy()
     policy["stages"]["analyse"]["primary"] = {
         "provider": "deepseek", "model": model,
         "capability_verified": True,
@@ -304,7 +304,7 @@ def test_text_only_deepseek_routes_fail_closed_even_when_self_declared(model):
 def test_stale_sole_revisions_one_to_ten_are_preserved_and_revision_eleven_selected(tmp_path):
     path = tmp_path / "seed-v11.db"
     store = ToolRunStore(str(path))
-    stale = default_ad_template_policy()
+    stale = default_ad_template_generator_policy()
     stale["seed_revision"] = 10
     stale["stages"]["analyse"]["primary"] = dict(stale["stages"]["compare"]["primary"])
     stale_json = json.dumps(stale, separators=(",", ":"), sort_keys=True)
@@ -337,7 +337,7 @@ def test_stale_sole_revisions_one_to_ten_are_preserved_and_revision_eleven_selec
     assert migrated.get_policy("ad-template-generator", 10)["policy"] == stale
     current = migrated.get_policy("ad-template-generator")
     assert current["revision"] == 11
-    assert current["policy"]["seed_revision"] == default_ad_template_policy()["seed_revision"]
+    assert current["policy"]["seed_revision"] == default_ad_template_generator_policy()["seed_revision"]
     assert current["policy"]["stages"]["final-review-b"]["primary"] == {
         "provider": "meta-direct",
         "model": "muse-spark-1.3-contributor",
@@ -347,7 +347,7 @@ def test_stale_sole_revisions_one_to_ten_are_preserved_and_revision_eleven_selec
         "supports_tools": True,
     }
     assert current["policy"]["stages"]["analyse"]["primary"]["model"] == "muse-spark-1.3-contributor"
-    assert current["policy"]["stages"]["quality-escalation"] == default_ad_template_policy()["stages"]["quality-escalation"]
+    assert current["policy"]["stages"]["quality-escalation"] == default_ad_template_generator_policy()["stages"]["quality-escalation"]
     pinned, _ = migrated.create_run(command(
         request_id="req-stale",
         idempotency_key="stale-policy-pin",
@@ -360,7 +360,7 @@ def test_stale_sole_revisions_one_to_ten_are_preserved_and_revision_eleven_selec
 def test_stale_builtin_project_default_is_superseded_without_touching_history(tmp_path):
     path = tmp_path / "project-seed-migration.db"
     store = ToolRunStore(str(path))
-    stale = default_ad_template_policy()
+    stale = default_ad_template_generator_policy()
     stale["seed_revision"] = 12
     stale["stages"]["final-review-b"]["primary"] = {
         "provider": "deepseek",
@@ -386,7 +386,7 @@ def test_stale_builtin_project_default_is_superseded_without_touching_history(tm
     assert historical["policy"] == stale
     assert current["revision"] > stale_record["revision"]
     assert current["project_id"] == "blockwise"
-    assert current["policy"]["seed_revision"] == default_ad_template_policy()["seed_revision"]
+    assert current["policy"]["seed_revision"] == default_ad_template_generator_policy()["seed_revision"]
     assert current["policy"]["stages"]["final-review-b"]["primary"]["provider"] == "meta-direct"
     assert current["policy"]["stages"]["final-review-b"]["primary"]["model"] == "muse-spark-1.3-contributor"
 
@@ -396,7 +396,7 @@ def test_stale_builtin_project_default_is_superseded_without_touching_history(tm
 def test_legacy_seed_is_superseded_without_rewriting_revision_one(tmp_path):
     path = tmp_path / "seed-migration.db"
     store = ToolRunStore(str(path))
-    legacy = default_ad_template_policy()
+    legacy = default_ad_template_generator_policy()
     legacy.pop("seed_revision", None)
     for stage_id in ("analyse", "visual-qa"):
         legacy["stages"][stage_id]["primary"]["provider"] = "openai"
@@ -423,7 +423,7 @@ def test_legacy_seed_is_superseded_without_rewriting_revision_one(tmp_path):
 
 def test_one_run_override_creates_new_revision(tmp_path):
     store = ToolRunStore(str(tmp_path / "override.db"))
-    override = default_ad_template_policy()
+    override = default_ad_template_generator_policy()
     override["name"] = "One run"
     run, _ = store.create_run(command(model_policy_revision=None, model_policy_override=override))
     assert run["model_policy_revision"] == 2
@@ -469,7 +469,7 @@ def test_tool_run_db_never_adds_chat_session_rows(tmp_path):
 
 def test_project_defaults_are_isolated_and_fall_back_to_global(tmp_path):
     store = ToolRunStore(str(tmp_path / "projects.db"))
-    blockwise = default_ad_template_policy()
+    blockwise = default_ad_template_generator_policy()
     blockwise["name"] = "Blockwise balanced"
     saved = store.create_policy("ad-template-generator", blockwise, project_id="blockwise")
     assert store.get_policy("ad-template-generator", project_id="blockwise")["revision"] == saved["revision"]
@@ -481,18 +481,18 @@ def test_project_defaults_are_isolated_and_fall_back_to_global(tmp_path):
 @pytest.mark.skip(reason="legacy image-model capability matrix is removed")
 def test_model_capability_mismatch_is_rejected(tmp_path):
     store = ToolRunStore(str(tmp_path / "capabilities.db"))
-    invalid = default_ad_template_policy()
+    invalid = default_ad_template_generator_policy()
     invalid["stages"]["analyse"]["primary"] = {"provider": "openai", "model": "gpt-image-2"}
     with pytest.raises(ToolRunError, match="cannot perform structured vision"):
         store.create_policy("ad-template-generator", invalid)
-    custom = default_ad_template_policy()
+    custom = default_ad_template_generator_policy()
     custom["stages"]["masked-text-cleanup"]["primary"] = {"provider": "custom", "model": "unknown-image-model"}
     with pytest.raises(ToolRunError, match="has not verified"):
         store.create_policy("ad-template-generator", custom)
 
 
 def test_meta_direct_policy_uses_reference_edit_not_masked_edit():
-    policy = default_ad_template_policy()
+    policy = default_ad_template_generator_policy()
     stage = policy["stages"]["aspect-reference-image"]
     assert stage["capability"] == "reference_image_edit"
     assert stage["primary"]["provider"] == "meta-direct"

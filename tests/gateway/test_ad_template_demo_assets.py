@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from PIL import Image
 import pytest
-import gateway.exact_clone_process as process
+import gateway.ad_template_generator_process as process
 
 
 def fixture(tmp_path, monkeypatch):

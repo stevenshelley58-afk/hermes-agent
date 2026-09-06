@@ -5,7 +5,7 @@ import json
 
 from PIL import Image
 
-from gateway.exact_clone_photo_qa import (
+from gateway.ad_template_generator_photo_qa import (
     materialize_source_photo_plan,
     source_photo_overrides,
 )

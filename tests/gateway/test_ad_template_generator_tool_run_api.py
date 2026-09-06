@@ -58,6 +58,31 @@ def _payload(response) -> dict:
 
 
 @pytest.mark.asyncio
+async def test_model_catalog_exposes_canonical_capabilities_with_legacy_alias(
+    tmp_path, monkeypatch,
+):
+    from hermes_cli import inventory
+
+    monkeypatch.setattr(inventory, "load_picker_context", lambda: object())
+    monkeypatch.setattr(
+        inventory,
+        "build_model_options_payload",
+        lambda *_args, **_kwargs: {"providers": []},
+    )
+    store = ToolRunStore(str(tmp_path / "models.db"))
+
+    response = await _API(store)._handle_tool_run_models(_Request(""))
+
+    result = _payload(response)
+    assert response.status == 200
+    assert result["ad_template_generator_capabilities"]
+    assert (
+        result["ad_studio_capabilities"]
+        == result["ad_template_generator_capabilities"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_approve_activates_quarantine_then_completes(tmp_path, monkeypatch):
     store = ToolRunStore(str(tmp_path / "approve.db"))
     run = _ready(store, "approve")

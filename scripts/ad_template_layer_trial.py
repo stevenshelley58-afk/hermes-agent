@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from PIL import Image, ImageChops
 from agent.auxiliary_client import OpenAI
 from gateway.ad_template_runtime import AdTemplateProcessError, vision_message
-from gateway.exact_clone_process import apply_patch, run_renderer
+from gateway.ad_template_generator_process import apply_patch, run_renderer
 from gateway.platforms.api_server import _resolve_request_runtime_agent_kwargs
 from gateway.tool_run_api import ToolRunAPIMixin
 ROOT = Path('/home/hermes/.hermes/tool_runs/ad-template-generator/trun_f2b0848ec6a14308a4c08cd513422d8c')

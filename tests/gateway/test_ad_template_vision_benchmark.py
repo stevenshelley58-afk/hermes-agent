@@ -112,10 +112,10 @@ def test_comparator_assessment_requires_an_applicable_patch(monkeypatch):
             "patchError": None,
         }
 
-    process = types.ModuleType("gateway.exact_clone_process")
+    process = types.ModuleType("gateway.ad_template_generator_process")
     process.validate_comparator_result = fake_validate
     process.validate_review = lambda value: value
-    monkeypatch.setitem(sys.modules, "gateway.exact_clone_process", process)
+    monkeypatch.setitem(sys.modules, "gateway.ad_template_generator_process", process)
     result = benchmark.assess_comparator_result(
         valid, baseline=_review(), candidate=_candidate()
     )

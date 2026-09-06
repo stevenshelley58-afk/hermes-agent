@@ -30,12 +30,12 @@ def agent_provider_usage(agent: Any) -> Dict[str, Any]:
 def assert_run_usage_accounted(totals: Dict[str, Any], cost_limit: float, *, before_call: bool) -> None:
     if int(totals.get("unpriced_call_count") or 0) > 0:
         raise RuntimeError(
-            "sole ad-template process has provider usage without cost accounting; refusing further model calls"
+            "Ad Template Generator has provider usage without cost accounting; refusing further model calls"
         )
     cost = float(totals.get("estimated_cost_usd") or 0.0)
     exhausted = cost >= cost_limit if before_call else cost > cost_limit
     if cost_limit > 0 and exhausted:
         raise RuntimeError(
-            f"sole ad-template process exceeded whole-run cost limit {cost_limit:.2f} "
+            f"Ad Template Generator exceeded whole-run cost limit {cost_limit:.2f} "
             f"(durable total {cost:.4f})"
         )

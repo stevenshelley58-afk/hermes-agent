@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PIL import Image
 
-import gateway.exact_clone_process as process
+import gateway.ad_template_generator_process as process
 import gateway.ad_template_runtime as runtime
 from gateway.tool_runs import TOOL_RUN_COMMAND_SCHEMA, ToolRunError, ToolRunStore
 import pytest
@@ -258,7 +258,7 @@ def _comparison(
     return result
 
 
-def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(monkeypatch, tmp_path):
+def test_ad_template_generator_is_measured_image_referenced_patch_bounded_and_quarantined(monkeypatch, tmp_path):
     source = tmp_path / "source.png"
     Image.new("RGB", (800, 1000), "white").save(source)
     order: list[str] = []
@@ -420,7 +420,7 @@ def test_exact_clone_is_measured_image_referenced_patch_bounded_and_quarantined(
         {"provider": "deepseek", "model": "final-b"},
         {"provider": "openai-codex", "model": "escalation"},
     ]
-    result = process.ExactCloneOrchestrator(
+    result = process.AdTemplateGeneratorOrchestrator(
         call_agent=call_agent,
         call_image_model=image_model,
         workspace=tmp_path / "run",
@@ -635,7 +635,7 @@ def test_five_non_improvements_trigger_one_frontier_diagnosis_then_resume_from_b
     workspace = tmp_path / "run"
 
     def orchestrator():
-        return process.ExactCloneOrchestrator(
+        return process.AdTemplateGeneratorOrchestrator(
             call_agent=call_agent,
             call_image_model=lambda *_args: (_ for _ in ()).throw(
                 AssertionError("image model must not be used")

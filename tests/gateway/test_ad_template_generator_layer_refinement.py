@@ -6,7 +6,7 @@ from PIL import Image
 import pytest
 
 from gateway.ad_template_runtime import AdTemplateProcessError
-from gateway.exact_clone_layer_refinement import (
+from gateway.ad_template_generator_layer_refinement import (
     build_refinement_batch_contract,
     build_refinement_contract,
     refinement_prompt,
@@ -134,8 +134,8 @@ def test_contract_locks_from_to_and_bare_numeric_targets():
 
 
 def test_comparator_validation_rejects_invented_layer_id_for_bounded_retry():
-    from gateway.exact_clone_process import validate_comparator_result
-    from tests.gateway.test_exact_clone_process import _review
+    from gateway.ad_template_generator_process import validate_comparator_result
+    from tests.gateway.test_ad_template_generator_process import _review
     candidate = _candidate()
     review = _review(accept=False)
     review["comparisonToBest"] = "not_applicable"

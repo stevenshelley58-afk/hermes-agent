@@ -27,7 +27,7 @@ def test_frontier_diagnosis_cost_remains_accounted_when_catalog_lags(monkeypatch
 def test_stall_diagnosis_is_strict_advice_not_an_edit_or_review():
     import jsonschema
     import pytest
-    from gateway.tool_run_api import _AD_TEMPLATE_ROLE_OUTPUT_TOKENS
+    from gateway.tool_run_api import _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS
 
     for instance in ("diagnosis-stall", "diagnosis-stall-format-retry"):
         assert ToolRunAPIMixin._tool_role_kind(instance) == "diagnosis"
@@ -44,18 +44,18 @@ def test_stall_diagnosis_is_strict_advice_not_an_edit_or_review():
         ):
             with pytest.raises(jsonschema.ValidationError):
                 jsonschema.validate(invalid, schema)
-    assert _AD_TEMPLATE_ROLE_OUTPUT_TOKENS["diagnosis"] >= 4096
+    assert _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS["diagnosis"] >= 4096
 
 
 def test_comparator_budget_covers_review_plus_patch_without_retry_truncation():
-    from gateway.tool_run_api import _AD_TEMPLATE_ROLE_OUTPUT_TOKENS
-    assert _AD_TEMPLATE_ROLE_OUTPUT_TOKENS["comparator"] >= _AD_TEMPLATE_ROLE_OUTPUT_TOKENS["patch"]
-    assert _AD_TEMPLATE_ROLE_OUTPUT_TOKENS["comparator"] > _AD_TEMPLATE_ROLE_OUTPUT_TOKENS["review"]
+    from gateway.tool_run_api import _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS
+    assert _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS["comparator"] >= _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS["patch"]
+    assert _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS["comparator"] > _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS["review"]
 
 
 
 def test_catalog_basename_normalization_is_unambiguous_and_consistent(monkeypatch):
-    from gateway import exact_clone_process as process
+    from gateway import ad_template_generator_process as process
     a = SimpleNamespace(file_name="interior/living.webp", mime_type="image/webp")
     b = SimpleNamespace(file_name="other/living.webp", mime_type="image/webp")
     catalog = SimpleNamespace(assets={a.file_name: a})

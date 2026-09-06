@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only vision-route benchmark for the sole ad-template process.
+"""Read-only vision-route benchmark for the Ad Template Generator.
 
 The harness replays one already-rendered comparison without invoking the
 controller, renderer, import route, or Tool-run store.  It deliberately keeps
@@ -148,7 +148,7 @@ def assess_review(
 ) -> dict[str, Any]:
     """Return auditable quality signals for one validated model response."""
     if validate is None:
-        from gateway.exact_clone_process import validate_review
+        from gateway.ad_template_generator_process import validate_review
 
         validate = validate_review
 
@@ -209,7 +209,7 @@ def assess_comparator_result(
     candidate: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Validate both the visual diagnosis and its one-call correction patch."""
-    from gateway.exact_clone_process import validate_comparator_result
+    from gateway.ad_template_generator_process import validate_comparator_result
 
     comparator = validate_comparator_result(dict(value), candidate=candidate)
     result = assess_review(
@@ -232,7 +232,7 @@ def assess_comparator_result(
 
 def load_benchmark_case(run_root: Path, iteration: int) -> dict[str, Any]:
     """Load one immutable comparison case without writing beneath ``run_root``."""
-    from gateway.exact_clone_process import review_prompt, vision_message
+    from gateway.ad_template_generator_process import review_prompt, vision_message
 
     root = run_root.expanduser().resolve(strict=True)
     checkpoint_path = root / "exact-clone-checkpoint.json"
