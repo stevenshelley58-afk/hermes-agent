@@ -63,7 +63,7 @@ TYPOGRAPHY_SUBSTITUTION_THRESHOLD = 9.5
 NORMAL_COMPARISONS = 4
 ESCALATION_COMPARISONS = 2
 MAX_COMPARISONS = NORMAL_COMPARISONS + ESCALATION_COMPARISONS
-MAX_FINAL_REVIEW_ROUNDS = 2
+MAX_FINAL_REVIEW_ROUNDS = 3
 MAX_OUTPUT_RETRIES = 1
 MAX_PATCH_REPLANS = 2
 MAX_PATCH_OPERATIONS = 64
@@ -853,7 +853,7 @@ def _layer_pointer_map(candidate: Mapping[str, Any]) -> Dict[str, str]:
 
 
 def patch_prompt(*, candidate: Mapping[str, Any], issues: Sequence[Mapping[str, Any]], manual_instructions: str = "") -> str:
-    return f"""Apply only the listed exact-clone corrections to the current valid Blockwise candidate. Do not redesign, regenerate or replace the document. Preserve every field and layer not named by the corrections. Return a bounded JSON patch only: {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}}. Use the exact JSON Pointer map below. For a layer type change, replace the whole layer at its mapped pointer. When changing to a font not already declared, also add its {{"file":"..."}} declaration at /template/fonts/-. Append list items with /- or the current list length, EXCEPT full-canvas background frames or plates: insert those at index 1, directly above the plate layer, never on top of the content (a covering background layer blanks the render). Remove multiple list items in descending index order. Do not change schema, templateId, createdAt, asset declarations or source-free asset assignments. Maximum {MAX_PATCH_OPERATIONS} operations. A remove operation omits value; add/replace requires value. Return JSON only.
+    return f"""Apply only the listed exact-clone corrections to the current valid Blockwise candidate. Do not redesign, regenerate or replace the document. Preserve every field and layer not named by the corrections. Return a bounded JSON patch only: {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}}. Use the exact JSON Pointer map below. When a correction states an explicit numeric target ("set ... to N"), apply that exact value to the named layer; never approximate or skip part of a group shift. For a layer type change, replace the whole layer at its mapped pointer. When changing to a font not already declared, also add its {{"file":"..."}} declaration at /template/fonts/-. Append list items with /- or the current list length, EXCEPT full-canvas background frames or plates: insert those at index 1, directly above the plate layer, never on top of the content (a covering background layer blanks the render). Remove multiple list items in descending index order. Do not change schema, templateId, createdAt, asset declarations or source-free asset assignments. Maximum {MAX_PATCH_OPERATIONS} operations. A remove operation omits value; add/replace requires value. Return JSON only.
 
 LAYER POINTERS: {_safe_json(_layer_pointer_map(candidate), max_bytes=40_000)}
 CURRENT CANDIDATE: {_safe_json(candidate)}
