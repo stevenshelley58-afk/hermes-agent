@@ -927,6 +927,21 @@ def _reject_unrenderable_field_values(after: Mapping[str, Any]) -> None:
                     f"{layout_name} layer at index {index} must be an object"
                 )
             layer_id = layer.get("layerId")
+            layer_type = layer.get("type")
+            if not isinstance(layer_type, str) or not layer_type:
+                raise AdTemplateProcessError(
+                    f"{layout_name} layer at index {index} is missing a type"
+                )
+            if not isinstance(layer.get("geometry"), dict):
+                raise AdTemplateProcessError(
+                    f"{layout_name} layer {layer_id!r} is missing a geometry object"
+                )
+            if layer_type in {"plate", "overlay_patch", "text", "vector", "icon"} and (
+                not isinstance(layer.get("colourRole"), str) or not layer["colourRole"]
+            ):
+                raise AdTemplateProcessError(
+                    f"{layout_name} layer {layer_id!r} is missing a colourRole"
+                )
             tracking = layer.get("tracking")
             if isinstance(tracking, (int, float)) and not isinstance(tracking, bool) and not -4 <= float(tracking) <= 4:
                 raise AdTemplateProcessError(

@@ -547,6 +547,21 @@ def test_patch_rejects_non_object_layer_for_replan():
         process.apply_patch(candidate, flattened)
 
 
+def test_patch_rejects_layer_missing_required_fields_for_replan():
+    candidate = {"template": _template(), "assets": []}
+    incomplete = {
+        "operations": [{"op": "add",
+                        "path": "/template/storyLayout/layers/1",
+                        "value": {
+                            "type": "vector", "layerId": "story_frame",
+                            "shape": "rect",
+                            "geometry": {"x": 20, "y": 20, "width": 1040, "height": 1880},
+                        }}],
+    }
+    with pytest.raises(process.AdTemplateProcessError, match="colourRole"):
+        process.apply_patch(candidate, incomplete)
+
+
 def test_patch_rejects_full_canvas_background_layer_on_top_of_content():
     candidate = {"template": _template(), "assets": []}
     covering = {
