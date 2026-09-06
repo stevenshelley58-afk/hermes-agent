@@ -184,6 +184,9 @@ def _template() -> dict:
             }, {
                 "type": "image_slot", "layerId": f"{placement}-hero",
                 "inputKey": "hero", "geometry": {"x": 0, "y": 0, "width": 1080, "height": height},
+                "mask": "rect", "minSourceWidth": 800, "minSourceHeight": 800,
+                "defaultCrop": {"x": 0, "y": 0, "width": 1, "height": 1},
+                "allowedPlacementOverrides": [],
             }],
             "safeZones": [],
         }

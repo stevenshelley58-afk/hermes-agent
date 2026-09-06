@@ -912,6 +912,42 @@ def validate_patch(value: Any) -> Dict[str, Any]:
     return {"operations": normalized}
 
 
+_REQUIRED_LAYER_FIELDS: Dict[str, tuple] = {
+    "plate": ("layerId", "colourRole", "geometry", "protected"),
+    "image_slot": ("layerId", "inputKey", "geometry", "mask", "minSourceWidth",
+                   "minSourceHeight", "defaultCrop", "allowedPlacementOverrides"),
+    "overlay_patch": ("layerId", "colourRole", "geometry"),
+    "text": ("layerId", "inputKey", "font", "fontSize", "lineHeight", "alignment",
+             "maxCharacters", "maxLines", "colourRole", "overflowBehaviour", "geometry"),
+    "logo": ("layerId", "inputKey", "geometry"),
+    "vector": ("layerId", "colourRole", "geometry", "shape"),
+    "icon": ("layerId", "colourRole", "geometry", "icon"),
+}
+_OPACITY_REQUIRED_TYPES = {"vector", "overlay_patch", "icon"}
+
+
+def _normalize_layer_defaults(after: Dict[str, Any]) -> None:
+    """Fill renderer-required defaults that build-time layers always carry.
+
+    ``vector``/``overlay_patch``/``icon`` layers must carry an ``opacity``;
+    originals ship 1. A patch that replaces such a layer wholesale without
+    one is corrected here instead of failing the shared renderer later.
+    """
+    template = (after.get("template") or {})
+    for layout_name in ("feedLayout", "storyLayout"):
+        layers = (template.get(layout_name) or {}).get("layers") or []
+        for layer in layers:
+            if not isinstance(layer, dict) or layer.get("type") not in _OPACITY_REQUIRED_TYPES:
+                continue
+            opacity = layer.get("opacity")
+            if not isinstance(opacity, (int, float)) or isinstance(opacity, bool):
+                layer["opacity"] = 1
+            elif not 0 <= float(opacity) <= 1:
+                raise AdTemplateProcessError(
+                    f"{layout_name} layer {layer.get('layerId')!r} opacity must be between 0 and 1"
+                )
+
+
 def _reject_unrenderable_field_values(after: Mapping[str, Any]) -> None:
     """Enforce the renderer's numeric field bounds on patched templates.
 
@@ -932,15 +968,20 @@ def _reject_unrenderable_field_values(after: Mapping[str, Any]) -> None:
                 raise AdTemplateProcessError(
                     f"{layout_name} layer at index {index} is missing a type"
                 )
-            if not isinstance(layer.get("geometry"), dict):
+            required = _REQUIRED_LAYER_FIELDS.get(layer_type)
+            if required is None:
                 raise AdTemplateProcessError(
-                    f"{layout_name} layer {layer_id!r} is missing a geometry object"
+                    f"{layout_name} layer {layer_id!r} has unknown type {layer_type!r}"
                 )
-            if layer_type in {"plate", "overlay_patch", "text", "vector", "icon"} and (
-                not isinstance(layer.get("colourRole"), str) or not layer["colourRole"]
-            ):
+            missing = [
+                field for field in required
+                if field == "geometry" and not isinstance(layer.get(field), dict)
+                or field != "geometry" and layer.get(field) in (None, "")
+            ]
+            if missing:
                 raise AdTemplateProcessError(
-                    f"{layout_name} layer {layer_id!r} is missing a colourRole"
+                    f"{layout_name} layer {layer_id!r} is missing required fields: "
+                    + ", ".join(missing)
                 )
             tracking = layer.get("tracking")
             if isinstance(tracking, (int, float)) and not isinstance(tracking, bool) and not -4 <= float(tracking) <= 4:
@@ -1078,6 +1119,7 @@ def apply_patch(candidate: Mapping[str, Any], value: Any, *, strict: bool = True
         "declarations": result.get("assets"),
     } != immutable:
         raise AdTemplateProcessError("revision patch changed immutable template identity or assets")
+    _normalize_layer_defaults(result)
     _reject_unrenderable_field_values(result)
     _reject_covering_overlays(before_candidate, result)
     return _candidate_envelope(result) if strict else _candidate_structure(result)
