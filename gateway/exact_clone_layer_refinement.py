@@ -121,6 +121,24 @@ def _numeric_targets(
         property_path = _FIELD_PATHS.get(token)
         if property_path:
             targets[property_path] = float(match.group(2))
+    from_to = re.compile(
+        rf"\b({fields})\b\s+from\s+[-+]?\d+(?:\.\d+)?\s*to\s+(-?\d+(?:\.\d+)?)",
+        flags=re.IGNORECASE,
+    )
+    for match in from_to.finditer(instruction):
+        token = match.group(1).lower()
+        property_path = _FIELD_PATHS.get(token)
+        if property_path and property_path not in targets:
+            targets[property_path] = float(match.group(2))
+    bare = re.compile(
+        rf"\b({fields})\b\s+(-?\d+(?:\.\d+)?)",
+        flags=re.IGNORECASE,
+    )
+    for match in bare.finditer(instruction):
+        token = match.group(1).lower()
+        property_path = _FIELD_PATHS.get(token)
+        if property_path and property_path not in targets:
+            targets[property_path] = float(match.group(2))
     delta = re.compile(
         rf"\b({fields})\b[^.;]{{0,24}}?([+-]\d+(?:\.\d+)?)\s*(?:px)?\s*delta",
         flags=re.IGNORECASE,

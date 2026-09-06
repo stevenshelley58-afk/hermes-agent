@@ -690,6 +690,11 @@ def _validate_issue(value: Any) -> Dict[str, Any]:
     actionable_target = (
         re.search(rf"\b({fields})\b\s*(?:to|=|at|:)\s*[-+]?\d", instruction, flags=re.IGNORECASE)
         or re.search(
+            rf"\b({fields})\b\s+from\s+[-+]?\d+(?:\.\d+)?\s*to\s+[-+]?\d",
+            instruction, flags=re.IGNORECASE,
+        )
+        or re.search(rf"\b({fields})\b\s+[-+]?\d+(?:\.\d+)?", instruction, flags=re.IGNORECASE)
+        or re.search(
             rf"\b({fields})\b[^.;]{{0,24}}?[+-]\d+(?:\.\d+)?\s*(?:px)?\s*delta",
             instruction, flags=re.IGNORECASE,
         )

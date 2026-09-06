@@ -114,6 +114,25 @@ def test_contract_trims_invented_layer_ids_from_mixed_issue():
     assert contract["issues"] == [{**issue, "layerIds": ["feed-features"]}]
 
 
+def test_contract_locks_from_to_and_bare_numeric_targets():
+    issue = {
+        "placement": "story",
+        "layerIds": ["story-features"],
+        "category": "geometry",
+        "instruction": "Reduce story-features width from 360 to 280 and set fontSize 36.",
+        "severity": "material",
+    }
+    contract = build_refinement_contract(
+        _candidate(),
+        [issue],
+        source_placement="feed",
+        available_fonts=[],
+    )
+    targets = contract["layers"]["story-features"]["numericTargets"]
+    assert targets["geometry/width"] == 280.0
+    assert targets["fontSize"] == 36.0
+
+
 def test_comparator_validation_rejects_invented_layer_id_for_bounded_retry():
     from gateway.exact_clone_process import validate_comparator_result
     from tests.gateway.test_exact_clone_process import _review
