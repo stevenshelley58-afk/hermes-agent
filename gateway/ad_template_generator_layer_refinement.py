@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -35,6 +36,277 @@ _FIELD_PATHS = {
     "maxlines": "maxLines",
     "maxcharacters": "maxCharacters",
 }
+
+
+
+# Review output may use friendly field names, while patch paths use the
+# renderer's canonical nested names. Keep this allow-list deliberately small:
+# a target is an authorization to mutate one property, not a general JSON
+# pointer into the candidate.
+_TARGET_PROPERTY_ALIASES = {
+    **_FIELD_PATHS,
+    "geometry/x": "geometry/x",
+    "geometry/y": "geometry/y",
+    "geometry/width": "geometry/width",
+    "geometry/height": "geometry/height",
+    "font/file": "font/file",
+    "fontsize": "fontSize",
+    "fontfamily": "fontFamily",
+    "fontweight": "fontWeight",
+    "lineheight": "lineHeight",
+    "tracking": "tracking",
+    "opacity": "opacity",
+    "cornerradius": "cornerRadius",
+    "rotationdegrees": "rotationDegrees",
+    "maxlines": "maxLines",
+    "maxcharacters": "maxCharacters",
+    "alignment": "alignment",
+    "defaultcrop/x": "defaultCrop/x",
+    "defaultcrop/y": "defaultCrop/y",
+    "defaultcrop/width": "defaultCrop/width",
+    "defaultcrop/height": "defaultCrop/height",
+    "defaultcrop/scale": "defaultCrop/scale",
+    "effects/shadow/blur": "effects/shadow/blur",
+    "effects/shadow/offsetx": "effects/shadow/offsetX",
+    "effects/shadow/offsety": "effects/shadow/offsetY",
+    "effects/stroke/width": "effects/stroke/width",
+    "fill": "fill",
+    "stroke": "effects/stroke",
+    "shadow": "effects/shadow",
+    "mask": "mask",
+    "defaultcrop": "defaultCrop",
+    "effects": "effects",
+    "blendmode": "effects/blendMode",
+    "colour": "fill/colour",
+    "color": "fill/colour",
+    "fill/colour": "fill/colour",
+    "fill/color": "fill/colour",
+    "effects/stroke/colour": "effects/stroke/colour",
+    "effects/stroke/color": "effects/stroke/colour",
+    "effects/shadow/colour": "effects/shadow/colour",
+    "effects/shadow/color": "effects/shadow/colour",
+}
+_NUMERIC_TARGET_PROPERTIES = {
+    "geometry/x", "geometry/y", "geometry/width", "geometry/height",
+    "fontSize", "fontWeight", "lineHeight", "tracking", "opacity",
+    "cornerRadius", "rotationDegrees", "maxLines", "maxCharacters",
+    "defaultCrop/x", "defaultCrop/y", "defaultCrop/width",
+    "defaultCrop/height", "defaultCrop/scale", "effects/shadow/blur",
+    "effects/shadow/offsetX", "effects/shadow/offsetY", "effects/stroke/width",
+}
+_STRING_TARGET_PROPERTIES = {
+    "font/file", "fontFamily", "alignment", "mask", "effects/blendMode",
+    "fill/colour", "effects/stroke/colour", "effects/shadow/colour",
+}
+_OBJECT_TARGET_PROPERTIES = {
+    "fill", "effects", "effects/stroke", "effects/shadow", "defaultCrop",
+}
+_SUPPORTED_TARGET_PROPERTIES = (
+    _NUMERIC_TARGET_PROPERTIES | _STRING_TARGET_PROPERTIES | _OBJECT_TARGET_PROPERTIES
+)
+
+
+def _canonical_target_property(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise AdTemplateProcessError("review target property is invalid")
+    raw = value.strip()
+    key = raw.replace("_", "").replace("-", "").lower()
+    property_path = _TARGET_PROPERTY_ALIASES.get(key)
+    if property_path is None:
+        raise AdTemplateProcessError(
+            f"review target property is unsupported: {raw}"
+        )
+    return property_path
+
+
+def _validate_target_value(property_path: str, value: Any) -> Any:
+    if property_path in _NUMERIC_TARGET_PROPERTIES:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise AdTemplateProcessError(
+                f"review target {property_path} must be numeric"
+            )
+        if not math.isfinite(float(value)):
+            raise AdTemplateProcessError(
+                f"review target {property_path} must be finite"
+            )
+        return float(value)
+    if property_path == "alignment":
+        if not isinstance(value, str) or value not in {"left", "center", "right"}:
+            raise AdTemplateProcessError("review target alignment is invalid")
+        return value
+    if property_path in _OBJECT_TARGET_PROPERTIES:
+        if not isinstance(value, (dict, list)):
+            raise AdTemplateProcessError(
+                f"review target {property_path} must be a JSON object or array"
+            )
+        forbidden = {"layerId", "inputKey", "assetKey", "assets", "protected"}
+        def check_json(item: Any) -> None:
+            if isinstance(item, bool) or item is None or isinstance(item, str):
+                return
+            if isinstance(item, (int, float)):
+                if not math.isfinite(float(item)):
+                    raise AdTemplateProcessError(
+                        f"review target {property_path} contains a non-finite number"
+                    )
+                return
+            if isinstance(item, list):
+                for child in item:
+                    check_json(child)
+                return
+            if isinstance(item, dict):
+                if any(key in forbidden for key in item):
+                    raise AdTemplateProcessError(
+                        f"review target {property_path} contains a protected field"
+                    )
+                for key, child in item.items():
+                    if not isinstance(key, str):
+                        raise AdTemplateProcessError(
+                            f"review target {property_path} has a non-string key"
+                        )
+                    check_json(child)
+                return
+            raise AdTemplateProcessError(
+                f"review target {property_path} contains an unsupported value"
+            )
+        check_json(value)
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > 2_000:
+            raise AdTemplateProcessError(
+                f"review target {property_path} is too large"
+            )
+        return copy.deepcopy(value)
+    if property_path in {"font/file", "fontFamily"}:
+        if not isinstance(value, str) or not value.strip():
+            raise AdTemplateProcessError(
+                f"review target {property_path} must be a non-empty string"
+            )
+        return value.strip()
+    if property_path == "mask":
+        if value not in {"rounded_rect", "circle", "none"}:
+            raise AdTemplateProcessError("review target mask is invalid")
+        return value
+    if property_path == "effects/blendMode":
+        if value not in {"normal", "multiply", "screen", "overlay"}:
+            raise AdTemplateProcessError("review target blendMode is invalid")
+        return value
+    if property_path in {
+        "fill/colour", "effects/stroke/colour", "effects/shadow/colour",
+    }:
+        if (
+            not isinstance(value, str)
+            or not re.fullmatch(r"#[0-9a-fA-F]{3,8}", value.strip())
+        ):
+            raise AdTemplateProcessError(
+                f"review target {property_path} must be a hex colour"
+            )
+        return value.strip()
+    raise AdTemplateProcessError(f"review target property is unsupported: {property_path}")
+
+
+def _structured_targets(
+    issue: Mapping[str, Any], layers: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]] | None:
+    # None means a historical issue with no targets field. A present field is
+    # strict so malformed live review data never falls back to ambiguous prose.
+    if "targets" not in issue:
+        return None
+    raw_targets = issue.get("targets")
+    if not isinstance(raw_targets, list) or len(raw_targets) > MAX_OPERATIONS:
+        raise AdTemplateProcessError("review issue targets are invalid")
+    issue_layer_ids = set(issue.get("layerIds") or [])
+    result: dict[str, dict[str, Any]] = {}
+    for raw_target in raw_targets:
+        if not isinstance(raw_target, Mapping) or set(raw_target) != {"layerId", "property", "value"}:
+            raise AdTemplateProcessError("review issue target has an invalid shape")
+        layer_id = raw_target.get("layerId")
+        if not isinstance(layer_id, str) or layer_id not in layers:
+            raise AdTemplateProcessError(
+                f"review target references unknown layer ID: {layer_id}"
+            )
+        if layer_id not in issue_layer_ids:
+            raise AdTemplateProcessError(
+                f"review target layer ID is not listed by its issue: {layer_id}"
+            )
+        property_path = _canonical_target_property(raw_target.get("property"))
+        layer = layers[layer_id]["layer"]
+        layer_type = layer.get("type")
+        if (
+            property_path in {
+                "font/file", "fontSize", "fontFamily", "fontWeight",
+                "lineHeight", "tracking", "alignment", "maxLines", "maxCharacters",
+            }
+            and layer_type != "text"
+        ):
+            raise AdTemplateProcessError(
+                f"review target {property_path} is not mutable on {layer_id}"
+            )
+        if property_path.startswith("defaultCrop") and layer_type != "image_slot":
+            raise AdTemplateProcessError(
+                f"review target {property_path} is not mutable on {layer_id}"
+            )
+        if (
+            property_path.startswith(("fill/", "effects/", "defaultCrop/"))
+            and not _legacy_property_supported(layer, property_path)
+        ):
+            raise AdTemplateProcessError(
+                f"review target {property_path} is unavailable on {layer_id}"
+            )
+        target_value = _validate_target_value(property_path, raw_target.get("value"))
+        if property_path == "tracking" and not -4 <= target_value <= 4:
+            raise AdTemplateProcessError("review target tracking is outside renderer bounds")
+        if property_path == "lineHeight" and target_value < 1:
+            raise AdTemplateProcessError("review target lineHeight is below renderer minimum")
+        if property_path == "fontSize" and target_value < (24 if layers[layer_id]["placement"] == "feed" else 32):
+            raise AdTemplateProcessError("review target fontSize is below placement minimum")
+        if property_path in {"geometry/x", "geometry/y"} and target_value < 0:
+            raise AdTemplateProcessError("review target geometry position is negative")
+        if property_path in {"geometry/width", "geometry/height"} and target_value <= 0:
+            raise AdTemplateProcessError("review target geometry size is not positive")
+        if property_path == "opacity" and not 0 <= target_value <= 1:
+            raise AdTemplateProcessError("review target opacity is outside renderer bounds")
+        prior = result.setdefault(layer_id, {}).get(property_path)
+        if prior is not None and prior != target_value:
+            raise AdTemplateProcessError(
+                f"review issue has conflicting target values for {layer_id}/{property_path}"
+            )
+        result[layer_id][property_path] = target_value
+    missing_layers = sorted(issue_layer_ids - set(result))
+    if raw_targets and missing_layers:
+        raise AdTemplateProcessError(
+            "review issue targets omit listed layer IDs: " + ", ".join(missing_layers)
+        )
+    for layer_id, layer_targets in result.items():
+        geometry = layers[layer_id]["layer"].get("geometry")
+        if not isinstance(geometry, Mapping):
+            continue
+        proposed = dict(geometry)
+        for property_path, target_value in layer_targets.items():
+            if property_path.startswith("geometry/"):
+                proposed[property_path.split("/", 1)[1]] = target_value
+        if any(field in layer_targets for field in {
+            "geometry/x", "geometry/y", "geometry/width", "geometry/height"
+        }):
+            placement = layers[layer_id]["placement"]
+            canvas_width, canvas_height = _CANVAS[placement]
+            values = [proposed.get(field) for field in ("x", "y", "width", "height")]
+            if (
+                any(
+                    isinstance(item, bool)
+                    or not isinstance(item, (int, float))
+                    or not math.isfinite(float(item))
+                    for item in values
+                )
+                or values[0] < 0
+                or values[1] < 0
+                or values[2] <= 0
+                or values[3] <= 0
+                or values[0] + values[2] > canvas_width
+                or values[1] + values[3] > canvas_height
+            ):
+                raise AdTemplateProcessError(
+                    f"review target geometry is outside the {placement} canvas for {layer_id}"
+                )
+    return result
 
 def _candidate_layers(candidate: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     template = candidate.get("template")
@@ -73,6 +345,12 @@ def _explicit_properties(
     )
     if alignment:
         properties.add("alignment")
+    if re.search(
+        r"\bcolou?r\b\s*(?:to|=|at|:)\s*#[0-9a-f]{3,8}\b",
+        instruction,
+        re.IGNORECASE,
+    ):
+        properties.add("fill/colour")
     explicit_objects = {
         "defaultCrop": r"\bcrop\b",
         "stroke": r"\bstroke\b",
@@ -87,61 +365,143 @@ def _explicit_properties(
             properties.add(property_path)
     return properties
 
-def _numeric_targets(
+def _legacy_property_supported(
+    layer: Mapping[str, Any], property_path: str
+) -> bool:
+    if property_path.startswith("geometry/"):
+        return isinstance(layer.get("geometry"), Mapping)
+    if property_path == "fill/colour":
+        return isinstance(layer.get("fill"), Mapping)
+    if property_path.startswith("effects/"):
+        current: Any = layer
+        for part in property_path.split("/"):
+            current = current.get(part) if isinstance(current, Mapping) else None
+        return current is not None
+    if property_path.startswith("defaultCrop/"):
+        return isinstance(layer.get("defaultCrop"), Mapping)
+    if property_path in {
+        "font/file", "fontSize", "fontFamily", "fontWeight",
+        "lineHeight", "tracking", "alignment", "maxLines", "maxCharacters",
+    }:
+        return layer.get("type") == "text"
+    if property_path in _SUPPORTED_TARGET_PROPERTIES:
+        return True
+    return property_path in layer
+
+def _legacy_numeric_targets(
     issue: Mapping[str, Any],
     layer: Mapping[str, Any],
     layer_id: str,
 ) -> dict[str, float]:
+    """Extract targets from historical prose without relying on word order."""
     instruction = str(issue.get("instruction") or "")
-    mentions = sorted(
+    issue_ids = [
+        item for item in issue.get("layerIds", [])
+        if isinstance(item, str)
+    ]
+    mentions = [
         (match.start(), match.end(), candidate_id)
-        for candidate_id in issue.get("layerIds", [])
-        for match in [re.search(
+        for candidate_id in issue_ids
+        for match in re.finditer(
             rf"(?<![A-Za-z0-9_-]){re.escape(candidate_id)}(?![A-Za-z0-9_-])",
             instruction,
-        )]
-        if match is not None
+            re.IGNORECASE,
+        )
+    ]
+    fields = (
+        "x|y|width|height|fontSize|lineHeight|tracking|opacity|cornerRadius|"
+        "rotationDegrees|maxLines|maxCharacters"
     )
-    own = next(
-        (index for index, item in enumerate(mentions) if item[2] == layer_id),
-        None,
-    )
-    if own is not None:
-        start = mentions[own][1]
-        end = mentions[own + 1][0] if own + 1 < len(mentions) else len(instruction)
-        instruction = instruction[start:end]
-    targets: dict[str, float] = {}
-    fields = "x|y|width|height|fontSize|lineHeight|tracking|opacity|cornerRadius|rotationDegrees|maxLines|maxCharacters"
+    parsed: dict[str, list[tuple[int, float, int, int]]] = {}
+
+    def add(match: re.Match[str], priority: int, value_group: int = 2) -> None:
+        property_path = _FIELD_PATHS.get(match.group(1).lower())
+        if not property_path:
+            return
+        value = float(match.group(value_group))
+        parsed.setdefault(property_path, []).append(
+            (priority, value, match.start(), match.end())
+        )
+
     direct = re.compile(
         rf"\b({fields})\b\s*(?:to|=|at|:)\s*(-?\d+(?:\.\d+)?)",
         flags=re.IGNORECASE,
     )
     for match in direct.finditer(instruction):
-        token = match.group(1).lower()
-        property_path = _FIELD_PATHS.get(token)
-        if property_path:
-            targets[property_path] = float(match.group(2))
+        add(match, 0)
     from_to = re.compile(
         rf"\b({fields})\b\s+from\s+[-+]?\d+(?:\.\d+)?\s*to\s+(-?\d+(?:\.\d+)?)",
         flags=re.IGNORECASE,
     )
     for match in from_to.finditer(instruction):
-        token = match.group(1).lower()
-        property_path = _FIELD_PATHS.get(token)
-        if property_path and property_path not in targets:
-            targets[property_path] = float(match.group(2))
+        add(match, 1)
     bare = re.compile(
         rf"\b({fields})\b\s+(-?\d+(?:\.\d+)?)",
         flags=re.IGNORECASE,
     )
     for match in bare.finditer(instruction):
-        token = match.group(1).lower()
-        property_path = _FIELD_PATHS.get(token)
-        if property_path and property_path not in targets:
-            targets[property_path] = float(match.group(2))
-    # Comparator targets must stay renderable.  Clamp to the renderer
-    # bounds instead of failing: the nearest renderable value preserves
-    # the measured direction of the correction.
+        prefix = instruction[max(0, match.start() - 18):match.start()]
+        if re.search(r"\b(?:current(?:ly)?|existing|before|was|is)\s*$", prefix, re.IGNORECASE):
+            continue
+        add(match, 2)
+    delta = re.compile(
+        rf"\b({fields})\b[^.;]{{0,24}}?([+-]\d+(?:\.\d+)?)\s*(?:px)?\s*delta",
+        flags=re.IGNORECASE,
+    )
+    for match in delta.finditer(instruction):
+        property_path = _FIELD_PATHS.get(match.group(1).lower())
+        if not property_path:
+            continue
+        current: Any = layer
+        for part in property_path.split("/"):
+            current = current.get(part) if isinstance(current, Mapping) else None
+        if isinstance(current, (int, float)) and not isinstance(current, bool):
+            parsed.setdefault(property_path, []).append(
+                (3, float(current) + float(match.group(2)), match.start(), match.end())
+            )
+
+    targets: dict[str, float] = {}
+    owned_values: dict[str, set[float]] = {}
+    for property_path, candidates in parsed.items():
+        best_priority = min(item[0] for item in candidates)
+        chosen = [item for item in candidates if item[0] == best_priority]
+        for _, value, begin, finish in chosen:
+            # A single-layer issue has no ambiguity, including the observed form
+            # where all coordinates precede the layer name. For grouped issues,
+            # attach each field to its nearest explicit layer mention.
+            if len(issue_ids) == 1:
+                owner = issue_ids[0]
+            else:
+                nearby = []
+                for mention_start, mention_end, candidate_id in mentions:
+                    distance = (
+                        0 if mention_start <= finish and begin <= mention_end
+                        else min(abs(begin - mention_end), abs(mention_start - finish))
+                    )
+                    if distance <= 120:
+                        nearby.append((distance, candidate_id))
+                nearby.sort()
+                owner = (
+                    nearby[0][1]
+                    if nearby and (len(nearby) == 1 or nearby[0][0] < nearby[1][0])
+                    else None
+                )
+            if owner is None:
+                continue
+            owned_values.setdefault(owner + "|" + property_path, set()).add(value)
+            if owner == layer_id:
+                targets[property_path] = value
+    conflicts = [
+        key.rsplit("|", 1)[1] for key, values in owned_values.items()
+        if len(values) > 1 and key.startswith(layer_id + "|")
+    ]
+    if conflicts:
+        raise AdTemplateProcessError(
+            f"review issue has conflicting numeric targets for {layer_id}/"
+            + ", ".join(sorted(conflicts))
+        )
+
+    # Historical comparator values are clamped to the renderer's safe range.
     if "tracking" in targets:
         targets["tracking"] = max(-4.0, min(4.0, targets["tracking"]))
     if "lineHeight" in targets:
@@ -152,21 +512,16 @@ def _numeric_targets(
     for field in ("geometry/x", "geometry/y"):
         if field in targets:
             targets[field] = max(0.0, targets[field])
-    delta = re.compile(
-        rf"\b({fields})\b[^.;]{{0,24}}?([+-]\d+(?:\.\d+)?)\s*(?:px)?\s*delta",
-        flags=re.IGNORECASE,
-    )
-    for match in delta.finditer(instruction):
-        token = match.group(1).lower()
-        property_path = _FIELD_PATHS.get(token)
-        if not property_path or property_path in targets:
-            continue
-        current: Any = layer
-        for part in property_path.split("/"):
-            current = current.get(part) if isinstance(current, Mapping) else None
-        if isinstance(current, (int, float)) and not isinstance(current, bool):
-            targets[property_path] = float(current) + float(match.group(2))
     return targets
+
+
+def _numeric_targets(
+    issue: Mapping[str, Any],
+    layer: Mapping[str, Any],
+    layer_id: str,
+) -> dict[str, float]:
+    # Kept as a compatibility seam for callers/tests that used the old helper.
+    return _legacy_numeric_targets(issue, layer, layer_id)
 
 
 def build_refinement_contract(
@@ -180,6 +535,12 @@ def build_refinement_contract(
     if not issues:
         raise AdTemplateProcessError("layer refinement requires review issues")
     layers = _candidate_layers(candidate)
+    # Present machine-readable targets are strict. Do this before the
+    # historical unknown-ID trimming so a malformed live review receives the
+    # existing bounded retry rather than being silently rewritten.
+    for issue in issues:
+        if "targets" in issue:
+            _structured_targets(issue, layers)
     # Comparator validation already rejects unknown layer IDs with a bounded
     # retry; this net drops any residual hallucinated references so one bad
     # issue cannot discard the whole comparison.
@@ -243,25 +604,55 @@ def build_refinement_contract(
             changed = True
 
     locks: dict[str, list[str]] = {}
-    targets: dict[str, dict[str, float]] = {}
+    targets: dict[str, dict[str, Any]] = {}
+    property_targets: dict[str, dict[str, Any]] = {}
+    unpatchable_issue_records: list[dict[str, Any]] = []
     for layer_id in selected_ids:
         related = [
             issue for issue in selected_issues if layer_id in issue["layerIds"]
         ]
-        target_values: dict[str, float] = {}
+        target_values: dict[str, Any] = {}
+        authoritative_properties: set[str] = set()
         properties: set[str] = set()
         placement = layers[layer_id]["placement"]
         for issue in related:
-            issue_targets = _numeric_targets(
-                issue, layers[layer_id]["layer"], layer_id
+            structured = _structured_targets(issue, layers)
+            issue_targets = (
+                structured.get(layer_id, {})
+                if structured is not None
+                else _numeric_targets(issue, layers[layer_id]["layer"], layer_id)
             )
-            if "fontSize" in issue_targets:
+            if (
+                structured is None
+                and "fontSize" in issue_targets
+                and "fontSize" in _NUMERIC_TARGET_PROPERTIES
+            ):
                 issue_targets["fontSize"] = max(
                     32.0 if placement in {"story", "both"} else 24.0,
                     issue_targets["fontSize"],
                 )
-            target_values.update(issue_targets)
-            properties.update(_explicit_properties(issue, issue_targets))
+            for property_path, value in issue_targets.items():
+                prior = target_values.get(property_path)
+                if prior is not None and prior != value:
+                    raise AdTemplateProcessError(
+                        f"review issue has conflicting target values for {layer_id}/{property_path}"
+                    )
+                target_values[property_path] = value
+            if structured is not None:
+                authoritative_properties.update(issue_targets)
+                properties.update(issue_targets)
+            else:
+                properties.update(
+                    property_path for property_path in _explicit_properties(
+                        issue, issue_targets
+                    )
+                    if (
+                        property_path in _SUPPORTED_TARGET_PROPERTIES
+                        and _legacy_property_supported(
+                            layers[layer_id]["layer"], property_path
+                        )
+                    )
+                )
         # Keep combined geometry inside the placement canvas so an
         # out-of-canvas reviewer phrasing converges on the nearest
         # renderable rectangle instead of creating an impossible contract
@@ -277,16 +668,38 @@ def build_refinement_contract(
             y = max(0.0, min(y, canvas_height - 1.0))
             width = max(1.0, min(width, canvas_width - x))
             height = max(1.0, min(height, canvas_height - y))
-            if "geometry/x" in target_values:
+            if "geometry/x" in target_values and "geometry/x" not in authoritative_properties:
                 target_values["geometry/x"] = x
-            if "geometry/y" in target_values:
+            if "geometry/y" in target_values and "geometry/y" not in authoritative_properties:
                 target_values["geometry/y"] = y
-            if "geometry/width" in target_values:
+            if "geometry/width" in target_values and "geometry/width" not in authoritative_properties:
                 target_values["geometry/width"] = width
-            if "geometry/height" in target_values:
+            if "geometry/height" in target_values and "geometry/height" not in authoritative_properties:
                 target_values["geometry/height"] = height
         locks[layer_id] = sorted(properties)
-        targets[layer_id] = target_values
+        targets[layer_id] = {
+            property_path: value for property_path, value in target_values.items()
+            if property_path in _NUMERIC_TARGET_PROPERTIES
+        }
+        property_targets[layer_id] = {
+            property_path: value
+            for property_path, value in target_values.items()
+            if property_path in authoritative_properties
+        }
+
+    structured_without_targets = [
+        issue for issue in selected_issues
+        if "targets" in issue and not issue.get("targets")
+    ]
+    if structured_without_targets:
+        unpatchable_issue_records.extend({
+            "issue": copy.deepcopy(dict(issue)),
+            "reason": "review issue supplied no patchable targets",
+        } for issue in structured_without_targets)
+        selected_issues = [
+            issue for issue in selected_issues
+            if issue not in structured_without_targets
+        ]
 
     template = candidate["template"]
     text_inputs = template.get("textInputs") or []
@@ -355,7 +768,11 @@ def build_refinement_contract(
             if (
                 not property_path
                 or property_path.split("/", 1)[0]
-                in {"layerId", "type", "inputKey", "protected"}
+                in {
+                    "layerId", "type", "inputKey", "protected", "assetKey",
+                    "assets", "colourRole", "shape", "icon",
+                }
+                or property_path not in _SUPPORTED_TARGET_PROPERTIES
             ):
                 raise AdTemplateProcessError(
                     "comparator proposed an unsafe layer identity change"
@@ -449,9 +866,19 @@ def build_refinement_contract(
         for item in template.get("fonts", [])
         if isinstance(item, Mapping) and isinstance(item.get("file"), str)
     })
+    normalized_targets = [
+        {
+            "layerId": layer_id,
+            "property": property_path,
+            "value": copy.deepcopy(value),
+        }
+        for layer_id in selected_ids
+        for property_path, value in property_targets[layer_id].items()
+    ]
     return {
         "primaryPlacement": group_placement,
         "issues": copy.deepcopy(selected_issues),
+        "targets": normalized_targets,
         "layerIds": selected_ids,
         "layers": {
             layer_id: {
@@ -459,6 +886,7 @@ def build_refinement_contract(
                 "pointer": layers[layer_id]["pointer"],
                 "allowedProperties": locks[layer_id],
                 "numericTargets": targets[layer_id],
+                "propertyTargets": property_targets[layer_id],
                 "current": layers[layer_id]["layer"],
             }
             for layer_id in selected_ids
@@ -469,6 +897,7 @@ def build_refinement_contract(
         "extraAllowedPaths": sorted(set(extra_allowed_paths)),
         "suggestedOperations": suggested_operations,
         "unpatchableLayerIds": sorted(dropped_layer_ids),
+        "unpatchableIssues": unpatchable_issue_records,
     }
 
 
@@ -480,25 +909,72 @@ def build_refinement_batch_contract(
     available_fonts: Sequence[str],
     suggested_patch: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # Build valid groups independently. One malformed/vague issue must not
+    # prevent unrelated review work from reaching the bounded refinement role.
     remaining = list(issues)
     groups: list[dict[str, Any]] = []
+    unpatchable: list[dict[str, Any]] = []
     while remaining and len(groups) < MAX_GROUPS_PER_CALL:
-        group = build_refinement_contract(
-            candidate,
-            remaining,
-            source_placement=source_placement,
-            available_fonts=available_fonts,
-            suggested_patch=suggested_patch,
-        )
+        try:
+            group = build_refinement_contract(
+                candidate,
+                remaining,
+                source_placement=source_placement,
+                available_fonts=available_fonts,
+                suggested_patch=suggested_patch,
+            )
+        except AdTemplateProcessError as exc:
+            # Isolate an issue that cannot be contracted on its own. If all
+            # individual issues are valid, the failure is an interaction
+            # (typically conflicting values); quarantine the first bounded
+            # issue so the remaining groups can still be recovered.
+            failing_index = None
+            failing_reason = str(exc)
+            for index, issue in enumerate(remaining):
+                try:
+                    build_refinement_contract(
+                        candidate,
+                        [issue],
+                        source_placement=source_placement,
+                        available_fonts=available_fonts,
+                        suggested_patch=suggested_patch,
+                    )
+                except AdTemplateProcessError as individual_exc:
+                    failing_index = index
+                    failing_reason = str(individual_exc)
+                    break
+            if failing_index is None:
+                failing_index = 0
+            failed_issue = remaining.pop(failing_index)
+            unpatchable.append({
+                "issue": copy.deepcopy(dict(failed_issue)),
+                "reason": failing_reason,
+            })
+            continue
         groups.append(group)
         selected = group["issues"]
-        remaining = [issue for issue in remaining if issue not in selected]
+        # Remove occurrences, not all equal values, so duplicate historical
+        # issues cannot accidentally disappear from the batch.
+        for selected_issue in [
+            *selected,
+            *[
+                item.get("issue")
+                for item in group.get("unpatchableIssues", [])
+                if isinstance(item, Mapping)
+            ],
+        ]:
+            for index, issue in enumerate(remaining):
+                if issue == selected_issue:
+                    remaining.pop(index)
+                    break
+
     merged_layers: dict[str, Any] = {}
     dependencies: list[dict[str, Any]] = []
     extra_paths: set[str] = set()
     suggested: list[dict[str, Any]] = []
     group_paths: list[list[str]] = []
     for group in groups:
+        unpatchable.extend(group.get("unpatchableIssues", []))
         merged_layers.update(group["layers"])
         for dependency in group["textInputDependencies"]:
             if dependency not in dependencies:
@@ -509,11 +985,34 @@ def build_refinement_batch_contract(
                 suggested.append(operation)
         group_paths.append(sorted(_allowed_paths(group)))
     if not groups:
+        if unpatchable:
+            summary = "; ".join(
+                item["reason"] for item in unpatchable[:3]
+            )
+            raise AdTemplateProcessError(
+                "layer refinement produced no patchable groups; "
+                f"unpatchable issues: {summary}"
+            )
         raise AdTemplateProcessError("layer refinement produced no bounded groups")
+    unpatchable_layer_ids = sorted({
+        layer_id
+        for item in unpatchable
+        for layer_id in item["issue"].get("layerIds", [])
+        if isinstance(layer_id, str)
+    })
+    normalized_targets = [
+        target
+        for group in groups
+        for target in group.get("targets", [])
+    ]
     return {
         "primaryPlacement": groups[0]["primaryPlacement"],
         "groups": groups,
+        "targets": normalized_targets,
         "remainingIssueCount": len(remaining),
+        "unpatchableIssueCount": len(unpatchable),
+        "unpatchableIssues": unpatchable,
+        "unpatchableLayerIds": unpatchable_layer_ids,
         "issues": [issue for group in groups for issue in group["issues"]],
         "layerIds": list(dict.fromkeys(
             layer_id for group in groups for layer_id in group["layerIds"]
@@ -535,7 +1034,7 @@ def _json(value: Any) -> str:
 def refinement_prompt(contract: Mapping[str, Any]) -> str:
     return f"""You are the layer-refinement role in an exact-clone compiler. Correct only the review-selected bounded groups. The attached images begin with repeated source/current crop pairs in the same order as contract.groups; every pair uses one exact canvas rectangle. Whole-frame evidence follows those pairs. Preserve all unlisted layers and fields byte-for-byte.
 
-Return exactly {{"operations":[{{"op":"replace|add","path":"/template/...","value":...}}]}}. Every layer operation must use one exact pointer and allowed property from the contract. Never replace a whole layer or change layerId, type, inputKey, assets, metadata, semantic colours, or another placement. A dependent text input may change only placeholder or maxLength; its sharedLayerIds explicitly show every placement affected by that editable value. Preserve six distinct source bullet lines as editable placeholder lines when requested. For typography, choose the closest permitted font first, then tune size, tracking and geometry without worsening rendered ink width or alignment. A font declaration may only append one available font as {{"file":"..."}} at /template/fonts/-. tracking is -4..4; lineHeight is at least 1; fontSize is at least 24 for Feed and 32 for Story; geometry width/height must remain positive and all geometry must stay on its canvas. Follow numericTargets exactly when present. Maximum {MAX_OPERATIONS} operations and {MAX_PATCH_BYTES} encoded bytes. Return JSON only.
+Return exactly {{"operations":[{{"op":"replace|add","path":"/template/...","value":...}}]}}. Every layer operation must use one exact pointer and allowed property from the contract. Never replace a whole layer or change layerId, type, inputKey, assets, metadata, semantic colours, or another placement. A dependent text input may change only placeholder or maxLength; its sharedLayerIds explicitly show every placement affected by that editable value. Preserve six distinct source bullet lines as editable placeholder lines when requested. For typography, choose the closest permitted font first, then tune size, tracking and geometry without worsening rendered ink width or alignment. A font declaration may only append one available font as {{"file":"..."}} at /template/fonts/-. tracking is -4..4; lineHeight is at least 1; fontSize is at least 24 for Feed and 32 for Story; geometry width/height must remain positive and all geometry must stay on its canvas. Follow numericTargets and propertyTargets exactly when present. Machine-readable targets are authoritative and must not be inferred from English wording. Maximum {MAX_OPERATIONS} operations and {MAX_PATCH_BYTES} encoded bytes. Return JSON only.
 
 LAYER REFINEMENT CONTRACT: {_json(contract)}"""
 
@@ -623,12 +1122,37 @@ def validate_refinement_patch(
         if layer_id is None:
             continue
         property_path = path[len(pointers[layer_id]) + 1:]
-        target = contract["layers"][layer_id]["numericTargets"].get(property_path)
-        if target is not None and (
+        numeric_target = contract["layers"][layer_id]["numericTargets"].get(property_path)
+        property_target = contract["layers"][layer_id].get(
+            "propertyTargets", {}
+        ).get(property_path)
+        if property_target is not None:
+            if (
+                op == "remove"
+                or (
+                    property_path in _NUMERIC_TARGET_PROPERTIES
+                    and (
+                        isinstance(value_item, bool)
+                        or not isinstance(value_item, (int, float))
+                        or not math.isfinite(float(value_item))
+                        or abs(float(value_item) - float(property_target)) > 0.01
+                    )
+                )
+                or (
+                    property_path not in _NUMERIC_TARGET_PROPERTIES
+                    and value_item != property_target
+                )
+            ):
+                raise AdTemplateProcessError(
+                    "layer refinement violated an authoritative property target "
+                    "(numeric target mismatch)"
+                )
+        elif numeric_target is not None and (
             op == "remove"
             or isinstance(value_item, bool)
             or not isinstance(value_item, (int, float))
-            or abs(float(value_item) - float(target)) > 0.01
+            or not math.isfinite(float(value_item))
+            or abs(float(value_item) - float(numeric_target)) > 0.01
         ):
             raise AdTemplateProcessError("layer refinement violated a measured numeric target")
         placement = contract["layers"][layer_id]["placement"]
@@ -665,6 +1189,27 @@ def validate_refinement_patch(
         if property_path == "font/file" and value_item not in fonts:
             raise AdTemplateProcessError("layer refinement requested an unavailable font")
     operation_paths = {operation["path"] for operation in operations}
+    for layer_id, item in contract["layers"].items():
+        for property_path, target_value in item.get("propertyTargets", {}).items():
+            path = item["pointer"] + "/" + property_path
+            if path in operation_paths:
+                continue
+            current: Any = item["current"]
+            for part in property_path.split("/"):
+                current = current.get(part) if isinstance(current, Mapping) else None
+            matches = (
+                abs(float(current) - float(target_value)) <= 0.01
+                if property_path in _NUMERIC_TARGET_PROPERTIES
+                and isinstance(current, (int, float))
+                and not isinstance(current, bool)
+                and isinstance(target_value, (int, float))
+                else current == target_value
+            )
+            if not matches:
+                raise AdTemplateProcessError(
+                    "layer refinement omitted authoritative target "
+                    f"{layer_id}/{property_path}"
+                )
     for group_paths in contract.get("groupAllowedPaths", []):
         if not operation_paths.intersection(group_paths):
             raise AdTemplateProcessError(

@@ -873,8 +873,11 @@ class ToolRunAPIMixin:
                 "category": {"type": "string", "enum": ["geometry", "typography", "colourEffects", "imageCrop", "details"]},
                 "instruction": {"type": "string"},
                 "severity": {"type": "string", "enum": ["blocker", "material", "minor"]},
+                "targets": {"type": "array", "items": {"type": "object", "properties": {
+                    "layerId": {"type": "string"}, "property": {"type": "string"}, "value": {},
+                }, "required": ["layerId", "property", "value"], "additionalProperties": False}},
             },
-            "required": ["placement", "layerIds", "category", "instruction", "severity"],
+            "required": ["placement", "layerIds", "category", "instruction", "severity", "targets"],
             "additionalProperties": False,
         }
         properties: Dict[str, Any] = {

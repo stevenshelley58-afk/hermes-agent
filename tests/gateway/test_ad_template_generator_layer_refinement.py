@@ -618,3 +618,169 @@ def test_reverse_text_uses_visual_review_instead_of_dark_ink_guard(tmp_path):
         contract, source_crop=paths[0], before_crop=paths[1], after_crop=paths[2]
     )
     assert result["mode"] == "visual-only"
+
+
+def test_structured_targets_are_authoritative_and_complete():
+    issue = {
+        **_issues()[0],
+        "instruction": "Set width to 1 and x to 2 on feed-features.",
+        "targets": [
+            {"layerId": "feed-features", "property": "x", "value": 90},
+            {"layerId": "feed-features", "property": "geometry/width", "value": 440},
+        ],
+    }
+    contract = build_refinement_contract(
+        _candidate(), [issue], source_placement="feed", available_fonts=[]
+    )
+    assert contract["targets"] == [
+        {"layerId": "feed-features", "property": "geometry/x", "value": 90.0},
+        {"layerId": "feed-features", "property": "geometry/width", "value": 440.0},
+    ]
+    with pytest.raises(AdTemplateProcessError, match="omitted authoritative target"):
+        validate_refinement_patch(
+            {"operations": [{
+                "op": "replace",
+                "path": "/template/feedLayout/layers/0/geometry/x",
+                "value": 90,
+            }]},
+            contract=contract,
+        )
+    patch = {"operations": [
+        {"op": "replace", "path": "/template/feedLayout/layers/0/geometry/x", "value": 90},
+        {"op": "replace", "path": "/template/feedLayout/layers/0/geometry/width", "value": 440},
+    ]}
+    assert validate_refinement_patch(patch, contract=contract) == patch
+
+
+@pytest.mark.parametrize(
+    "target, message",
+    [
+        ({"layerId": "missing", "property": "x", "value": 1}, "unknown layer"),
+        ({"layerId": "feed-features", "property": "unknown", "value": 1}, "unsupported"),
+        ({"layerId": "feed-features", "property": "x", "value": "1"}, "numeric"),
+        ({"layerId": "feed-features", "property": "x", "value": float("nan")}, "finite"),
+    ],
+)
+def test_structured_targets_reject_unsafe_values(target, message):
+    issue = {**_issues()[0], "targets": [target]}
+    with pytest.raises(AdTemplateProcessError, match=message):
+        build_refinement_contract(
+            _candidate(), [issue], source_placement="feed", available_fonts=[]
+        )
+
+
+def test_structured_targets_reject_conflicts_and_support_bounded_effect_objects():
+    candidate = _candidate()
+    layer = candidate["template"]["feedLayout"]["layers"][0]
+    layer["fill"] = {"type": "solid", "colour": "#111111"}
+    conflict = {
+        **_issues()[0],
+        "targets": [
+            {"layerId": "feed-features", "property": "x", "value": 90},
+            {"layerId": "feed-features", "property": "x", "value": 91},
+        ],
+    }
+    with pytest.raises(AdTemplateProcessError, match="conflicting"):
+        build_refinement_contract(
+            candidate, [conflict], source_placement="feed", available_fonts=[]
+        )
+    issue = {
+        **_issues()[0],
+        "targets": [{
+            "layerId": "feed-features",
+            "property": "fill",
+            "value": {"type": "solid", "colour": "#222222"},
+        }],
+    }
+    contract = build_refinement_contract(
+        candidate, [issue], source_placement="feed", available_fonts=[]
+    )
+    patch = {"operations": [{
+        "op": "replace",
+        "path": "/template/feedLayout/layers/0/fill",
+        "value": {"type": "solid", "colour": "#222222"},
+    }]}
+    assert validate_refinement_patch(patch, contract=contract) == patch
+
+
+def test_legacy_geometry_before_layer_and_grouped_layer_syntax():
+    candidate = _candidate()
+    second = dict(candidate["template"]["feedLayout"]["layers"][0])
+    second["geometry"] = dict(second["geometry"])
+    second.update(layerId="feed-heading", inputKey="heading")
+    candidate["template"]["feedLayout"]["layers"].append(second)
+    issue = {
+        "placement": "feed",
+        "layerIds": ["feed-features"],
+        "category": "geometry",
+        "instruction": (
+            "Set x to 0, y to 0, width to 1080, and height to 660 on "
+            "layer feed-features to restore flush top bleed."
+        ),
+        "severity": "material",
+    }
+    contract = build_refinement_contract(
+        candidate, [issue], source_placement="feed", available_fonts=[]
+    )
+    assert contract["layers"]["feed-features"]["numericTargets"] == {
+        "geometry/x": 0.0, "geometry/y": 0.0, "geometry/width": 1080.0,
+        "geometry/height": 660.0,
+    }
+    grouped = {
+        "placement": "feed",
+        "layerIds": ["feed-features", "feed-heading"],
+        "category": "geometry",
+        "instruction": (
+            "Set feed-features y from 800 to 900 and feed-heading y from "
+            "800 to 850."
+        ),
+        "severity": "material",
+    }
+    contract = build_refinement_contract(
+        candidate, [grouped], source_placement="feed", available_fonts=[]
+    )
+    assert contract["layers"]["feed-features"]["numericTargets"] == {"geometry/y": 900.0}
+    assert contract["layers"]["feed-heading"]["numericTargets"] == {"geometry/y": 850.0}
+
+
+def test_batch_surfaces_unpatchable_issue_and_keeps_valid_group():
+    vague = {
+        "placement": "story",
+        "layerIds": ["story-features"],
+        "category": "details",
+        "instruction": "Improve the card.",
+        "severity": "minor",
+    }
+    contract = build_refinement_batch_contract(
+        _candidate(), [vague, _issues()[0]], source_placement="feed", available_fonts=[]
+    )
+    assert contract["remainingIssueCount"] == 0
+    assert contract["unpatchableIssueCount"] == 1
+    assert contract["unpatchableLayerIds"] == ["story-features"]
+    assert contract["groups"][0]["layerIds"] == ["feed-features"]
+
+
+def test_legacy_current_values_are_not_targets():
+    issue = {
+        **_issues()[0],
+        "instruction": (
+            "Current x is 80, y is 800, width is 420, height is 220. "
+            "Set x to 90."
+        ),
+    }
+    contract = build_refinement_contract(
+        _candidate(), [issue], source_placement="feed", available_fonts=[]
+    )
+    assert contract["layers"]["feed-features"]["numericTargets"] == {
+        "geometry/x": 90.0
+    }
+
+
+def test_empty_structured_targets_are_surfaceable_unpatchable_issue():
+    structural = {**_issues()[0], "targets": [], "instruction": "Add the missing CTA layer."}
+    contract = build_refinement_batch_contract(
+        _candidate(), [structural, _issues()[0]],
+        source_placement="feed", available_fonts=[]
+    )
+    assert contract["unpatchableIssueCount"] == 1
+    assert contract["unpatchableIssues"][0]["issue"]["targets"] == []

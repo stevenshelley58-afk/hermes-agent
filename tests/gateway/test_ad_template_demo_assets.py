@@ -77,6 +77,7 @@ def test_unknown_image_call_is_not_blindly_retried(tmp_path, monkeypatch):
 def test_import_sends_exact_generated_photo_bytes(tmp_path, monkeypatch):
     candidate, generated, args = fixture(tmp_path, monkeypatch)
     document, overrides = process.prepare_demo_assets(candidate, call_image_model=lambda *a: str(generated), **args)
+    document["template"]["metadata"]["publishRequirements"] = {"objective": "OUTCOME_LEADS"}
     monkeypatch.setattr(process, "_candidate_envelope", lambda value: value)
     monkeypatch.setattr(process, "resolve_declared_assets", lambda catalog, declarations: [])
     sent = []

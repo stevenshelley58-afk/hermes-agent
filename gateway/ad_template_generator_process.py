@@ -44,6 +44,7 @@ from gateway.ad_template_runtime import (
 )
 from gateway.ad_template_generator_layer_refinement import (
     _candidate_layers,
+    _structured_targets,
     build_refinement_batch_contract,
     build_refinement_contract,
     find_candidate_render,
@@ -653,7 +654,11 @@ Run {run_id}; project {project_id}; placements {json.dumps(placements)}; brief {
 
 def _validate_issue(value: Any, *, require_actionable_target: bool = True) -> Dict[str, Any]:
     required = {"placement", "layerIds", "category", "instruction", "severity"}
-    if not isinstance(value, dict) or set(value) != required:
+    if (
+        not isinstance(value, dict)
+        or not required.issubset(value)
+        or set(value) - required - {"targets"}
+    ):
         raise AdTemplateProcessError("review issue has an invalid shape")
     placement = value.get("placement")
     if placement not in {"feed", "story", "both"}:
@@ -667,6 +672,9 @@ def _validate_issue(value: Any, *, require_actionable_target: bool = True) -> Di
     instruction = value.get("instruction")
     if not isinstance(instruction, str) or not instruction.strip() or len(instruction) > 1200:
         raise AdTemplateProcessError("review issue instruction is invalid")
+    targets_present = "targets" in value
+    if targets_present and not isinstance(value.get("targets"), list):
+        raise AdTemplateProcessError("review issue targets are invalid")
     target_field = re.search(
         (
             r"\b(?:x|y|width|height|font|fontSize|fontFamily|fontWeight|"
@@ -686,7 +694,7 @@ def _validate_issue(value: Any, *, require_actionable_target: bool = True) -> Di
         instruction,
         flags=re.IGNORECASE,
     )
-    if require_actionable_target and (not target_field or not target_value):
+    if require_actionable_target and not targets_present and (not target_field or not target_value):
         raise AdTemplateProcessError(
             "review issue instruction requires a concrete field and numeric, colour, crop or font target"
         )
@@ -697,7 +705,7 @@ def _validate_issue(value: Any, *, require_actionable_target: bool = True) -> Di
     # current 2 units" extracts zero targets and would leave the bounded
     # refinement contract nothing to lock.  Final reviewers may report
     # qualitative guidance, so the check only applies to comparator issues.
-    if require_actionable_target and not _instruction_has_actionable_target(instruction):
+    if require_actionable_target and not targets_present and not _instruction_has_actionable_target(instruction):
         raise AdTemplateProcessError(
             "review issue instruction requires an actionable numeric, colour, crop or font target"
         )
@@ -728,7 +736,7 @@ def _same_font_substitution(reviewer_value: Any, comparator_value: Any) -> bool:
     )
 
 
-def validate_review(value: Any, *, require_actionable_targets: bool = True) -> Dict[str, Any]:
+def validate_review(value: Any, *, require_actionable_targets: bool = True, candidate: Mapping[str, Any] | None = None) -> Dict[str, Any]:
     required = {"decision", "scores", "issues", "warnings", "effects", "fontSubstitution"}
     if (
         not isinstance(value, dict)
@@ -758,10 +766,13 @@ def validate_review(value: Any, *, require_actionable_targets: bool = True) -> D
     issues = value.get("issues")
     if not isinstance(issues, list) or len(issues) > 64:
         raise AdTemplateProcessError("visual review issues are invalid")
-    normalized_issues = [
-        _validate_issue(item, require_actionable_target=require_actionable_targets)
-        for item in issues
-    ]
+    layers = _candidate_layers(candidate) if candidate is not None else None
+    normalized_issues = []
+    for item in issues:
+        normalized = _validate_issue(item, require_actionable_target=require_actionable_targets)
+        if "targets" in normalized and layers is not None:
+            _structured_targets(normalized, layers)
+        normalized_issues.append(normalized)
     warnings = value.get("warnings")
     if not isinstance(warnings, list) or len(warnings) > 32 or any(not isinstance(item, str) or len(item) > 1000 for item in warnings):
         raise AdTemplateProcessError("visual review warnings are invalid")
@@ -817,7 +828,7 @@ def review_prompt(*, final: bool, candidate: Mapping[str, Any], reference: Mappi
 When revision is required, return the exact correction as patch in this same response. patch must be {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}} with no more than {MAX_PATCH_OPERATIONS} operations and no more than {MAX_PATCH_BYTES} encoded bytes. A remove operation omits value; add/replace requires value. Every operation must directly implement a listed issue against the current candidate using an existing JSON Pointer path (add may create only an allowed missing field). Do not change schema, templateId, createdAt, asset declarations or source-free asset assignments. comparisonToBest must be better, same, worse, or not_applicable; use not_applicable only when no BEST pair is attached. When the evidence passes the {LIKENESS_THRESHOLD} gate, issues must be [] and patch must be null. Do not return a full replacement template."""
     return f"""You are one {role} for an exact-clone template. Attached images are ordered: original source, Feed comparison render, Story comparison render, then (for final review) neutral production Feed and Story renders, followed by the original-placement overlay and difference views. The original source is the ONLY design authority. Source placement is {reference["sourcePlacement"]}; it must match the source as close to pixel-for-pixel as editable reconstruction permits. The other placement is a native aspect adaptation using the measured layout plan below: preserve the source design, hierarchy, effects and image roles without stretching or cropping the whole ad. There is no separate generated-ad target and no pixel-similarity score for that different aspect ratio. Score its composition, source-design preservation and production correctness visually. Both placements must pass the same {LIKENESS_THRESHOLD} quality gate. Comparison renders use only frozen text-free source photo regions when independently validated; other slots retain neutral catalog/generated photographs. Never treat a different property, room, sky or brand identity as a likeness defect. Compare those slots by boundaries, crop framing, hierarchy and source-design roles, not photo-content pixels. The original source remains the layout authority. Editable text must match its footprint/density but cannot be copied from baked photo text. Raw pixel/edge metrics and difference heatmaps include intentional photograph differences and are diagnostics only, NEVER an acceptance score. Separate source-layout likeness from production correctness. Before scoring, check the whole frame for overlapping elements, clipped or missing text, stray glyphs, illegible text and missing media. Any such defect blocks acceptance regardless of average score. Do not reward creative redesign. Missing shading, gradients, shadows, transparency, borders, masks, texture or decorative details are material defects.
 
-Return JSON only with exactly {output_fields}. scores must contain exactly, in this order: overall, geometry, typography, colourEffects, imageCrop, details. effects must contain exactly, in this order: shading, gradients, shadows, transparency, borders, masks, texture; each is match, not_present, or mismatch. issues is a list of objects with exactly placement (feed|story|both), layerIds (real candidate layer IDs), category (geometry|typography|colourEffects|imageCrop|details), instruction, severity (blocker|material|minor). Every issue instruction must be directly patchable: name at least one exact target field (x, y, width, height, font/fontSize/fontFamily/fontWeight, lineHeight, tracking, colour, or crop) and give its measured numeric/hex/font-file target or delta from the attached overlay. Vague phrases such as "match the source", "align", or "fix spacing" without target values are invalid. Every visible discrepancy is an issue; acceptance requires issues=[] and every effect matched or genuinely absent. decision is evidence only; the controller derives accept/revise from scores, issues, effects and the font rule. An obvious defect blocks acceptance regardless of average. fontSubstitution is null or exactly {{source,used,reason}}.{patch_contract} Return no prose.
+Return JSON only with exactly {output_fields}. scores must contain exactly, in this order: overall, geometry, typography, colourEffects, imageCrop, details. effects must contain exactly, in this order: shading, gradients, shadows, transparency, borders, masks, texture; each is match, not_present, or mismatch. issues is a list of objects with exactly placement (feed|story|both), layerIds (real candidate layer IDs), category (geometry|typography|colourEffects|imageCrop|details), instruction, severity (blocker|material|minor), targets (an array of {{layerId, property, value}}). For measured property corrections, targets are authoritative: use canonical layer-relative properties such as geometry/x, geometry/y, geometry/width, geometry/height, fontSize, tracking or font/file, with the exact desired value. Include a target for every listed layer and explain the correction in instruction. Use targets=[] only for structural changes or shared semantic-colour rebinding that cannot safely be represented as layer-property targets; describe the concrete correction without inventing a property or layer ID. Vague requests such as "match the source" or "fix spacing" without a concrete correction are invalid. Every visible discrepancy is an issue; acceptance requires issues=[] and every effect matched or genuinely absent. decision is evidence only; the controller derives accept/revise from scores, issues, effects and the font rule. An obvious defect blocks acceptance regardless of average. fontSubstitution is null or exactly {{source,used,reason}}.{patch_contract} Return no prose.
 
 PRODUCTION SAFETY: Do not reproduce accidental source clipping, duplicate glyphs, or missing contact text as a requested correction. Match the source structure while keeping customer replacements readable; list unavoidable source defects as warnings, never a reason to damage the production template. Repeated feature wording intentionally present in the source is not itself a stray-glyph defect.
 COORDINATE AND FIT RULES: Feed is exactly 1080x1350; Story is exactly 1080x1920. The original-source comparison image is normalized to its matching canvas without cropping. All geometry targets use those canvas pixels, NEVER thumbnail/display pixels. Preserve the renderer's minimum font sizes: Feed 24px and Story 32px, multiline lineHeight >= 1. Do not request a smaller font; reflow the native adaptation or resize the editable box instead. The comparison source map and render share the same coordinate scale.
@@ -1172,17 +1183,18 @@ def apply_patch(candidate: Mapping[str, Any], value: Any, *, strict: bool = True
         "declarations": copy.deepcopy(result.get("assets")),
     }
     for operation in patch["operations"]:
-        tokens = [_decode_pointer_token(token) for token in operation["path"].split("/")[1:]]
+        path = operation["path"]
+        tokens = [_decode_pointer_token(token) for token in path.split("/")[1:]]
         parent: Any = result
         for token in tokens[:-1]:
             if isinstance(parent, list):
                 if not token.isdigit() or int(token) >= len(parent):
-                    raise AdTemplateProcessError("revision path list index does not exist")
+                    raise AdTemplateProcessError(f"revision path list index does not exist: {path}")
                 parent = parent[int(token)]
             elif isinstance(parent, dict) and token in parent:
                 parent = parent[token]
             else:
-                raise AdTemplateProcessError("revision path does not exist")
+                raise AdTemplateProcessError(f"revision path does not exist: {path}")
         leaf = tokens[-1]
         if isinstance(parent, list):
             if operation["op"] == "add" and leaf == "-":
@@ -1191,24 +1203,24 @@ def apply_patch(candidate: Mapping[str, Any], value: Any, *, strict: bool = True
                 index = int(leaf)
                 if operation["op"] == "add":
                     if index > len(parent):
-                        raise AdTemplateProcessError("revision list add is out of bounds")
+                        raise AdTemplateProcessError(f"revision list add is out of bounds: {path}")
                     parent.insert(index, copy.deepcopy(operation["value"]))
                 elif index >= len(parent):
-                    raise AdTemplateProcessError("revision list operation is out of bounds")
+                    raise AdTemplateProcessError(f"revision list operation is out of bounds: {path}")
                 elif operation["op"] == "remove":
                     parent.pop(index)
                 else:
                     parent[index] = copy.deepcopy(operation["value"])
             else:
-                raise AdTemplateProcessError("revision list operation is out of bounds")
+                raise AdTemplateProcessError(f"revision list operation is out of bounds: {path}")
         elif isinstance(parent, dict):
             if operation["op"] == "remove":
                 if leaf not in parent:
-                    raise AdTemplateProcessError("revision remove path does not exist")
+                    raise AdTemplateProcessError(f"revision remove path does not exist: {path}")
                 del parent[leaf]
             elif operation["op"] == "replace":
                 if leaf not in parent:
-                    raise AdTemplateProcessError("revision replace path does not exist")
+                    raise AdTemplateProcessError(f"revision replace path does not exist: {path}")
                 parent[leaf] = copy.deepcopy(operation["value"])
             else:
                 parent[leaf] = copy.deepcopy(operation["value"])
@@ -1265,6 +1277,7 @@ def validate_comparator_result(
     review = validate_review(
         {field: value[field] for field in review_fields},
         require_actionable_targets=strict_issues,
+        candidate=candidate,
     )
     if not strict_issues:
         known_layer_ids = set(_candidate_layers(candidate))
@@ -2506,10 +2519,13 @@ def _call_applied_patch(
     *, instance: str, prompt: str, paths: Sequence[str], route: Mapping[str, str],
     candidate: Mapping[str, Any], emit: Callable[[str, str, Dict[str, Any]], None],
     strict: bool = True,
+    validate_candidate: Callable[[Mapping[str, Any]], Dict[str, Any]] | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     def validate_and_apply(value: Any) -> Dict[str, Any]:
         patch = validate_patch(value)
         updated = apply_patch(candidate, patch, strict=strict)
+        if validate_candidate is not None:
+            updated = validate_candidate(updated)
         return {"patch": patch, "candidate": updated}
 
     rejection = ""
@@ -2958,6 +2974,10 @@ class AdTemplateGeneratorOrchestrator:
                 prompt=contract_repair_prompt(candidate=candidate, reasons=[str(binding_error)]),
                 paths=[source, reciprocal_reference], route=builder_route,
                 candidate=candidate, emit=self.emit, strict=False,
+                validate_candidate=lambda value: _normalize_generator_asset_bindings(
+                    value,
+                    allow_generated=(self.workspace / "demo-assets" / "plan.json").exists(),
+                ),
             )
             self.emit("candidate.patch-applied", "build", {"source": "asset-binding", "operations": len(repair["operations"])})
             persist_checkpoint(self.workspace, {"candidate": candidate, "accepted": False}, merge=True)
@@ -3366,13 +3386,37 @@ class AdTemplateGeneratorOrchestrator:
                 break
             if comparison_budget_used >= MAX_COMPARISONS:
                 break
-            contract = build_refinement_batch_contract(
-                candidate,
-                revision_review["issues"],
-                source_placement=source_placement,
-                available_fonts=sorted(AVAILABLE_FONT_FILES),
-                suggested_patch=suggested_refinement_patch,
-            )
+            try:
+                contract = build_refinement_batch_contract(
+                    candidate,
+                    revision_review["issues"],
+                    source_placement=source_placement,
+                    available_fonts=sorted(AVAILABLE_FONT_FILES),
+                    suggested_patch=suggested_refinement_patch,
+                )
+                if contract.get("unpatchableIssues"):
+                    raise AdTemplateProcessError("refinement batch has unpatchable issues: " + _safe_json(contract["unpatchableIssues"]))
+            except (AdTemplateProcessError, AdTemplateStructuredOutputError) as exc:
+                repair_candidate = copy.deepcopy(best_candidate or candidate)
+                _, candidate = _call_applied_patch(
+                    self.call_agent,
+                    instance=f"guarded-refinement-{global_iteration}",
+                    prompt=(
+                        patch_prompt(candidate=repair_candidate, issues=revision_review["issues"])
+                        + _best_repair_context(
+                            best_candidate=repair_candidate,
+                            best_iteration=best_iteration,
+                            diagnosis=stall_diagnosis,
+                        )
+                        + f"\nThe refinement batch was unpatchable: {exc}. Return a bounded correction for the original issues."
+                    ),
+                    paths=revision_paths,
+                    route=builder_route,
+                    candidate=repair_candidate,
+                    emit=self.emit,
+                )
+                persist_checkpoint(self.workspace, {"candidate": candidate, "accepted": False}, merge=True)
+                continue
             refinement_root = (
                 self.workspace / "iterations" / f"{global_iteration:02d}"
                 / "layer-refinement"
@@ -3689,7 +3733,7 @@ class AdTemplateGeneratorOrchestrator:
                     prompt=review_prompt(final=True, candidate=candidate, reference=reference, metrics=final_metrics),
                     paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
                     route=route,
-                    validate=lambda value: validate_review(value, require_actionable_targets=False),
+                    validate=lambda value: validate_review(value, require_actionable_targets=False, candidate=candidate),
                     emit=lambda kind, node, data: buffered_events.append((kind, node, data)),
                 )
                 return ({"id": identity, "route": f"{route.get('provider')}/{route.get('model')}", **result}, buffered_events)
@@ -3750,19 +3794,28 @@ class AdTemplateGeneratorOrchestrator:
             )
             if (
                 not references_unknown_layer
-                and all(_instruction_has_actionable_target(str(issue.get("instruction") or "")) for issue in merged_issues)
+                and all(
+                    bool(issue.get("targets"))
+                    or (
+                        "targets" not in issue
+                        and _instruction_has_actionable_target(str(issue.get("instruction") or ""))
+                    )
+                    for issue in merged_issues
+                )
             ):
                 try:
                     # Repair through the refinement contract so every explicitly
                     # measured reviewer target is locked and validated; the
                     # generic patch prompt let group shifts be approximated or
                     # skipped.
-                    repair_contract = build_refinement_contract(
+                    repair_contract = build_refinement_batch_contract(
                         candidate,
                         merged_issues,
                         source_placement=source_placement,
                         available_fonts=sorted(AVAILABLE_FONT_FILES),
                     )
+                    if repair_contract.get("unpatchableIssues") or repair_contract.get("remainingIssueCount"):
+                        repair_contract = None
                 except AdTemplateProcessError:
                     # The actionable-target pre-check is a heuristic; when the
                     # contract still cannot lock a structured target for any
@@ -3771,6 +3824,10 @@ class AdTemplateGeneratorOrchestrator:
                     # the run outside any bounded retry.
                     repair_contract = None
             if repair_contract is not None:
+                def validate_final_repair(value: Any) -> Dict[str, Any]:
+                    patch = validate_refinement_patch(value, contract=repair_contract)
+                    return {"patch": patch, "candidate": apply_patch(candidate, patch)}
+
                 repair_result = _call_json(
                     self.call_agent,
                     instance="final-merged-patch",
@@ -3784,10 +3841,10 @@ class AdTemplateGeneratorOrchestrator:
                     ),
                     paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
                     route=builder_route,
-                    validate=lambda value: validate_refinement_patch(value, contract=repair_contract),
+                    validate=validate_final_repair,
                     emit=self.emit,
                 )
-                candidate = apply_patch(candidate, repair_result)
+                candidate = repair_result["candidate"]
             else:
                 # Qualitative reviewer guidance has no lockable targets, and
                 # add-a-layer requests cannot be expressed as property
