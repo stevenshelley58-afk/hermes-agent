@@ -1539,7 +1539,15 @@ class ToolRunAPIMixin:
             logger.exception("durable Tool run failed: %s", run_id)
             error = redact_sensitive_text(str(exc), force=True)
             try:
-                self._tool_run_store.update_run(run_id, status="failed", error=error, attention=True)
+                failed_evidence = getattr(exc, "evidence", None)
+                failed_output = None
+                if isinstance(failed_evidence, dict):
+                    prior_output = self._tool_run_store.get_run(run_id).get("output")
+                    failed_output = dict(prior_output) if isinstance(prior_output, dict) else {}
+                    failed_output["reusable_validation"] = failed_evidence
+                self._tool_run_store.update_run(
+                    run_id, status="failed", error=error, attention=True, output=failed_output
+                )
                 self._tool_run_store.append_event(run_id, "run.failed", status="error", node_id=current_stage, data={"error": error[:2000]})
             except Exception:
                 pass
