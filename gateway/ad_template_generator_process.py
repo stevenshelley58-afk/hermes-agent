@@ -3666,7 +3666,7 @@ class AdTemplateGeneratorOrchestrator:
             asset_overrides=demo_overrides,
         )
         try:
-            reusable_validation = validate_reusable_template(candidate, workspace=self.workspace, render=run_renderer, asset_overrides=demo_overrides, cached=checkpoint.get("reusableValidation"))
+            reusable_validation = validate_reusable_template(candidate, workspace=self.workspace, render=run_renderer, asset_overrides=demo_overrides, cached=checkpoint.get("reusableValidation"), check_stop=self._check_stop)
         except ReusableTemplateValidationError as exc:
             if exc.evidence:
                 persist_checkpoint(self.workspace, {"reusableValidation": exc.evidence}, merge=True)
@@ -3951,7 +3951,7 @@ class AdTemplateGeneratorOrchestrator:
             comparator_accepted_review = accepted_review
 
         try:
-            reusable_validation = validate_reusable_template(candidate, workspace=self.workspace, render=run_renderer, asset_overrides=demo_overrides, cached=reusable_validation)
+            reusable_validation = validate_reusable_template(candidate, workspace=self.workspace, render=run_renderer, asset_overrides=demo_overrides, cached=reusable_validation, check_stop=self._check_stop)
         except ReusableTemplateValidationError as exc:
             if exc.evidence:
                 persist_checkpoint(self.workspace, {"reusableValidation": exc.evidence}, merge=True)

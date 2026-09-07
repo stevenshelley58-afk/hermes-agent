@@ -178,6 +178,7 @@ def validate_reusable_template(
     asset_overrides: Mapping[str, bytes] | None = None,
     cached: Mapping[str, Any] | None = None,
     renderer_identity: str | None = None,
+    check_stop: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     asset_identity = hashlib.sha256(
         b"".join(
@@ -214,6 +215,8 @@ def validate_reusable_template(
         if isinstance(x, Mapping) and isinstance(x.get("identity"), str)
     }
     for i, s in enumerate(_SCENARIOS[:MAX_SCENARIOS]):
+        if check_stop is not None:
+            check_stop()
         identity = _identity(candidate, s, renderer, asset_identity)
         prior = old.get(identity)
         if (
