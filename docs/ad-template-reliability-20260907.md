@@ -105,7 +105,7 @@ Deployment and canary results are recorded in
 Quality limits, budget exhaustion and explicit approval remain real controls;
 these changes do not guarantee that every source image will pass visual review.
 
-## Release gate
+## First-release gate
 
 The final affected suite passed 186 tests with 2 existing skips across 17 files
 in 14.5 seconds using the canonical hermetic runner. Ruff and whitespace checks
@@ -126,3 +126,32 @@ assertions and the production validation guard.
 Fresh pre-deploy SQLite and override backups are state.pre-deploy.db and
 only-ad-template-process.pre-deploy.conf in the backup directory above.
 The running release was verified unchanged and no Tool runs were active.
+
+
+## Follow-up deployment result
+
+Code release **33d59a1d9d6ccced7729f2d6ef74e0ce71e1c2e3** was deployed
+at 2026-09-07 10:44:23 UTC. The actual gateway process environment referenced
+`/opt/releases/hermes-template-33d59a1d9d`, its import probe passed, and its
+authenticated health endpoint returned HTTP 200. No active runs were interrupted.
+Fresh pre-second-deploy database, override and checkpoint backups are in the
+same restricted backup directory noted above.
+
+The normal retry API resumed meta044 at lifetime comparison 10. The live run
+successfully used deterministic measured-target patches at iterations 12-14.
+At iteration 15, all requested coordinates already matched saved best 6; the
+new controller rechecked without a builder call, then reached comparison 16.
+The original parsing, invalid empty-repair and no-material-change faults did
+not recur on this retry.
+
+**The canary did not pass the visual quality gate.** It stopped with
+`exact-clone quality loop exhausted 16 comparisons below 9.5`; its final
+comparison scored 9.2. Best iteration 6 and the failure evidence remain intact.
+The controller's cost/comparison limits, frozen routes, independent final
+review and explicit approval were not changed. No approval or publication
+was performed, and no fresh run was started to bypass the exhausted budget.
+
+This is verified remediation of the software failure classes, not evidence
+that the entire visual-generation outcome is solved. The remaining task is a
+focused design/review decision for the saved draft; repeating an unchanged
+retry cannot supply more comparison budget or establish a quality pass.
