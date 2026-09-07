@@ -998,14 +998,16 @@ def patch_prompt(*, candidate: Mapping[str, Any], issues: Sequence[Mapping[str, 
 LAYER POINTERS: {_safe_json(_layer_pointer_map(candidate), max_bytes=40_000)}
 CURRENT CANDIDATE: {_safe_json(candidate)}
 CORRECTIONS: {_safe_json(list(issues), max_bytes=80_000)}
-MANUAL REVIEW INSTRUCTIONS: {manual_instructions[:4000]}"""
+MANUAL REVIEW INSTRUCTIONS: {manual_instructions[:4000]}
+SUPPORTED ICON RULE: use only arrow, check, tick, phone, mail, globe or location. For boxed checkmarks, add a separate vector rectangle behind a supported check/tick icon and put the border in effects.stroke (not a top-level stroke field). Never use check-square or invent an icon name."""
 
 
 def contract_repair_prompt(*, candidate: Mapping[str, Any], reasons: Sequence[str]) -> str:
     return f"""Repair only the listed Blockwise contract/renderer validation failures in this otherwise complete exact-clone candidate. Preserve its visual design, geometry, inputs, neutral assets, copy and metadata except where a listed failure requires a direct correction. Return a bounded JSON patch only: {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}}. Use JSON Pointer paths. Address every listed failure in this one patch. Do not return a full template and do not make creative changes. Maximum {MAX_PATCH_OPERATIONS} operations. Return JSON only.
 
 CURRENT CANDIDATE: {_safe_json(candidate)}
-BLOCKWISE CONTRACT/RENDERER FAILURES: {_safe_json(list(reasons), max_bytes=40_000)}"""
+BLOCKWISE CONTRACT/RENDERER FAILURES: {_safe_json(list(reasons), max_bytes=40_000)}
+SUPPORTED ICON RULE: use only arrow, check, tick, phone, mail, globe or location. For boxed checkmarks, add a separate vector rectangle behind a supported check/tick icon and put the border in effects.stroke (not a top-level stroke field). Never use check-square or invent an icon name."""
 
 
 def _decode_pointer_token(token: str) -> str:
@@ -3899,6 +3901,13 @@ class AdTemplateGeneratorOrchestrator:
                     # takes the generic bounded patch path instead of failing
                     # the run outside any bounded retry.
                     repair_contract = None
+            def validate_final_patch_candidate(value: Mapping[str, Any]) -> Dict[str, Any]:
+                run_renderer(
+                    value,
+                    self.workspace / "final-repair-validation" / f"{global_iteration:02d}-{final_round:02d}",
+                    asset_overrides=demo_overrides,
+                )
+                return copy.deepcopy(dict(value))
             if repair_contract is not None:
                 measured_repair = compile_refinement_patch(repair_contract)
                 if measured_repair is not None and not measured_repair["operations"]:
@@ -3912,7 +3921,9 @@ class AdTemplateGeneratorOrchestrator:
 
                 def validate_final_repair(value: Any) -> Dict[str, Any]:
                     patch = validate_refinement_patch(value, contract=repair_contract)
-                    return {"patch": patch, "candidate": apply_patch(candidate, patch)}
+                    updated = apply_patch(candidate, patch)
+                    validate_final_patch_candidate(updated)
+                    return {"patch": patch, "candidate": updated}
 
                 repair_result = _call_json(
                     self.call_agent,
@@ -3947,6 +3958,7 @@ class AdTemplateGeneratorOrchestrator:
                             diagnosis=None,
                         )
                     ),
+                    validate_candidate=validate_final_patch_candidate,
                     paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
                     route=builder_route,
                     candidate=candidate,
@@ -4004,17 +4016,17 @@ class AdTemplateGeneratorOrchestrator:
                 final_comparator_result["comparisonToBest"] == "better"
                 and _review_improved(accepted_review, pre_repair_review)
             )
-            comparator_state_accepted = (
-                accepted_review["decision"] == "accept"
-                and final_repair_improved
-            )
+            # A final-review repair must pass the absolute comparator gate;
+            # relative "better" only decides whether a below-gate repair is
+            # worth keeping, not whether a passing repair reaches final review.
+            comparator_state_accepted = accepted_review["decision"] == "accept"
             iterations.append({
                 "iteration": global_iteration,
                 "cycle_iteration": cycle_comparisons,
                 "mode": "final-repair",
                 "decision": "accepted" if comparator_state_accepted else "revise",
                 "comparisonToBest": final_comparator_result["comparisonToBest"],
-                "discarded": not final_repair_improved,
+                "discarded": not (final_repair_improved or comparator_state_accepted),
                 "comparison": accepted_review,
                 "previews": [item["name"] for item in final_rendered["previews"]],
                 "diffs": [item["name"] for item in final_comparison_views],

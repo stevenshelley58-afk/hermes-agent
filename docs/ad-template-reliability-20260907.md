@@ -247,3 +247,38 @@ output and the first50 quality checker. Separate real cases verify typography
 or overlong reusable evidence is rejected by the success projection. Ruff and
 whitespace checks passed. The obsolete equality-only helper/test were removed
 in the focused simplification pass.
+
+
+## Final repair validation and candidate retention
+
+Release c27080b590 was deployed and its actual process environment and health
+verified at13:04 UTC. The ordinary canary retry passed the earlier font-reporting
+handoff, but a fresh final reviewer identified missing checkbox outlines.
+Event359 then exposed an unsupported check-square icon in the merged repair.
+Patch application validated the Python envelope; the shared renderer rejected
+the icon only after the bounded repair callback had returned.
+
+Both measured and structural final repairs now call the existing shared renderer
+inside bounded retry validation. Invalid enum/schema/font/render output therefore
+feeds repair feedback before the candidate advances. Patch prompts explain the
+supported icon set and a rectangle with effects.stroke for boxed checks. There
+is no second Python icon validator and no renderer/schema exception bypass.
+
+The final-repair selection path also discarded fully passing repairs when the
+relative review said same/worse or their score tied the pre-repair draft, even
+though independent final review had rejected that draft. A full absolute
+comparator pass now reaches fresh independent final review. Below-gate repairs
+retain existing regression handling; immutable drafts, score floors, budgets,
+reusable validation and quarantine remain intact.
+
+A real offline production render added2px mainText strokes to the existing Feed
+checkbox backgrounds and equivalent Story rectangles. Both layouts rendered
+correctly and all4 actual reusable scenarios passed, under
+/srv/ad-template-generator/canary/boxed-checks-meta044-6ltv05bg.
+No live candidate or original source was modified by this diagnostic.
+
+Final affected checks:110 tests passed,0 failed across8 files in13.7s; Ruff and
+whitespace checks passed. Real orchestrator regressions cover unsupported first
+icon followed by supported retry and quarantine import; accepted repairs with
+(9.8,same),(9.8,worse),(9.6,same); and a9.4 repair that never imports. Reviewer
+fixtures remain candidate-aware, rejecting the restored unrepaired draft.
