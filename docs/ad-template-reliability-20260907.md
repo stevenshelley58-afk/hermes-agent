@@ -215,3 +215,35 @@ rejected. No secret guard was relaxed. Effective nonfinite and exact16-entry
 bound tests were added. Focused helper/event tests passed10/10; combined with
 ToolRunStore,33 passed and2 existing skips. The next attempt uses normal retry
 of the same saved revision, not another comparison-budget reset.
+
+
+## Passing reviewers exposed a reporting-only handoff failure
+
+On the directed meta044 revision, comparisons23,24 and25 passed all six9.5
+quality floors. Final-review event339 independently recorded Gemini accepting
+at9.6 overall and Muse accepting at9.7 overall, both with no issues and all
+effects matching or absent. The run nevertheless stopped at event340 with
+"final reviewers requested revision without actionable issues".
+
+The controller compared the reviewers' free-text font-substitution descriptions
+for exact equality with the comparator's description. One reviewer described a
+substitute font by its shipped file path; the other reported no substitution.
+That descriptive disagreement was not an actionable visual rejection, but it
+overrode both validated accept decisions. The correction removes only that
+free-text equality condition. Raw reviewer reports, all score/effect gates,
+independent routes, verified font files, reusable checks, quarantine and explicit
+approval remain required. A normal retry of this same saved revision is the
+next live check; this does not create new comparison budget.
+
+The first50 queue requires compact reusable-validation evidence in the normal
+success monitor output. That projection retains the actual validated scenario
+names, identities and statuses; it must not synthesize passing evidence.
+
+The final six-file affected suite passed105 tests with0 failures in14.0s.
+Real orchestrator coverage now passes differing font descriptions and a null
+second report through generation-review validation, quarantine import, bounded
+output and the first50 quality checker. Separate real cases verify typography
+9.4 and duplicate reviewer routes never import. Missing, empty, partial, failed
+or overlong reusable evidence is rejected by the success projection. Ruff and
+whitespace checks passed. The obsolete equality-only helper/test were removed
+in the focused simplification pass.

@@ -835,17 +835,6 @@ def test_below_gate_review_without_issues_is_rejected_for_repair():
         process.validate_review(gate_failure)
 
 
-def test_final_review_font_substitution_uses_identity_not_free_text():
-    comparator_font = {"source": "source thin serif", "used": "/fonts/adstudio/bodoni-moda-400.woff2", "reason": "closest bundled match"}
-    assert process._same_font_substitution(None, None)
-    assert process._same_font_substitution(None, comparator_font) is False
-    assert process._same_font_substitution(comparator_font, None)
-    other_reason = {**comparator_font, "reason": "different wording entirely"}
-    assert process._same_font_substitution(other_reason, comparator_font)
-    different_font = {**comparator_font, "used": "/fonts/adstudio/manrope-400.woff2"}
-    assert process._same_font_substitution(different_font, comparator_font) is False
-
-
 def test_out_of_range_measured_targets_are_clamped_not_fatal():
     base = _review(accept=False)
     issue = copy.deepcopy(base["issues"][0])

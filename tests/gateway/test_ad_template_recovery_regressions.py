@@ -18,6 +18,20 @@ def _review_with_issue(*, targets_marker=...):
     return result
 
 
+def _reusable_validation():
+    scenarios = [
+        {"name": name, "identity": f"identity-{name}", "status": "passed"}
+        for name in ("short", "max", "unicode", "optional-empty")
+    ]
+    return {
+        "schema": "blockwise.reusable-template-validation.v1",
+        "status": "passed",
+        "scenarioLimit": 4,
+        "counts": {"total": 4, "passed": 4, "failed": 0},
+        "scenarios": scenarios,
+    }
+
+
 def test_guarded_patch_missing_replace_path_gets_feedback_and_retries(monkeypatch):
     candidate = {"template": _template(), "assets": []}
     calls = []
@@ -195,7 +209,7 @@ def test_unpatchable_structured_batch_uses_guarded_repair_then_recompares(
     monkeypatch.setattr(
         process,
         "validate_reusable_template",
-        lambda *args, **kwargs: {"status": "passed", "scenarios": []},
+        lambda *args, **kwargs: _reusable_validation(),
     )
     monkeypatch.setattr(
         process,
@@ -359,6 +373,7 @@ def test_unpatchable_structured_batch_uses_guarded_repair_then_recompares(
     ("identical", "same"), ("identical", "worse"),
     ("different", "same"), ("different", "worse"),
     ("rebased", "worse"), ("final-already-current", "same"),
+    ("font-reporting", "same"), ("below-floor", "same"), ("same-route", "same"),
 ])
 def test_recovery_rechecks_real_orchestrator_without_empty_or_noop_repairs(
     monkeypatch, tmp_path, scenario, relative,
@@ -371,6 +386,7 @@ def test_recovery_rechecks_real_orchestrator_without_empty_or_noop_repairs(
     workspace.mkdir()
     process.persist_checkpoint(workspace, {"comparisonBudgetUsed": 5})
     calls, events, observed_x = [], [], []
+    imported = []
     monkeypatch.setattr(process, "vision_message", lambda text, paths, **kwargs: [
         {"type": "text", "text": text}, {"type": "test_paths", "paths": list(paths)},
     ])
@@ -383,12 +399,16 @@ def test_recovery_rechecks_real_orchestrator_without_empty_or_noop_repairs(
     monkeypatch.setattr(process, "prepare_demo_assets", lambda item, **kwargs: (item, {}))
     monkeypatch.setattr(process, "_comparison_views", lambda *args, **kwargs: [])
     monkeypatch.setattr(process, "_comparison_metrics", lambda **kwargs: {})
-    monkeypatch.setattr(process, "validate_reusable_template", lambda *args, **kwargs: {"status": "passed", "scenarios": []})
-    monkeypatch.setattr(process, "import_template", lambda output, **kwargs: {
-        "template_id": output["template"]["templateId"], "status": "imported",
-        "asset_count": 0, "replayed": False, "library_status": "quarantined",
-        "run_id": "trun_recheck",
-    })
+    monkeypatch.setattr(process, "validate_reusable_template", lambda *args, **kwargs: _reusable_validation())
+    def import_candidate(output, **kwargs):
+        imported.append(copy.deepcopy(output))
+        return {
+            "template_id": output["template"]["templateId"], "status": "imported",
+            "asset_count": 0, "replayed": False, "library_status": "quarantined",
+            "run_id": "trun_recheck",
+        }
+
+    monkeypatch.setattr(process, "import_template", import_candidate)
     monkeypatch.setattr(process, "review_template_action", lambda **kwargs: {
         "templateId": kwargs["template_id"], "status": "passed",
     })
@@ -439,6 +459,11 @@ def test_recovery_rechecks_real_orchestrator_without_empty_or_noop_repairs(
             ))
             result["patch"] = None
             result["scores"] = {key: 9.2 if revising else 9.6 for key in result["scores"]}
+            if scenario in {"font-reporting", "below-floor"}:
+                result["fontSubstitution"] = {
+                    "source": "Source script", "used": "Cormorant Garamond",
+                    "reason": "Documented closest available shipped font",
+                }
             if revising:
                 x = 12 if comparison_count == 1 and scenario in {"different", "rebased"} else 0
                 result["issues"] = [issue_at(x)]
@@ -448,18 +473,39 @@ def test_recovery_rechecks_real_orchestrator_without_empty_or_noop_repairs(
                 result = _review(accept=False)
                 result["issues"] = [issue_at(0)]
                 return result
-            return _review(accept=True)
+            review = _review(accept=True)
+            if scenario in {"font-reporting", "below-floor"} and "final-reviewer-a" in instance:
+                review["fontSubstitution"] = {
+                    "source": "Custom script lettering",
+                    "used": "/fonts/adstudio/cormorant-garamond-700.woff2",
+                    "reason": "Installed substitute has a matching visual role",
+                }
+                if scenario == "below-floor":
+                    review["scores"]["typography"] = 9.4
+            return review
         raise AssertionError(f"unnecessary repair or unexpected provider call: {instance}")
 
-    result = process.AdTemplateGeneratorOrchestrator(
+    orchestrator = process.AdTemplateGeneratorOrchestrator(
         call_agent=call_agent,
         call_image_model=lambda *args: pytest.fail("no image generation expected"),
         workspace=workspace, run_id="trun_recheck", project_id="blockwise",
         emit=lambda kind, node, data: events.append((kind, node, data)),
-    ).run(source=str(source), brief="clone", placements=["feed", "story"], routes=[
+    )
+    routes = [
         {"provider": "test", "model": name}
         for name in ["image", "builder", "comparator", "final-a", "final-b"]
-    ])
+    ]
+    if scenario == "same-route":
+        routes[-1] = copy.deepcopy(routes[-2])
+    if scenario in {"same-route", "below-floor"}:
+        with pytest.raises(process.AdTemplateProcessError, match=(
+            "independent" if scenario == "same-route" else "below-gate"
+        )):
+            orchestrator.run(source=str(source), brief="clone", placements=["feed", "story"], routes=routes)
+        assert imported == []
+        return
+    result = orchestrator.run(source=str(source), brief="clone", placements=["feed", "story"], routes=routes)
+    assert len(imported) == 1
     expected_comparisons = 3 if scenario in {"different", "rebased"} else 2
     assert comparison_count == expected_comparisons
     assert process.load_checkpoint(workspace)["comparisonBudgetUsed"] == 5 + expected_comparisons
@@ -475,6 +521,29 @@ def test_recovery_rechecks_real_orchestrator_without_empty_or_noop_repairs(
         assert result["iterations"][1]["discarded"] is True
         assert any(kind == "candidate.patch-applied" and data["source"] == "measured-targets" for kind, _, data in events)
     assert not result["iterations"][-1].get("discarded")
+    if scenario == "font-reporting":
+        from scripts.ad_template_first50 import _quality_pass
+        reviewers = result["final_review"]["reviewers"]
+        assert reviewers[0]["fontSubstitution"]["source"] == "Custom script lettering"
+        assert reviewers[1]["fontSubstitution"] is None
+        bounded = process.bounded_review_output(result, model_profile={})
+        assert bounded["reusable_validation"] == _reusable_validation()
+        assert _quality_pass({"output": bounded})
+        for mutation in ("missing", "empty", "failed", "partial", "extra"):
+            invalid = copy.deepcopy(result)
+            evidence = invalid["reusable_validation"]
+            if mutation == "missing":
+                del invalid["reusable_validation"]
+            elif mutation == "empty":
+                evidence.update(scenarios=[], counts={"total": 0, "passed": 0, "failed": 0})
+            elif mutation == "failed":
+                evidence["scenarios"][0]["status"] = "failed"
+            elif mutation == "partial":
+                evidence["scenarios"].pop()
+            else:
+                evidence["scenarios"].append(copy.deepcopy(evidence["scenarios"][0]))
+            with pytest.raises(process.AdTemplateProcessError, match="reusable validation"):
+                process.bounded_review_output(invalid, model_profile={})
 
 
 def test_stall_diagnosis_repeats_review_neutral_photo_and_font_constraints():

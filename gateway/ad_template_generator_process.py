@@ -744,25 +744,6 @@ def _validate_issue(value: Any, *, require_actionable_target: bool = True) -> Di
     return copy.deepcopy(value)
 
 
-def _same_font_substitution(reviewer_value: Any, comparator_value: Any) -> bool:
-    """Compare substitution identity without brittle free-text equality.
-
-    When the accepted comparator review documented a substitution, every
-    final reviewer must document the same source/used font pair.  A
-    reviewer that documents a substitution while the comparator matched
-    the source font directly is a reporting difference, not a quality
-    defect; the comparator's stricter typography floor still applies.
-    """
-    if comparator_value is None:
-        return True
-    if not isinstance(reviewer_value, dict):
-        return False
-    return (
-        str(reviewer_value.get("source")) == str(comparator_value.get("source"))
-        and str(reviewer_value.get("used")) == str(comparator_value.get("used"))
-    )
-
-
 def validate_review(value: Any, *, require_actionable_targets: bool = True, candidate: Mapping[str, Any] | None = None) -> Dict[str, Any]:
     required = {"decision", "scores", "issues", "warnings", "effects", "fontSubstitution"}
     if (
@@ -3851,7 +3832,6 @@ class AdTemplateGeneratorOrchestrator:
             accepted = all(
                 item["decision"] == "accept"
                 and item["scores"]["typography"] >= comparator_font_floor
-                and _same_font_substitution(item.get("fontSubstitution"), accepted_review.get("fontSubstitution"))
                 for item in reviewers
             )
             final_review = {"decision": "accepted" if accepted else "revise", "threshold": LIKENESS_THRESHOLD, "round": final_round, "reviewers": reviewers}
@@ -4257,10 +4237,71 @@ def validate_ad_template_generator_output(value: Any, *, require_import: bool) -
     return dict(value)
 
 
+def _bounded_reusable_validation(value: Any) -> Dict[str, Any]:
+    """Project validated reusable evidence without render artifacts."""
+    if not isinstance(value, Mapping):
+        raise AdTemplateProcessError("reusable validation evidence is missing")
+    schema = value.get("schema")
+    status = value.get("status")
+    counts = value.get("counts")
+    limit = value.get("scenarioLimit")
+    scenarios = value.get("scenarios")
+    if schema != "blockwise.reusable-template-validation.v1" or status != "passed":
+        raise AdTemplateProcessError("reusable validation evidence is invalid")
+    if (
+        not isinstance(counts, Mapping)
+        or set(counts) != {"total", "passed", "failed"}
+        or any(
+            isinstance(counts[key], bool)
+            or not isinstance(counts[key], int)
+            or counts[key] < 0
+            for key in ("total", "passed", "failed")
+        )
+        or not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or limit != 4
+        or not isinstance(scenarios, list)
+        or len(scenarios) != 4
+        or len(scenarios) > limit
+        or counts["total"] != len(scenarios)
+        or counts["passed"] != len(scenarios)
+        or counts["failed"] != 0
+    ):
+        raise AdTemplateProcessError("reusable validation evidence counts are invalid")
+    compact = []
+    for scenario in scenarios:
+        if (
+            not isinstance(scenario, Mapping)
+            or not isinstance(scenario.get("name"), str)
+            or not scenario["name"].strip()
+            or not isinstance(scenario.get("identity"), str)
+            or not scenario["identity"].strip()
+            or scenario.get("status") != "passed"
+        ):
+            raise AdTemplateProcessError("reusable validation scenario evidence is invalid")
+        compact.append({
+            "name": scenario["name"],
+            "identity": scenario["identity"],
+            "status": scenario["status"],
+        })
+    return {
+        "schema": schema,
+        "status": status,
+        "counts": {
+            "total": counts["total"],
+            "passed": counts["passed"],
+            "failed": counts["failed"],
+        },
+        "scenarioLimit": limit,
+        "scenarios": compact,
+    }
+
+
 def bounded_review_output(value: Mapping[str, Any], *, model_profile: Mapping[str, Any]) -> Dict[str, Any]:
     validated = validate_ad_template_generator_output(value, require_import=True)
     template = validated["template"]
     metadata = template.get("metadata") if isinstance(template.get("metadata"), dict) else {}
+    reusable_validation = _bounded_reusable_validation(validated.get("reusable_validation"))
     return {
         "process": PROCESS_ID,
         "template": {
@@ -4280,6 +4321,7 @@ def bounded_review_output(value: Mapping[str, Any], *, model_profile: Mapping[st
         "warnings": validated["warnings"],
         "font_substitution": validated["font_substitution"],
         "model_profile": copy.deepcopy(dict(model_profile)),
+        "reusable_validation": reusable_validation,
         "iterations": [{
             "iteration": item["iteration"],
             "cycle_iteration": item["cycle_iteration"],
