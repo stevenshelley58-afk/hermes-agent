@@ -259,6 +259,8 @@ def _comparison(
 
 
 def test_ad_template_generator_is_measured_image_referenced_patch_bounded_and_quarantined(monkeypatch, tmp_path):
+    # Exercise the model-repair path; exact compilation has separate coverage.
+    monkeypatch.setattr(process, "compile_refinement_patch", lambda _contract: None)
     source = tmp_path / "source.png"
     Image.new("RGB", (800, 1000), "white").save(source)
     order: list[str] = []
@@ -515,6 +517,8 @@ def test_ad_template_generator_is_measured_image_referenced_patch_bounded_and_qu
 def test_five_non_improvements_trigger_one_frontier_diagnosis_then_resume_from_best(
     monkeypatch, tmp_path, diagnosis_value, expect_guidance,
 ):
+    # Exercise the model-repair path; exact compilation has separate coverage.
+    monkeypatch.setattr(process, "compile_refinement_patch", lambda _contract: None)
     source = tmp_path / "source.png"
     Image.new("RGB", (800, 1000), "white").save(source)
     comparison_count = 0

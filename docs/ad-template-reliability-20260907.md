@@ -57,9 +57,53 @@ Backup: `/srv/hermes/backups/ad-template-reliability-20260907-v1w8iel0`, created
 
 Rollback uses the saved override and prior immutable release documented in `docs/ad-template-best-refinement.md`. Preserve intervening state and policy history.
 
-## Limits
+## First deployment and live canary
 
-No new deployment result, approval/import claim, retry, or readiness claim is made. Remaining run-control or layer-repair causes require affected tests and the bounded post-release canary.
+Release 07c4f3de5113602f5e3573c5d3135297952c917b was deployed through
+an immutable release directory and verified in the gateway process environment.
+The affected meta044 run was resumed using the normal retry API, with its
+source, best draft, policy and lifetime budgets preserved.
+
+The canary passed the original parsing failure and reached an absolute 9.6
+comparison at iteration 8. It then exposed a control-flow defect: an accepted
+draft rated the same as the saved best was discarded, after which the controller
+asked for a repair with no issues. It ultimately failed at iteration 10 trying
+to change coordinates already correct in the restored best. No approval or
+publication was performed.
+
+## Follow-up safeguards
+
+A passing absolute review for the identical saved best now proceeds to the
+independent final gates. A different passing draft that is not better than the
+saved best causes a fresh comparison of the restored best, not an empty repair.
+
+Fully measured corrections are compiled into exact bounded operations and pass
+the existing patch, render and text-ink checks. Already-current targets trigger
+fresh comparison without a builder call or inferred acceptance. Qualitative,
+structural and unsafe dependency work still uses the bounded repair path.
+Final reviewers likewise recheck an unchanged draft when all their measured
+targets are already present, within the existing final-round limit.
+
+Structured geometry targets no longer unlock text-input changes based only on
+words such as text, copy or bullets in the explanation. The strict review schema
+lists supported target properties instead of inviting unsupported fields.
+
+The saved iteration-10 failure replay now returns zero operations across its two
+groups and no inferred input dependencies. All ten coordinates already match
+best iteration 6. This diagnostic did not mutate the original run.
+
+The latest full affected suite passed **199 tests, 0 failures, 2 existing skips**
+across 17 files in 14.0 seconds. Ruff and whitespace checks passed. Six new real
+orchestrator scenarios cover same/worse identical-best acceptance, different
+passing-draft restoration, rebased no-op targets, and final-review no-op rechecks.
+They preserve lifetime comparison counts and verify independent final reviewers
+and quarantine. Existing fallback-specific tests explicitly exercise model
+repair; deterministic compilation is tested separately.
+
+Deployment and canary results are recorded in
+`/srv/hermes/deployment-records/ad-template-reliability-20260907.json`.
+Quality limits, budget exhaustion and explicit approval remain real controls;
+these changes do not guarantee that every source image will pass visual review.
 
 ## Release gate
 

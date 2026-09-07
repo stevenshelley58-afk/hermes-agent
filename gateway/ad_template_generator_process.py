@@ -47,6 +47,7 @@ from gateway.ad_template_generator_layer_refinement import (
     _structured_targets,
     build_refinement_batch_contract,
     build_refinement_contract,
+    compile_refinement_patch,
     find_candidate_render,
     refinement_prompt,
     validate_refinement_patch,
@@ -3263,9 +3264,18 @@ class AdTemplateGeneratorOrchestrator:
                 consecutive_non_improving = 0
                 recent_rejects = []
             elif (
-                comparator_result["comparisonToBest"] == "better"
-                and _review_improved(review, best_review)
+                (
+                    comparator_result["comparisonToBest"] == "better"
+                    and _review_improved(review, best_review)
+                )
+                or (
+                    candidate == best_candidate
+                    and review["decision"] == "accept"
+                )
             ):
+                # A fresh absolute pass for the identical saved document is
+                # valid even when the pairwise judge correctly reports a tie.
+                # Different documents still must improve on the saved best.
                 best_candidate = copy.deepcopy(candidate)
                 best_review = copy.deepcopy(review)
                 best_iteration = global_iteration
@@ -3376,7 +3386,6 @@ class AdTemplateGeneratorOrchestrator:
                 "stallDiagnosisStatus": checkpoint.get("stallDiagnosisStatus"),
                 "stallDiagnosis": stall_diagnosis,
             })
-            ensure_stall_diagnosis()
             self._check_stop()
             if review["decision"] == "accept" and not record.get("discarded"):
                 accepted_review = review
@@ -3386,6 +3395,17 @@ class AdTemplateGeneratorOrchestrator:
                 break
             if comparison_budget_used >= MAX_COMPARISONS:
                 break
+            if review["decision"] == "accept":
+                # This passing document was not better than the saved best.
+                # Recheck the restored document; there are no defects to send
+                # to a repair model, and this is not acceptance of the best.
+                self.emit("iteration.recheck-requested", "compare", {
+                    "iteration": global_iteration,
+                    "reason": "passing comparison restored best; revalidate its absolute gate",
+                    "bestIteration": best_iteration,
+                })
+                continue
+            ensure_stall_diagnosis()
             try:
                 contract = build_refinement_batch_contract(
                     candidate,
@@ -3416,6 +3436,18 @@ class AdTemplateGeneratorOrchestrator:
                     emit=self.emit,
                 )
                 persist_checkpoint(self.workspace, {"candidate": candidate, "accepted": False}, merge=True)
+                continue
+            compiled_patch = compile_refinement_patch(contract)
+            if compiled_patch is not None and not compiled_patch["operations"]:
+                # Rebased criticism can already be true on the restored best.
+                # Preserve it and obtain fresh evidence, never a no-op edit or
+                # inferred acceptance. The lifetime comparison budget remains.
+                self.emit("iteration.recheck-requested", "compare", {
+                    "iteration": global_iteration,
+                    "reason": "all measured corrections already match the saved candidate",
+                    "bestIteration": best_iteration,
+                    "layerIds": contract["layerIds"],
+                })
                 continue
             refinement_root = (
                 self.workspace / "iterations" / f"{global_iteration:02d}"
@@ -3497,7 +3529,7 @@ class AdTemplateGeneratorOrchestrator:
                     "inkChecks": ink_checks,
                 }
 
-            direct_patch = {
+            direct_patch = compiled_patch if compiled_patch is not None else {
                 "operations": copy.deepcopy(contract["suggestedOperations"])
             }
             refined: Dict[str, Any] | None = None
@@ -3525,8 +3557,14 @@ class AdTemplateGeneratorOrchestrator:
                 "crop": [item["crop"] for item in group_evidence],
             }
             if refined is not None:
-                patch_source = "iteration-comparator"
-                revision_event["mode"] = "comparator-patch-validated"
+                patch_source = (
+                    "measured-targets" if compiled_patch is not None
+                    else "iteration-comparator"
+                )
+                revision_event["mode"] = (
+                    "measured-targets-patch-validated" if compiled_patch is not None
+                    else "comparator-patch-validated"
+                )
             else:
                 if layer_refinement_budget_used >= MAX_COMPARISONS:
                     raise AdTemplateProcessError(
@@ -3548,7 +3586,7 @@ class AdTemplateGeneratorOrchestrator:
                 })
                 if direct_error:
                     revision_event["reason"] = (
-                        "bounded comparator patch failed validation: "
+                        "bounded direct patch failed validation: "
                         + direct_error
                     )
                 self.emit(
@@ -3580,7 +3618,7 @@ class AdTemplateGeneratorOrchestrator:
                     emit=self.emit,
                 )
                 patch_source = "layer-refinement"
-            if patch_source == "iteration-comparator":
+            if patch_source in {"iteration-comparator", "measured-targets"}:
                 self.emit(
                     "iteration.revision-requested", "build", revision_event
                 )
@@ -3824,6 +3862,16 @@ class AdTemplateGeneratorOrchestrator:
                     # the run outside any bounded retry.
                     repair_contract = None
             if repair_contract is not None:
+                measured_repair = compile_refinement_patch(repair_contract)
+                if measured_repair is not None and not measured_repair["operations"]:
+                    # Contradictory criticism of the unchanged accepted draft
+                    # needs fresh independent evidence, not an invented edit.
+                    self.emit("final-review.recheck-requested", "final-check", {
+                        "round": final_round,
+                        "reason": "all measured reviewer targets already match the candidate",
+                    })
+                    continue
+
                 def validate_final_repair(value: Any) -> Dict[str, Any]:
                     patch = validate_refinement_patch(value, contract=repair_contract)
                     return {"patch": patch, "candidate": apply_patch(candidate, patch)}

@@ -711,7 +711,10 @@ def build_refinement_contract(
         related_instructions = " ".join(
             str(issue.get("instruction") or "")
             for issue in selected_issues
-            if layer_id in issue["layerIds"]
+            if (
+                layer_id in issue["layerIds"]
+                and not ("targets" in issue and issue.get("targets"))
+            )
         )
         if not re.search(
             r"\b(?:text|copy|lines?|bullets?|placeholder|maxLength|editable)\b",
@@ -1055,6 +1058,263 @@ def _allowed_paths(contract: Mapping[str, Any]) -> set[str]:
     return allowed
 
 
+def _read_contract_path(value: Any, property_path: str) -> tuple[bool, Any]:
+    current = value
+    for part in property_path.split("/"):
+        if isinstance(current, Mapping) and part in current:
+            current = current[part]
+        elif isinstance(current, list) and part.isdigit() and int(part) < len(current):
+            current = current[int(part)]
+        else:
+            return False, None
+    return True, current
+
+
+def _contract_target(item: Mapping[str, Any], property_path: str) -> tuple[bool, Any]:
+    for key in ("propertyTargets", "numericTargets"):
+        targets = item.get(key)
+        if isinstance(targets, Mapping) and property_path in targets:
+            return True, copy.deepcopy(targets[property_path])
+    return False, None
+
+
+def _target_matches(property_path: str, current: Any, target: Any) -> bool:
+    if property_path in _NUMERIC_TARGET_PROPERTIES:
+        return (
+            isinstance(current, (int, float))
+            and not isinstance(current, bool)
+            and math.isfinite(float(current))
+            and isinstance(target, (int, float))
+            and not isinstance(target, bool)
+            and math.isfinite(float(target))
+            and abs(float(current) - float(target)) <= 0.01
+        )
+    return current == target
+
+
+def _group_paths_satisfied(
+    contract: Mapping[str, Any], group_paths: Sequence[str],
+) -> bool:
+    if not group_paths:
+        return False
+    layers = contract.get("layers")
+    if not isinstance(layers, Mapping):
+        return False
+    for path in group_paths:
+        matched = False
+        for item in layers.values():
+            if not isinstance(item, Mapping):
+                continue
+            pointer = item.get("pointer")
+            if not isinstance(pointer, str) or not path.startswith(pointer + "/"):
+                continue
+            property_path = path[len(pointer) + 1:]
+            allowed = item.get("allowedProperties")
+            if not isinstance(allowed, list) or property_path not in allowed:
+                continue
+            has_target, target = _contract_target(item, property_path)
+            current = item.get("current")
+            exists, current_value = _read_contract_path(current, property_path)
+            if not has_target or not exists or not _target_matches(
+                property_path, current_value, target,
+            ):
+                return False
+            matched = True
+            break
+        if not matched:
+            # Dependency and semantic-colour paths are intentionally not
+            # considered deterministically satisfied.
+            return False
+    return True
+
+
+def _safe_suggested_operations(contract: Mapping[str, Any]) -> bool:
+    """Check whether suggestions are redundant exact layer-target hints."""
+    layers = contract.get("layers")
+    suggestions = contract.get("suggestedOperations")
+    if suggestions in (None, []):
+        return True
+    if not isinstance(layers, Mapping) or not isinstance(suggestions, list):
+        return False
+    for operation in suggestions:
+        if not isinstance(operation, Mapping):
+            return False
+        if operation.get("op") not in {"add", "replace"}:
+            return False
+        path = operation.get("path")
+        if (
+            not isinstance(path, str)
+            or path.startswith("/template/semanticColours/")
+            or path.startswith("/template/textInputs/")
+            or path == "/template/fonts/-"
+            or "value" not in operation
+        ):
+            return False
+        matched = False
+        for item in layers.values():
+            if not isinstance(item, Mapping):
+                continue
+            pointer = item.get("pointer")
+            if not isinstance(pointer, str) or not path.startswith(pointer + "/"):
+                continue
+            property_path = path[len(pointer) + 1:]
+            allowed = item.get("allowedProperties")
+            if not isinstance(allowed, list) or property_path not in allowed:
+                return False
+            has_target, target = _contract_target(item, property_path)
+            if not has_target or not _target_matches(
+                property_path, operation["value"], target,
+            ):
+                return False
+            matched = True
+            break
+        if not matched:
+            return False
+    return True
+
+
+def is_refinement_satisfied(contract: Mapping[str, Any]) -> bool:
+    """Return whether every compiled group already equals its exact targets."""
+    if not isinstance(contract, Mapping):
+        return False
+    if contract.get("unpatchableIssues") or contract.get("unpatchableIssueCount"):
+        return False
+    if contract.get("remainingIssueCount"):
+        return False
+    groups = contract.get("groups")
+    if not isinstance(groups, list):
+        groups = [contract]
+    if not groups:
+        return False
+    for group in groups:
+        if not isinstance(group, Mapping):
+            return False
+        if group.get("unpatchableIssues") or group.get("unpatchableIssueCount"):
+            return False
+        layers = group.get("layers")
+        if not isinstance(layers, Mapping) or not layers:
+            return False
+        if group.get("textInputDependencies") or group.get("extraAllowedPaths"):
+            return False
+        if not _safe_suggested_operations(group):
+            return False
+        for item in layers.values():
+            if not isinstance(item, Mapping):
+                return False
+            allowed = item.get("allowedProperties")
+            if not isinstance(allowed, list) or not allowed:
+                return False
+            for property_path in allowed:
+                has_target, target = _contract_target(item, property_path)
+                exists, current = _read_contract_path(
+                    item.get("current"), property_path,
+                )
+                if not has_target or not exists or not _target_matches(
+                    property_path, current, target,
+                ):
+                    return False
+    return True
+
+
+def compile_refinement_patch(
+    contract: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Compile only exact, fully targeted layer repairs.
+
+    An empty operation list means all exact targets are already present.
+    Qualitative, semantic, dependency, font-declaration, and incomplete
+    contracts return None so callers can use bounded model repair instead.
+    """
+    if not isinstance(contract, Mapping):
+        return None
+    if (
+        contract.get("unpatchableIssues")
+        or contract.get("unpatchableIssueCount")
+        or contract.get("remainingIssueCount")
+        or contract.get("textInputDependencies")
+        or contract.get("extraAllowedPaths")
+        or not _safe_suggested_operations(contract)
+    ):
+        return None
+    groups = contract.get("groups")
+    if not isinstance(groups, list):
+        groups = [contract]
+    if not groups:
+        return None
+    operations: list[dict[str, Any]] = []
+    for group in groups:
+        if not isinstance(group, Mapping):
+            return None
+        layers = group.get("layers")
+        if not isinstance(layers, Mapping) or not layers:
+            return None
+        for layer_id in sorted(layers):
+            item = layers[layer_id]
+            if not isinstance(item, Mapping):
+                return None
+            pointer = item.get("pointer")
+            allowed = item.get("allowedProperties")
+            current_layer = item.get("current")
+            if (
+                not isinstance(pointer, str)
+                or not pointer.startswith("/template/")
+                or not isinstance(allowed, list)
+                or not allowed
+                or not isinstance(current_layer, Mapping)
+            ):
+                return None
+            for property_path in sorted(allowed):
+                if not isinstance(property_path, str) or not property_path:
+                    return None
+                has_target, target = _contract_target(item, property_path)
+                if not has_target:
+                    return None
+                exists, current = _read_contract_path(
+                    current_layer, property_path,
+                )
+                if exists and _target_matches(property_path, current, target):
+                    continue
+                if property_path == "font/file":
+                    declared_fonts = group.get("declaredFonts") or contract.get("declaredFonts") or []
+                    if target not in declared_fonts:
+                        return None
+                parts = property_path.split("/")
+                if any(part in {"", ".", ".."} for part in parts):
+                    return None
+                if exists:
+                    operation = "replace"
+                else:
+                    parent_path = "/".join(parts[:-1])
+                    if not parent_path:
+                        parent_exists, parent = True, current_layer
+                    else:
+                        parent_exists, parent = _read_contract_path(
+                            current_layer, parent_path,
+                        )
+                    if (
+                        not parent_exists
+                        or not isinstance(parent, (Mapping, list))
+                        or isinstance(parent, list)
+                    ):
+                        return None
+                    operation = "add"
+                operations.append({
+                    "op": operation,
+                    "path": pointer + "/" + property_path,
+                    "value": copy.deepcopy(target),
+                })
+                if len(operations) > MAX_OPERATIONS:
+                    return None
+    patch = {"operations": operations}
+    if len(_json(patch).encode("utf-8")) > MAX_PATCH_BYTES:
+        return None
+    try:
+        validate_refinement_patch(patch, contract=contract)
+    except (AdTemplateProcessError, AdTemplateStructuredOutputError, KeyError, TypeError, ValueError):
+        return None
+    return patch
+
+
 def validate_refinement_patch(
     value: Any,
     *,
@@ -1065,11 +1325,14 @@ def validate_refinement_patch(
     operations = value.get("operations")
     if (
         not isinstance(operations, list)
-        or not operations
         or len(operations) > MAX_OPERATIONS
         or len(_json(value).encode("utf-8")) > MAX_PATCH_BYTES
     ):
         raise AdTemplateProcessError("layer refinement patch exceeds its bounded contract")
+    if not operations and not is_refinement_satisfied(contract):
+        raise AdTemplateProcessError(
+            "layer refinement empty patch does not satisfy every exact target"
+        )
     allowed_paths = _allowed_paths(contract)
     fonts = set(contract["availableFonts"])
     font_changes_allowed = any(
@@ -1194,24 +1457,20 @@ def validate_refinement_patch(
             path = item["pointer"] + "/" + property_path
             if path in operation_paths:
                 continue
-            current: Any = item["current"]
-            for part in property_path.split("/"):
-                current = current.get(part) if isinstance(current, Mapping) else None
-            matches = (
-                abs(float(current) - float(target_value)) <= 0.01
-                if property_path in _NUMERIC_TARGET_PROPERTIES
-                and isinstance(current, (int, float))
-                and not isinstance(current, bool)
-                and isinstance(target_value, (int, float))
-                else current == target_value
+            exists, current = _read_contract_path(
+                item.get("current"), property_path,
             )
-            if not matches:
+            if not exists or not _target_matches(
+                property_path, current, target_value,
+            ):
                 raise AdTemplateProcessError(
                     "layer refinement omitted authoritative target "
                     f"{layer_id}/{property_path}"
                 )
     for group_paths in contract.get("groupAllowedPaths", []):
-        if not operation_paths.intersection(group_paths):
+        if not operation_paths.intersection(group_paths) and not _group_paths_satisfied(
+            contract, group_paths,
+        ):
             raise AdTemplateProcessError(
                 "layer refinement omitted one selected issue group"
             )

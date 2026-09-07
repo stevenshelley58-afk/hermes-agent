@@ -863,6 +863,8 @@ class ToolRunAPIMixin:
 
     @staticmethod
     def _tool_review_schema(*, comparator: bool) -> Dict[str, Any]:
+        from gateway.ad_template_generator_layer_refinement import _SUPPORTED_TARGET_PROPERTIES
+
         scores = ("overall", "geometry", "typography", "colourEffects", "imageCrop", "details")
         effects = ("shading", "gradients", "shadows", "transparency", "borders", "masks", "texture")
         issue = {
@@ -874,7 +876,9 @@ class ToolRunAPIMixin:
                 "instruction": {"type": "string"},
                 "severity": {"type": "string", "enum": ["blocker", "material", "minor"]},
                 "targets": {"type": "array", "items": {"type": "object", "properties": {
-                    "layerId": {"type": "string"}, "property": {"type": "string"}, "value": {},
+                    "layerId": {"type": "string"},
+                    "property": {"type": "string", "enum": sorted(_SUPPORTED_TARGET_PROPERTIES)},
+                    "value": {},
                 }, "required": ["layerId", "property", "value"], "additionalProperties": False}},
             },
             "required": ["placement", "layerIds", "category", "instruction", "severity", "targets"],

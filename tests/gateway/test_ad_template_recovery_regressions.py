@@ -353,3 +353,125 @@ def test_unpatchable_structured_batch_uses_guarded_repair_then_recompares(
         and data.get("decision") == "accept"
         for kind, _, data in events
     )
+
+
+@pytest.mark.parametrize(("scenario", "relative"), [
+    ("identical", "same"), ("identical", "worse"),
+    ("different", "same"), ("different", "worse"),
+    ("rebased", "worse"), ("final-already-current", "same"),
+])
+def test_recovery_rechecks_real_orchestrator_without_empty_or_noop_repairs(
+    monkeypatch, tmp_path, scenario, relative,
+):
+    source = tmp_path / "source.png"
+    Image.new("RGB", (1080, 1350), "white").save(source)
+    candidate = {"template": _template(), "assets": []}
+    candidate["template"]["feedLayout"]["layers"][1]["geometry"]["width"] = 900
+    workspace = tmp_path / "run"
+    workspace.mkdir()
+    process.persist_checkpoint(workspace, {"comparisonBudgetUsed": 5})
+    calls, events, observed_x = [], [], []
+    monkeypatch.setattr(process, "vision_message", lambda text, paths, **kwargs: [
+        {"type": "text", "text": text}, {"type": "test_paths", "paths": list(paths)},
+    ])
+    monkeypatch.setattr(process, "build_source_map", lambda _source: {
+        "sourceMapVersion": process.SOURCE_MAP_VERSION, "ocrStatus": "not_run",
+        "ocr": [], "edgeRegions": [],
+    })
+    monkeypatch.setattr(process, "materialize_source_photo_plan", lambda **kwargs: str(tmp_path / "plan.json"))
+    monkeypatch.setattr(process, "build_ephemeral_qa_candidate", lambda item, **kwargs: (item, {}))
+    monkeypatch.setattr(process, "prepare_demo_assets", lambda item, **kwargs: (item, {}))
+    monkeypatch.setattr(process, "_comparison_views", lambda *args, **kwargs: [])
+    monkeypatch.setattr(process, "_comparison_metrics", lambda **kwargs: {})
+    monkeypatch.setattr(process, "validate_reusable_template", lambda *args, **kwargs: {"status": "passed", "scenarios": []})
+    monkeypatch.setattr(process, "import_template", lambda output, **kwargs: {
+        "template_id": output["template"]["templateId"], "status": "imported",
+        "asset_count": 0, "replayed": False, "library_status": "quarantined",
+        "run_id": "trun_recheck",
+    })
+    monkeypatch.setattr(process, "review_template_action", lambda **kwargs: {
+        "templateId": kwargs["template_id"], "status": "passed",
+    })
+
+    def render(item, target, *, asset_overrides=None):
+        target.mkdir(parents=True, exist_ok=True)
+        paths = {}
+        for placement, height in [("feed", 1350), ("story", 1920)]:
+            path = target / (placement + ".png")
+            Image.new("RGB", (1080, height), "white").save(path)
+            paths[placement] = str(path)
+        artifact = target / "artifact.json"
+        artifact.write_text(process._safe_json(item), encoding="utf-8")
+        observed_x.append(item["template"]["feedLayout"]["layers"][1]["geometry"]["x"])
+        return {"render": paths, "previews": [], "review_previews": [], "template_path": str(artifact)}
+
+    monkeypatch.setattr(process, "run_renderer", render)
+    comparison_count = 0
+
+    def issue_at(x):
+        return {"placement": "feed", "layerIds": ["feed-hero"],
+                "category": "geometry", "instruction": "Use the measured hero position.",
+                "severity": "material", "targets": [
+                    {"layerId": "feed-hero", "property": "geometry/x", "value": x},
+                ]}
+
+    def call_agent(instance, prompt, route):
+        nonlocal comparison_count
+        calls.append(instance)
+        if instance == "aspect-reference":
+            return {
+                "sourcePlacement": "feed", "targetPlacement": "story",
+                "canvas": {"width": 1080, "height": 1920},
+                "regions": [{"regionId": "main", "sourceRole": "main",
+                             "target": {"x": 0, "y": 0, "width": 1080, "height": 1920},
+                             "zIndex": 0}],
+                "preserve": ["all visible geometry and effects"],
+            }
+        if instance == "builder-initial":
+            return copy.deepcopy(candidate)
+        if instance.startswith("comparator-"):
+            comparison_count += 1
+            # Initial review saves x=0. Only the different/rebased cases ask
+            # for x=12, which the exact compiler applies without a model.
+            revising = comparison_count == 1 or (scenario == "rebased" and comparison_count == 2)
+            result = _comparison(accept=not revising, comparison_to_best=(
+                "not_applicable" if comparison_count == 1 else relative
+            ))
+            result["patch"] = None
+            result["scores"] = {key: 9.2 if revising else 9.6 for key in result["scores"]}
+            if revising:
+                x = 12 if comparison_count == 1 and scenario in {"different", "rebased"} else 0
+                result["issues"] = [issue_at(x)]
+            return result
+        if instance.startswith("final-reviewer-"):
+            if scenario == "final-already-current" and instance.endswith("-1"):
+                result = _review(accept=False)
+                result["issues"] = [issue_at(0)]
+                return result
+            return _review(accept=True)
+        raise AssertionError(f"unnecessary repair or unexpected provider call: {instance}")
+
+    result = process.AdTemplateGeneratorOrchestrator(
+        call_agent=call_agent,
+        call_image_model=lambda *args: pytest.fail("no image generation expected"),
+        workspace=workspace, run_id="trun_recheck", project_id="blockwise",
+        emit=lambda kind, node, data: events.append((kind, node, data)),
+    ).run(source=str(source), brief="clone", placements=["feed", "story"], routes=[
+        {"provider": "test", "model": name}
+        for name in ["image", "builder", "comparator", "final-a", "final-b"]
+    ])
+    expected_comparisons = 3 if scenario in {"different", "rebased"} else 2
+    assert comparison_count == expected_comparisons
+    assert process.load_checkpoint(workspace)["comparisonBudgetUsed"] == 5 + expected_comparisons
+    assert result["template"]["feedLayout"]["layers"][1]["geometry"]["x"] == 0
+    assert len([name for name in calls if name.startswith("final-reviewer-")]) == (
+        4 if scenario == "final-already-current" else 2
+    )
+    assert result["import"]["library_status"] == "quarantined"
+    assert any(kind == "iteration.recheck-requested" for kind, _, _ in events)
+    assert all(not name.startswith(("guarded-refinement-", "layer-refinement-", "final-merged-patch")) for name in calls)
+    if scenario in {"different", "rebased"}:
+        assert 12 in observed_x
+        assert result["iterations"][1]["discarded"] is True
+        assert any(kind == "candidate.patch-applied" and data["source"] == "measured-targets" for kind, _, data in events)
+    assert not result["iterations"][-1].get("discarded")

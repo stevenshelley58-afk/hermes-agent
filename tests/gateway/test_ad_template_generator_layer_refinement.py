@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 from PIL import Image
@@ -9,6 +10,8 @@ from gateway.ad_template_runtime import AdTemplateProcessError
 from gateway.ad_template_generator_layer_refinement import (
     build_refinement_batch_contract,
     build_refinement_contract,
+    compile_refinement_patch,
+    is_refinement_satisfied,
     refinement_prompt,
     validate_refinement_patch,
     validate_text_ink_regression,
@@ -784,3 +787,205 @@ def test_empty_structured_targets_are_surfaceable_unpatchable_issue():
     )
     assert contract["unpatchableIssueCount"] == 1
     assert contract["unpatchableIssues"][0]["issue"]["targets"] == []
+
+
+def test_compile_refinement_patch_all_noop_contract_returns_empty_operations():
+    issue = {
+        **_issues()[0],
+        "instruction": "The measured target is already present.",
+        "targets": [
+            {"layerId": "feed-features", "property": "geometry/x", "value": 80},
+            {"layerId": "feed-features", "property": "geometry/width", "value": 420},
+        ],
+    }
+    contract = build_refinement_contract(
+        _candidate(), [issue], source_placement="feed", available_fonts=[]
+    )
+    assert is_refinement_satisfied(contract)
+    assert compile_refinement_patch(contract) == {"operations": []}
+    assert validate_refinement_patch({"operations": []}, contract=contract) == {
+        "operations": []
+    }
+
+
+def test_compile_refinement_patch_mixed_groups_omits_noop_and_changes_exact_target():
+    candidate = _candidate()
+    footer = dict(candidate["template"]["feedLayout"]["layers"][0])
+    footer["geometry"] = dict(footer["geometry"])
+    footer.update(layerId="feed-footer", inputKey="footer")
+    candidate["template"]["feedLayout"]["layers"].append(footer)
+    candidate["template"]["textInputs"].append(
+        {"key": "footer", "label": "Footer", "placeholder": "Footer", "maxLength": 20}
+    )
+    issues = [
+        {
+            "placement": "feed",
+            "layerIds": ["feed-features"],
+            "category": "geometry",
+            "instruction": "Keep the measured x target.",
+            "severity": "material",
+            "targets": [{
+                "layerId": "feed-features",
+                "property": "geometry/x",
+                "value": 80,
+            }],
+        },
+        {
+            "placement": "feed",
+            "layerIds": ["feed-footer"],
+            "category": "details",
+            "instruction": "Set the measured opacity target.",
+            "severity": "material",
+            "targets": [{
+                "layerId": "feed-footer",
+                "property": "opacity",
+                "value": 0.8,
+            }],
+        },
+    ]
+    contract = build_refinement_batch_contract(
+        candidate, issues, source_placement="feed", available_fonts=[]
+    )
+    patch = compile_refinement_patch(contract)
+    assert patch == {
+        "operations": [{
+            "op": "add",
+            "path": "/template/feedLayout/layers/1/opacity",
+            "value": 0.8,
+        }]
+    }
+    assert validate_refinement_patch(patch, contract=contract) == patch
+
+
+def test_compile_refinement_patch_missing_parent_returns_none():
+    contract = {
+        "layers": {
+            "feed-hero": {
+                "pointer": "/template/feedLayout/layers/0",
+                "placement": "feed",
+                "allowedProperties": ["effects/shadow/blur"],
+                "numericTargets": {},
+                "propertyTargets": {"effects/shadow/blur": 8.0},
+                "current": {"type": "text", "geometry": {}},
+            }
+        },
+        "textInputDependencies": [],
+        "extraAllowedPaths": [],
+        "suggestedOperations": [],
+        "groupAllowedPaths": [[
+            "/template/feedLayout/layers/0/effects/shadow/blur"
+        ]],
+    }
+    assert not is_refinement_satisfied(contract)
+    assert compile_refinement_patch(contract) is None
+
+
+def test_compile_refinement_patch_uses_exact_values_and_does_not_mutate_or_unlock_layers():
+    candidate = _candidate()
+    before = copy.deepcopy(candidate)
+    issue = {
+        **_issues()[0],
+        "instruction": "Apply the measured geometry.",
+        "targets": [{
+            "layerId": "feed-features",
+            "property": "geometry/x",
+            "value": 90,
+        }],
+    }
+    contract = build_refinement_contract(
+        candidate, [issue], source_placement="feed", available_fonts=[]
+    )
+    patch = compile_refinement_patch(contract)
+    assert patch == {
+        "operations": [{
+            "op": "replace",
+            "path": "/template/feedLayout/layers/0/geometry/x",
+            "value": 90.0,
+        }]
+    }
+    assert validate_refinement_patch(patch, contract=contract) == patch
+    assert candidate == before
+    assert all(
+        operation["path"] == "/template/feedLayout/layers/0/geometry/x"
+        for operation in patch["operations"]
+    )
+
+
+def test_compile_refinement_patch_supports_legacy_numeric_targets():
+    issue = {
+        **_issues()[0],
+        "instruction": "Set x to 90 and width to 440.",
+    }
+    contract = build_refinement_contract(
+        _candidate(), [issue], source_placement="feed", available_fonts=[]
+    )
+    patch = compile_refinement_patch(contract)
+    assert [operation["path"] for operation in patch["operations"]] == [
+        "/template/feedLayout/layers/0/geometry/width",
+        "/template/feedLayout/layers/0/geometry/x",
+    ]
+    assert [operation["value"] for operation in patch["operations"]] == [440.0, 90.0]
+
+
+def test_compile_refinement_patch_ignores_redundant_exact_suggestions_but_not_structural():
+    candidate = _candidate()
+    issue = {
+        **_issues()[0],
+        "instruction": "Apply the measured x correction.",
+        "targets": [{
+            "layerId": "feed-features",
+            "property": "geometry/x",
+            "value": 90,
+        }],
+    }
+    suggested = {
+        "operations": [{
+            "op": "replace",
+            "path": "/template/feedLayout/layers/0/geometry/x",
+            "value": 90,
+        }]
+    }
+    contract = build_refinement_contract(
+        candidate, [issue], source_placement="feed", available_fonts=[],
+        suggested_patch=suggested,
+    )
+    assert compile_refinement_patch(contract) == {
+        "operations": [{
+            "op": "replace",
+            "path": "/template/feedLayout/layers/0/geometry/x",
+            "value": 90.0,
+        }]
+    }
+
+    unsafe = dict(contract)
+    unsafe["suggestedOperations"] = [{
+        "op": "remove",
+        "path": "/template/feedLayout/layers/0/geometry/x",
+    }]
+    assert compile_refinement_patch(unsafe) is None
+
+
+def test_structured_geometry_target_does_not_infer_text_input_dependency_from_prose():
+    issue = {
+        "placement": "feed",
+        "layerIds": ["feed-features"],
+        "category": "geometry",
+        "instruction": "Move the body-copy bullets with the measured geometry target.",
+        "severity": "material",
+        "targets": [{
+            "layerId": "feed-features",
+            "property": "geometry/y",
+            "value": 820,
+        }],
+    }
+    contract = build_refinement_contract(
+        _candidate(), [issue], source_placement="feed", available_fonts=[]
+    )
+    assert contract["textInputDependencies"] == []
+    assert compile_refinement_patch(contract) == {
+        "operations": [{
+            "op": "replace",
+            "path": "/template/feedLayout/layers/0/geometry/y",
+            "value": 820.0,
+        }]
+    }
