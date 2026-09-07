@@ -475,3 +475,30 @@ def test_recovery_rechecks_real_orchestrator_without_empty_or_noop_repairs(
         assert result["iterations"][1]["discarded"] is True
         assert any(kind == "candidate.patch-applied" and data["source"] == "measured-targets" for kind, _, data in events)
     assert not result["iterations"][-1].get("discarded")
+
+
+def test_stall_diagnosis_repeats_review_neutral_photo_and_font_constraints():
+    candidate = {"template": _template(), "assets": []}
+    reference = {
+        "sourcePlacement": "feed",
+        "targetPlacement": "story",
+        "canvas": {"width": 1080, "height": 1920},
+        "regions": [],
+        "preserve": ["all visible geometry"],
+    }
+    ordinary = process.review_prompt(
+        final=False, candidate=candidate, reference=reference, metrics={}
+    )
+    diagnosis = process.stall_diagnosis_prompt(
+        best_candidate=candidate,
+        best_review=_review(accept=False),
+        best_iteration=6,
+        recent_rejects=[],
+    )
+    for phrase in (
+        "Neutral replacement/catalog photographs are not likeness defects",
+        "Unavailable or proprietary font differences are not capability blockers",
+    ):
+        assert phrase in ordinary
+        assert phrase in diagnosis
+    assert len(diagnosis) < 100_000

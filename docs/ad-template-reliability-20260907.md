@@ -155,3 +155,46 @@ This is verified remediation of the software failure classes, not evidence
 that the entire visual-generation outcome is solved. The remaining task is a
 focused design/review decision for the saved draft; repeating an unchanged
 retry cannot supply more comparison budget or establish a quality pass.
+
+
+## Measured reconstruction and explicit revision cycle
+
+The user explicitly requested continued correction until templates pass, followed
+by the first 50 templates. This authorizes a new directed revision, not silent
+retry-budget resets or approval. Failed/cancelled/blocked build runs now support
+the same bounded request-changes operation when a candidate checkpoint exists.
+The API atomically claims a terminal run before checkpoint mutation, preserves
+frozen policy and durable usage, discards any imported quarantine via the normal
+path, and restores terminal status/error if setup fails. Concurrent requests
+cannot revise the same checkpoint twice.
+
+Visual inspection found major defects that scalar comparison scores had missed:
+the hero ended near630 instead of674; the gallery extended behind the footer;
+body text and headline were displaced; the CTA text was not centered. An offline
+source-measured correction uses Bodoni Moda400 for the high-contrast headline,
+correct panel bounds and slightly negative body tracking at the unchanged24px
+readability floor. All four real shared-renderer reusable scenarios passed.
+This is render/reusability evidence, not a live quality pass.
+
+Comparison evidence now pairs high-confidence source/render OCR words with their
+declared editable text input and layer box. Ambiguous, low-confidence, nonfinite
+or insufficiently matched words are omitted. Bounded ink offsets and thin
+source-edge bands are advisory only. They cannot patch, score or approve a draft.
+All four comparison/restoration paths supply this evidence. Text-free sources
+avoid a redundant OCR pass. Build, ordinary review and stall diagnosis share the
+same photo-neutrality, font-substitution and measurement constraints.
+
+The generator previously advertised7 fonts despite118 shipped renderer faces.
+It now discovers the active renderer manifest, verifies safe filenames, licence
+metadata and SHA256 bytes, and exposes only verified font paths. Missing legacy
+manifests retain the established fallback; invalid present manifests fail closed.
+No font was downloaded or immutable renderer release modified.
+
+The final affected coverage totals231 passing tests and2 existing skips across
+20 files. The initial full run exposed one legacy text-free-source assertion;
+avoiding unproductive render OCR preserved that original assertion unchanged.
+The affected process/measurement files then passed64/64 in13.4s. Ruff and
+whitespace checks passed. A read-only actual-source probe found118 fonts,
+completed render OCR, body21 matched tokens with80.77% coverage, offset(-1,+1),
+and source boundary bands near674 and1142. No quality or approval gate changed.
+Live revision results will be recorded after deployment.

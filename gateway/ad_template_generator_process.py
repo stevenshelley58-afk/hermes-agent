@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import mimetypes
 import os
 import re
@@ -55,8 +56,10 @@ from gateway.ad_template_generator_layer_refinement import (
     write_fixed_crop,
     write_matching_crops,
 )
+from gateway.ad_template_font_catalog import available_font_files
 
 from gateway.ad_template_generator_photo_qa import materialize_source_photo_plan, source_photo_overrides
+from gateway.ad_template_text_evidence import build_text_alignment_evidence
 from gateway.ad_template_reusable_validation import ReusableTemplateValidationError, validate_reusable_template
 
 
@@ -85,6 +88,19 @@ AVAILABLE_FONT_FILES = frozenset({
     "/fonts/adstudio/cormorant-garamond-700.woff2",
     "/fonts/adstudio/bodoni-moda-400.woff2",
 })
+REVIEW_PHOTO_IDENTITY_RULE = (
+    "Neutral replacement/catalog photographs are not likeness defects when "
+    "their identity differs from the source. Never treat a different property, "
+    "room or sky as a likeness defect; compare photo slots by boundaries, crop "
+    "framing, hierarchy and source-design roles, not photo-content pixels."
+)
+REVIEW_FONT_SUBSTITUTION_RULE = (
+    "Unavailable or proprietary font differences are not capability blockers "
+    "when editable text remains valid. Use the closest available bundled or "
+    "declared font, record unavoidable differences in fontSubstitution, and "
+    "never request an unavailable font file."
+)
+REVIEW_MEASUREMENT_RULE = 'MEASUREMENT EVIDENCE: textAlignment contains high-confidence matching glyph bounds, not editable text boxes. Its offset is candidate minus source; subtract that delta to correct displacement, then render and remeasure. Do not replace box dimensions or font sizes directly with glyph bounds. Missing OCR is unknown, not proof that text is missing or correct. Thin sourceStructuralBands indicate horizontal edges, not complete photo rectangles. Estimated sourceImageRegions are not ground truth when original source edges or text measurements contradict them. Correct major panel boundaries, overlaps, lost copy and hierarchy before small coordinate tweaks.'
 SOURCE_MAP_VERSION = 2
 QA_PROJECTION_VERSION = 5
 EVALUATION_POLICY_VERSION = 5
@@ -128,6 +144,15 @@ _MUTABLE_PATCH_ROOTS = (
     "/template/fonts/",
     "/template/metadata/",
 )
+
+
+def _available_font_files() -> tuple[str, ...]:
+    try:
+        return available_font_files(
+            os.environ.get("AD_TEMPLATE_GENERATOR_CMD", ""), AVAILABLE_FONT_FILES,
+        )
+    except ValueError as exc:
+        raise AdTemplateProcessError(f"renderer font catalog is invalid: {exc}") from exc
 
 
 def _runtime_catalog():
@@ -639,7 +664,7 @@ DIRECT BLOCKWISE CONTRACT:
 - Renderer text constraints: Feed effective font size must be at least 24px; Story at least 32px. Multiline lineHeight must be at least 1. Preserve source geometry and hierarchy within these constraints; do not let text exceed its box or erase contacts.
 - Brandmarks and wordmarks must use a logo layer, never image_slot: preserve the asset aspect ratio and source footprint so the renderer fits the whole mark without cover-cropping it. If the logo asset already contains its wordmark, do not duplicate that wordmark as text unless the source visibly has a separate text element.
 - imageInputs is a list of {{key,label,required?,acceptedTypes,defaultAssetKey?}}. textInputs is a list of {{key,label,placeholder,maxLength}}. Every image/logo/text layer inputKey is declared. Keep neutral reusable placeholders here with lengths close to the source; QA retains these authored strings and only substitutes source photo crops.
-- semanticColours contains exactly background, primary, secondary, accent, mainText, inverseText. assets is an object mapping each assetKey to {{fileName,mimeType}}. fonts is a list of unique {{file}} objects; text layer font.file must be declared. Use matching available font paths such as /fonts/adstudio/poppins-500.woff2, /fonts/adstudio/poppins-700.woff2, /fonts/adstudio/manrope-400.woff2, /fonts/adstudio/manrope-700.woff2, /fonts/adstudio/playfair-display-700.woff2, /fonts/adstudio/cormorant-garamond-700.woff2 or /fonts/adstudio/bodoni-moda-400.woff2.
+- semanticColours contains exactly background, primary, secondary, accent, mainText, inverseText. assets is an object mapping each assetKey to {{fileName,mimeType}}. fonts is a list of unique {{file}} objects; text layer font.file must be declared. Choose from these verified bundled font paths: {_safe_json(list(_available_font_files()))}. Match source typography character and measured text footprint, not merely a generic serif or sans label.
 - Generic body-copy placeholders must preserve the source line count, approximate words per line, and overall text density. Neutralize advertiser identity only; do not shorten dense copy into a sparse slogan.
 - metadata contains exactly title, description, gallerySamples, metaCopyDefaults, aiWritingGuidance, publishRequirements, replacementAssets, realAssetRefs. gallerySamples is {{feed?:{{assetKey?,placement:"feed",purpose}},story?:{{assetKey?,placement:"story",purpose}}}}. metaCopyDefaults is {{primaryText:[],headlines:[],descriptions:[],cta}}. aiWritingGuidance is {{summary,fields}}. publishRequirements is {{objective,specialAdCategory,instantForm:{{required,dependency,defaults?}},destination:{{required,kind,dependency}},fulfilment?,offer?,claims?,requiredCtaTypes}}. replacementAssets is a list of {{inputKey,assetKey,purpose?}}. realAssetRefs is a list of {{inputKey,kind,required}}. Do not create generationReview; the controller adds it after final review.
 - The outer assets list contains exactly one {{assetKey,fileName,mimeType}} declaration for every template.assets entry, with matching values. Never return bytes, hashes, signatures, source paths or a flattened source image.
@@ -649,6 +674,7 @@ DIRECT BLOCKWISE CONTRACT:
 Use only these catalog files:\n{catalog}
 
 RECIPROCAL ASPECT REFERENCE: {_safe_json(reference)}
+{REVIEW_MEASUREMENT_RULE}
 DETERMINISTIC SOURCE MAP (measurements override coordinate guesses): {_safe_json(source_map)}
 Run {run_id}; project {project_id}; placements {json.dumps(placements)}; brief {brief[:3000]}."""
 
@@ -827,7 +853,7 @@ def review_prompt(*, final: bool, candidate: Mapping[str, Any], reference: Mappi
     )
     patch_contract = "" if final else f"""
 When revision is required, return the exact correction as patch in this same response. patch must be {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}} with no more than {MAX_PATCH_OPERATIONS} operations and no more than {MAX_PATCH_BYTES} encoded bytes. A remove operation omits value; add/replace requires value. Every operation must directly implement a listed issue against the current candidate using an existing JSON Pointer path (add may create only an allowed missing field). Do not change schema, templateId, createdAt, asset declarations or source-free asset assignments. comparisonToBest must be better, same, worse, or not_applicable; use not_applicable only when no BEST pair is attached. When the evidence passes the {LIKENESS_THRESHOLD} gate, issues must be [] and patch must be null. Do not return a full replacement template."""
-    return f"""You are one {role} for an exact-clone template. Attached images are ordered: original source, Feed comparison render, Story comparison render, then (for final review) neutral production Feed and Story renders, followed by the original-placement overlay and difference views. The original source is the ONLY design authority. Source placement is {reference["sourcePlacement"]}; it must match the source as close to pixel-for-pixel as editable reconstruction permits. The other placement is a native aspect adaptation using the measured layout plan below: preserve the source design, hierarchy, effects and image roles without stretching or cropping the whole ad. There is no separate generated-ad target and no pixel-similarity score for that different aspect ratio. Score its composition, source-design preservation and production correctness visually. Both placements must pass the same {LIKENESS_THRESHOLD} quality gate. Comparison renders use only frozen text-free source photo regions when independently validated; other slots retain neutral catalog/generated photographs. Never treat a different property, room, sky or brand identity as a likeness defect. Compare those slots by boundaries, crop framing, hierarchy and source-design roles, not photo-content pixels. The original source remains the layout authority. Editable text must match its footprint/density but cannot be copied from baked photo text. Raw pixel/edge metrics and difference heatmaps include intentional photograph differences and are diagnostics only, NEVER an acceptance score. Separate source-layout likeness from production correctness. Before scoring, check the whole frame for overlapping elements, clipped or missing text, stray glyphs, illegible text and missing media. Any such defect blocks acceptance regardless of average score. Do not reward creative redesign. Missing shading, gradients, shadows, transparency, borders, masks, texture or decorative details are material defects.
+    return f"""You are one {role} for an exact-clone template. Attached images are ordered: original source, Feed comparison render, Story comparison render, then (for final review) neutral production Feed and Story renders, followed by the original-placement overlay and difference views. The original source is the ONLY design authority. Source placement is {reference["sourcePlacement"]}; it must match the source as close to pixel-for-pixel as editable reconstruction permits. The other placement is a native aspect adaptation using the measured layout plan below: preserve the source design, hierarchy, effects and image roles without stretching or cropping the whole ad. There is no separate generated-ad target and no pixel-similarity score for that different aspect ratio. Score its composition, source-design preservation and production correctness visually. Both placements must pass the same {LIKENESS_THRESHOLD} quality gate. Comparison renders use only frozen text-free source photo regions when independently validated; other slots retain neutral catalog/generated photographs. {REVIEW_PHOTO_IDENTITY_RULE} Brand identity remains intentional and is checked by footprint and role. The original source remains the layout authority. Editable text must match its footprint/density but cannot be copied from baked photo text. Raw pixel/edge metrics and difference heatmaps include intentional photograph differences and are diagnostics only, NEVER an acceptance score. Separate source-layout likeness from production correctness. Before scoring, check the whole frame for overlapping elements, clipped or missing text, stray glyphs, illegible text and missing media. Any such defect blocks acceptance regardless of average score. Do not reward creative redesign. Missing shading, gradients, shadows, transparency, borders, masks, texture or decorative details are material defects.
 
 Return JSON only with exactly {output_fields}. scores must contain exactly, in this order: overall, geometry, typography, colourEffects, imageCrop, details. effects must contain exactly, in this order: shading, gradients, shadows, transparency, borders, masks, texture; each is match, not_present, or mismatch. issues is a list of objects with exactly placement (feed|story|both), layerIds (real candidate layer IDs), category (geometry|typography|colourEffects|imageCrop|details), instruction, severity (blocker|material|minor), targets (an array of {{layerId, property, value}}). For measured property corrections, targets are authoritative: use canonical layer-relative properties such as geometry/x, geometry/y, geometry/width, geometry/height, fontSize, tracking or font/file, with the exact desired value. Include a target for every listed layer and explain the correction in instruction. Use targets=[] only for structural changes or shared semantic-colour rebinding that cannot safely be represented as layer-property targets; describe the concrete correction without inventing a property or layer ID. Vague requests such as "match the source" or "fix spacing" without a concrete correction are invalid. Every visible discrepancy is an issue; acceptance requires issues=[] and every effect matched or genuinely absent. decision is evidence only; the controller derives accept/revise from scores, issues, effects and the font rule. An obvious defect blocks acceptance regardless of average. fontSubstitution is null or exactly {{source,used,reason}}.{patch_contract} Return no prose.
 
@@ -835,7 +861,8 @@ PRODUCTION SAFETY: Do not reproduce accidental source clipping, duplicate glyphs
 COORDINATE AND FIT RULES: Feed is exactly 1080x1350; Story is exactly 1080x1920. The original-source comparison image is normalized to its matching canvas without cropping. All geometry targets use those canvas pixels, NEVER thumbnail/display pixels. Preserve the renderer's minimum font sizes: Feed 24px and Story 32px, multiline lineHeight >= 1. Do not request a smaller font; reflow the native adaptation or resize the editable box instead. The comparison source map and render share the same coordinate scale.
 BRAND IDENTITY: Logo layers retain the actual neutral production brand asset, not a source-advertiser crop. Different brand names/marks are intentional. Check the logo footprint, full visibility and aspect ratio; do not request copying advertiser identity or score a neutral mark as missing source artwork.
 
-AVAILABLE BUNDLED FONT FILES: {_safe_json(sorted(AVAILABLE_FONT_FILES))}. Existing declared asset-backed fonts may also be used. Never request a font file that is neither available here nor supplied by the candidate. Record unavoidable differences in fontSubstitution and choose the closest available face, weight and tracking; do not repeatedly demand unavailable proprietary fonts.
+AVAILABLE BUNDLED FONT FILES: {_safe_json(list(_available_font_files()))}. Existing declared asset-backed fonts may also be used. {REVIEW_FONT_SUBSTITUTION_RULE} Choose the closest available face, weight and tracking; do not repeatedly demand unavailable proprietary fonts.
+{REVIEW_MEASUREMENT_RULE}
 IMAGE ORDER NOTE: Neutral production images follow the three original-source/QA images and precede the original-placement overlay/difference views. Never interpret a difference heatmap as a customer preview.
 
 RECIPROCAL ASPECT REFERENCE: {_safe_json(reference)}
@@ -891,11 +918,14 @@ def stall_diagnosis_prompt(
         "editable": True,
         "patchFormat": "bounded RFC-6902-style JSON operations",
         "placements": {"feed": [1080, 1350], "story": [1080, 1920]},
-        "availableFonts": sorted(AVAILABLE_FONT_FILES),
+        "availableFonts": list(_available_font_files()),
         "constraints": [
             "preserve accepted layers and all unlisted fields",
             "no full-document regeneration after initial build",
             "customer-editable text, images, colours and fonts remain editable",
+            REVIEW_PHOTO_IDENTITY_RULE,
+            REVIEW_FONT_SUBSTITUTION_RULE,
+            REVIEW_MEASUREMENT_RULE,
             "Feed minimum font size 24px; Story minimum font size 32px",
             "the ordinary builder, not this diagnosis role, applies the next patch",
         ],
@@ -2016,13 +2046,15 @@ def _matching_saved_candidate_render_paths(
 def _comparison_metrics(
     *, source: str, reciprocal_reference: str, source_placement: str,
     target_placement: str, rendered: Mapping[str, Any],
+    candidate: Mapping[str, Any] | None = None,
+    source_map: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     render = rendered.get("render") if isinstance(rendered.get("render"), Mapping) else {}
     source_render = render.get(source_placement)
     target_render = render.get(target_placement)
     if not isinstance(source_render, str) or not isinstance(target_render, str):
         raise AdTemplateProcessError("native placement renders are unavailable for comparison")
-    return {
+    metrics = {
         source_placement: {
             **deterministic_pixel_metrics(source, source_render),
             "photoIdentityComparable": False,
@@ -2032,6 +2064,30 @@ def _comparison_metrics(
                            if Path(source).resolve() == Path(reciprocal_reference).resolve()
                            else deterministic_pixel_metrics(reciprocal_reference, target_render)),
     }
+    if candidate is not None and source_map is not None:
+        # OCR failure is advisory, not a new reason to fail a valid render.
+        try:
+            # No paired measurement can be made without source words. Avoid
+            # an otherwise redundant OCR subprocess for text-free references.
+            render_map = (build_source_map(source_render) if source_map.get("ocr")
+                          else {"ocr": [], "ocrStatus": "no-source-evidence"})
+            metrics[source_placement]["textAlignment"] = build_text_alignment_evidence(
+                candidate, source_map, render_map, source_placement,
+            )
+            metrics[source_placement]["renderOcrStatus"] = render_map.get("ocrStatus", "unknown")
+        except (OSError, ValueError, AdTemplateProcessError):
+            metrics[source_placement]["renderOcrStatus"] = "unavailable"
+        bands = source_map.get("rectangleRegions", [])
+        if isinstance(bands, list):
+            metrics[source_placement]["sourceStructuralBands"] = [
+                {key: band[key] for key in ("x", "y", "width", "height")}
+                for band in bands if isinstance(band, Mapping)
+                and band.get("kind") == "edge-band"
+                and all(isinstance(band.get(key), (int, float)) and not isinstance(band[key], bool)
+                        and math.isfinite(band[key]) for key in ("x", "y", "width", "height"))
+                and 0 < band["height"] <= 12 and band["width"] > 0
+            ][:16]
+    return metrics
 
 
 def _layer_summary(template: Mapping[str, Any]) -> Dict[str, Any]:
@@ -3201,6 +3257,7 @@ class AdTemplateGeneratorOrchestrator:
                     source=source, reciprocal_reference=reciprocal_reference,
                     source_placement=source_placement, target_placement=target_placement,
                     rendered=rendered,
+                    candidate=candidate, source_map=source_map,
                 )
                 comparison_views = views_future.result()
                 metrics = metrics_future.result()
@@ -3411,7 +3468,7 @@ class AdTemplateGeneratorOrchestrator:
                     candidate,
                     revision_review["issues"],
                     source_placement=source_placement,
-                    available_fonts=sorted(AVAILABLE_FONT_FILES),
+                    available_fonts=list(_available_font_files()),
                     suggested_patch=suggested_refinement_patch,
                 )
                 if contract.get("unpatchableIssues"):
@@ -3694,6 +3751,7 @@ class AdTemplateGeneratorOrchestrator:
                 source=source, reciprocal_reference=reciprocal_reference,
                 source_placement=source_placement, target_placement=target_placement,
                 rendered=final_rendered,
+                candidate=candidate, source_map=source_map,
             )
             iterations.append({
                 "iteration": global_iteration,
@@ -3850,7 +3908,7 @@ class AdTemplateGeneratorOrchestrator:
                         candidate,
                         merged_issues,
                         source_placement=source_placement,
-                        available_fonts=sorted(AVAILABLE_FONT_FILES),
+                        available_fonts=list(_available_font_files()),
                     )
                     if repair_contract.get("unpatchableIssues") or repair_contract.get("remainingIssueCount"):
                         repair_contract = None
@@ -3934,6 +3992,7 @@ class AdTemplateGeneratorOrchestrator:
                 source=source, reciprocal_reference=reciprocal_reference,
                 source_placement=source_placement, target_placement=target_placement,
                 rendered=final_rendered,
+                candidate=candidate, source_map=source_map,
             )
             final_current_paths = _vision_paths(
                 source, reciprocal_reference, final_rendered,
@@ -4027,6 +4086,7 @@ class AdTemplateGeneratorOrchestrator:
                         source=source, reciprocal_reference=reciprocal_reference,
                         source_placement=source_placement, target_placement=target_placement,
                         rendered=final_rendered,
+                        candidate=candidate, source_map=source_map,
                     )
                     iterations.append({
                         "iteration": global_iteration,

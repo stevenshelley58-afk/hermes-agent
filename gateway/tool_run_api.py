@@ -1958,38 +1958,97 @@ class ToolRunAPIMixin:
             if not isinstance(instructions, str) or not instructions.strip() or len(instructions) > 4000:
                 raise ToolRunError("review instructions must be a bounded non-empty string")
             run = self._tool_run_store.get_run(run_id)
+            if (
+                run.get("tool_id") != "ad-template-generator"
+                or run.get("action") != "build-template"
+            ):
+                raise ToolRunError("request changes are supported only for ad-template build runs")
+            original_status = run.get("status")
+            allowed_statuses = {"ready_for_review", "failed", "cancelled", "blocked"}
+            if original_status not in allowed_statuses:
+                raise ToolRunError(
+                    "request changes require a ready-for-review or terminal/blocked ad-template run"
+                )
             output = run.get("output") if isinstance(run.get("output"), dict) else {}
             template_id = ((output.get("template") or {}).get("templateId") if isinstance(output.get("template"), dict) else None)
-            if not isinstance(template_id, str) or not template_id:
-                raise ToolRunError("reviewed template identity is unavailable")
             from hermes_constants import get_hermes_home
             workspace = (get_hermes_home() / "tool_runs" / "ad-template-generator" / run_id).resolve()
-            await asyncio.to_thread(request_checkpoint_revision, workspace, instructions)
-            self._tool_run_store.transition_run(
-                run_id, expected_statuses={"ready_for_review"}, status="discarding",
-                stage="ready-for-review", attention=False,
-                event_kind="command.changes-requested",
-                event_data={"instructions": instructions.strip()},
-            )
+            # A failed/cancelled/blocked run can be resumed only from a real
+            # candidate checkpoint. Read this before claiming the run, but do
+            # not call the mutating revision helper until the lifecycle claim
+            # below succeeds. Ready-for-review keeps its historical output
+            # identity check and lets the helper report a missing checkpoint.
+            imported_template_id = None
+            imported = False
+            if original_status != "ready_for_review":
+                from gateway.ad_template_generator_process import load_checkpoint
+                checkpoint = await asyncio.to_thread(load_checkpoint, workspace)
+                if not isinstance(checkpoint.get("candidate"), dict) or not checkpoint.get("candidate"):
+                    raise ToolRunError("ad-template candidate checkpoint is unavailable")
+                for event in self._tool_run_store.events(run_id):
+                    if event.get("kind") != "template.imported":
+                        continue
+                    imported = True
+                    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+                    candidate_id = data.get("template_id") or data.get("templateId")
+                    if isinstance(candidate_id, str) and candidate_id.strip():
+                        imported_template_id = candidate_id.strip()
+            if original_status == "ready_for_review":
+                if not isinstance(template_id, str) or not template_id:
+                    raise ToolRunError("reviewed template identity is unavailable")
+                imported = True
+            elif imported and not imported_template_id:
+                raise ToolRunError("imported template identity is unavailable")
+
+            discard_template_id = template_id if original_status == "ready_for_review" else imported_template_id
+            original_stage = str(run.get("stage") or "source")
+            original_attention = bool(run.get("attention"))
+            original_error = run.get("error")
+            claimed = False
             try:
-                await asyncio.to_thread(
-                    review_template_action, template_id=template_id, run_id=run_id,
-                    action="discard", reason="operator requested changes",
-                )
-            except Exception as exc:
+                # ``discarding`` is the existing single-writer claim state for
+                # this operation. It prevents a second request from mutating
+                # the checkpoint while the first request is awaiting I/O. A
+                # failed run with no imported artifact never calls remote
+                # discard; the state is only used as the short-lived claim.
                 self._tool_run_store.transition_run(
-                    run_id, expected_statuses={"discarding"}, status="ready_for_review",
-                    stage="ready-for-review", attention=True,
-                    event_kind="template.discard-failed", event_status="error",
-                    event_data={"error": redact_sensitive_text(str(exc), force=True)[:1000]},
+                    run_id, expected_statuses={original_status}, status="discarding",
+                    stage="ready-for-review" if original_status == "ready_for_review" else original_stage,
+                    attention=False,
+                    event_kind="command.changes-requested",
+                    event_data={"instructions": instructions.strip()},
                 )
+                claimed = True
+                await asyncio.to_thread(request_checkpoint_revision, workspace, instructions)
+                if imported:
+                    await asyncio.to_thread(
+                        review_template_action, template_id=discard_template_id, run_id=run_id,
+                        action="discard", reason="operator requested changes",
+                    )
+                queued = self._tool_run_store.requeue(
+                    run_id, stage="build", expected_statuses={"discarding"},
+                    event_data={"reason": "operator-requested-changes"},
+                )
+                self._start_tool_task(run_id)
+                return web.json_response(queued, status=202)
+            except Exception as exc:
+                if claimed:
+                    try:
+                        current = self._tool_run_store.get_run(run_id)
+                        if current.get("status") == "discarding":
+                            self._tool_run_store.update_run(
+                                run_id, status=original_status, stage=original_stage,
+                                attention=original_attention, error=original_error,
+                            )
+                            self._tool_run_store.append_event(
+                                run_id,
+                                "template.discard-failed" if imported else "command.changes-failed",
+                                status="error", node_id=original_stage,
+                                data={"error": redact_sensitive_text(str(exc), force=True)[:1000]},
+                            )
+                    except Exception:
+                        logger.exception("failed to restore request-changes claim for %s", run_id)
                 raise
-            queued = self._tool_run_store.requeue(
-                run_id, stage="build", expected_statuses={"discarding"},
-                event_data={"reason": "operator-requested-changes"},
-            )
-            self._start_tool_task(run_id)
-            return web.json_response(queued, status=202)
         except KeyError as exc:
             return web.json_response(_error(str(exc), "tool_run_not_found"), status=404)
         except (
