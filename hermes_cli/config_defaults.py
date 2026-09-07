@@ -10,6 +10,18 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # Canonical Ad Radar projection settings. Credentials remain environment
+    # secrets and are never stored in this config.
+    "ad_db": {
+        "rest_url": "http://127.0.0.1:8652/rest/v1",
+        "archive_root": "/srv/hermes/ad-db/assets",
+        # Executor is intentionally blank until the canonical worker is
+        # explicitly registered in the runtime config.
+        "scan_executor": "",
+        "scan_provider": "scrapingbee",
+        "max_credits_per_page": 25,
+        "max_pages_per_request": 50,
+    },
     # SQLite journal mode used by every Hermes database opener. WAL is the
     # normal default; set DELETE for weak-fsync/shared filesystems where WAL is
     # not crash-safe (for example macOS virtiofs, NFS, or SMB).
