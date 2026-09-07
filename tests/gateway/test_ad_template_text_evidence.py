@@ -1,6 +1,9 @@
 from __future__ import annotations
 import copy
+import pytest
 from gateway.ad_template_text_evidence import build_text_alignment_evidence
+from gateway.tool_runs import ToolRunError, ToolRunStore
+from tests.gateway.test_tool_runs import command
 
 def _candidate(placement="feed"):
     return {"template": {"textInputs": [{"key": "headline", "placeholder": "OPEN HOUSE"}], f"{placement}Layout": {"layers": [{"type": "text", "layerId": f"{placement}-headline", "inputKey": "headline", "geometry": {"x": 80, "y": 450, "width": 850, "height": 180}}]}}}
@@ -20,7 +23,7 @@ def test_alignment_reports_offsets_and_size_ratios_without_mutation():
     assert candidate == before
     assert evidence["sourcePlacement"] == "feed"
     assert evidence["entries"][0]["layerId"] == "feed-headline"
-    assert evidence["entries"][0]["matchedTokenCount"] == 2
+    assert evidence["entries"][0]["matchedWordCount"] == 2
     assert evidence["entries"][0]["coverage"] == 1.0
     assert evidence["entries"][0]["offset"] == {"dx": 10, "dy": 40}
     assert evidence["entries"][0]["sizeRatios"]["width"] > 1
@@ -41,7 +44,7 @@ def test_one_unique_long_word_can_supply_adequate_evidence():
     candidate = _candidate()
     candidate["template"]["textInputs"][0]["placeholder"] = "OPENHOUSE"
     source, rendered = _maps([_word("OPENHOUSE", 100, 500)], [_word("open-house", 120, 520)])
-    assert build_text_alignment_evidence(candidate, source, rendered, "feed")["entries"][0]["matchedTokenCount"] == 1
+    assert build_text_alignment_evidence(candidate, source, rendered, "feed")["entries"][0]["matchedWordCount"] == 1
 
 def test_story_source_placement_uses_story_canvas():
     candidate = _candidate("story")
@@ -51,10 +54,31 @@ def test_story_source_placement_uses_story_canvas():
     assert evidence["entries"][0]["placement"] == "story"
 
 def test_repeated_candidate_placements_are_ambiguous_and_output_bounded():
-    candidate = {"template": {"feedLayout": {"layers": [{"type": "text", "layerId": f"headline-{i}", "geometry": {"x": 80, "y": 450 + i * 20, "width": 850, "height": 100}} for i in range(20)]}}}
-    source, rendered = _maps([_word("OPEN", 100, 500), _word("HOUSE", 200, 500)], [_word("OPEN", 120, 470), _word("HOUSE", 220, 470)])
+    candidate = {
+        "template": {
+            "textInputs": [
+                {"key": f"headline-{i}", "placeholder": f"WORD{i:02d}"}
+                for i in range(20)
+            ],
+            "feedLayout": {
+                "layers": [
+                    {
+                        "type": "text",
+                        "layerId": f"headline-{i}",
+                        "inputKey": f"headline-{i}",
+                        "geometry": {"x": 80, "y": 40 + i * 60, "width": 300, "height": 40},
+                    }
+                    for i in range(20)
+                ],
+            },
+        },
+    }
+    source, rendered = _maps(
+        [_word(f"WORD{i:02d}", 100, 50 + i * 60) for i in range(20)],
+        [_word(f"WORD{i:02d}", 110, 50 + i * 60) for i in range(20)],
+    )
     evidence = build_text_alignment_evidence(candidate, source, rendered, "feed")
-    assert len(evidence["entries"]) <= 16
+    assert len(evidence["entries"]) == 16
     assert evidence == build_text_alignment_evidence(candidate, source, rendered, "feed")
 
 def test_resolved_copy_controls_meaningful_coverage():
@@ -72,3 +96,35 @@ def test_nonfinite_coordinates_are_rejected():
         [_word("OPEN", 100, 500), _word("HOUSE", 200, 500)],
         [_word("OPEN", float("nan"), 520), _word("HOUSE", 220, 520)],
     )
+    assert build_text_alignment_evidence(_candidate(), source, rendered, "feed")["entries"] == []
+
+def test_actual_text_evidence_persists_at_tool_run_event_boundary(tmp_path):
+    store = ToolRunStore(str(tmp_path / "text-evidence.db"))
+    run, created = store.create_run(command(idempotency_key="text-evidence-boundary"))
+    assert created is True
+    source, rendered = _maps(
+        [_word("OPEN", 100, 500), _word("HOUSE", 200, 500)],
+        [_word("OPEN", 120, 520), _word("HOUSE", 220, 520)],
+    )
+    evidence = build_text_alignment_evidence(
+        _candidate(), source, rendered, "feed",
+    )
+    event = store.append_event(
+        run["run_id"],
+        "iteration.rendered",
+        status="ok",
+        node_id="compare",
+        data={"metrics": {"feed": {"textAlignment": evidence}}},
+    )
+    persisted = store.events(run["run_id"])[-1]["data"]
+    entry = persisted["metrics"]["feed"]["textAlignment"]["entries"][0]
+    assert event["data"] == persisted
+    assert entry["matchedWordCount"] == 2
+    assert "matchedTokenCount" not in entry
+    with pytest.raises(ToolRunError, match="secret-bearing"):
+        store.append_event(
+            run["run_id"],
+            "iteration.rendered",
+            data={"metrics": {"feed": {"textAlignment": {"api_token": "secret"}}}},
+        )
+    store.close()

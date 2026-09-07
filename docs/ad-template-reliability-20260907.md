@@ -198,3 +198,20 @@ whitespace checks passed. A read-only actual-source probe found118 fonts,
 completed render OCR, body21 matched tokens with80.77% coverage, offset(-1,+1),
 and source boundary bands near674 and1142. No quality or approval gate changed.
 Live revision results will be recorded after deployment.
+
+
+### Live event-boundary correction
+
+Release de46a2e7cd deployed at12:18 UTC and the explicit meta044 revision
+returned202. The39-operation directed correction applied; three unsupported
+stroke fields were repaired by the existing renderer-contract recovery. The
+first render then exposed a persistence-boundary bug: matchedTokenCount was
+rejected as secret-bearing. No new comparison had been consumed; the corrected
+candidate remained durable with manualRevision1 and comparisonBudgetUsed0.
+
+The advisory field is now matchedWordCount. A real ToolRunStore.append_event
+regression persists the actual helper evidence and confirms api_token is still
+rejected. No secret guard was relaxed. Effective nonfinite and exact16-entry
+bound tests were added. Focused helper/event tests passed10/10; combined with
+ToolRunStore,33 passed and2 existing skips. The next attempt uses normal retry
+of the same saved revision, not another comparison-budget reset.

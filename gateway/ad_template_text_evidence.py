@@ -199,7 +199,7 @@ def _entry(
         "placement": placement,
         "layerId": str(layer["layerId"]),
         "inputKey": layer.get("inputKey"),
-        "matchedTokenCount": len(matched),
+        "matchedWordCount": len(matched),
         "coverage": round(coverage, 4),
         "sourceInkBounds": source_bounds,
         "candidateInkBounds": candidate_bounds,
