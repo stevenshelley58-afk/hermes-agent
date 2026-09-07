@@ -55,6 +55,7 @@ from gateway.ad_template_generator_layer_refinement import (
 )
 
 from gateway.ad_template_generator_photo_qa import materialize_source_photo_plan, source_photo_overrides
+from gateway.ad_template_reusable_validation import ReusableTemplateValidationError, validate_reusable_template
 
 
 PROCESS_ID = "exact-clone"
@@ -2941,10 +2942,29 @@ class AdTemplateGeneratorOrchestrator:
         # resumes it, so retries never regenerate or re-bill photo calls, and
         # candidates restored from older checkpoints get bound instead of
         # rendering blank photo slots.
-        candidate, demo_overrides = prepare_demo_assets(
-            candidate, source=source, source_placement=source_placement, workspace=self.workspace,
-            route=image_route, call_image_model=self.call_image_model, emit=self.emit,
-        )
+        try:
+            candidate, demo_overrides = prepare_demo_assets(
+                candidate, source=source, source_placement=source_placement, workspace=self.workspace,
+                route=image_route, call_image_model=self.call_image_model, emit=self.emit,
+            )
+        except AdTemplateProcessError as binding_error:
+            if not any(token in str(binding_error) for token in ("replacementAssets", "defaultAsset", "generator input")):
+                raise
+            # A structurally valid document can still have a stale or
+            # undeclared replacementAssets binding. Give the builder one
+            # bounded patch opportunity; never relax the binding validator.
+            repair, candidate = _call_applied_patch(
+                self.call_agent, instance="asset-binding-repair",
+                prompt=contract_repair_prompt(candidate=candidate, reasons=[str(binding_error)]),
+                paths=[source, reciprocal_reference], route=builder_route,
+                candidate=candidate, emit=self.emit, strict=False,
+            )
+            self.emit("candidate.patch-applied", "build", {"source": "asset-binding", "operations": len(repair["operations"])})
+            persist_checkpoint(self.workspace, {"candidate": candidate, "accepted": False}, merge=True)
+            candidate, demo_overrides = prepare_demo_assets(
+                candidate, source=source, source_placement=source_placement, workspace=self.workspace,
+                route=image_route, call_image_model=self.call_image_model, emit=self.emit,
+            )
 
         def best_whole_frame_paths() -> list[str]:
             paths = _saved_iteration_render_paths(
@@ -3645,6 +3665,14 @@ class AdTemplateGeneratorOrchestrator:
             candidate, self.workspace / f"final-review-production-{global_iteration:02d}",
             asset_overrides=demo_overrides,
         )
+        try:
+            reusable_validation = validate_reusable_template(candidate, workspace=self.workspace, render=run_renderer, asset_overrides=demo_overrides, cached=checkpoint.get("reusableValidation"))
+        except ReusableTemplateValidationError as exc:
+            if exc.evidence:
+                persist_checkpoint(self.workspace, {"reusableValidation": exc.evidence}, merge=True)
+            raise
+        self.emit("reusable-validation.completed", "final-check", {"scenarios": len(reusable_validation["scenarios"])})
+        persist_checkpoint(self.workspace, {"reusableValidation": reusable_validation}, merge=True)
         for final_round in range(1, MAX_FINAL_REVIEW_ROUNDS + 1):
             self._check_stop()
             reviewer_specs = (("a", final_a_route), ("b", final_b_route))
@@ -3922,6 +3950,13 @@ class AdTemplateGeneratorOrchestrator:
             comparator_accepted_candidate = candidate
             comparator_accepted_review = accepted_review
 
+        try:
+            reusable_validation = validate_reusable_template(candidate, workspace=self.workspace, render=run_renderer, asset_overrides=demo_overrides, cached=reusable_validation)
+        except ReusableTemplateValidationError as exc:
+            if exc.evidence:
+                persist_checkpoint(self.workspace, {"reusableValidation": exc.evidence}, merge=True)
+            raise
+        persist_checkpoint(self.workspace, {"reusableValidation": reusable_validation}, merge=True)
         assert final_review is not None
         template = copy.deepcopy(candidate["template"])
         metadata = template.get("metadata") if isinstance(template.get("metadata"), dict) else None
@@ -3963,6 +3998,7 @@ class AdTemplateGeneratorOrchestrator:
             "warnings": list(dict.fromkeys(warnings)),
             "font_substitution": accepted_review.get("fontSubstitution"),
             "metrics": final_metrics,
+            "reusable_validation": reusable_validation,
             "elapsed_seconds": round(time.time() - started, 3),
             "process": PROCESS_ID,
         }
@@ -4009,6 +4045,9 @@ def validate_ad_template_generator_output(value: Any, *, require_import: bool) -
         required |= {"import", "smoke_test"}
     if not isinstance(value, dict) or value.get("process") != PROCESS_ID or not required.issubset(value):
         raise AdTemplateProcessError("exact-clone output is incomplete")
+    reusable = value.get("reusable_validation")
+    if reusable is not None and (not isinstance(reusable, dict) or reusable.get("status") != "passed"):
+        raise AdTemplateProcessError("reusable validation evidence is invalid")
     _candidate_envelope({"template": value["template"], "assets": value["assets"]})
     metadata = value["template"].get("metadata") if isinstance(value["template"].get("metadata"), dict) else {}
     validate_generation_review(metadata.get("generationReview"))
