@@ -2664,6 +2664,7 @@ _CURRENT_PUBLISH_OBJECTIVES = {
     "traffic": "OUTCOME_TRAFFIC",
     "engagement": "OUTCOME_ENGAGEMENT",
     "leads": "OUTCOME_LEADS",
+    "lead": "OUTCOME_LEADS",
     "app_promotion": "OUTCOME_APP_PROMOTION",
     "sales": "OUTCOME_SALES",
 }
@@ -4521,6 +4522,7 @@ class AdTemplateGeneratorOrchestrator:
         persist_checkpoint(self.workspace, {"reusableValidation": reusable_validation}, merge=True)
         assert final_review is not None
         template = copy.deepcopy(candidate["template"])
+        _normalize_publish_objective(template)
         metadata = template.get("metadata") if isinstance(template.get("metadata"), dict) else None
         if metadata is None:
             raise AdTemplateProcessError("template metadata is required")
