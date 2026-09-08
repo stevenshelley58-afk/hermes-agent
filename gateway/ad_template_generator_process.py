@@ -62,6 +62,7 @@ from gateway.ad_template_font_catalog import available_font_files
 
 from gateway.ad_template_generator_photo_qa import materialize_source_photo_plan, source_photo_overrides
 from gateway.ad_template_text_evidence import build_text_alignment_evidence
+from gateway.ad_template_control_ink import control_ink_alignment
 from gateway.ad_template_reusable_validation import ReusableTemplateValidationError, reusable_repair_context, validate_reusable_template
 from gateway.ad_template_production_repair import repair_production_candidate
 
@@ -905,6 +906,7 @@ BRAND IDENTITY: Logo layers retain the actual neutral production brand asset, no
 
 FONT POLICY: {REVIEW_FONT_SUBSTITUTION_RULE} Keep the candidate's declared font family fixed during visual review; do not request family substitution as a likeness correction. Font-file validity is checked by the renderer.
 {REVIEW_MEASUREMENT_RULE}
+BUTTON MEASUREMENT: controlInkAlignment measures actual painted default glyphs inside high-contrast button backgrounds. moveLabelDownByPx is positive when letters are ABOVE center and must move DOWN. labelYForCurrentButton is the corrected text y for the unchanged background. Do not center an invisible multiline text box instead of its letters. If changing the button, recompute from paintedInkBounds and the new button center; preserve measured maximum/Unicode text capacity and recheck the rendered result. Missing measurements are unknown, never a pass.
 IMAGE ORDER NOTE: Neutral production images, when supplied, follow the original-source/Feed-QA/Story-QA images and precede the original-placement overlay/difference views. Iteration reviews without them inspect the current QA renders. Never interpret a difference heatmap as a customer preview.
 RESPONSE ECONOMY: Return compact JSON, no indentation. Keep each issue instruction to at most 45 words of observed evidence and correction. Do not repeat the candidate, rubric, targets or patch in prose. Group the same correction across related layers into one issue, but retain every distinct observed defect and all required targets/operations. Never omit an issue to fit or inflate a score. Keep warnings and fontSubstitution explanations brief.
 
@@ -2226,6 +2228,13 @@ def _comparison_metrics(
                            else deterministic_pixel_metrics(reciprocal_reference, target_render)),
     }
     if candidate is not None and source_map is not None:
+        for placement, path in ((source_placement, source_render), (target_placement, target_render)):
+            try:
+                alignment = control_ink_alignment(candidate, placement, path)
+                if alignment:
+                    metrics[placement]["controlInkAlignment"] = alignment
+            except (OSError, ValueError, TypeError):
+                pass  # Missing evidence is unknown, not a pass or a new score.
         # OCR failure is advisory, not a new reason to fail a valid render.
         try:
             # No paired measurement can be made without source words. Avoid
@@ -4355,6 +4364,7 @@ class AdTemplateGeneratorOrchestrator:
                         best_iteration=global_iteration - 1,
                         best_candidate=pre_repair_candidate,
                     )
+                    + _preflight_review_context(checkpoint)
                 ),
                 paths=[*final_current_paths, *pre_repair_frames],
                 baseline_paths=pre_repair_frames,
