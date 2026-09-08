@@ -2658,10 +2658,33 @@ def _optional_final_diagnosis(call_agent, **kwargs):
         return None
 
 
+def _label_review_evidence(message, paths, baseline_paths):
+    """Keep image identity adjacent to pixels, not only in a distant preamble."""
+    baseline = set(baseline_paths)
+    result = []
+    images = iter(enumerate(paths, 1))
+    for part in message:
+        if part.get("type") == "image_url":
+            index, path = next(images)
+            name = Path(path).name
+            if path in baseline:
+                role = "SAVED BASELINE ONLY. Do not report its old defects as CURRENT defects"
+            elif any(token in name for token in ("overlay", "difference", "edges")):
+                role = "DIAGNOSTIC ONLY. Not a customer render"
+            elif index == 1:
+                role = "ORIGINAL SOURCE. Sole design authority"
+            else:
+                role = "CURRENT CANDIDATE. Score and correct these pixels"
+            result.append({"type": "text", "text": f"IMAGE {index}: {role}. Evidence name: {name}"})
+        result.append(part)
+    return result
+
+
 def _call_json(
     call_agent: Callable[[str, Any, str], Dict[str, Any]],
     *, instance: str, prompt: str, paths: Sequence[str], route: Mapping[str, str],
     validate: Callable[[Any], Dict[str, Any]], emit: Callable[[str, str, Dict[str, Any]], None],
+    baseline_paths: Sequence[str] = (),
 ) -> Dict[str, Any]:
     rejection = ""
     rejected_response = ""
@@ -2675,9 +2698,13 @@ def _call_json(
             )
         raw = None
         try:
+            unique_paths = list(dict.fromkeys(paths))
+            message = vision_message(prompt + suffix, unique_paths, bounded=True)
+            if instance.startswith(("comparator", "final-review")):
+                message = _label_review_evidence(message, unique_paths, baseline_paths)
             raw = call_agent(
                 instance if attempt == 0 else f"{instance}-format-retry",
-                vision_message(prompt + suffix, list(dict.fromkeys(paths)), bounded=True),
+                message,
                 f"{route.get('provider')}/{route.get('model')}",
             )
             return validate(raw)
@@ -3443,6 +3470,7 @@ class AdTemplateGeneratorOrchestrator:
                     + _review_iteration_context(iterations, stall_diagnosis)
                 ),
                 paths=[*current_vision_paths, *best_render_paths],
+                baseline_paths=best_render_paths,
                 route=comparator_route,
                 validate=lambda value: validate_comparator_result(
                     value, candidate=candidate, best_available=best_available,
@@ -4235,6 +4263,7 @@ class AdTemplateGeneratorOrchestrator:
                     )
                 ),
                 paths=[*final_current_paths, *pre_repair_frames],
+                baseline_paths=pre_repair_frames,
                 route=comparator_route,
                 validate=lambda value: validate_comparator_result(
                     value, candidate=candidate, strict_issues=False,

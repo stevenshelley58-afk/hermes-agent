@@ -201,10 +201,11 @@ def test_single_format_retry_can_correct_all_reported_issues(monkeypatch):
     corrected["issues"][1]["targets"] = [
         {"layerId": "date", "property": "geometry/width", "value": 500},
     ]
-    monkeypatch.setattr(process, "vision_message", lambda prompt, paths, **kwargs: prompt)
+    monkeypatch.setattr(process, "vision_message", lambda prompt, paths, **kwargs: [{"type": "text", "text": prompt}])
     calls, events = [], []
 
     def call_agent(instance, prompt, route):
+        prompt = prompt[0]["text"]
         calls.append(instance)
         if len(calls) == 1:
             return invalid

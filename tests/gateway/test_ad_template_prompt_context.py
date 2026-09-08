@@ -1,9 +1,38 @@
 import copy
 import pytest
+from PIL import Image
 
 import gateway.ad_template_generator_process as process
 from tests.gateway.test_ad_template_generator_process import _review
 from gateway.ad_template_reusable_validation import _scenario, reusable_repair_context
+
+
+def test_review_labels_stay_adjacent_to_their_actual_images(tmp_path):
+    names = ["source.png", "iteration-03-feed.png", "iteration-03-story.png",
+             "iteration-03-feed-difference.png", "iteration-01-feed.png", "iteration-01-story.png"]
+    paths = []
+    for index, name in enumerate(names):
+        path = tmp_path / name
+        Image.new("RGB", (8, 8), (index, 0, 0)).save(path)
+        paths.append(str(path))
+    calls = []
+    def agent(instance, message, route):
+        calls.append(message)
+        return {"ok": True}
+    result = process._call_json(
+        agent, instance="comparator-3", prompt="Review current", paths=paths,
+        baseline_paths=paths[-2:], route={"provider": "test", "model": "test"},
+        validate=lambda value: value, emit=lambda *args: None,
+    )
+    assert result == {"ok": True}
+    message = calls[0]
+    assert len([p for p in message if p["type"] == "image_url"]) == len(paths)
+    for index, name in enumerate(names):
+        label, pixels = message[1 + index * 2:3 + index * 2]
+        assert name in label["text"]
+        assert pixels["type"] == "image_url"
+        expected = "ORIGINAL SOURCE" if index == 0 else "CURRENT CANDIDATE" if index < 3 else "DIAGNOSTIC ONLY" if index == 3 else "SAVED BASELINE ONLY"
+        assert expected in label["text"]
 
 
 def test_revision_memory_exposes_criticism_and_attempts_without_score_anchoring():

@@ -52,3 +52,39 @@ bounded contract-repair loop. Old visual baselines expire; iteration evidence,
 comparison usage and spending bounds remain intact. Scenario cache version 2
 uses candidate-specific output paths so different drafts cannot overwrite cached
 evidence. Full renderer errors are bounded to 16,000 characters for repair.
+
+## Measured fit and contradictory correction recovery (07:30 UTC)
+
+Dated progress only: no complete successful live handoff is established here.
+Canary `trun_1c4ad23be565457ca919f830b63b0dd1` exhausted its preserved
+16-comparison limit and failed. Its earlier comparator pass did not survive
+policy-9 requalification. No score or budget was reset; it was not imported.
+
+Hermes releases `8988cfca64`, `dc73adcb56`, `eea4ba0df7` and `e43fcc56ab`
+added actual four-scenario text payloads to repair feedback, a once-per-run
+optional final diagnosis with transport-failure recovery, redacted request
+fingerprints/error categories, and source plus current-render repair evidence.
+The intermittent Meta HTTP 500 cause remains unproven; a matching read-only
+diagnostic request succeeded. This is not evidence of insufficient Meta balance.
+
+Renderer `a009543dda9ccf47a3ebe56b69ee168828d31436`, deployed at 07:07:41 UTC,
+reports measured required text lines and dimensions at the existing font floors.
+It does not change rendering or layout algorithms. The renderer's 18 tests,
+repository tests, NUL check, typecheck and production build passed. Its pinned
+release is `/opt/releases/blockwise-template-renderer-a009543dd`.
+
+Hermes `924d83ad13` (252 passing tests) tightened initial capacity planning,
+distinguished text-box capacity from painted ink, and removed duplicated candidate
+data in generic repair prompts. Fresh canary
+`trun_df2ed27692b846fcbfd46de3fca12e13` still needed five contract repairs and
+then failed because a reviewer requested rounding the opaque canvas background.
+The first repair made transparent corners; its retry omitted the locked target.
+
+Hermes `bb6e266e6d14af08a24b5bc98a8fd600320a231c`, deployed at 07:30:37 UTC
+after all 253 generator tests, Ruff and whitespace checks passed, rejects that
+invalid target before repair and directs review to the actual visible card layers.
+The same sample resumed through the supported API with saved photos and budgets.
+Acceptance, provider policy 45, quarantine and approval gates remain unchanged.
+Protected release and online-backup paths retain their existing revision suffixes;
+the latest are `/opt/releases/hermes-template-bb6e266e6d` and
+`/srv/hermes/backups/ad-template-feedback-20260908-bb6e266e6d`.
