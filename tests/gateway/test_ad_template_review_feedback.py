@@ -1,4 +1,5 @@
 import copy
+import json
 
 import pytest
 
@@ -10,7 +11,7 @@ from gateway.ad_template_generator_layer_refinement import (
 )
 
 @pytest.mark.parametrize("effect", [
-    '{"colourRole":"mainText","opacity":1,"width":2}',
+    '{"colourRole":"mainText","width":2}',
     {"colourRole": "mainText", "width": 2},
     {"colourRole": "#ffffff", "opacity": 1, "width": 2},
     {"colourRole": "mainText", "opacity": 1, "width": 0},
@@ -26,7 +27,8 @@ def test_malformed_outline_is_rejected_before_it_can_reach_renderer(effect):
 
 
 @pytest.mark.parametrize("existing", [None, {"rotationDegrees": 0}, {"stroke": {"colourRole": "accent", "opacity": 1, "width": 1}}])
-def test_whole_stroke_target_adds_outline_without_losing_other_effects(existing):
+@pytest.mark.parametrize("encoded", [False, True])
+def test_whole_stroke_target_adds_outline_without_losing_other_effects(existing, encoded):
     candidate = {"template": _template(), "assets": []}
     layer = copy.deepcopy(_candidate()["template"]["feedLayout"]["layers"][0])
     if existing is not None:
@@ -36,7 +38,7 @@ def test_whole_stroke_target_adds_outline_without_losing_other_effects(existing)
     review["issues"] = review["issues"][:1]
     stroke = {"colourRole": "mainText", "opacity": 1, "width": 3}
     review["issues"][0]["targets"] = [
-        {"layerId": "checkbox", "property": "effects/stroke", "value": stroke},
+        {"layerId": "checkbox", "property": "effects/stroke", "value": json.dumps(stroke) if encoded else stroke},
     ]
     validated = process.validate_review(review, candidate=candidate)
     contract = build_refinement_contract(
@@ -52,6 +54,19 @@ def test_whole_stroke_target_adds_outline_without_losing_other_effects(existing)
         assert effects["rotationDegrees"] == existing["rotationDegrees"]
     assert candidate["template"]["feedLayout"]["layers"][-1].get("effects") == existing
 
+
+
+def test_encoded_effect_patch_is_decoded_but_customer_copy_is_unchanged():
+    stroke = {"colourRole": "mainText", "opacity": 1, "width": 2}
+    literal_copy = json.dumps({"stroke": stroke})
+    raw = {"operations": [
+        {"op": "add", "path": "/template/feedLayout/layers/2/effects", "value": {"stroke": json.dumps(stroke)}},
+        {"op": "replace", "path": "/template/textInputs/0/placeholder", "value": literal_copy},
+    ]}
+    result = process.validate_patch(raw)
+    assert result["operations"][0]["value"] == {"stroke": stroke}
+    assert result["operations"][1]["value"] == literal_copy
+    assert isinstance(raw["operations"][0]["value"]["stroke"], str)
 
 
 def test_generic_repair_cannot_skip_measured_targets(monkeypatch):

@@ -148,6 +148,23 @@ def _validate_target_value(property_path: str, value: Any) -> Any:
         return value
     if property_path in _OBJECT_TARGET_PROPERTIES:
         if property_path in {"effects", "effects/stroke", "effects/shadow"}:
+            def decode_object(item):
+                if not isinstance(item, str):
+                    return copy.deepcopy(item)
+                if len(item.encode("utf-8")) > 2000:
+                    raise AdTemplateProcessError("encoded effect object exceeds repair limit")
+                try:
+                    decoded = json.loads(item)
+                except json.JSONDecodeError as exc:
+                    raise AdTemplateProcessError("encoded effect object is invalid JSON") from exc
+                if not isinstance(decoded, dict):
+                    raise AdTemplateProcessError("encoded effect value must decode to an object")
+                return decoded
+            value = decode_object(value)
+            if property_path == "effects" and isinstance(value, dict):
+                for key in ("stroke", "shadow"):
+                    if key in value:
+                        value[key] = decode_object(value[key])
             if not isinstance(value, dict):
                 raise AdTemplateProcessError(f"review target {property_path} must be a JSON object, not encoded JSON text")
             effect_objects = value if property_path == "effects" else {property_path.split("/")[1]: value}

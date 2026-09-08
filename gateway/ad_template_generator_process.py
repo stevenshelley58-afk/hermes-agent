@@ -46,6 +46,7 @@ from gateway.ad_template_runtime import (
 from gateway.ad_template_generator_layer_refinement import (
     _candidate_layers,
     _structured_targets,
+    _validate_target_value,
     build_refinement_batch_contract,
     build_refinement_contract,
     compile_refinement_patch,
@@ -1143,7 +1144,13 @@ def validate_patch(value: Any) -> Dict[str, Any]:
         if len(tokens) < 3 or any(token == "" for token in tokens):
             raise AdTemplateProcessError("revision path is not a bounded field path")
         [_decode_pointer_token(token) for token in tokens]
-        normalized.append(copy.deepcopy(operation))
+        item = copy.deepcopy(operation)
+        if op != "remove" and re.fullmatch(
+            r"/template/(feedLayout|storyLayout)/layers/[0-9]+/effects(?:/(?:stroke|shadow))?", path,
+        ):
+            property_path = path.split("/", 5)[-1]
+            item["value"] = _validate_target_value(property_path, item["value"])
+        normalized.append(item)
     return {"operations": normalized}
 
 
@@ -1172,6 +1179,8 @@ def _normalize_layer_defaults(after: Dict[str, Any]) -> None:
     for layout_name in ("feedLayout", "storyLayout"):
         layers = (template.get(layout_name) or {}).get("layers") or []
         for layer in layers:
+            if isinstance(layer, dict) and "effects" in layer:
+                layer["effects"] = _validate_target_value("effects", layer["effects"])
             if not isinstance(layer, dict) or layer.get("type") not in _OPACITY_REQUIRED_TYPES:
                 continue
             opacity = layer.get("opacity")
