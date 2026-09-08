@@ -93,7 +93,9 @@ def test_contract_locks_real_layer_properties_and_shared_text_dependency():
             "sharedLayerIds": ["feed-features", "story-features"],
         }
     ]
-    assert "six distinct source bullet lines" in refinement_prompt(contract)
+    prompt = refinement_prompt(contract)
+    assert _issues()[0]["instruction"] in prompt
+    assert "Preserve the actual source item count in every placement" in prompt
 
 
 def test_contract_rejects_review_invented_layer_id():
