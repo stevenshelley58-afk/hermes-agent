@@ -98,3 +98,27 @@ def test_asset_validator_cannot_bypass_immutable_asset_definitions(tmp_path):
         )
     assert validated == []
     assert candidate == original
+
+
+def test_initial_builder_repairs_all_missing_declarations_before_freezing(tmp_path):
+    valid = _generator_asset_candidate()
+    invalid = copy.deepcopy(valid)
+    invalid["assets"] = []
+    invalid["template"]["assets"] = {}
+    calls, prompts = [], []
+
+    def build(instance, prompt, route):
+        calls.append(instance)
+        prompts.append(str(prompt))
+        return invalid if len(calls) == 1 else valid
+
+    result = process._call_json(
+        build, instance="builder-initial", prompt="Build the complete template.",
+        paths=[_source(tmp_path)], route={"provider": "test", "model": "builder"},
+        validate=process._candidate_envelope, emit=lambda *_args: None,
+    )
+    assert calls == ["builder-initial", "builder-initial-format-retry"]
+    assert "hero-default" in prompts[1] and "brand-default" in prompts[1]
+    assert "complete initial document" in prompts[1]
+    assert result == valid
+    assert invalid["assets"] == []

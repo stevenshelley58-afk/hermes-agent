@@ -242,6 +242,27 @@ def _candidate_structure(value: Any) -> Dict[str, Any]:
 def _candidate_envelope(value: Any) -> Dict[str, Any]:
     candidate = _candidate_structure(value)
     violations: list[str] = []
+    # Resolve declared references while the initial full document is still
+    # repairable. Once saved, asset declarations are deliberately immutable.
+    template = candidate["template"]
+    declared = template["assets"]
+    references = [
+        ("replacementAssets", item.get("inputKey"), item.get("assetKey"))
+        for item in template["metadata"].get("replacementAssets", [])
+        if isinstance(item, dict)
+    ] + [
+        ("imageInputs", item.get("key"), item["defaultAssetKey"])
+        for item in template["imageInputs"]
+        if isinstance(item, dict) and item.get("defaultAssetKey") is not None
+    ]
+    for field, input_key, asset_key in references:
+        if not isinstance(asset_key, str) or asset_key not in declared:
+            violations.append(
+                f"{field} input {input_key!r} references undeclared asset {asset_key!r}. "
+                "Return the complete initial document with a safe catalog file declared "
+                "identically in template.assets and the outer assets list for EVERY reference; "
+                "do not return a patch or erase the image input."
+            )
     allowed_types = {"plate", "image_slot", "overlay_patch", "text", "logo", "vector", "icon"}
     for placement, field, canvas_height in (
         ("feed", "feedLayout", 1350),
@@ -687,6 +708,7 @@ FIRST-PASS CONSTRUCTION CHECKLIST (complete before returning JSON):
 - Brandmarks and wordmarks must use a logo layer, never image_slot: preserve the asset aspect ratio and source footprint so the renderer fits the whole mark without cover-cropping it. If the logo asset already contains its wordmark, do not duplicate that wordmark as text unless the source visibly has a separate text element.
 - imageInputs is a list of {{key,label,required?,acceptedTypes,defaultAssetKey?}}. textInputs is a list of {{key,label,placeholder,maxLength}}. Every image/logo/text layer inputKey is declared. Keep neutral reusable placeholders here with lengths close to the source; QA retains these authored strings and only substitutes source photo crops.
 - semanticColours contains exactly background, primary, secondary, accent, mainText, inverseText. assets is an object mapping each assetKey to {{fileName,mimeType}}. fonts is a list of unique {{file}} objects; text layer font.file must be declared. Choose from these verified bundled font paths: {_safe_json(list(_available_font_files()))}. Match source typography character and measured text footprint, not merely a generic serif or sans label.
+- ASSET COMPLETENESS: every image/logo input needs defaultAssetKey and a matching replacementAssets entry. Every referenced key MUST exist in BOTH template.assets and the outer assets list, using a real file from the safe catalog below. Empty asset declarations with named replacements are invalid. These declarations are frozen after initial build, so complete them now; later patches cannot add missing assets.
 - Generic body-copy placeholders must preserve the source line count, approximate words per line, and overall text density. Neutralize advertiser identity only; do not shorten dense copy into a sparse slogan.
 - metadata contains exactly title, description, gallerySamples, metaCopyDefaults, aiWritingGuidance, publishRequirements, replacementAssets, realAssetRefs. gallerySamples is {{feed?:{{assetKey?,placement:"feed",purpose}},story?:{{assetKey?,placement:"story",purpose}}}}. metaCopyDefaults is {{primaryText:[],headlines:[],descriptions:[],cta}}. aiWritingGuidance is {{summary,fields}}. publishRequirements is {{objective,specialAdCategory,instantForm:{{required,dependency,defaults?}},destination:{{required,kind,dependency}},fulfilment?,offer?,claims?,requiredCtaTypes}}. replacementAssets is a list of {{inputKey,assetKey,purpose?}}. realAssetRefs is a list of {{inputKey,kind,required}}. Do not create generationReview; the controller adds it after final review.
 - The outer assets list contains exactly one {{assetKey,fileName,mimeType}} declaration for every template.assets entry, with matching values. Never return bytes, hashes, signatures, source paths or a flattened source image.
