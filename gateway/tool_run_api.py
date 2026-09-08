@@ -2311,6 +2311,18 @@ class ToolRunAPIMixin:
         status = getattr(exc, "status_code", None)
         suffix = f", HTTP {status}" if type(status) is int and 100 <= status <= 599 else ""
         # Never include exception text, URLs, request headers, or provider body.
+        request = getattr(exc, "request", None)
+        try:
+            payload = json.loads(request.content) if request is not None else None
+            if isinstance(payload, dict):
+                import hashlib
+                signature = {
+                    field: hashlib.sha256(json.dumps(payload.get(field), sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+                    for field in ("model", "input", "text", "reasoning", "max_output_tokens")
+                }
+                suffix += ", request signatures=" + json.dumps(signature, sort_keys=True)
+        except (AttributeError, TypeError, ValueError, UnicodeError):
+            pass
         return f"frozen structured Responses role failed ({type(exc).__name__}{suffix})"
 
     @staticmethod

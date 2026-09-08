@@ -7,6 +7,7 @@ import pytest
 import gateway.tool_run_api as tool_run_api
 from gateway.tool_run_api import ToolRunAPIMixin
 from gateway.tool_runs import TOOL_RUN_COMMAND_SCHEMA, ToolRunStore
+from types import SimpleNamespace
 
 @pytest.mark.parametrize("status", [400, 429, 502, None])
 def test_transport_failure_keeps_status_without_secrets(status):
@@ -20,6 +21,17 @@ def test_transport_failure_keeps_status_without_secrets(status):
     else:
         assert "HTTP" not in message
 
+
+
+def test_transport_request_signature_never_exposes_content_or_credentials():
+    error = RuntimeError("private provider response")
+    error.request = SimpleNamespace(content=json.dumps({
+        "model": "private-model", "input": "private-content", "api_key": "secret-token",
+    }).encode())
+    message = ToolRunAPIMixin._tool_safe_transport_error(error)
+    assert "request signatures=" in message
+    assert "private" not in message and "secret" not in message
+    assert message == ToolRunAPIMixin._tool_safe_transport_error(error)
 
 
 def _command(key: str) -> dict:
