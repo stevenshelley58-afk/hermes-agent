@@ -107,9 +107,25 @@ REVIEW_FONT_SUBSTITUTION_RULE = (
     "because the exact font is unavailable, and never request an unavailable font file."
 )
 REVIEW_MEASUREMENT_RULE = 'MEASUREMENT EVIDENCE: textAlignment contains high-confidence matching glyph bounds, not editable text boxes. Its offset is candidate minus source; subtract that delta to correct displacement, then render and remeasure. Do not replace box dimensions or font sizes directly with glyph bounds. Missing OCR is unknown, not proof that text is missing or correct. Thin sourceStructuralBands indicate horizontal edges, not complete photo rectangles. Estimated sourceImageRegions are not ground truth when original source edges or text measurements contradict them. Correct major panel boundaries, overlaps, lost copy and hierarchy before small coordinate tweaks.'
+META_IMAGE_CTA_RULE = (
+    "META AD IMAGE POLICY (overrides source-clone instructions and older layout plans): "
+    "Meta supplies the clickable call-to-action outside the uploaded image. "
+    "Do not render a CTA button, its label, button-only background, arrow or shadow "
+    "inside either Feed or Story artwork, even when the source contains one. "
+    "Remove editable inputs used only by that image CTA. Preserve Meta's publishing "
+    "CTA metadata (metaCopyDefaults.cta and publishRequirements.requiredCtaTypes). "
+    "Keep informational website/contact details, offer copy and other source content; "
+    "do not misclassify them as CTA buttons. Rebalance only the vacated CTA area, "
+    "removing orphan button dividers; preserve all other design regions. "
+    "This intentional omission and local rebalancing are not missing-detail, "
+    "geometry, typography or effects defects: never restore or deduct scores for "
+    "the source CTA or its button-only styling. A remaining embedded CTA button "
+    "is an obvious production error and must block acceptance. "
+    "All other five section checks remain >=9.8, exact font-family identity excepted."
+)
 SOURCE_MAP_VERSION = 2
 QA_PROJECTION_VERSION = 5
-EVALUATION_POLICY_VERSION = 9
+EVALUATION_POLICY_VERSION = 10
 STAGES = (
     "source",
     "aspect-reference",
@@ -677,6 +693,7 @@ def _validate_aspect_reference(
 def aspect_reference_prompt(*, source_placement: str, target_placement: str, canvas: Mapping[str, int], brief: str) -> str:
     source_height = 1350 if source_placement == "feed" else 1920
     return f"""Inspect the attached original ad. This is measurement and faithful reconstruction, not redesign.
+{META_IMAGE_CTA_RULE}
 Return exactly sourcePlacement, targetPlacement, canvas, regions, preserve, sourceImageRegions.
 sourcePlacement={source_placement}; targetPlacement={target_placement}; canvas={json.dumps(dict(canvas))}.
 regions describes the native {target_placement} adaptation: each object has regionId, sourceRole, target={{x,y,width,height}}, zIndex. Preserve every region, hierarchy, spacing relationship, typography, shading, gradients, borders, masks and texture.
@@ -690,17 +707,19 @@ def build_prompt(*, run_id: str, project_id: str, brief: str, placements: Any, r
 
 Return JSON only with exactly {{"template":{{...}},"assets":[]}}. The template object must have exactly these keys: schema, templateId, createdAt, feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata. Do not return schemaVersion, fields, placements, name or any legacy pack envelope.
 
+{META_IMAGE_CTA_RULE}
+
 DIRECT BLOCKWISE CONTRACT:
 FIRST-PASS CONSTRUCTION CHECKLIST (complete before returning JSON):
 - Inventory the source from top to bottom: panel boundaries, every text block, each checklist row and its icon enclosure, all image slots, CTA and footer. Measure the source on its normalized canvas. Reproduce the ORIGINAL placement first; adapt the other placement independently without losing any content role.
 - Treat source pixels as design authority; region estimates are advisory. Do not invent pill buttons, rounded panels, borders or extra decorations. A plain check is not an outlined checkbox: where the source has a box, use a separate outlined vector behind the supported check icon. Keep a fully opaque rectangular background plate beneath any decorative rounding.
-- Choose a bundled font once and preserve its choice during positional repairs. Exact font-family identity is excluded. Prioritize matching the visible text footprint, baseline, density and line count over family resemblance. Center visible CTA glyphs inside their button, not merely the editable text box.
+- Choose a bundled font once and preserve its choice during positional repairs. Exact font-family identity is excluded. Prioritize matching the visible text footprint, baseline, density and line count over family resemblance. Do not create an embedded CTA button; Meta supplies it outside the image.
 - Build complete Feed and Story layouts in this response. Shared checklist inputs must bind every row in both placements; do not bind a multi-item list to its first item alone.
 - Declare usable text capacity, not optimistic character counts. Each textInputs.maxLength must fit ALL its Feed/Story layers at the stated maxLines and at least 24px/32px respectively. Layer maxCharacters must cover the shared input limit. Reserve measured width/height for long words and accents; do not rely on scale_down below the readability floor, truncation of essential copy, or a tiny maxLength that makes the field unusable.
 - CAPACITY PLANNING BEFORE GEOMETRY: set realistic per-field limits from the source role and authored copy, not generic defaults such as 260 for every body or 40 for every short checklist label. Aim for the full source-like placeholder plus modest useful editing headroom (roughly 10-20% where the source layout permits). Never set a limit below the complete placeholder. A short one-line feature field is not a paragraph field. If the full placeholder cannot fit at the readability floor, widen/reflow the native adaptation before locking its geometry. Allocate non-overlapping rectangles for the MAX content, then place default ink within them to match the source. Do not displace the entire checklist/footer merely to provide unrequested, speculative double-length copy.
 - Geometry arithmetic is mandatory: Feed x+width <=1080 and y+height <=1350; Story x+width <=1080 and y+height <=1920. Assign every photo and decorative panel its own measured rectangle. Do not copy a CTA text rectangle to its footer plate, divider or globe icon. Keep structural panels, icons and text separate; never add a white overlay on top to hide a fit defect.
 - The real reusable tests replace each field with short text, repeated "Maximum editable content " up to maxLength, Unicode "Ångström 東京 — café 🏡", and optional-empty text. Account for these substitutions now; matching the placeholder alone is insufficient. Preserve source-like default copy density and useful editing capacity.
-- Before emitting, self-check both layouts for missing rows/media, text overlap, CTA alignment, text capacity, unsupported properties, array bindings and font declarations. Fix these together before the first external review.
+- Before emitting, self-check both layouts for missing rows/media, text overlap, absence of embedded CTA buttons, text capacity, unsupported properties, array bindings and font declarations. Fix these together before the first external review.
 
 - schema is "blockwise.ad-template"; templateId is a stable safe ID; createdAt is an ISO-8601 UTC datetime.
 - Every layer MUST include a literal type field: "plate", "image_slot", "overlay_patch", "text", "logo", "vector", or "icon". For example, an image layer begins {{"type":"image_slot","layerId":"hero","inputKey":"hero",...}}. Never use "image", "shape", or "rectangle" as a layer type.
@@ -891,14 +910,16 @@ When revision is required, return the exact correction as patch in this same res
 
 Return JSON only with exactly {output_fields}. scores must contain exactly, in this order: overall, geometry, typography, colourEffects, imageCrop, details. overall is non-gating ranking evidence only; the sole overall acceptance check is whether issues contains any obvious error. Do not lower any score for exact font-family mismatch. typography scores only size, weight, spacing, alignment, hierarchy and legibility. effects must contain exactly, in this order: shading, gradients, shadows, transparency, borders, masks, texture; each is match, not_present, or mismatch. issues is a list of objects with exactly placement (feed|story|both), layerIds (real candidate layer IDs), category (geometry|typography|colourEffects|imageCrop|details), instruction, severity (blocker|material|minor), targets (an array of {{layerId, property, value}}). For measured property corrections, targets are authoritative: use canonical layer-relative properties such as geometry/x, geometry/y, geometry/width, geometry/height, fontSize, tracking or font/file, with the exact desired value. Include a target for every listed layer and explain the correction in instruction. Use targets=[] only for structural changes or shared semantic-colour rebinding that cannot safely be represented as layer-property targets; describe the concrete correction without inventing a property or layer ID. Vague requests such as "match the source" or "fix spacing" without a concrete correction are invalid. Every visible discrepancy is an issue; acceptance requires issues=[] and every effect matched or genuinely absent. decision is evidence only; the controller derives accept/revise from the five section scores, issues and effects. fontSubstitution is informational only and is null or exactly {{source,used,reason}}.{patch_contract} Return no prose.
 
+{META_IMAGE_CTA_RULE}
+
 PRODUCTION SAFETY: Do not reproduce accidental source clipping, duplicate glyphs, or missing contact text as a requested correction. Match the source structure while keeping customer replacements readable; list unavoidable source defects as warnings, never a reason to damage the production template. Repeated feature wording intentionally present in the source is not itself a stray-glyph defect.
 FACT-FIRST REVIEW, NOT TARGET-SCORE OPTIMIZATION:
 1. Inspect source and CURRENT renders before assigning numbers. Check all regions in one pass: panel geometry, headline/body footprint, every checklist row and enclosure, image roles/crops, footer and CTA. Compare BOTH placements. The numeric gate is an acceptance rule, never a score to work toward or a reason to inflate a score.
 2. Ground each issue in an observation: source feature and approximate bounds; CURRENT defect; named layer; smallest supported correction. For a numeric target, state current value, desired value and measured reason. Do not infer pill ends, outer rounding or missing borders from a previous review. Source evidence wins over all previous model opinions.
 3. Keep one issue per independently repairable defect, with only affected layers. Enumerate every observed defect now; do not drip-feed one new defect per iteration. Cover every below-threshold section with an actionable issue. Do not reopen a corrected section unless its pixels changed or you identify a specifically evidenced oversight.
-4. Correct text by its VISIBLE GLYPH position. If a CTA label sits above its button center, move the label alone by the glyph-center delta. Moving the button and label together cannot correct internal alignment. Do not lower font size below the floor or change the font family to solve a coordinate problem.
+4. Correct text by its VISIBLE GLYPH position. If an embedded CTA button remains, remove its label and button-only styling instead of repairing its alignment. Do not lower font size below the floor or change the font family to solve a coordinate problem.
 4a. A transparent text box is NOT visible ink or a panel. Its unused capacity does not push neighbouring layers: this renderer uses absolute positions, not document flow. Never shorten an invisible geometry/height just because it exceeds the default paragraph's painted height. If checklist glyphs are too low, move those glyphs/icons and assess maximum-content clearance separately; do not invent a causal relationship to a preceding box's height. Preserve usable editing capacity and all passed preflight constraints. Request a height change only for an actual clipping/overlap defect supported by pixels and a fit-safe alternative. Do not apply a fix to labels, icons, footer and background as though they were one rectangle.
-5. Assign scores from these findings, then run the single whole-frame no-obvious-errors check. A missing checkbox enclosure, lost checklist row, clipped copy or visibly off-center button label is never compatible with acceptance, even if other sections are excellent. Never use budget, iteration number, earlier scores or a desire to finish as evidence of quality. Do not award 9.8 merely because few issues remain.
+5. Assign scores from these findings, then run the single whole-frame no-obvious-errors check. A missing checkbox enclosure, lost checklist row, clipped copy or an embedded CTA button is never compatible with acceptance, even if other sections are excellent. Never use budget, iteration number, earlier scores or a desire to finish as evidence of quality. Do not award 9.8 merely because few issues remain.
 6. If evidence contradicts a prior correction, explicitly explain the contradiction in the issue instruction. If a target already equals CURRENT, do not request it again; inspect the painted result and find the actual cause. An uncertain coordinate estimate is not a measured target. Do not copy source-specific artifacts such as privacy/redaction blocks into the design.
 
 COORDINATE AND FIT RULES: Feed is exactly 1080x1350; Story is exactly 1080x1920. The original-source comparison image is normalized to its matching canvas without cropping. All geometry targets use those canvas pixels, NEVER thumbnail/display pixels. Preserve the renderer's minimum font sizes: Feed 24px and Story 32px, multiline lineHeight >= 1. Do not request a smaller font; reflow the native adaptation or resize the editable box instead. The comparison source map and render share the same coordinate scale.
@@ -1105,6 +1126,8 @@ def _instruction_has_actionable_target(instruction: str) -> bool:
 def patch_prompt(*, candidate: Mapping[str, Any], issues: Sequence[Mapping[str, Any]], manual_instructions: str = "") -> str:
     return f"""Apply only the listed exact-clone corrections to the current valid Blockwise candidate. Do not redesign, regenerate or replace the document. Preserve every field and layer not named by the corrections. Return a bounded JSON patch only: {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}}. Use the exact JSON Pointer map below. When a correction states an explicit numeric target ("set ... to N"), apply that exact value to the named layer; never approximate or skip part of a group shift. For a layer type change, replace the whole layer at its mapped pointer. When changing to a font not already declared, also add its {{"file":"..."}} declaration at /template/fonts/-. Append list items with /- or the current list length, EXCEPT full-canvas background frames or plates: insert those at index 1, directly above the plate layer, never on top of the content (a covering background layer blanks the render). Remove multiple list items in descending index order. Do not change schema, templateId, createdAt, asset declarations or source-free asset assignments. Maximum {MAX_PATCH_OPERATIONS} operations. A remove operation omits value; add/replace requires value. Return JSON only.
 
+{META_IMAGE_CTA_RULE}
+
 LAYER POINTERS: {_safe_json(_layer_pointer_map(candidate), max_bytes=40_000)}
 PATCH EXISTENCE RULE: replace requires the complete property path to exist, not merely its parent layer. Use add for an absent optional property when allowed. Resolve every layerId against THIS candidate; no remembered array indices. Use effects.stroke, never top-level stroke. Check all paths before returning.
 Keep valid font families fixed. Preserve text capacity and the opaque full-canvas plate. Correct visible label-to-container alignment by moving the label rather than both elements. Listed issues are model claims to reconcile with source and any newer diagnosis, not permission to reproduce a known false feature.
@@ -1118,6 +1141,7 @@ def contract_repair_prompt(*, candidate: Mapping[str, Any], reasons: Sequence[st
     return f"""Repair only the listed Blockwise contract/renderer validation failures in this otherwise complete exact-clone candidate. Preserve its visual design, geometry, inputs, neutral assets, copy and metadata except where a listed failure requires a direct correction. Return a bounded JSON patch only: {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}}. Use JSON Pointer paths. Address every listed failure in this one patch. Do not return a full template and do not make creative changes. Maximum {MAX_PATCH_OPERATIONS} operations. Return JSON only.
 
 CURRENT CANDIDATE: {_safe_json(candidate)}
+{META_IMAGE_CTA_RULE}
 BLOCKWISE CONTRACT/RENDERER FAILURES: {_safe_json(list(reasons), max_bytes=40_000)}
 IMAGE ORDER: original source first; when available, the current Feed and Story renders follow. These are CURRENT candidate pixels, not new target references. Use their neighbouring elements and free space to plan a coherent repair; replacement-text failures describe the test payloads below, not necessarily the default pixels shown.
 PATCH EXISTENCE RULE: replace requires an existing leaf property; add creates an allowed absent optional property. Resolve layer indices from CURRENT CANDIDATE. Fix every listed failure in one coherent patch without lowering readability or usable text capacity.
