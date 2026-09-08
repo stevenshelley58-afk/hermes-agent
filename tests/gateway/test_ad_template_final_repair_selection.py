@@ -179,6 +179,10 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
         if instance.startswith("comparator-") and instance != "comparator-final-repair":
             return _comparison(accept=True, comparison_to_best="not_applicable")
         if instance.startswith("final-reviewer-"):
+            # Assert on the real second-round request, not source-code shape.
+            assert "REVISION MEMORY" not in prompt[0]["text"]
+            assert "CANDIDATE CONTRACT" in prompt[0]["text"]
+            assert "no-obvious-errors" in prompt[0]["text"]
             if current_description[0] == "initial" or (recovery and "diagnosis-stall-final-repair" not in calls):
                 result = _review(accept=False)
                 result["issues"][0]["targets"] = []

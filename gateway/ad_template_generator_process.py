@@ -4163,14 +4163,14 @@ class AdTemplateGeneratorOrchestrator:
             def run_final_reviewer(label: str, route: Mapping[str, str]) -> tuple[Dict[str, Any], list[tuple[str, str, Dict[str, Any]]]]:
                 identity = f"final-reviewer-{label}-{self.run_id}-{final_round}"
                 buffered_events: list[tuple[str, str, Dict[str, Any]]] = []
+                # Independent judges inspect current pixels and measured fit,
+                # not each other's historical criticisms. Repair history stays
+                # with the repair/comparator loop; duplicating it here grows
+                # the vision request and anchors a fresh judge to stale defects.
                 result = _call_json(
                     self.call_agent,
                     instance=identity,
                     prompt=(review_prompt(final=True, candidate=candidate, reference=reference, metrics=final_metrics)
-                            + _review_iteration_context([
-                                {"iteration": item["round"], "comparison": {"issues": item["issues"]}}
-                                for item in final_repair_history[-2:]
-                            ], None)
                             + _preflight_review_context(checkpoint)
                             + "\nCheck each against CURRENT pixels; do not repeat a corrected target. "
                             "Report all still-visible defects together. Earlier acceptance is not evidence of quality."),

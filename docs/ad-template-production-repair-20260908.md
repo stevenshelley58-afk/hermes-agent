@@ -208,3 +208,17 @@ and all diagnostics remain attached; only production images proven byte-identica
 to the corresponding QA render are omitted. Unknown identity retains evidence.
 Health returned 200. The same saved sample resumed at final review; successful
 quarantined import and smoke-test evidence are still pending.
+
+Release a359763ad3099eb3435ed125468e543584561ec8 deployed at 09:06:22 UTC
+after 265 passing tests. It retains a below-gate working repair only when
+measured prior targets are all resolved, fewer unrelated defects remain, and
+pairwise evidence is not worse. Retention never grants acceptance or import.
+This fixes logs 220/221 rolling back corrected CTA labels and hero geometry
+because the comparator discovered a different footer defect.
+
+The resumed run failed on Meta final review with HTTP 500 in 4.5 seconds.
+An isolated request without prior reviewers' history completed in 52.36 seconds
+with a valid review and correctly measured CTA corrections. Independent final
+judges now receive current evidence and measured fit, without previous model
+criticisms; the repair/comparator loop retains its history. This reduces request
+growth and stale-judgment anchoring, without changing routes or acceptance.
