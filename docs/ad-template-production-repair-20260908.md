@@ -242,3 +242,28 @@ after 266 passing tests, Ruff, whitespace checks and authenticated health 200.
 It also persists comparator-approved final repairs before subsequent calls;
 an injected handoff failure test proves recovery selects the repaired candidate
 without inventing final-review/import/smoke acceptance. Full handoff is pending.
+
+## Complete successful handoff, 8 September 2026
+
+Hermes 78f6f3db8fcad7370ad65b95130eb4c0a6acd549 deployed at 09:33:12 UTC
+after 267 passing tests, Ruff and whitespace checks. Fully measured final
+repairs now use the existing patch compiler and the same renderer/reusable
+validators without a redundant model rewrite. Invalid/qualitative cases retain
+bounded model repair. Event 336 proves the compiled path ran live.
+
+The visual checks passed, but Blockwise import returned invalid_template_artifact.
+Live app 031bf62a76fe2aa44276296e76a9b2e5703f62a3 still accepted only the
+old generationReview shape. The current policy contract was applied on top of
+that exact live base, not by replacing unrelated newer application changes.
+Blockwise e09a5d6f9b141c2613d914e293c1d4bfd9521a00 deployed at 09:42:34 UTC;
+its full tests, NUL/type/build checks, isolated compiled-route probe and public
+compiled-revision health passed. Renderer a009543dd remains pinned separately.
+
+Run trun_cf767d809b8c438497a1e9bc9676ea80 reached ready_for_review. Events
+363/365/367/368 record accepted final review, four-asset quarantined import,
+passed matching smoke test and completed handoff. Template open-house-estate-1080
+has every comparator/final-reviewer section >=9.8, no issues, all effects matched
+or absent, no_obvious_errors=true and all four reusable scenarios passed.
+The actual serving first50 _quality_pass predicate returned true. The dry
+manifest contains 50 distinct IDs and hashes; its batch directory remains empty.
+No template was activated/published and the 50-template batch has not started.
