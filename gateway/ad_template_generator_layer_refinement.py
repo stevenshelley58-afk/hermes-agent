@@ -76,6 +76,8 @@ _TARGET_PROPERTY_ALIASES = {
     "effects/shadow/colourrole": "effects/shadow/colourRole",
     "stroke": "effects/stroke",
     "shadow": "effects/shadow",
+    "effects/stroke": "effects/stroke",
+    "effects/shadow": "effects/shadow",
     "mask": "mask",
     "defaultcrop": "defaultCrop",
     "effects": "effects",
@@ -239,6 +241,15 @@ def _structured_targets(
             )
         property_path = _canonical_target_property(raw_target.get("property"))
         layer = layers[layer_id]["layer"]
+        raw_value = raw_target.get("value")
+        if property_path in {"effects/stroke", "effects/shadow"}:
+            # Whole effect objects can be added. When the optional parent is
+            # absent, lock the equivalent effects object so JSON patch can
+            # create it atomically without discarding any existing effect.
+            raw_value = _validate_target_value(property_path, raw_value)
+            if "effects" not in layer:
+                raw_value = {property_path.split("/")[1]: raw_value}
+                property_path = "effects"
         layer_type = layer.get("type")
         if property_path == "colourRole" and "colourRole" not in layer:
             raise AdTemplateProcessError(
@@ -260,13 +271,14 @@ def _structured_targets(
             )
         if (
             property_path.startswith(("fill/", "effects/", "defaultCrop/"))
+            and property_path not in {"effects/stroke", "effects/shadow"}
             and not _legacy_property_supported(layer, property_path)
         ):
             raise AdTemplateProcessError(
                 f"review target {property_path} is unavailable on {layer_id}; "
                 "use an existing candidate property, or targets=[] for a concrete structural/semantic-colour correction"
             )
-        target_value = _validate_target_value(property_path, raw_target.get("value"))
+        target_value = _validate_target_value(property_path, raw_value)
         if property_path == "tracking" and not -4 <= target_value <= 4:
             raise AdTemplateProcessError("review target tracking is outside renderer bounds")
         if property_path == "lineHeight" and target_value < 1:

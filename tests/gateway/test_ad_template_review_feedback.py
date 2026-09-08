@@ -6,7 +6,36 @@ import gateway.ad_template_generator_process as process
 from tests.gateway.test_ad_template_generator_process import _review, _template
 from gateway.ad_template_generator_layer_refinement import (
     build_refinement_contract, validate_refinement_patch,
+    compile_refinement_patch,
 )
+
+@pytest.mark.parametrize("existing", [None, {"rotationDegrees": 0}, {"stroke": {"colourRole": "accent", "opacity": 1, "width": 1}}])
+def test_whole_stroke_target_adds_outline_without_losing_other_effects(existing):
+    candidate = {"template": _template(), "assets": []}
+    layer = copy.deepcopy(_candidate()["template"]["feedLayout"]["layers"][0])
+    if existing is not None:
+        layer["effects"] = copy.deepcopy(existing)
+    candidate["template"]["feedLayout"]["layers"].append(layer)
+    review = _invalid_review()
+    review["issues"] = review["issues"][:1]
+    stroke = {"colourRole": "mainText", "opacity": 1, "width": 3}
+    review["issues"][0]["targets"] = [
+        {"layerId": "checkbox", "property": "effects/stroke", "value": stroke},
+    ]
+    validated = process.validate_review(review, candidate=candidate)
+    contract = build_refinement_contract(
+        candidate, validated["issues"], source_placement="feed", available_fonts=[],
+    )
+    patch = compile_refinement_patch(contract)
+    assert patch is not None
+    validate_refinement_patch(patch, contract=contract)
+    result = process.apply_patch(candidate, patch)
+    effects = result["template"]["feedLayout"]["layers"][-1]["effects"]
+    assert effects["stroke"] == stroke
+    if existing and "rotationDegrees" in existing:
+        assert effects["rotationDegrees"] == existing["rotationDegrees"]
+    assert candidate["template"]["feedLayout"]["layers"][-1].get("effects") == existing
+
 
 
 def test_semantic_colour_target_survives_review_and_locked_patch():

@@ -21,6 +21,7 @@ patch operations. Invalid issues still fail closed. Scores, thresholds,
 comparison budgets, provider routes, approval and publishing remain unchanged.
 
 Verification before deployment: 214 tests passed across all 20 ad-template
+test files via `scripts/run_tests.sh`; Ruff and `git diff --check` passed.
 
 The feedback release `a5c6a795673352ad9f8ba5349c3bf122fc00ab9b` deployed
 at 05:12:37 UTC. The same canary reused its saved candidate/images, reported
@@ -35,6 +36,7 @@ from nonexistent solid fill/colour fields and supplies the complete stroke
 object. No invalid target is silently converted or discarded.
 
 Follow-up verification: all 220 tests in 20 ad-template files passed; Ruff
+and diff whitespace checks passed. Live acceptance remained a separate gate.
 
 ## Final live outcome
 
@@ -62,5 +64,3 @@ The renderer's renderImageSlot maps the selected source crop directly onto the
 destination rectangle; nonmatching aspect ratios therefore distort. A high
 comparator score did not establish image correctness. The first-50 batch remains
 unstarted, and the live run collection has no active generation runs.
-and diff whitespace checks passed. Live acceptance remains a separate gate.
-test files via `scripts/run_tests.sh`; Ruff and `git diff --check` passed.
