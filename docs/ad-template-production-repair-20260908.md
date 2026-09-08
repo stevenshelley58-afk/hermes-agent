@@ -110,3 +110,21 @@ the issue count decreases, and blocker/material/effect-mismatch counts do not
 increase. This changes draft selection, not 9.8 acceptance or final reviews.
 Saved discarded records remain untouched. The sample resumed with nine used
 comparisons; a full live success and first50 readiness remain unproven.
+
+## Reasoning-setting qualification
+
+The sample's main comparison 11 met every section floor, with four reusable
+checks passed. Independent final review rejected missing checkbox outlines and
+button alignment; subsequent repair comparisons regressed and were reverted.
+A final-review response error ended the attempt before import. Both optional
+high-reasoning Astra diagnosis calls timed out at 150 seconds. This is not a
+successful handoff or a reason to lower acceptance thresholds.
+
+Small real image/strict-JSON probes on the unchanged providers qualified medium
+reasoning: Meta Muse Spark returned the correct above-center CTA and absent
+checkbox outlines in 54.31 seconds (2,581 tokens); Concentrate Gemini did so in
+6.80 seconds (1,753 tokens), and Concentrate Astra in 6.38 seconds (1,001 tokens).
+The initial Meta probe's 1,000-token allowance did not produce parseable output;
+the 4,096-token probe completed. These probes are diagnostic, not template runs.
+The Responses roles now request medium reasoning within unchanged time, output,
+cost, route and acceptance bounds. A fresh full canary must establish readiness.

@@ -1234,7 +1234,10 @@ class ToolRunAPIMixin:
                                     "strict": True,
                                     "schema": self._tool_role_json_schema(instance_id),
                                 }},
-                                reasoning={"effort": "high" if role_kind == "diagnosis" else "minimal"},
+                                # Visual reconstruction needs deliberate geometry
+                                # and constraint checks. Minimal reasoning produced
+                                # contradictory repairs; high diagnosis timed out.
+                                reasoning={"effort": "medium"},
                                 max_output_tokens=_AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS[role_kind],
                             )
 
