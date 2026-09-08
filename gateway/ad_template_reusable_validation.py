@@ -22,7 +22,7 @@ def _json(v):
 def _identity(c, s, r, asset_identity=""):
     return hashlib.sha256(
         _json({
-            "version": 1,
+            "version": 2,
             "candidate": c,
             "scenario": s,
             "renderer": r,
@@ -234,7 +234,7 @@ def validate_reusable_template(
         try:
             result = render(
                 _scenario(candidate, s),
-                workspace / "reusable-validation" / f"{i:02d}-{s}",
+                workspace / "reusable-validation" / f"{i:02d}-{s}-{identity[:16]}",
                 asset_overrides=asset_overrides,
             )
             outputs = result.get("render") if isinstance(result, Mapping) else None
@@ -252,7 +252,7 @@ def validate_reusable_template(
                 "outputs": dict(outputs),
             })
         except Exception as exc:
-            error = str(exc)[:1200]
+            error = str(exc)[:16000]
             out["scenarios"].append({
                 "name": s,
                 "identity": identity,

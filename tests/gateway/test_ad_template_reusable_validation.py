@@ -97,6 +97,29 @@ def test_cached_passes_are_reused(tmp_path):
     assert len(calls) == 4 and second["scenarios"] == first["scenarios"]
 
 
+def test_distinct_candidates_cannot_overwrite_cached_evidence(tmp_path):
+    calls = []
+    def render(c, w, **kwargs):
+        calls.append(w)
+        return renderer(c, w, **kwargs)
+    first = validate_reusable_template(candidate(), workspace=tmp_path, render=render)
+    other = candidate()
+    other["template"]["textInputs"][0]["maxLength"] = 30
+    second = validate_reusable_template(other, workspace=tmp_path, render=render, cached=first)
+    assert {s["outputs"]["feed"] for s in first["scenarios"]}.isdisjoint(
+        {s["outputs"]["feed"] for s in second["scenarios"]}
+    )
+    validate_reusable_template(candidate(), workspace=tmp_path, render=render, cached=first)
+    assert len(calls) == 8
+
+
+def test_repair_receives_complete_bounded_renderer_failure(tmp_path):
+    def fail(c, w, **kwargs):
+        raise RuntimeError("first-layer " + "x" * 1400 + " final-layer needs width")
+    with pytest.raises(ReusableTemplateValidationError, match="final-layer needs width"):
+        validate_reusable_template(candidate(), workspace=tmp_path, render=fail)
+
+
 def test_undeclared_required_binding_fails_closed(tmp_path):
     value = candidate()
     value["template"]["imageInputs"][0].pop("defaultAssetKey")

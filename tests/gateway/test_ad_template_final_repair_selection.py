@@ -24,7 +24,7 @@ def _reusable_validation():
     }
 
 
-def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to_best, icon_repair=False, trace=None, recovery=False):
+def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to_best, icon_repair=False, trace=None, recovery=False, reusable_repair=False):
     source = tmp_path / "source.png"
     Image.new("RGB", (1080, 1350), "white").save(source)
     original = {"template": _template(), "assets": []}
@@ -65,11 +65,14 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
     )
     monkeypatch.setattr(process, "_comparison_views", lambda *args, **kwargs: [])
     monkeypatch.setattr(process, "_comparison_metrics", lambda **kwargs: {})
-    monkeypatch.setattr(
-        process,
-        "validate_reusable_template",
-        lambda *args, **kwargs: _reusable_validation(),
-    )
+    def reusable(candidate, **kwargs):
+        if reusable_repair and candidate["template"]["metadata"]["description"] == "initial":
+            raise process.ReusableTemplateValidationError(
+                "reusable scenario short failed: Story checklist needs usable text capacity",
+            )
+        return _reusable_validation()
+
+    monkeypatch.setattr(process, "validate_reusable_template", reusable)
     monkeypatch.setattr(
         process,
         "import_template",
@@ -136,6 +139,10 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
             }
         if instance == "builder-initial":
             return copy.deepcopy(original)
+        if reusable_repair and instance.startswith("contract-repair-"):
+            return {"operations": [{
+                "op": "replace", "path": "/template/metadata/description", "value": "capacity-fixed",
+            }]}
         if instance.startswith("comparator-") and instance != "comparator-final-repair":
             return _comparison(accept=True, comparison_to_best="not_applicable")
         if instance.startswith("final-reviewer-"):
@@ -229,6 +236,17 @@ def test_below_gate_final_repair_cannot_inherit_acceptance(tmp_path, monkeypatch
             tmp_path, monkeypatch, repair_score=9.6, comparison_to_best="same", trace=trace,
         )
     assert trace["imported"] == []
+
+
+def test_reusable_failure_is_repaired_before_first_visual_comparison(tmp_path, monkeypatch):
+    result, imported, calls, events = _run_final_repair_case(
+        tmp_path, monkeypatch, repair_score=9.8, comparison_to_best="same", reusable_repair=True,
+    )
+    assert imported == ["capacity-fixed"]
+    assert calls.index("contract-repair-1-1") < calls.index("comparator-1")
+    assert result["reusable_validation"]["counts"]["passed"] == 4
+    assert result["final_review"]["decision"] == "accepted"
+    assert any(kind == "candidate.contract-rejected" for kind, _, _ in events)
 
 
 def test_repeated_final_rejection_gets_diagnosis_and_successful_repair(tmp_path, monkeypatch):

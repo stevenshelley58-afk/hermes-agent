@@ -108,7 +108,7 @@ REVIEW_FONT_SUBSTITUTION_RULE = (
 REVIEW_MEASUREMENT_RULE = 'MEASUREMENT EVIDENCE: textAlignment contains high-confidence matching glyph bounds, not editable text boxes. Its offset is candidate minus source; subtract that delta to correct displacement, then render and remeasure. Do not replace box dimensions or font sizes directly with glyph bounds. Missing OCR is unknown, not proof that text is missing or correct. Thin sourceStructuralBands indicate horizontal edges, not complete photo rectangles. Estimated sourceImageRegions are not ground truth when original source edges or text measurements contradict them. Correct major panel boundaries, overlaps, lost copy and hierarchy before small coordinate tweaks.'
 SOURCE_MAP_VERSION = 2
 QA_PROJECTION_VERSION = 5
-EVALUATION_POLICY_VERSION = 8
+EVALUATION_POLICY_VERSION = 9
 STAGES = (
     "source",
     "aspect-reference",
@@ -2897,6 +2897,14 @@ class AdTemplateGeneratorOrchestrator:
             previous_version = checkpoint.get("evaluationPolicyVersion")
             checkpoint["accepted"] = False
             checkpoint.pop("finalReview", None)
+            # Earlier visual scores did not require reusable-content preflight.
+            # Preserve evidence and lifetime budgets, but requalify the current
+            # editable document before treating any old draft as a baseline.
+            for key in ("bestCandidate", "bestReview", "bestIteration"):
+                checkpoint.pop(key, None)
+            for record in checkpoint.get("iterations", []):
+                record["discarded"] = True
+                record["preflightPolicyExpired"] = True
             checkpoint_policy_events.append(("evaluation-policy.updated", {
                 "from_version": previous_version,
                 "to_version": EVALUATION_POLICY_VERSION,
@@ -3277,6 +3285,18 @@ class AdTemplateGeneratorOrchestrator:
                         run_renderer(qa_candidate, iteration_root, asset_overrides={**demo_overrides, **qa_asset_overrides}),
                         self.workspace, global_iteration,
                     )
+                    try:
+                        preflight = validate_reusable_template(
+                            candidate, workspace=self.workspace, render=run_renderer,
+                            asset_overrides=demo_overrides, cached=checkpoint.get("reusableValidation"),
+                            check_stop=self._check_stop,
+                        )
+                    except ReusableTemplateValidationError as exc:
+                        if exc.evidence:
+                            persist_checkpoint(self.workspace, {"reusableValidation": exc.evidence}, merge=True)
+                        raise AdTemplateRendererRejection([str(exc)]) from exc
+                    checkpoint["reusableValidation"] = preflight
+                    persist_checkpoint(self.workspace, {"reusableValidation": preflight}, merge=True)
                     break
                 except AdTemplateRendererRejection as rejection:
                     if contract_repairs >= MAX_CONTRACT_REPAIRS:
@@ -4075,6 +4095,16 @@ class AdTemplateGeneratorOrchestrator:
                     self.workspace / "final-repair-validation" / f"{global_iteration:02d}-{final_round:02d}",
                     asset_overrides=demo_overrides,
                 )
+                try:
+                    validate_reusable_template(
+                        value, workspace=self.workspace, render=run_renderer,
+                        asset_overrides=demo_overrides, cached=reusable_validation,
+                        check_stop=self._check_stop,
+                    )
+                except ReusableTemplateValidationError as exc:
+                    if exc.evidence:
+                        persist_checkpoint(self.workspace, {"reusableValidation": exc.evidence}, merge=True)
+                    raise AdTemplateRendererRejection([str(exc)]) from exc
                 return copy.deepcopy(dict(value))
             if repair_contract is not None:
                 measured_repair = compile_refinement_patch(repair_contract)
