@@ -50,8 +50,12 @@ not a mechanism for rewriting text. Patches preserve unaffected layers and the
 best candidate. No automatic geometry expansion. Six comparisons are allowed
 across automatic retries; explicit manual revision can start a new bounded cycle.
 
-Both placements need the 9.8 gate, no obvious production defects and two accepted
-completion reviews. Final reviewers inspect actual neutral renders. Scores are
+Both placements need at least 9.8 for geometry, typography, colour/effects,
+image crop and details, plus one aggregate pass confirming there are no obvious
+production defects. Exact font-family identity is excluded from scoring; font
+substitutions remain recorded evidence, while typography still covers size,
+spacing, alignment, hierarchy and legibility. Two accepted completion reviews
+remain required, and final reviewers inspect actual neutral renders. Scores are
 evidence, not proof of pixel identity. Generated photos are reused on retry;
 the same bytes are rendered, reviewed and imported into quarantine. Unknown image
 call outcomes require receipt inspection, not blind repeated charges. Only

@@ -64,9 +64,9 @@ from gateway.ad_template_reusable_validation import ReusableTemplateValidationEr
 
 
 PROCESS_ID = "exact-clone"
-LIKENESS_THRESHOLD = 9.5
+LIKENESS_THRESHOLD = 9.8
+GENERATION_REVIEW_POLICY = "section-98-font-exempt-no-obvious-errors-v1"
 MAX_DEMO_PHOTO_EDGE = 1100
-TYPOGRAPHY_SUBSTITUTION_THRESHOLD = 9.5
 NORMAL_COMPARISONS = 4
 MAX_COMPARISONS = 16
 STALL_DIAGNOSIS_THRESHOLD = 5
@@ -96,14 +96,16 @@ REVIEW_PHOTO_IDENTITY_RULE = (
 )
 REVIEW_FONT_SUBSTITUTION_RULE = (
     "Unavailable or proprietary font differences are not capability blockers "
-    "when editable text remains valid. Use the closest available bundled or "
-    "declared font, record unavoidable differences in fontSubstitution, and "
-    "never request an unavailable font file."
+    "and exact font-family matching is excluded from every score and acceptance "
+    "gate. Score typography on size, weight, spacing, alignment, hierarchy and "
+    "legibility only. Use the closest available bundled or declared font, record "
+    "unavoidable family differences in fontSubstitution, never lower a score only "
+    "because the exact font is unavailable, and never request an unavailable font file."
 )
 REVIEW_MEASUREMENT_RULE = 'MEASUREMENT EVIDENCE: textAlignment contains high-confidence matching glyph bounds, not editable text boxes. Its offset is candidate minus source; subtract that delta to correct displacement, then render and remeasure. Do not replace box dimensions or font sizes directly with glyph bounds. Missing OCR is unknown, not proof that text is missing or correct. Thin sourceStructuralBands indicate horizontal edges, not complete photo rectangles. Estimated sourceImageRegions are not ground truth when original source edges or text measurements contradict them. Correct major panel boundaries, overlaps, lost copy and hierarchy before small coordinate tweaks.'
 SOURCE_MAP_VERSION = 2
 QA_PROJECTION_VERSION = 5
-EVALUATION_POLICY_VERSION = 5
+EVALUATION_POLICY_VERSION = 6
 STAGES = (
     "source",
     "aspect-reference",
@@ -119,6 +121,16 @@ STAGES = (
 )
 SCORE_FIELDS = (
     "overall",
+    "geometry",
+    "typography",
+    "colourEffects",
+    "imageCrop",
+    "details",
+)
+# Overall is retained as non-gating ranking evidence for the bounded refinement
+# loop. The five section scores are the only numeric acceptance checks. Exact
+# font-family identity is deliberately excluded from typography scoring.
+GATED_SCORE_FIELDS = (
     "geometry",
     "typography",
     "colourEffects",
@@ -788,14 +800,8 @@ def validate_review(value: Any, *, require_actionable_targets: bool = True, cand
     if font_substitution is not None:
         if not isinstance(font_substitution, dict) or set(font_substitution) != {"source", "used", "reason"} or any(not isinstance(font_substitution[key], str) or not font_substitution[key].strip() for key in font_substitution):
             raise AdTemplateProcessError("font substitution evidence is invalid")
-    typography_floor = TYPOGRAPHY_SUBSTITUTION_THRESHOLD if font_substitution else LIKENESS_THRESHOLD
     passed = (
-        normalized_scores["overall"] >= LIKENESS_THRESHOLD
-        and normalized_scores["geometry"] >= LIKENESS_THRESHOLD
-        and normalized_scores["typography"] >= typography_floor
-        and normalized_scores["colourEffects"] >= LIKENESS_THRESHOLD
-        and normalized_scores["imageCrop"] >= LIKENESS_THRESHOLD
-        and normalized_scores["details"] >= LIKENESS_THRESHOLD
+        all(normalized_scores[field] >= LIKENESS_THRESHOLD for field in GATED_SCORE_FIELDS)
         and not normalized_issues
         and "mismatch" not in effects.values()
     )
@@ -809,10 +815,10 @@ def validate_review(value: Any, *, require_actionable_targets: bool = True, cand
             "below-gate review requires actionable issues for the failed scores"
         )
     reason = (
-        f"All exact-clone evidence met the {LIKENESS_THRESHOLD} gate."
+        f"All scored sections met the {LIKENESS_THRESHOLD} gate and no obvious errors were found."
         if passed
         else "; ".join(issue["instruction"] for issue in normalized_issues[:3])
-        or f"One or more exact-clone score/effect gates remain below {LIKENESS_THRESHOLD}."
+        or f"One or more scored sections remain below {LIKENESS_THRESHOLD}, or an obvious error remains."
     )
     return {
         "decision": expected,
@@ -834,9 +840,9 @@ def review_prompt(*, final: bool, candidate: Mapping[str, Any], reference: Mappi
     )
     patch_contract = "" if final else f"""
 When revision is required, return the exact correction as patch in this same response. patch must be {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}} with no more than {MAX_PATCH_OPERATIONS} operations and no more than {MAX_PATCH_BYTES} encoded bytes. A remove operation omits value; add/replace requires value. Every operation must directly implement a listed issue against the current candidate using an existing JSON Pointer path (add may create only an allowed missing field). Do not change schema, templateId, createdAt, asset declarations or source-free asset assignments. comparisonToBest must be better, same, worse, or not_applicable; use not_applicable only when no BEST pair is attached. When the evidence passes the {LIKENESS_THRESHOLD} gate, issues must be [] and patch must be null. Do not return a full replacement template."""
-    return f"""You are one {role} for an exact-clone template. Attached images are ordered: original source, Feed comparison render, Story comparison render, then (for final review) neutral production Feed and Story renders, followed by the original-placement overlay and difference views. The original source is the ONLY design authority. Source placement is {reference["sourcePlacement"]}; it must match the source as close to pixel-for-pixel as editable reconstruction permits. The other placement is a native aspect adaptation using the measured layout plan below: preserve the source design, hierarchy, effects and image roles without stretching or cropping the whole ad. There is no separate generated-ad target and no pixel-similarity score for that different aspect ratio. Score its composition, source-design preservation and production correctness visually. Both placements must pass the same {LIKENESS_THRESHOLD} quality gate. Comparison renders use only frozen text-free source photo regions when independently validated; other slots retain neutral catalog/generated photographs. {REVIEW_PHOTO_IDENTITY_RULE} Brand identity remains intentional and is checked by footprint and role. The original source remains the layout authority. Editable text must match its footprint/density but cannot be copied from baked photo text. Raw pixel/edge metrics and difference heatmaps include intentional photograph differences and are diagnostics only, NEVER an acceptance score. Separate source-layout likeness from production correctness. Before scoring, check the whole frame for overlapping elements, clipped or missing text, stray glyphs, illegible text and missing media. Any such defect blocks acceptance regardless of average score. Do not reward creative redesign. Missing shading, gradients, shadows, transparency, borders, masks, texture or decorative details are material defects.
+    return f"""You are one {role} for an exact-clone template. Attached images are ordered: original source, Feed comparison render, Story comparison render, then (for final review) neutral production Feed and Story renders, followed by the original-placement overlay and difference views. The original source is the ONLY design authority. Source placement is {reference["sourcePlacement"]}; it must match the source as close to pixel-for-pixel as editable reconstruction permits. The other placement is a native aspect adaptation using the measured layout plan below: preserve the source design, hierarchy, effects and image roles without stretching or cropping the whole ad. There is no separate generated-ad target and no pixel-similarity score for that different aspect ratio. Score its composition, source-design preservation and production correctness visually. Geometry, typography, colourEffects, imageCrop and details must each score at least {LIKENESS_THRESHOLD}. Exact font-family identity is excluded from scoring. Comparison renders use only frozen text-free source photo regions when independently validated; other slots retain neutral catalog/generated photographs. {REVIEW_PHOTO_IDENTITY_RULE} Brand identity remains intentional and is checked by footprint and role. The original source remains the layout authority. Editable text must match its footprint/density but cannot be copied from baked photo text. Raw pixel/edge metrics and difference heatmaps include intentional photograph differences and are diagnostics only, NEVER an acceptance score. Separate source-layout likeness from production correctness. Before scoring, make one overall check for obvious errors across both placements: overlapping elements, clipped or missing text, stray glyphs, illegible text, missing media or any other immediately visible production defect. Any such defect must be listed as an issue and blocks acceptance. Do not reward creative redesign. Missing shading, gradients, shadows, transparency, borders, masks, texture or decorative details are material defects.
 
-Return JSON only with exactly {output_fields}. scores must contain exactly, in this order: overall, geometry, typography, colourEffects, imageCrop, details. effects must contain exactly, in this order: shading, gradients, shadows, transparency, borders, masks, texture; each is match, not_present, or mismatch. issues is a list of objects with exactly placement (feed|story|both), layerIds (real candidate layer IDs), category (geometry|typography|colourEffects|imageCrop|details), instruction, severity (blocker|material|minor), targets (an array of {{layerId, property, value}}). For measured property corrections, targets are authoritative: use canonical layer-relative properties such as geometry/x, geometry/y, geometry/width, geometry/height, fontSize, tracking or font/file, with the exact desired value. Include a target for every listed layer and explain the correction in instruction. Use targets=[] only for structural changes or shared semantic-colour rebinding that cannot safely be represented as layer-property targets; describe the concrete correction without inventing a property or layer ID. Vague requests such as "match the source" or "fix spacing" without a concrete correction are invalid. Every visible discrepancy is an issue; acceptance requires issues=[] and every effect matched or genuinely absent. decision is evidence only; the controller derives accept/revise from scores, issues, effects and the font rule. An obvious defect blocks acceptance regardless of average. fontSubstitution is null or exactly {{source,used,reason}}.{patch_contract} Return no prose.
+Return JSON only with exactly {output_fields}. scores must contain exactly, in this order: overall, geometry, typography, colourEffects, imageCrop, details. overall is non-gating ranking evidence only; the sole overall acceptance check is whether issues contains any obvious error. Do not lower any score for exact font-family mismatch. typography scores only size, weight, spacing, alignment, hierarchy and legibility. effects must contain exactly, in this order: shading, gradients, shadows, transparency, borders, masks, texture; each is match, not_present, or mismatch. issues is a list of objects with exactly placement (feed|story|both), layerIds (real candidate layer IDs), category (geometry|typography|colourEffects|imageCrop|details), instruction, severity (blocker|material|minor), targets (an array of {{layerId, property, value}}). For measured property corrections, targets are authoritative: use canonical layer-relative properties such as geometry/x, geometry/y, geometry/width, geometry/height, fontSize, tracking or font/file, with the exact desired value. Include a target for every listed layer and explain the correction in instruction. Use targets=[] only for structural changes or shared semantic-colour rebinding that cannot safely be represented as layer-property targets; describe the concrete correction without inventing a property or layer ID. Vague requests such as "match the source" or "fix spacing" without a concrete correction are invalid. Every visible discrepancy is an issue; acceptance requires issues=[] and every effect matched or genuinely absent. decision is evidence only; the controller derives accept/revise from the five section scores, issues and effects. fontSubstitution is informational only and is null or exactly {{source,used,reason}}.{patch_contract} Return no prose.
 
 PRODUCTION SAFETY: Do not reproduce accidental source clipping, duplicate glyphs, or missing contact text as a requested correction. Match the source structure while keeping customer replacements readable; list unavoidable source defects as warnings, never a reason to damage the production template. Repeated feature wording intentionally present in the source is not itself a stray-glyph defect.
 COORDINATE AND FIT RULES: Feed is exactly 1080x1350; Story is exactly 1080x1920. The original-source comparison image is normalized to its matching canvas without cropping. All geometry targets use those canvas pixels, NEVER thumbnail/display pixels. Preserve the renderer's minimum font sizes: Feed 24px and Story 32px, multiline lineHeight >= 1. Do not request a smaller font; reflow the native adaptation or resize the editable box instead. The comparison source map and render share the same coordinate scale.
@@ -2611,28 +2617,30 @@ def _generation_review(
     final_review: Mapping[str, Any], warnings: Sequence[str],
 ) -> Dict[str, Any]:
     return {
+        "policy": GENERATION_REVIEW_POLICY,
         "process": PROCESS_ID,
         "sourcePlacement": source_placement,
         "targetPlacement": target_placement,
-        "likenessThreshold": LIKENESS_THRESHOLD,
+        "sectionThreshold": LIKENESS_THRESHOLD,
+        "fontMatchRequired": False,
         "comparator": {
-            "overall": comparator["scores"]["overall"],
             "geometry": comparator["scores"]["geometry"],
             "colourEffects": comparator["scores"]["colourEffects"],
             "compositionCrop": comparator["scores"]["imageCrop"],
             "typography": comparator["scores"]["typography"],
+            "details": comparator["scores"]["details"],
             "decision": "ready" if comparator["decision"] == "accept" else "revise",
         },
         "finalReviewers": [
             {
                 "id": item["id"],
                 "route": item["route"],
-                "overall": item["scores"]["overall"],
-                "minimum": min(item["scores"].values()),
+                "minimum": min(item["scores"][field] for field in GATED_SCORE_FIELDS),
                 "decision": "pass" if item["decision"] == "accept" else "fail",
             }
             for item in final_review["reviewers"]
         ],
+        "overallCheck": {"noObviousErrors": True},
         "warnings": list(dict.fromkeys(str(item) for item in warnings if str(item).strip())),
         "fontSubstitution": comparator.get("fontSubstitution"),
     }
@@ -2640,18 +2648,26 @@ def _generation_review(
 
 def validate_generation_review(value: Any) -> Dict[str, Any]:
     required = {
-        "process", "sourcePlacement", "targetPlacement", "likenessThreshold",
-        "comparator", "finalReviewers", "warnings", "fontSubstitution",
+        "policy", "process", "sourcePlacement", "targetPlacement", "sectionThreshold",
+        "fontMatchRequired", "comparator", "finalReviewers", "overallCheck",
+        "warnings", "fontSubstitution",
     }
-    if not isinstance(value, dict) or set(value) != required or value.get("process") != PROCESS_ID:
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or value.get("policy") != GENERATION_REVIEW_POLICY
+        or value.get("process") != PROCESS_ID
+    ):
         raise AdTemplateProcessError("generationReview has an invalid exact-clone shape")
     if {value.get("sourcePlacement"), value.get("targetPlacement")} != {"feed", "story"}:
         raise AdTemplateProcessError("generationReview placements must be reciprocal")
-    if value.get("likenessThreshold") != LIKENESS_THRESHOLD:
-        raise AdTemplateProcessError("generationReview likeness threshold is invalid")
+    if value.get("sectionThreshold") != LIKENESS_THRESHOLD or value.get("fontMatchRequired") is not False:
+        raise AdTemplateProcessError("generationReview section or font policy is invalid")
+    if value.get("overallCheck") != {"noObviousErrors": True}:
+        raise AdTemplateProcessError("generationReview obvious-error check did not pass")
     comparator = value.get("comparator")
     comparator_fields = {
-        "overall", "geometry", "colourEffects", "compositionCrop", "typography", "decision",
+        "geometry", "colourEffects", "compositionCrop", "typography", "details", "decision",
     }
     if not isinstance(comparator, dict) or set(comparator) != comparator_fields or comparator.get("decision") != "ready":
         raise AdTemplateProcessError("generationReview comparator is invalid")
@@ -2671,29 +2687,21 @@ def validate_generation_review(value: Any) -> Dict[str, Any]:
         )
     ):
         raise AdTemplateProcessError("generationReview font substitution is invalid")
-    typography_floor = (
-        TYPOGRAPHY_SUBSTITUTION_THRESHOLD
-        if font_substitution else LIKENESS_THRESHOLD
-    )
     score_values = {
         field: float(comparator[field])
         for field in comparator_fields - {"decision"}
     }
     if (
         any(score > 10 for score in score_values.values())
-        or score_values["overall"] < LIKENESS_THRESHOLD
-        or score_values["geometry"] < LIKENESS_THRESHOLD
-        or score_values["colourEffects"] < LIKENESS_THRESHOLD
-        or score_values["compositionCrop"] < LIKENESS_THRESHOLD
-        or score_values["typography"] < typography_floor
+        or any(score < LIKENESS_THRESHOLD for score in score_values.values())
     ):
-        raise AdTemplateProcessError("generationReview comparator is below the likeness gate")
+        raise AdTemplateProcessError("generationReview comparator is below the section gate")
     reviewers = value.get("finalReviewers")
     if not isinstance(reviewers, list) or len(reviewers) != 2:
         raise AdTemplateProcessError("generationReview requires exactly two final reviewers")
     routes: set[str] = set()
     for reviewer in reviewers:
-        if not isinstance(reviewer, dict) or set(reviewer) != {"id", "route", "overall", "minimum", "decision"}:
+        if not isinstance(reviewer, dict) or set(reviewer) != {"id", "route", "minimum", "decision"}:
             raise AdTemplateProcessError("generationReview final reviewer is invalid")
         if (
             reviewer.get("decision") != "pass"
@@ -2701,12 +2709,9 @@ def validate_generation_review(value: Any) -> Dict[str, Any]:
             or not reviewer["id"].strip()
             or not isinstance(reviewer.get("route"), str)
             or not reviewer["route"].strip()
-            or isinstance(reviewer.get("overall"), bool)
-            or not isinstance(reviewer.get("overall"), (int, float))
-            or not LIKENESS_THRESHOLD <= float(reviewer["overall"]) <= 10
             or isinstance(reviewer.get("minimum"), bool)
             or not isinstance(reviewer.get("minimum"), (int, float))
-            or not typography_floor <= float(reviewer["minimum"]) <= 10
+            or not LIKENESS_THRESHOLD <= float(reviewer["minimum"]) <= 10
         ):
             raise AdTemplateProcessError("generationReview final reviewer did not pass")
         routes.add(reviewer["route"])
@@ -3826,16 +3831,7 @@ class AdTemplateGeneratorOrchestrator:
                 for kind, node, data in buffered_events:
                     self.emit(kind, node, data)
                 reviewers.append(reviewer)
-            comparator_font_floor = (
-                TYPOGRAPHY_SUBSTITUTION_THRESHOLD
-                if accepted_review.get("fontSubstitution")
-                else LIKENESS_THRESHOLD
-            )
-            accepted = all(
-                item["decision"] == "accept"
-                and item["scores"]["typography"] >= comparator_font_floor
-                for item in reviewers
-            )
+            accepted = all(item["decision"] == "accept" for item in reviewers)
             final_review = {"decision": "accepted" if accepted else "revise", "threshold": LIKENESS_THRESHOLD, "round": final_round, "reviewers": reviewers}
             self.emit("final-review.completed", "final-check", {"decision": final_review["decision"], "round": final_round, "reviewers": reviewers})
             if accepted:
@@ -4330,6 +4326,7 @@ def bounded_review_output(value: Mapping[str, Any], *, model_profile: Mapping[st
             "comparator": validated["iterations"][-1]["comparison"]["scores"],
             "finalReviewers": [item["scores"] for item in validated["final_review"]["reviewers"]],
         },
+        "overall_check": {"no_obvious_errors": True},
         "warnings": validated["warnings"],
         "font_substitution": validated["font_substitution"],
         "model_profile": copy.deepcopy(dict(model_profile)),

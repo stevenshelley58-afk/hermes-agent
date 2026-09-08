@@ -484,7 +484,10 @@ def test_ad_template_generator_is_measured_image_referenced_patch_bounded_and_qu
     assert refinement_event["reason"]
     assert result["import"]["library_status"] == "quarantined"
     assert result["smoke_test"]["status"] == "passed"
-    assert result["template"]["metadata"]["generationReview"]["likenessThreshold"] == process.LIKENESS_THRESHOLD
+    generation_review = result["template"]["metadata"]["generationReview"]
+    assert generation_review["sectionThreshold"] == process.LIKENESS_THRESHOLD
+    assert generation_review["fontMatchRequired"] is False
+    assert generation_review["overallCheck"] == {"noObviousErrors": True}
     assert result["template"]["metadata"]["generationReview"]["comparator"]["decision"] == "ready"
     assert all(item["decision"] == "pass" for item in result["template"]["metadata"]["generationReview"]["finalReviewers"])
     assert imported["template"]["assets"] == {}
@@ -905,6 +908,17 @@ def test_visual_gate_requires_every_score_and_effect_at_98():
     effect_failure["decision"] = "revise"
     effect_failure["issues"] = [below_gate_issue]
     assert process.validate_review(effect_failure)["decision"] == "revise"
+
+
+def test_visual_gate_uses_one_obvious_error_check_and_excludes_font_identity():
+    passing = _review(accept=True)
+    passing["scores"]["overall"] = 1.0
+    passing["fontSubstitution"] = {
+        "source": "Proprietary Display",
+        "used": "Bodoni Moda",
+        "reason": "The source family is unavailable.",
+    }
+    assert process.validate_review(passing)["decision"] == "accept"
 
 
 def test_visual_gate_derives_decision_from_evidence_not_model_label():

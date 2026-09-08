@@ -385,20 +385,23 @@ def _quality_pass(run: Mapping[str, Any]) -> bool:
     final = output.get("final_review")
     scores_document = output.get("scores")
     reusable = output.get("reusable_validation")
+    overall_check = output.get("overall_check")
     if (
         not isinstance(template, dict)
         or not isinstance(template.get("templateId"), str)
         or not template["templateId"].strip()
         or not isinstance(final, dict)
         or final.get("decision") != "accepted"
+        or overall_check != {"no_obvious_errors": True}
     ):
         return False
     comparator = scores_document.get("comparator") if isinstance(scores_document, dict) else None
     score_fields = {"overall", "geometry", "typography", "colourEffects", "imageCrop", "details"}
+    gated_score_fields = score_fields - {"overall"}
     if (
         not isinstance(comparator, dict)
         or set(comparator) != score_fields
-        or any(not _quality_score(comparator.get(field)) for field in score_fields)
+        or any(not _quality_score(comparator.get(field)) for field in gated_score_fields)
     ):
         return False
     reviewers = final.get("reviewers")
@@ -419,7 +422,7 @@ def _quality_pass(run: Mapping[str, Any]) -> bool:
             or not isinstance(route, str) or not route.strip()
             or identity in reviewer_ids or route in reviewer_routes
             or not isinstance(reviewer_scores, dict) or set(reviewer_scores) != score_fields
-            or any(not _quality_score(reviewer_scores.get(field)) for field in score_fields)
+            or any(not _quality_score(reviewer_scores.get(field)) for field in gated_score_fields)
             or not isinstance(reviewer.get("issues"), list) or reviewer["issues"]
             or not isinstance(effects, dict) or set(effects) != effect_fields
             or any(effects[field] not in {"match", "not_present"} for field in effect_fields)
@@ -466,7 +469,7 @@ def _quality_score(value: Any) -> bool:
         numeric = float(value)
     except (OverflowError, TypeError, ValueError):
         return False
-    return math.isfinite(numeric) and 9.5 <= numeric <= 10
+    return math.isfinite(numeric) and 9.8 <= numeric <= 10
 
 
 def _run_outcome(run: Mapping[str, Any]) -> str:

@@ -167,7 +167,7 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
             return {"operations": operations}
         if instance == "comparator-final-repair":
             result = _comparison(
-                accept=repair_score >= 9.5,
+                accept=repair_score >= 9.8,
                 comparison_to_best=comparison_to_best,
             )
             result["scores"] = {key: repair_score for key in result["scores"]}
@@ -197,7 +197,7 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
 
 
 @pytest.mark.parametrize(("repair_score", "comparison_to_best"), [
-    (9.8, "same"), (9.8, "worse"), (9.6, "same"),
+    (9.8, "same"), (9.8, "worse"),
 ])
 def test_same_score_final_repair_is_kept_and_imported(
     tmp_path, monkeypatch, repair_score, comparison_to_best,
@@ -217,6 +217,6 @@ def test_below_gate_final_repair_cannot_inherit_acceptance(tmp_path, monkeypatch
     trace = {}
     with pytest.raises(process.AdTemplateProcessError, match="comparator still scores below|did not accept"):
         _run_final_repair_case(
-            tmp_path, monkeypatch, repair_score=9.4, comparison_to_best="same", trace=trace,
+            tmp_path, monkeypatch, repair_score=9.6, comparison_to_best="same", trace=trace,
         )
     assert trace["imported"] == []

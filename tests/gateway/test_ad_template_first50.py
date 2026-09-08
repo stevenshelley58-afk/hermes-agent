@@ -56,6 +56,7 @@ def _quality_run(run_id: str, status: str = "ready_for_review") -> dict:
                 "artifact": f"/tmp/{template_id}.json",
             },
             "scores": {"comparator": scores.copy(), "finalReviewers": [scores.copy(), scores.copy()]},
+            "overall_check": {"no_obvious_errors": True},
             "final_review": {"decision": "accepted", "reviewers": reviewers},
             "import": {"template_id": template_id, "library_status": "quarantined"},
             "smoke_test": {"templateId": template_id, "status": "passed"},
@@ -366,9 +367,17 @@ def test_quality_gate_requires_complete_generation_and_reusable_evidence():
     del missing_metadata["output"]["scores"]["comparator"]
     assert not module._quality_pass(missing_metadata)
 
+    missing_overall_check = copy.deepcopy(good)
+    del missing_overall_check["output"]["overall_check"]
+    assert not module._quality_pass(missing_overall_check)
+
     low_comparator = copy.deepcopy(good)
-    low_comparator["output"]["scores"]["comparator"]["overall"] = 9.4
+    low_comparator["output"]["scores"]["comparator"]["details"] = 9.79
     assert not module._quality_pass(low_comparator)
+
+    diagnostic_overall = copy.deepcopy(good)
+    diagnostic_overall["output"]["scores"]["comparator"]["overall"] = 1.0
+    assert module._quality_pass(diagnostic_overall)
 
     duplicate_reviewer = copy.deepcopy(good)
     duplicate_reviewer["output"]["final_review"]["reviewers"][1]["id"] = "reviewer-a"
@@ -407,4 +416,3 @@ def test_api_uses_larger_bounded_collection_and_detail_reads(monkeypatch):
     assert collection.read_size == module._MAX_COLLECTION_BYTES + 1
     assert api.get_run("trun-detail")["run_id"] == "trun-detail"
     assert detail.read_size == module._MAX_DETAIL_BYTES + 1
-

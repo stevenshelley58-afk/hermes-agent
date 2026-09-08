@@ -458,7 +458,7 @@ def test_recovery_rechecks_real_orchestrator_without_empty_or_noop_repairs(
                 "not_applicable" if comparison_count == 1 else relative
             ))
             result["patch"] = None
-            result["scores"] = {key: 9.2 if revising else 9.6 for key in result["scores"]}
+            result["scores"] = {key: 9.2 if revising else 9.8 for key in result["scores"]}
             if scenario in {"font-reporting", "below-floor"}:
                 result["fontSubstitution"] = {
                     "source": "Source script", "used": "Cormorant Garamond",
