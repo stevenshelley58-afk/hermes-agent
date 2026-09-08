@@ -88,3 +88,25 @@ Acceptance, provider policy 45, quarantine and approval gates remain unchanged.
 Protected release and online-backup paths retain their existing revision suffixes;
 the latest are `/opt/releases/hermes-template-bb6e266e6d` and
 `/srv/hermes/backups/ad-template-feedback-20260908-bb6e266e6d`.
+
+## Evidence identity and draft selection (07:44 UTC)
+
+The sample reached six comparisons, then optional diagnosis timed out. A subsequent
+PNG-read error stopped it; independent verification and full decoding of all 147
+saved PNGs succeeded. No saved image was replaced or deleted, and no permanent
+corruption or root cause is claimed.
+
+Release `df327de2876ae62df59bbbec5e0697213c1a453d` deployed at 07:39:22 UTC
+after 254 passing tests. Each comparator/final-review image now has adjacent
+source/current/diagnostic/baseline identity text. The run advanced its best draft
+at comparison eight, but discarded comparison nine despite improved section
+scores and fewer defects because its pairwise result was same. A subsequent Meta
+repair call returned HTTP 500 with an internal category; no import occurred.
+
+Release `b8e8d4d1b7fb9d1fabd54e3ac3e025c71830a5aa` deployed at 07:44:49 UTC
+after 255 passing tests, Ruff and whitespace checks. A same pairwise result may
+now retain a draft only if no gated score decreases, at least one improves,
+the issue count decreases, and blocker/material/effect-mismatch counts do not
+increase. This changes draft selection, not 9.8 acceptance or final reviews.
+Saved discarded records remain untouched. The sample resumed with nine used
+comparisons; a full live success and first50 readiness remain unproven.
