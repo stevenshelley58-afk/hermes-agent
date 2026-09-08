@@ -274,22 +274,21 @@ def validate_reusable_template(
                 "error": error,
             })
             out["status"] = "failed"
-            out["error"] = f"reusable scenario {s} failed: {error}"
-            out["counts"] = {
-                "total": len(out["scenarios"]),
-                "passed": sum(
-                    1 for x in out["scenarios"] if x.get("status") == "passed"
-                ),
-                "failed": sum(
-                    1 for x in out["scenarios"] if x.get("status") == "failed"
-                ),
-            }
-            out["results"] = out["scenarios"]
-            raise ReusableTemplateValidationError(out["error"], evidence=out) from exc
     out["counts"] = {
         "total": len(out["scenarios"]),
         "passed": sum(1 for x in out["scenarios"] if x.get("status") == "passed"),
         "failed": sum(1 for x in out["scenarios"] if x.get("status") == "failed"),
     }
     out["results"] = out["scenarios"]
+    if out["status"] == "failed":
+        # Report every scenario in one repair turn, rather than teaching the
+        # model about short, maximum and Unicode failures in separate rounds.
+        # Keep complete bounded per-scenario errors in durable evidence, while
+        # the combined prompt message stays inside the controller byte budget.
+        out["error"] = "\n".join(
+            f"reusable scenario {item['name']} failed: "
+            + item["error"].encode("utf-8")[:7000].decode("utf-8", errors="ignore")
+            for item in out["scenarios"] if item["status"] == "failed"
+        )
+        raise ReusableTemplateValidationError(out["error"], evidence=out)
     return out

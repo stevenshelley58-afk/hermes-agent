@@ -159,8 +159,30 @@ def test_failed_render_retains_counted_evidence(tmp_path):
         validate_reusable_template(candidate(), workspace=tmp_path, render=fail)
     evidence = failure.value.evidence
     assert evidence["status"] == "failed"
-    assert evidence["counts"] == {"total": 1, "passed": 0, "failed": 1}
+    assert evidence["counts"] == {"total": 4, "passed": 0, "failed": 4}
     assert evidence["results"][0]["error"] == "bad crop"
+
+
+def test_all_scenario_failures_reach_one_repair_and_successes_remain_cached(tmp_path):
+    calls = []
+    def render(c, w, **kwargs):
+        calls.append(w.name)
+        if w.name.startswith(("00-short-", "01-max-")):
+            raise RuntimeError("needs two lines" if w.name.startswith("00-") else "needs four lines")
+        return renderer(c, w, **kwargs)
+    with pytest.raises(ReusableTemplateValidationError) as failure:
+        validate_reusable_template(candidate(), workspace=tmp_path, render=render)
+    assert len(calls) == 4
+    assert "reusable scenario short failed: needs two lines" in str(failure.value)
+    assert "reusable scenario max failed: needs four lines" in str(failure.value)
+    evidence = failure.value.evidence
+    assert evidence["counts"] == {"total": 4, "passed": 2, "failed": 2}
+    def repaired(c, w, **kwargs):
+        calls.append(w.name)
+        return renderer(c, w, **kwargs)
+    result = validate_reusable_template(candidate(), workspace=tmp_path, render=repaired, cached=evidence)
+    assert len(calls) == 6
+    assert result["counts"] == {"total": 4, "passed": 4, "failed": 0}
 
 
 def test_asset_change_invalidates_cached_renders(tmp_path):
