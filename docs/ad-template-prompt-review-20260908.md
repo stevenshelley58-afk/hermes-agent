@@ -42,6 +42,8 @@ The pre-deploy online database and exact selectors are retained at /srv/hermes/b
 
 On the same captured CURRENT/BEST evidence, the iteration-review prompt decreased from 49,788 to 39,985 characters (19.7%) including the new revision memory and diagnosis. This is a prompt-size measurement, not a measured latency or convergence improvement.
 
-Changed-prompt canary trun_d0564e0fcfa540b1b293d165796b25c9 used the same meta_044 source and frozen model policy 45. Both its initial source-analysis call and one normal retry failed with provider HTTP 402, Insufficient Balance. Neither reached the modified builder/reviewer prompts or consumed a comparison. No further retry, route change, top-up, import, approval or publication was performed.
+Changed-prompt canary trun_d0564e0fcfa540b1b293d165796b25c9 used the same meta_044 source and frozen model policy 45. Both its initial source-analysis call and one normal retry failed with the generic message frozen structured Responses role failed. Neither reached the modified builder/reviewer prompts or consumed a comparison. No further retry, route change, top-up, import, approval or publication was performed.
 
-Current result: implementation deployed and regression-tested; live speed/quality comparison is blocked by provider balance. The first-50 batch remains unstarted.
+Correction after checking the exact timestamp and process: the HTTP 402 Insufficient Balance entry at 04:30:38 UTC was a separate chat request to api.deepseek.com, logged by the previous gateway PID 1185799. The Meta canary failures at 04:30:59 and 04:32:19 were logged by PID 1376125, without their underlying provider exception. The earlier Meta balance diagnosis was unsupported.
+
+Current result: implementation deployed and regression-tested; live speed/quality comparison remains blocked by an undiagnosed source-analysis failure, not a demonstrated Meta billing problem. The first-50 batch remains unstarted.
