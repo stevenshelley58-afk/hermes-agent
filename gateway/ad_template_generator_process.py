@@ -22,6 +22,7 @@ import shlex
 import shutil
 import subprocess
 import time
+from functools import lru_cache
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -63,6 +64,12 @@ from gateway.ad_template_font_catalog import available_font_files
 from gateway.ad_template_generator_photo_qa import materialize_source_photo_plan, source_photo_overrides
 from gateway.ad_template_text_evidence import build_text_alignment_evidence
 from gateway.ad_template_control_ink import control_ink_alignment
+from gateway.ad_template_output_qa import (
+    run_ad_output_qa,
+    repair_known_output_qa,
+    validate_output_qa,
+    reviewed_unknowns_match,
+)
 from gateway.ad_template_reusable_validation import ReusableTemplateValidationError, reusable_repair_context, validate_reusable_template
 from gateway.ad_template_production_repair import repair_production_candidate
 
@@ -83,6 +90,7 @@ MAX_PATCH_BYTES = 32_000
 MAX_CONTRACT_REPAIRS = 6
 MAX_RENDERER_REASON_CHARS = 16_000
 REGRESSION_EPSILON = 0.05
+AD_OUTPUT_QA_CHECKLIST_RELATIVE = Path("skills/creative/ad-output-qa/references/review-checklist.md")
 AVAILABLE_FONT_FILES = frozenset({
     "/fonts/adstudio/poppins-500.woff2",
     "/fonts/adstudio/poppins-700.woff2",
@@ -185,6 +193,27 @@ _MUTABLE_PATCH_ROOTS = (
     "/template/fonts/",
     "/template/metadata/",
 )
+
+
+@lru_cache(maxsize=1)
+def _trusted_ad_output_qa_checklist() -> tuple[str, str]:
+    """Load the release-pinned checklist, never a user-supplied prompt file."""
+    path = (Path(__file__).resolve().parents[1] / AD_OUTPUT_QA_CHECKLIST_RELATIVE).resolve()
+    root = (Path(__file__).resolve().parents[1] / "skills" / "creative" / "ad-output-qa").resolve()
+    try:
+        path.relative_to(root)
+        text = path.read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        raise AdTemplateProcessError("trusted ad output QA checklist is unavailable") from exc
+    if not text.startswith("# Ad Output QA review checklist v1"):
+        raise AdTemplateProcessError("trusted ad output QA checklist has an unsupported version")
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return text, digest
+
+
+def _ad_output_qa_prompt_context() -> str:
+    text, digest = _trusted_ad_output_qa_checklist()
+    return f"\n\nTRUSTED OUTPUT-QA CHECKLIST (release-pinned; sha256={digest}):\n{text}"
 
 
 def _available_font_files() -> tuple[str, ...]:
@@ -943,6 +972,8 @@ RESPONSE ECONOMY: Return compact JSON, no indentation. Keep each issue instructi
 RECIPROCAL ASPECT REFERENCE: {_safe_json(reference)}
 DETERMINISTIC PIXEL/EDGE/COLOUR DIAGNOSTICS: {_safe_json(metrics)}. These are diagnostic differences from the comparison renders, including intentional neutral-photo differences; assess layout fidelity visually.
 CANDIDATE CONTRACT: {_safe_json(candidate)}
+
+{_ad_output_qa_prompt_context()}
 
 REPAIR VOCABULARY CHECK BEFORE RETURNING JSON:
 - The first full-canvas plate is an opaque rectangular background, NOT the visible card. Never round it to reproduce source card corners: that exposes transparent canvas corners and cannot mask layers above it. Correct the actual visible photo/card/footer geometry or use targets=[] with a structural correction above the unchanged base. A parent background radius does not clip its sibling layers.
@@ -3611,6 +3642,67 @@ class AdTemplateGeneratorOrchestrator:
                 )
                 comparison_views = views_future.result()
                 metrics = metrics_future.result()
+            # Measure authored default text, not source-filled QA text. Only
+            # the matching candidate may consume the measured repair offsets.
+            output_qa_rendered = run_renderer(
+                candidate, iteration_root / "output-qa-production", asset_overrides=demo_overrides,
+            )
+            output_qa = run_ad_output_qa(candidate, output_qa_rendered.get("render"))
+            qa_changes: list[dict[str, Any]] = []
+            if output_qa["status"] == "fail":
+                repaired_candidate, qa_changes = repair_known_output_qa(candidate, output_qa)
+                if qa_changes:
+                    candidate = repaired_candidate
+                    self.emit("output-qa.repair-applied", "render", {
+                        "iteration": global_iteration, "changes": qa_changes,
+                        "version": output_qa["version"],
+                    })
+                    qa_candidate, qa_asset_overrides = build_ephemeral_qa_candidate(
+                        candidate, source=source, reciprocal_reference=reciprocal_reference,
+                        source_placement=source_placement, source_map=source_map,
+                        target_map=target_map, workspace=iteration_root / "output-qa-recheck",
+                    )
+                    rendered = _copy_public_previews(
+                        run_renderer(qa_candidate, iteration_root / "output-qa-recheck",
+                                     asset_overrides={**demo_overrides, **qa_asset_overrides}),
+                        self.workspace, global_iteration, kind="output-qa-recheck",
+                    )
+                    comparison_views = _comparison_views(
+                        source, reciprocal_reference, rendered, self.workspace,
+                        global_iteration, source_placement, target_placement,
+                    )
+                    metrics = _comparison_metrics(
+                        source=source, reciprocal_reference=reciprocal_reference,
+                        source_placement=source_placement, target_placement=target_placement,
+                        rendered=rendered, candidate=candidate, source_map=source_map,
+                    )
+                    output_qa_rendered = run_renderer(
+                        candidate, iteration_root / "output-qa-production-recheck", asset_overrides=demo_overrides,
+                    )
+                    output_qa = run_ad_output_qa(candidate, output_qa_rendered.get("render"))
+                    self.emit("output-qa.rechecked", "render", {
+                        "iteration": global_iteration, "status": output_qa["status"],
+                        "version": output_qa["version"],
+                    })
+                else:
+                    self.emit("output-qa.blocked", "render", {
+                        "iteration": global_iteration, "status": output_qa["status"],
+                        "findings": output_qa["findings"][:16],
+                        "version": output_qa["version"],
+                    })
+            output_qa["checklistSha256"] = _trusted_ad_output_qa_checklist()[1]
+            if qa_changes:
+                try:
+                    reusable_validation = validate_reusable_template(
+                        candidate, workspace=self.workspace, render=run_renderer,
+                        asset_overrides=demo_overrides, cached=None, check_stop=self._check_stop,
+                    )
+                except ReusableTemplateValidationError as exc:
+                    if exc.evidence:
+                        persist_checkpoint(self.workspace, {"reusableValidation": exc.evidence}, merge=True)
+                    raise AdTemplateRendererRejection([str(exc)]) from exc
+                persist_checkpoint(self.workspace, {"reusableValidation": reusable_validation}, merge=True)
+            metrics["outputQa"] = output_qa
             self.emit("iteration.rendered", "render", {
                 "iteration": global_iteration,
                 "previews": [item["name"] for item in rendered["previews"]],
@@ -3648,6 +3740,26 @@ class AdTemplateGeneratorOrchestrator:
                 ),
                 emit=self.emit,
             )
+            if output_qa["status"] == "fail":
+                # Model scores can never bypass a deterministic production
+                # defect. Keep the model's evidence, but force the bounded
+                # repair path to carry every unresolved QA finding.
+                qa_issues = []
+                for finding in output_qa.get("findings", []):
+                    if finding.get("status") == "unknown":
+                        continue
+                    qa_issues.append({
+                        "placement": finding.get("placement", "both"),
+                        "layerIds": [finding.get("layerId") or "output-qa"],
+                        "category": "details" if finding.get("category") == "meta-embedded-cta" else "geometry",
+                        "instruction": str(finding.get("reason") or "Deterministic output QA defect requires repair.")[:1200],
+                        "severity": "blocker",
+                        "targets": [],
+                    })
+                if qa_issues:
+                    comparator_result["review"]["decision"] = "revise"
+                    comparator_result["review"]["issues"] = qa_issues + list(comparator_result["review"].get("issues") or [])
+                    comparator_result["review"]["reason"] = "Deterministic output QA blocked acceptance: " + "; ".join(item["instruction"] for item in qa_issues[:3])
             review = comparator_result["review"]
             comparison_budget_used += 1
             record = {
@@ -4189,6 +4301,13 @@ class AdTemplateGeneratorOrchestrator:
         verified_progress = False
         for final_round in range(1, MAX_FINAL_REVIEW_ROUNDS + 1):
             self._check_stop()
+            production_output_qa = run_ad_output_qa(candidate, production_rendered.get("render"))
+            production_output_qa["checklistSha256"] = _trusted_ad_output_qa_checklist()[1]
+            final_metrics["outputQa"] = production_output_qa
+            self.emit("output-qa.final-review", "final-check", {
+                "round": final_round, "status": production_output_qa["status"],
+                "version": production_output_qa["version"],
+            })
             reviewer_specs = (("a", final_a_route), ("b", final_b_route))
             for label, route in reviewer_specs:
                 identity = f"final-reviewer-{label}-{self.run_id}-{final_round}"
@@ -4227,7 +4346,11 @@ class AdTemplateGeneratorOrchestrator:
                 for kind, node, data in buffered_events:
                     self.emit(kind, node, data)
                 reviewers.append(reviewer)
-            accepted = all(item["decision"] == "accept" for item in reviewers) and comparator_state_accepted
+            accepted = (
+                all(item["decision"] == "accept" for item in reviewers)
+                and comparator_state_accepted
+                and production_output_qa["status"] != "fail"
+            )
             final_review = {"decision": "accepted" if accepted else "revise", "threshold": LIKENESS_THRESHOLD, "round": final_round, "reviewers": reviewers}
             self.emit("final-review.completed", "final-check", {"decision": final_review["decision"], "round": final_round, "reviewers": reviewers})
             if accepted:
@@ -4238,6 +4361,14 @@ class AdTemplateGeneratorOrchestrator:
                     f"{MAX_FINAL_REVIEW_ROUNDS} review rounds"
                 )
             merged_issues = [issue for reviewer in reviewers for issue in reviewer["issues"]]
+            if production_output_qa["status"] == "fail":
+                merged_issues.extend({
+                    "placement": finding.get("placement", "both"),
+                    "layerIds": [finding.get("layerId") or "output-qa"],
+                    "category": "details" if finding.get("category") == "meta-embedded-cta" else "geometry",
+                    "instruction": str(finding.get("reason") or "Deterministic output QA defect requires repair.")[:1200],
+                    "severity": "blocker", "targets": [],
+                } for finding in production_output_qa.get("findings", []) if finding.get("status") != "unknown")
             if not comparator_state_accepted:
                 # A newly found comparator defect still needs repair even if
                 # both independent reviewers missed it. No disagreement ships.
@@ -4602,6 +4733,23 @@ class AdTemplateGeneratorOrchestrator:
             run_renderer(candidate, final_root, asset_overrides=demo_overrides), self.workspace, global_iteration + 1,
             kind="final-neutral-shippable",
         )
+        # Last boundary guard: inspect the exact candidate/production renders
+        # immediately before import. Cached accepted scores and earlier QA
+        # renders cannot bypass this fresh check.
+        final_output_qa = run_ad_output_qa(candidate, final_rendered.get("render"))
+        final_output_qa["checklistSha256"] = _trusted_ad_output_qa_checklist()[1]
+        visual_review_cleared = (
+            len(final_review.get("reviewers", [])) == 2
+            and all(item.get("decision") == "accept" for item in final_review["reviewers"])
+            and reviewed_unknowns_match(final_output_qa, production_output_qa)
+        )
+        if final_output_qa["status"] == "needs_review" and visual_review_cleared:
+            final_output_qa["visualReviewCleared"] = True
+        validate_output_qa(final_output_qa, allow_needs_review=visual_review_cleared)
+        self.emit("output-qa.completed", "final-check", {
+            "status": final_output_qa["status"], "version": final_output_qa["version"],
+            "visualReviewCleared": visual_review_cleared,
+        })
         documents = deterministic_documents(template)
         validated = {
             "template": template,
@@ -4622,6 +4770,7 @@ class AdTemplateGeneratorOrchestrator:
             "warnings": list(dict.fromkeys(warnings)),
             "font_substitution": accepted_review.get("fontSubstitution"),
             "metrics": final_metrics,
+            "output_qa": final_output_qa,
             "reusable_validation": reusable_validation,
             "elapsed_seconds": round(time.time() - started, 3),
             "process": PROCESS_ID,
@@ -4653,6 +4802,7 @@ class AdTemplateGeneratorOrchestrator:
             "bestCandidate": best_candidate,
             "bestReview": best_review,
             "bestIteration": best_iteration,
+            "outputQa": final_output_qa,
             "import": imported,
             "smokeTest": smoke,
         })

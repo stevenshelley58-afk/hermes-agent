@@ -258,7 +258,8 @@ def _comparison(
     return result
 
 
-def test_ad_template_generator_is_measured_image_referenced_patch_bounded_and_quarantined(monkeypatch, tmp_path):
+@pytest.mark.parametrize("final_output_defect", [False, True])
+def test_ad_template_generator_is_measured_image_referenced_patch_bounded_and_quarantined(monkeypatch, tmp_path, final_output_defect):
     # Exercise the model-repair path; exact compilation has separate coverage.
     monkeypatch.setattr(process, "compile_refinement_patch", lambda _contract: None)
     source = tmp_path / "source.png"
@@ -370,7 +371,10 @@ def test_ad_template_generator_is_measured_image_referenced_patch_bounded_and_qu
             return result
         if instance.startswith("final-reviewer-"):
             final_review_barrier.wait(timeout=10)
-            return _review(accept=True)
+            review = _review(accept=True)
+            if final_output_defect:
+                review["scores"] = {key: 9.9 for key in review["scores"]}
+            return review
         raise AssertionError(instance)
 
     def render(candidate, workspace, *, asset_overrides=None):
@@ -388,6 +392,10 @@ def test_ad_template_generator_is_measured_image_referenced_patch_bounded_and_qu
         story = output / "story.png"
         Image.new("RGB", (1080, 1350), "white").save(feed)
         Image.new("RGB", (1080, 1920), "white").save(story)
+        if final_output_defect and workspace.name == "final":
+            image = Image.open(feed).convert("RGBA")
+            image.putpixel((0, 0), (255, 255, 255, 0))
+            image.save(feed)
         return {
             "render": {"feed": str(feed), "story": str(story)},
             "previews": [], "review_previews": [], "template_path": str(artifact),
@@ -422,14 +430,24 @@ def test_ad_template_generator_is_measured_image_referenced_patch_bounded_and_qu
         {"provider": "deepseek", "model": "final-b"},
         {"provider": "openai-codex", "model": "escalation"},
     ]
-    result = process.AdTemplateGeneratorOrchestrator(
+    orchestrator = process.AdTemplateGeneratorOrchestrator(
         call_agent=call_agent,
         call_image_model=image_model,
         workspace=tmp_path / "run",
         run_id="trun_test",
         project_id="blockwise",
         emit=lambda kind, node, data: emitted.append((kind, node, data)),
-    ).run(source=str(source), brief="clone", placements=["feed", "story"], routes=routes)
+    )
+    if final_output_defect:
+        from gateway.ad_template_output_qa import AdTemplateOutputQaError
+        with pytest.raises(AdTemplateOutputQaError, match="not fully opaque"):
+            orchestrator.run(source=str(source), brief="clone", placements=["feed", "story"], routes=routes)
+        assert imported == {}, "A fresh output defect must block the real import call"
+        final_checks = [data for kind, _, data in emitted if kind == "final-review.completed"]
+        assert final_checks[-1]["decision"] == "accepted"
+        assert all(min(item["scores"].values()) == 9.9 for item in final_checks[-1]["reviewers"])
+        return
+    result = orchestrator.run(source=str(source), brief="clone", placements=["feed", "story"], routes=routes)
 
     assert order == ["source-map"]
     assert image_calls == []  # Image models are reserved for photo assets.
