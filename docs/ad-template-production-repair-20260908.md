@@ -283,3 +283,20 @@ Every comparator and both final-reviewer section scores are >=9.85, issues=[],
 all effects match/not_present, no_obvious_errors=true and reusable tests 4/4.
 The serving first50 quality predicate passes. Batch not started; nothing
 activated or published. Temporary canary removed; backups retained.
+
+
+### Full-bleed Meta revision passed 8 September 2026
+
+Run trun_cf767d809b8c438497a1e9bc9676ea80 completed its square-corner revision
+under Hermes 4758d83a8c1c703801a73112ce9c4c0e790e07f2 (evaluation policy 11),
+with existing Blockwise de606ac66 and renderer a009543dd unchanged. Its first
+revised candidate passed comparator iteration 18. A supported retry recovered
+one Meta HTTP 500 without changing the artwork. Both independent final reviews,
+all four reusable scenarios, quarantined four-asset import and matching smoke
+passed; the final status is ready_for_review. Every scored section >=9.85,
+issues=[], no_obvious_errors=true; the serving first50 quality predicate passes.
+Pixel inspection confirms fully opaque Feed 1080x1350 and Story 1080x1920,
+photo-filled top corners and dark footer-filled bottom corners, no white corner
+cutouts, zero outer radii and no image CTA layers. The batch remains unstarted;
+nothing was activated/published. Previous Hermes dc5e088681 release and selector
+backup /srv/hermes/backups/ad-template-feedback-20260908-4758d83a8c are retained.
