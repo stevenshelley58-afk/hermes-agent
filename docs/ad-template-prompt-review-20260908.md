@@ -33,3 +33,15 @@ No model routing, threshold, comparison/cost budget, readability minimum, quaran
 The affected 19-file ad-template suite passed 211 tests with no failures. Regression coverage exercises diagnosis-to-comparator propagation before repair, fewer stale repair calls in the same eight-comparison fixture, bounded score-free history, correct history field extraction, and unchanged low-score/obvious-defect rejection. Ruff and whitespace checks passed.
 
 Prompt tests establish correct wiring, not faster live convergence. A separate changed-prompt canary is needed to measure initial-build and iteration performance; do not start the first-50 batch on test results alone.
+
+## Deployment and changed-prompt canary
+
+Hermes 502fafe9f8f8262e7c7e5aa68324a33b26eada21 deployed on 8 September at 04:30:39 UTC. Its immutable release is /opt/releases/hermes-template-502fafe9f8; the running process selected that path and the unchanged renderer /opt/releases/blockwise-template-renderer-cbc3f92e0. Authenticated health returned HTTP 200, status ok. No active runs were interrupted.
+
+The pre-deploy online database and exact selectors are retained at /srv/hermes/backups/ad-template-prompts-20260908-502fafe9f8. The prior release /opt/releases/hermes-template-75bd842674 remains available for rollback; preserve newer run history instead of restoring an old database casually.
+
+On the same captured CURRENT/BEST evidence, the iteration-review prompt decreased from 49,788 to 39,985 characters (19.7%) including the new revision memory and diagnosis. This is a prompt-size measurement, not a measured latency or convergence improvement.
+
+Changed-prompt canary trun_d0564e0fcfa540b1b293d165796b25c9 used the same meta_044 source and frozen model policy 45. Both its initial source-analysis call and one normal retry failed with provider HTTP 402, Insufficient Balance. Neither reached the modified builder/reviewer prompts or consumed a comparison. No further retry, route change, top-up, import, approval or publication was performed.
+
+Current result: implementation deployed and regression-tested; live speed/quality comparison is blocked by provider balance. The first-50 batch remains unstarted.
