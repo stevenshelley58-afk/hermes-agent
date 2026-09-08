@@ -696,6 +696,8 @@ FIRST-PASS CONSTRUCTION CHECKLIST (complete before returning JSON):
 - Choose a bundled font once and preserve its choice during positional repairs. Exact font-family identity is excluded. Prioritize matching the visible text footprint, baseline, density and line count over family resemblance. Center visible CTA glyphs inside their button, not merely the editable text box.
 - Build complete Feed and Story layouts in this response. Shared checklist inputs must bind every row in both placements; do not bind a multi-item list to its first item alone.
 - Declare usable text capacity, not optimistic character counts. Each textInputs.maxLength must fit ALL its Feed/Story layers at the stated maxLines and at least 24px/32px respectively. Layer maxCharacters must cover the shared input limit. Reserve measured width/height for long words and accents; do not rely on scale_down below the readability floor, truncation of essential copy, or a tiny maxLength that makes the field unusable.
+- CAPACITY PLANNING BEFORE GEOMETRY: set realistic per-field limits from the source role and authored copy, not generic defaults such as 260 for every body or 40 for every short checklist label. Aim for the full source-like placeholder plus modest useful editing headroom (roughly 10-20% where the source layout permits). Never set a limit below the complete placeholder. A short one-line feature field is not a paragraph field. If the full placeholder cannot fit at the readability floor, widen/reflow the native adaptation before locking its geometry. Allocate non-overlapping rectangles for the MAX content, then place default ink within them to match the source. Do not displace the entire checklist/footer merely to provide unrequested, speculative double-length copy.
+- Geometry arithmetic is mandatory: Feed x+width <=1080 and y+height <=1350; Story x+width <=1080 and y+height <=1920. Assign every photo and decorative panel its own measured rectangle. Do not copy a CTA text rectangle to its footer plate, divider or globe icon. Keep structural panels, icons and text separate; never add a white overlay on top to hide a fit defect.
 - The real reusable tests replace each field with short text, repeated "Maximum editable content " up to maxLength, Unicode "Ångström 東京 — café 🏡", and optional-empty text. Account for these substitutions now; matching the placeholder alone is insufficient. Preserve source-like default copy density and useful editing capacity.
 - Before emitting, self-check both layouts for missing rows/media, text overlap, CTA alignment, text capacity, unsupported properties, array bindings and font declarations. Fix these together before the first external review.
 
@@ -894,6 +896,7 @@ FACT-FIRST REVIEW, NOT TARGET-SCORE OPTIMIZATION:
 2. Ground each issue in an observation: source feature and approximate bounds; CURRENT defect; named layer; smallest supported correction. For a numeric target, state current value, desired value and measured reason. Do not infer pill ends, outer rounding or missing borders from a previous review. Source evidence wins over all previous model opinions.
 3. Keep one issue per independently repairable defect, with only affected layers. Enumerate every observed defect now; do not drip-feed one new defect per iteration. Cover every below-threshold section with an actionable issue. Do not reopen a corrected section unless its pixels changed or you identify a specifically evidenced oversight.
 4. Correct text by its VISIBLE GLYPH position. If a CTA label sits above its button center, move the label alone by the glyph-center delta. Moving the button and label together cannot correct internal alignment. Do not lower font size below the floor or change the font family to solve a coordinate problem.
+4a. A transparent text box is NOT visible ink or a panel. Its unused capacity does not push neighbouring layers: this renderer uses absolute positions, not document flow. Never shorten an invisible geometry/height just because it exceeds the default paragraph's painted height. If checklist glyphs are too low, move those glyphs/icons and assess maximum-content clearance separately; do not invent a causal relationship to a preceding box's height. Preserve usable editing capacity and all passed preflight constraints. Request a height change only for an actual clipping/overlap defect supported by pixels and a fit-safe alternative. Do not apply a fix to labels, icons, footer and background as though they were one rectangle.
 5. Assign scores from these findings, then run the single whole-frame no-obvious-errors check. A missing checkbox enclosure, lost checklist row, clipped copy or visibly off-center button label is never compatible with acceptance, even if other sections are excellent. Never use budget, iteration number, earlier scores or a desire to finish as evidence of quality. Do not award 9.8 merely because few issues remain.
 6. If evidence contradicts a prior correction, explicitly explain the contradiction in the issue instruction. If a target already equals CURRENT, do not request it again; inspect the painted result and find the actual cause. An uncertain coordinate estimate is not a measured target. Do not copy source-specific artifacts such as privacy/redaction blocks into the design.
 
@@ -1034,6 +1037,7 @@ AVAILABLE CAPABILITIES AND CONSTRAINTS: {_safe_json(capabilities, max_bytes=40_0
 def _best_repair_context(
     *, best_candidate: Mapping[str, Any], best_iteration: int,
     diagnosis: Mapping[str, Any] | None, renders_attached: bool = True,
+    document_already_supplied: bool = False,
 ) -> str:
     guidance = ""
     if diagnosis:
@@ -1051,7 +1055,7 @@ IMMUTABLE BEST CONTEXT: {render_context} Begin from
 this exact editable
 BEST candidate from iteration {best_iteration}. Preserve every unlisted field
 and accepted layer; never revive a discarded equal or worse attempt.
-BEST EDITABLE TEMPLATE: {_safe_json(best_candidate)}{guidance}"""
+BEST EDITABLE TEMPLATE: {"the CURRENT CANDIDATE already supplied above; intentionally not duplicated" if document_already_supplied else _safe_json(best_candidate)}{guidance}"""
 
 
 def _layer_pointer_map(candidate: Mapping[str, Any]) -> Dict[str, str]:
@@ -3089,6 +3093,7 @@ class AdTemplateGeneratorOrchestrator:
                         ),
                         diagnosis=None,
                         renders_attached=bool(manual_best_frames),
+                        document_already_supplied=True,
                     )
                 ),
                 paths=[source, *manual_best_frames],
@@ -3642,6 +3647,7 @@ class AdTemplateGeneratorOrchestrator:
                             best_candidate=repair_candidate,
                             best_iteration=best_iteration,
                             diagnosis=stall_diagnosis,
+                            document_already_supplied=True,
                         )
                         + f"\nThe refinement batch was unpatchable: {exc}. Return a bounded correction for the original issues."
                     ),
@@ -4176,6 +4182,7 @@ class AdTemplateGeneratorOrchestrator:
                             best_candidate=pre_repair_candidate,
                             best_iteration=global_iteration,
                             diagnosis=final_diagnosis,
+                            document_already_supplied=True,
                         )
                     ),
                     validate_candidate=validate_final_patch_candidate,

@@ -83,6 +83,24 @@ def test_contract_repair_receives_actual_replacement_payloads_without_mutation()
     assert candidate == original
 
 
+def test_review_distinguishes_unused_box_capacity_from_visible_ink():
+    prompt = process.review_prompt(final=False, candidate={"template": {}}, reference={"sourcePlacement": "feed"}, metrics={})
+    assert "absolute positions, not document flow" in prompt
+    assert "Never shorten an invisible geometry/height" in prompt
+    assert "fit-safe alternative" in prompt
+    assert "9.8" in prompt
+
+
+def test_best_context_does_not_duplicate_current_document():
+    prompt = process._best_repair_context(
+        best_candidate={"template": {"sentinel": "LARGE-CONTRACT-ALREADY-SUPPLIED"}},
+        best_iteration=3, diagnosis={"diagnosis": "Keep capacity", "nextChanges": [], "capabilityBlockers": []},
+        document_already_supplied=True,
+    )
+    assert "LARGE-CONTRACT-ALREADY-SUPPLIED" not in prompt
+    assert "Keep capacity" in prompt
+
+
 def test_optional_final_diagnosis_transport_failure_preserves_repair_path(monkeypatch):
     events = []
     def fail(*args, **kwargs):
