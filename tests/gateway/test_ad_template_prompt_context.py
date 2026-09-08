@@ -6,6 +6,20 @@ import gateway.ad_template_generator_process as process
 from tests.gateway.test_ad_template_generator_process import _review
 from gateway.ad_template_reusable_validation import _scenario, reusable_repair_context
 
+def test_final_evidence_omits_only_proven_identical_production_pixels(tmp_path):
+    paths = {}
+    for name, colour in (("qa-feed", "white"), ("qa-story", "black"), ("prod-feed", "white"), ("prod-story", "red")):
+        path = tmp_path / (name + ".png")
+        Image.new("RGB", (8, 8), colour).save(path)
+        paths[name] = str(path)
+    rendered = {"render": {p: paths["qa-" + p] for p in ("feed", "story")}}
+    production = {"render": {p: paths["prod-" + p] for p in ("feed", "story")}}
+    evidence = process._vision_paths("source", "source", rendered, [{"kind":"difference", "path":"diff"}], production)
+    assert evidence == ["source", paths["qa-feed"], paths["qa-story"], paths["prod-story"], "diff"]
+    production["render"]["feed"] = "missing-production"
+    assert "missing-production" in process._vision_paths("source", "source", rendered, [], production)
+
+
 def test_measured_fit_feedback_is_bounded_durable_and_not_a_score(tmp_path):
     checkpoint = {}
     assert process._preflight_review_context(checkpoint) == ""

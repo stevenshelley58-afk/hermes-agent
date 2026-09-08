@@ -2094,7 +2094,16 @@ def _comparison_views(
 def _vision_paths(source: str, reciprocal_reference: str, rendered: Mapping[str, Any], comparisons: Sequence[Mapping[str, str]], production_rendered: Mapping[str, Any] | None = None) -> list[str]:
     paths = [source, reciprocal_reference, rendered["render"]["feed"], rendered["render"]["story"]]
     if production_rendered is not None:
-        paths.extend((production_rendered["render"]["feed"], production_rendered["render"]["story"]))
+        for placement in ("feed", "story"):
+            production_path = production_rendered["render"][placement]
+            try:
+                identical = Path(production_path).read_bytes() == Path(rendered["render"][placement]).read_bytes()
+            except OSError:
+                identical = False  # Unknown identity must retain the evidence.
+            if not identical:
+                paths.append(production_path)
+            # Equal bytes prove the QA image also shows the neutral production
+            # pixels. Keep distinct production renders and every diagnostic.
     # Pixel overlays and absolute differences expose the material visual delta;
     # edge similarity is already supplied as deterministic numeric evidence.
     # Bounding the image set keeps every role request inside one stable vision
