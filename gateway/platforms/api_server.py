@@ -2124,6 +2124,8 @@ class APIServerAdapter(ToolRunAPIMixin, BasePlatformAdapter):
             ("POST", "/v1/tool-runs/{run_id}/cancel", self._handle_cancel_tool_run),
             ("POST", "/v1/tool-runs/{run_id}/approve", self._handle_approve_tool_run),
             ("POST", "/v1/tool-runs/{run_id}/request-changes", self._handle_request_changes_tool_run),
+            ("POST", "/v1/tool-runs/{run_id}/review-messages", self._handle_request_changes_tool_run),
+            ("GET", "/v1/tool-runs/{run_id}/revisions", self._handle_list_review_revisions),
             ("POST", "/v1/tool-runs/{run_id}/discard", self._handle_discard_tool_run),
         ]
         if _CRON_AVAILABLE:

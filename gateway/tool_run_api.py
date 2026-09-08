@@ -8,6 +8,7 @@ tool to every Hermes conversation.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -46,6 +47,11 @@ from gateway.tool_runs import (
     validate_model_policy,
 )
 from gateway.tool_run_usage import assert_run_usage_accounted
+from gateway.review_revisions import (
+    ReviewRevisionStore, ReviewRevisionError, freeze_snapshot,
+    load_snapshot_candidate, restore_before_candidate,
+    validate_structured_review, structured_review_instructions,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -1041,6 +1047,13 @@ class ToolRunAPIMixin:
             background.add(task)
             task.add_done_callback(background.discard)
 
+    def _review_revision_store(self):
+        store = getattr(self, "_review_revisions", None)
+        if store is None:
+            store = ReviewRevisionStore(self._tool_run_store)
+            self._review_revisions = store
+        return store
+
     def _start_tool_task(self, run_id: str, *, finalize: bool = False) -> None:
         task = self._tool_run_tasks.get(run_id)
         if task is not None and not task.done():
@@ -1522,6 +1535,14 @@ class ToolRunAPIMixin:
                 refreshed["model_policy"], revision=refreshed["model_policy_revision"],
             )
             output = self._prepare_candidate_output(run_id, output)
+            from hermes_constants import get_hermes_home
+            from gateway.ad_template_generator_process import load_checkpoint
+            review_workspace = get_hermes_home() / "tool_runs" / "ad-template-generator" / run_id
+            finalized = self._review_revision_store().finalize_after(
+                review_workspace, run_id, load_checkpoint(review_workspace).get("candidate") or {},
+            )
+            if finalized and finalized["status"] != "ready_for_review":
+                raise ReviewRevisionError("could not freeze the reviewed after snapshot")
             self._tool_run_store.transition_run(
                 run_id,
                 expected_statuses={"running"},
@@ -1950,6 +1971,151 @@ class ToolRunAPIMixin:
         ) as exc:
             return web.json_response(_error(str(exc), "invalid_template_approval"), status=409)
 
+    @staticmethod
+    def _review_public_record(record: dict) -> dict:
+        def snapshot(value):
+            if not isinstance(value, dict): return None
+            previews = value.get("previews") if isinstance(value.get("previews"), dict) else {}
+            return {place: previews[place] for place in ("feed", "story") if isinstance(previews.get(place), str)} or None
+        return {"id": record["revision_id"], "revision": record["revision"], "parent_revision_id": record.get("parent_revision_id"),
+                "message": record["message"], "annotations": record.get("annotations_json") or [], "status": record["status"],
+                "before": snapshot(record.get("before_json")), "after": snapshot(record.get("after_json")),
+                "candidate_hash": record.get("candidate_hash"), "undo_of": record.get("undo_of"),
+                "error": record.get("error"), "created_at": record.get("created_at"), "updated_at": record.get("updated_at")}
+
+    def _review_run_workspace(self, run_id, project_id):
+        run = self._tool_run_store.get_run(run_id)
+        if run.get("tool_id") != "ad-template-generator" or run.get("action") != "build-template":
+            raise ToolRunError("review is supported only for ad-template build runs")
+        if not isinstance(project_id, str) or not project_id or project_id != str((run.get("scope") or {}).get("project_id") or ""):
+            raise ToolRunError("review project scope does not match the Tool run")
+        from hermes_constants import get_hermes_home
+        root = (get_hermes_home() / "tool_runs" / "ad-template-generator").resolve()
+        workspace = root / run_id
+        if workspace.is_symlink() or workspace.resolve().parent != root:
+            raise ToolRunError("review workspace is invalid")
+        return run, workspace
+
+    async def _handle_list_review_revisions(self, request: web.Request) -> web.Response:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from gateway.ad_template_generator_process import load_checkpoint
+            run_id = request.match_info["run_id"]
+            project_id = request.query.get("project_id")
+            run, workspace = self._review_run_workspace(run_id, project_id)
+            records = self._review_revision_store().list(run_id, project_id)
+            public = [self._review_public_record(item) for item in records]
+            for item in public:
+                if item["status"] == "pending" and run["status"] in {"failed", "cancelled", "blocked"}:
+                    item["status"] = run["status"]
+            return web.json_response({"run_id": run_id, "project_id": project_id,
+                "current_revision": int(load_checkpoint(workspace).get("manualRevision") or 0),
+                "run_status": run["status"], "revisions": public})
+        except KeyError as exc:
+            return web.json_response(_error(str(exc), "tool_run_not_found"), status=404)
+        except (ToolRunError, ReviewRevisionError, ValueError, OSError) as exc:
+            return web.json_response(_error(str(exc), "invalid_review_revisions"), status=409)
+
+    async def _handle_structured_review_changes(self, request: web.Request) -> web.Response:
+        run_id = request.match_info["run_id"]
+        # Serialize structured requests before idempotency lookup. The durable
+        # lifecycle claim also excludes approve/discard and legacy revisions.
+        if not hasattr(self, "_structured_review_locks"):
+            self._structured_review_locks = {}
+        lock = self._structured_review_locks.setdefault(run_id, asyncio.Lock())
+        async with lock:
+            return await self._apply_structured_review(request, run_id)
+
+    async def _apply_structured_review(self, request, run_id):
+        ledger = self._review_revision_store()
+        claimed = False
+        discard_attempted = False
+        record = None
+        checkpoint_path = None
+        checkpoint_bytes = None
+        try:
+            from gateway.ad_template_generator_process import load_checkpoint
+            body = await request.json()
+            allowed = {"review", "project_id", "expected_revision", "idempotency_key", "candidate_hash", "undo_of"}
+            if not isinstance(body, dict) or set(body) - allowed or "review" not in body:
+                raise ToolRunError("structured review fields are invalid")
+            expected, key = body.get("expected_revision"), body.get("idempotency_key")
+            if not isinstance(expected, int) or isinstance(expected, bool) or expected < 0:
+                raise ToolRunError("expected_revision is invalid")
+            if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", key):
+                raise ToolRunError("idempotency_key is invalid")
+            review = validate_structured_review(body["review"], expected_revision=expected, candidate_hash=body.get("candidate_hash"))
+            instructions = structured_review_instructions(review)
+            fingerprint = hashlib.sha256(json.dumps({**body, "review": review}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            run, workspace = self._review_run_workspace(run_id, body.get("project_id"))
+            existing = ledger.by_idempotency(run_id, key)
+            if existing:
+                if existing["request_hash"] != fingerprint:
+                    raise ToolRunError("idempotency key was already used for different feedback")
+                return web.json_response({"status": run["status"], "current_revision": int(load_checkpoint(workspace).get("manualRevision") or 0),
+                    "review_revision": self._review_public_record(existing)}, status=409 if existing["status"] == "failed" else 200)
+            if run["status"] != "ready_for_review":
+                raise ToolRunError("structured review requires a ready-for-review Tool run")
+            checkpoint = load_checkpoint(workspace)
+            if expected != int(checkpoint.get("manualRevision") or 0):
+                raise ToolRunError("review revision is stale; reload the current preview")
+            template_id = ((run.get("output") or {}).get("template") or {}).get("templateId")
+            if not isinstance(template_id, str) or not template_id:
+                raise ToolRunError("reviewed template identity is unavailable")
+            target = None
+            if body.get("undo_of") is not None:
+                target = ledger.get(body["undo_of"])
+                if target["run_id"] != run_id or target["project_id"] != body["project_id"] or target["revision"] != expected or target["status"] != "ready_for_review":
+                    raise ToolRunError("only the latest successful revision can be undone")
+                load_snapshot_candidate(workspace, target["before_json"])
+            checkpoint_path = workspace / "exact-clone-checkpoint.json"
+            if checkpoint_path.is_symlink():
+                raise ToolRunError("checkpoint path is invalid")
+            checkpoint_bytes = checkpoint_path.read_bytes()
+            self._tool_run_store.transition_run(run_id, expected_statuses={"ready_for_review"}, status="discarding",
+                stage="ready-for-review", attention=False, event_kind="command.changes-requested",
+                event_data={"expected_revision": expected, "structured_review": True})
+            claimed = True
+            rid = "rrev_" + uuid.uuid4().hex
+            before = freeze_snapshot(workspace, rid, "before", checkpoint.get("candidate"))
+            if body.get("candidate_hash") and body["candidate_hash"] != before["candidate_hash"]:
+                raise ToolRunError("displayed candidate is stale")
+            record = ledger.create_pending(run_id=run_id, project_id=body["project_id"], idempotency_key=key,
+                message=review["message"], annotations=review["annotations"], expected_revision=expected,
+                candidate_hash=before["candidate_hash"], before=before, revision_id=rid,
+                request_hash=fingerprint, undo_of=body.get("undo_of"))
+            if target:
+                restore_before_candidate(workspace, target)
+            else:
+                request_checkpoint_revision(workspace, instructions)
+            discard_attempted = True
+            await asyncio.to_thread(review_template_action, template_id=template_id, run_id=run_id,
+                action="discard", reason="operator requested changes")
+            queued = self._tool_run_store.requeue(run_id, stage="build", expected_statuses={"discarding"},
+                event_data={"reason": "operator-requested-review-revision", "review_revision_id": rid})
+            self._start_tool_task(run_id)
+            return web.json_response({**queued, "current_revision": record["revision"],
+                "review_revision": self._review_public_record(record)}, status=202)
+        except (KeyError, ToolRunError, ReviewRevisionError, AdTemplateProcessError, OSError, ValueError, TypeError) as exc:
+            safe_error = redact_sensitive_text(str(exc), force=True)[:1000]
+            if claimed:
+                if not discard_attempted and checkpoint_path is not None and checkpoint_bytes is not None:
+                    temporary = checkpoint_path.with_suffix(".review-restore")
+                    temporary.write_bytes(checkpoint_bytes)
+                    os.replace(temporary, checkpoint_path)
+                current = self._tool_run_store.get_run(run_id)
+                if current["status"] == "discarding":
+                    self._tool_run_store.update_run(run_id, status="failed" if discard_attempted else "ready_for_review",
+                        stage="build" if discard_attempted else "ready-for-review", attention=True,
+                        error=safe_error if discard_attempted else run.get("error"))
+                self._tool_run_store.append_event(run_id, "review.revision.failed", status="error",
+                    node_id="build", data={"error": safe_error})
+            if record and not discard_attempted:
+                ledger.mark_failed(record["revision_id"], safe_error)
+            return web.json_response(_error(safe_error, "invalid_template_review"), status=409)
+
     async def _handle_request_changes_tool_run(self, request: web.Request) -> web.Response:
         auth_err = self._check_auth(request)
         if auth_err:
@@ -1957,6 +2123,8 @@ class ToolRunAPIMixin:
         run_id = request.match_info["run_id"]
         try:
             body = await request.json()
+            if isinstance(body, dict) and "review" in body:
+                return await self._handle_structured_review_changes(request)
             if not isinstance(body, dict) or set(body) != {"instructions"}:
                 raise ToolRunError("request-changes body must contain exactly instructions")
             instructions = body.get("instructions")
