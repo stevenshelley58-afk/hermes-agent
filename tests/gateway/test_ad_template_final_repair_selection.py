@@ -121,6 +121,7 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
     def render(candidate, workspace, *, asset_overrides=None):
         del asset_overrides
         current_description[0] = candidate["template"]["metadata"]["description"]
+        trace["hero_height"] = candidate["template"]["feedLayout"]["layers"][1]["geometry"]["height"]
         for layer in candidate["template"]["feedLayout"]["layers"]:
             if layer.get("type") == "icon":
                 render_checks.append(layer["icon"])
@@ -179,6 +180,15 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
             assert "REVISION MEMORY" not in prompt[0]["text"]
             assert "CANDIDATE CONTRACT" in prompt[0]["text"]
             assert "no-obvious-errors" in prompt[0]["text"]
+            if trace.get("measured"):
+                result = _review(accept=trace["hero_height"] == 1340)
+                if result["issues"]:
+                    result["issues"][0].update(
+                        category="geometry", layerIds=["feed-hero"], placement="feed",
+                        instruction="Reduce feed hero height from 1350 to 1340.",
+                        targets=[{"layerId": "feed-hero", "property": "geometry/height", "value": 1340}],
+                    )
+                return result
             if current_description[0] == "initial" or (recovery and "diagnosis-stall-final-repair" not in calls):
                 result = _review(accept=False)
                 result["issues"][0]["targets"] = []
@@ -248,6 +258,18 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
         ] + ([{"provider": "test", "model": "diagnosis"}] if recovery else []),
     )
     return result, imported, calls, events
+
+
+def test_exact_final_targets_skip_model_rewrite_but_require_all_checks(tmp_path, monkeypatch):
+    result, imported, calls, events = _run_final_repair_case(
+        tmp_path, monkeypatch, repair_score=9.8, comparison_to_best="same", trace={"measured": True})
+    assert not any(call.startswith("final-merged-patch") for call in calls)
+    assert "comparator-final-repair" in calls
+    assert sum(call.startswith("final-reviewer-") for call in calls) == 4
+    assert result["template"]["feedLayout"]["layers"][1]["geometry"]["height"] == 1340
+    assert result["final_review"]["decision"] == "accepted"
+    assert result["reusable_validation"]["status"] == "passed"
+    assert any(kind == "final-repair.compiled" and not data["accepted"] for kind, _, data in events)
 
 
 def test_handoff_failure_preserves_comparator_accepted_repair(tmp_path, monkeypatch):

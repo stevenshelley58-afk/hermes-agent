@@ -4322,22 +4322,37 @@ class AdTemplateGeneratorOrchestrator:
                     updated = validate_final_patch_candidate(updated)
                     return {"patch": patch, "candidate": updated}
 
-                repair_result = _call_json(
-                    self.call_agent,
-                    instance="final-merged-patch",
-                    prompt=(
-                        refinement_prompt(repair_contract)
-                        + _best_repair_context(
-                            best_candidate=pre_repair_candidate,
-                            best_iteration=global_iteration,
-                            diagnosis=final_diagnosis,
-                        )
-                    ),
-                    paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
-                    route=builder_route,
-                    validate=validate_final_repair,
-                    emit=self.emit,
-                )
+                repair_result = None
+                compiled_rejection = ""
+                if measured_repair is not None:
+                    try:
+                        repair_result = validate_final_repair(measured_repair)
+                    except (AdTemplateProcessError, AdTemplateRendererRejection) as exc:
+                        compiled_rejection = str(exc)
+                        self.emit("final-repair.compiled-rejected", "final-check", {"reason": compiled_rejection})
+                    else:
+                        self.emit("final-repair.compiled", "final-check", {
+                            "operations": len(measured_repair["operations"]),
+                            "accepted": False,
+                        })
+                if repair_result is None:
+                    repair_result = _call_json(
+                        self.call_agent,
+                        instance="final-merged-patch",
+                        prompt=(
+                            refinement_prompt(repair_contract)
+                            + _best_repair_context(
+                                best_candidate=pre_repair_candidate,
+                                best_iteration=global_iteration,
+                                diagnosis=final_diagnosis,
+                            )
+                            + ("\nThe exact compiled edit failed validation: " + compiled_rejection if compiled_rejection else "")
+                        ),
+                        paths=_vision_paths(source, reciprocal_reference, final_rendered, [], production_rendered),
+                        route=builder_route,
+                        validate=validate_final_repair,
+                        emit=self.emit,
+                    )
                 candidate = repair_result["candidate"]
             else:
                 # Qualitative reviewer guidance has no lockable targets, and

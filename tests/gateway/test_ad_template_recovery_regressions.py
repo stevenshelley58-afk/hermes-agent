@@ -282,14 +282,6 @@ def test_unpatchable_structured_batch_uses_guarded_repair_then_recompares(
                 result["issues"][0]["targets"] = []
                 return result
             return _comparison(accept=True, comparison_to_best="better")
-        if instance.startswith("final-merged-patch"):
-            return {
-                "operations": [{
-                    "op": "replace" if instance == "final-merged-patch" else "add",
-                    "path": "/template/feedLayout/layers/1/opacity",
-                    "value": 0.8,
-                }],
-            }
         if instance.startswith("guarded-refinement-"):
             return {
                 "operations": [{
@@ -350,16 +342,8 @@ def test_unpatchable_structured_batch_uses_guarded_repair_then_recompares(
     assert "unpatchable" in guarded_prompt[0]["text"].lower()
     assert result["template"]["metadata"]["description"] == "guarded-repair"
     assert result["template"]["feedLayout"]["layers"][1]["opacity"] == 0.8
-    assert [name for name, _, _ in calls if name.startswith("final-merged-patch")] == [
-        "final-merged-patch", "final-merged-patch-format-retry",
-    ]
-    retry_prompt = next(prompt for name, prompt, _ in calls if name == "final-merged-patch-format-retry")
-    assert "revision replace path does not exist: /template/feedLayout/layers/1/opacity" in retry_prompt[0]["text"]
-    final_merge_prompt = next(
-        prompt for name, prompt, _ in calls if name == "final-merged-patch"
-    )
-    assert "opacity" in final_merge_prompt[0]["text"]
-    assert "propertyTargets" in final_merge_prompt[0]["text"]
+    assert not any(name.startswith("final-merged-patch") for name, _, _ in calls)
+    assert any(kind == "final-repair.compiled" for kind, _, _ in events)
     assert result["iterations"][0]["comparison"]["issues"][0]["targets"] == []
     assert any(
         kind == "iteration.compared"
