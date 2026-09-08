@@ -881,7 +881,12 @@ IMAGE ORDER NOTE: Neutral production images, when supplied, follow the original-
 
 RECIPROCAL ASPECT REFERENCE: {_safe_json(reference)}
 DETERMINISTIC PIXEL/EDGE/COLOUR DIAGNOSTICS: {_safe_json(metrics)}. These are diagnostic differences from the comparison renders, including intentional neutral-photo differences; assess layout fidelity visually.
-CANDIDATE CONTRACT: {_safe_json(candidate)}"""
+CANDIDATE CONTRACT: {_safe_json(candidate)}
+
+REPAIR VOCABULARY CHECK BEFORE RETURNING JSON:
+- Solid colours use colourRole, NOT fill/colour. A colour correction target is {{"layerId":"<existing layer>","property":"colourRole","value":"<existing semantic role>"}}. Choose background, primary, secondary, accent, mainText or inverseText from the candidate's semanticColours. Stroke/shadow colours use effects/stroke/colourRole or effects/shadow/colourRole. Never invent fill/colour, fill/color, stroke/colour or a hex-valued colourRole. fill is only a full linear_gradient object with angleDegrees and stops.
+- A checkbox outline on a light panel can use the panel's colourRole for its vector fill and effects.stroke={{colourRole:"mainText",opacity:1,width:<measured pixels>}}, with its separate visible check icon above it. Stroke objects require ALL THREE fields. Change only the affected layer; do not recolour shared semanticColours merely to fix one box.
+- Validate every target AND corresponding patch: Feed fontSize >=24; Story fontSize >=32; lineHeight >=1; tracking between -4 and 4; actual candidate layer IDs and on-canvas geometry. Resize or reflow clipped text instead of proposing an illegal font size. Keep every observed defect in issues even when its repair requires targets=[] and a concrete structural patch."""
 
 
 def _pairwise_review_context(

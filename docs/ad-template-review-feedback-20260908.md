@@ -21,4 +21,19 @@ patch operations. Invalid issues still fail closed. Scores, thresholds,
 comparison budgets, provider routes, approval and publishing remain unchanged.
 
 Verification before deployment: 214 tests passed across all 20 ad-template
+
+The feedback release `a5c6a795673352ad9f8ba5349c3bf122fc00ab9b` deployed
+at 05:12:37 UTC. The same canary reused its saved candidate/images, reported
+both invalid corrections together and corrected the Story font target, but
+repeated the invalid colour target. No batch was started.
+
+The follow-up aligns reviewer vocabulary with Blockwise's actual semantic
+colour contract: locked targets now support colourRole and existing stroke/
+shadow colourRole fields, restricted to the six contract roles and layers
+that expose the property. The review prompt explicitly distinguishes these
+from nonexistent solid fill/colour fields and supplies the complete stroke
+object. No invalid target is silently converted or discarded.
+
+Follow-up verification: all 220 tests in 20 ad-template files passed; Ruff
+and diff whitespace checks passed. Live acceptance remains a separate gate.
 test files via `scripts/run_tests.sh`; Ruff and `git diff --check` passed.

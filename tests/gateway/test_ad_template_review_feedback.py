@@ -3,17 +3,76 @@ import copy
 import pytest
 
 import gateway.ad_template_generator_process as process
-from tests.gateway.test_ad_template_generator_process import _review
+from tests.gateway.test_ad_template_generator_process import _review, _template
+from gateway.ad_template_generator_layer_refinement import (
+    build_refinement_contract, validate_refinement_patch,
+)
+
+
+def test_semantic_colour_target_survives_review_and_locked_patch():
+    template = _template()
+    template["feedLayout"]["layers"].append(_candidate()["template"]["feedLayout"]["layers"][0])
+    index = len(template["feedLayout"]["layers"]) - 1
+    candidate = {"template": template, "assets": [
+        {"assetKey": key, **declaration} for key, declaration in template["assets"].items()
+    ]}
+    review = _invalid_review()
+    review["issues"] = review["issues"][:1]
+    review["issues"][0]["targets"] = [
+        {"layerId": "checkbox", "property": "colourRole", "value": "background"},
+    ]
+    validated = process.validate_review(review, candidate=candidate)
+    assert validated["decision"] == "revise"
+    contract = build_refinement_contract(
+        candidate, validated["issues"], source_placement="feed", available_fonts=[],
+    )
+    patch = {"operations": [{
+        "op": "replace", "path": f"/template/feedLayout/layers/{index}/colourRole",
+        "value": "background",
+    }]}
+    assert validate_refinement_patch(patch, contract=contract) == patch
+    updated = process.apply_patch(candidate, patch)
+    assert updated["template"]["feedLayout"]["layers"][index]["colourRole"] == "background"
+    assert candidate["template"]["feedLayout"]["layers"][index]["colourRole"] == "mainText"
+    patch["operations"][0]["value"] = "accent"
+    with pytest.raises(process.AdTemplateProcessError):
+        validate_refinement_patch(patch, contract=contract)
+
+
+@pytest.mark.parametrize("value", ["#ffffff", "white", [], None])
+def test_semantic_colour_target_rejects_non_roles(value):
+    review = _invalid_review()
+    review["issues"] = review["issues"][:1]
+    review["issues"][0]["targets"] = [
+        {"layerId": "checkbox", "property": "colourRole", "value": value},
+    ]
+    with pytest.raises(process.AdTemplateProcessError, match="semantic role"):
+        process.validate_review(review, candidate=_candidate())
+
+
+def test_review_prompt_names_real_renderer_colour_fields():
+    prompt = process.review_prompt(
+        final=False, candidate=_candidate(), reference={"sourcePlacement": "feed"}, metrics={},
+    )
+    assert "Solid colours use colourRole, NOT fill/colour" in prompt
+    assert "opacity:1" in prompt
+    assert "Story fontSize >=32" in prompt
+
 
 
 def _candidate():
     return {"template": {
         "feedLayout": {"layers": [{
             "layerId": "checkbox", "type": "vector", "colourRole": "mainText",
+            "shape": "rect", "opacity": 1,
             "geometry": {"x": 20, "y": 20, "width": 30, "height": 30},
         }]},
         "storyLayout": {"layers": [{
             "layerId": "date", "type": "text", "fontSize": 36,
+            "inputKey": "date", "font": {"file": "/fonts/adstudio/manrope-400.woff2"},
+            "lineHeight": 1.2, "tracking": 0, "alignment": "left",
+            "maxCharacters": 30, "maxLines": 2, "colourRole": "mainText",
+            "overflowBehaviour": "refuse",
             "geometry": {"x": 100, "y": 100, "width": 400, "height": 80},
         }]},
     }}

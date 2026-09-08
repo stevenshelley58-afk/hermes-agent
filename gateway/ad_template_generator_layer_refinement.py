@@ -71,6 +71,9 @@ _TARGET_PROPERTY_ALIASES = {
     "effects/shadow/offsety": "effects/shadow/offsetY",
     "effects/stroke/width": "effects/stroke/width",
     "fill": "fill",
+    "colourrole": "colourRole",
+    "effects/stroke/colourrole": "effects/stroke/colourRole",
+    "effects/shadow/colourrole": "effects/shadow/colourRole",
     "stroke": "effects/stroke",
     "shadow": "effects/shadow",
     "mask": "mask",
@@ -95,6 +98,7 @@ _NUMERIC_TARGET_PROPERTIES = {
     "effects/shadow/offsetX", "effects/shadow/offsetY", "effects/stroke/width",
 }
 _STRING_TARGET_PROPERTIES = {
+    "colourRole", "effects/stroke/colourRole", "effects/shadow/colourRole",
     "font/file", "fontFamily", "alignment", "mask", "effects/blendMode",
     "fill/colour", "effects/stroke/colour", "effects/shadow/colour",
 }
@@ -120,6 +124,12 @@ def _canonical_target_property(value: Any) -> str:
 
 
 def _validate_target_value(property_path: str, value: Any) -> Any:
+    if property_path in {"colourRole", "effects/stroke/colourRole", "effects/shadow/colourRole"}:
+        if not isinstance(value, str) or value not in {
+            "background", "primary", "secondary", "accent", "mainText", "inverseText",
+        }:
+            raise AdTemplateProcessError("review target colourRole must name a declared semantic role")
+        return value
     if property_path in _NUMERIC_TARGET_PROPERTIES:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise AdTemplateProcessError(
@@ -230,6 +240,10 @@ def _structured_targets(
         property_path = _canonical_target_property(raw_target.get("property"))
         layer = layers[layer_id]["layer"]
         layer_type = layer.get("type")
+        if property_path == "colourRole" and "colourRole" not in layer:
+            raise AdTemplateProcessError(
+                f"review target colourRole is unavailable on {layer_id}"
+            )
         if (
             property_path in {
                 "font/file", "fontSize", "fontFamily", "fontWeight",
