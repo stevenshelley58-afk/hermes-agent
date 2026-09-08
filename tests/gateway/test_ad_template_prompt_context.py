@@ -1,4 +1,5 @@
 import copy
+import pytest
 
 import gateway.ad_template_generator_process as process
 from tests.gateway.test_ad_template_generator_process import _review
@@ -80,3 +81,21 @@ def test_contract_repair_receives_actual_replacement_payloads_without_mutation()
     assert "Story minimum 32px" in prompt
     assert "lowering maxLength/maxCharacters" in prompt
     assert candidate == original
+
+
+def test_optional_final_diagnosis_transport_failure_preserves_repair_path(monkeypatch):
+    events = []
+    def fail(*args, **kwargs):
+        raise process.AdTemplateTransportError("diagnosis deadline exceeded")
+    monkeypatch.setattr(process, "_call_json", fail)
+    assert process._optional_final_diagnosis(None, emit=lambda *args: events.append(args)) is None
+    assert events[0][0] == "final-repair.diagnosis-failed"
+    assert events[0][2]["continuing_with_bounded_repairs"] is True
+
+
+def test_optional_diagnosis_does_not_swallow_budget_or_process_errors(monkeypatch):
+    def fail(*args, **kwargs):
+        raise process.AdTemplateProcessError("run cost limit exceeded")
+    monkeypatch.setattr(process, "_call_json", fail)
+    with pytest.raises(process.AdTemplateProcessError, match="cost limit"):
+        process._optional_final_diagnosis(None, emit=lambda *args: None)

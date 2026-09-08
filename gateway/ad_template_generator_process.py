@@ -2641,6 +2641,17 @@ def review_template_action(*, template_id: str, run_id: str, action: str, reason
     return result
 
 
+def _optional_final_diagnosis(call_agent, **kwargs):
+    """Optional transport failure cannot abort mandatory repair/review gates."""
+    try:
+        return _call_json(call_agent, **kwargs)
+    except AdTemplateTransportError as exc:
+        kwargs["emit"]("final-repair.diagnosis-failed", "final-check", {
+            "reason": str(exc)[:2000], "continuing_with_bounded_repairs": True,
+        })
+        return None
+
+
 def _call_json(
     call_agent: Callable[[str, Any, str], Dict[str, Any]],
     *, instance: str, prompt: str, paths: Sequence[str], route: Mapping[str, str],
@@ -3957,8 +3968,8 @@ class AdTemplateGeneratorOrchestrator:
             raise
         self.emit("reusable-validation.completed", "final-check", {"scenarios": len(reusable_validation["scenarios"])})
         persist_checkpoint(self.workspace, {"reusableValidation": reusable_validation}, merge=True)
-        final_repair_history = []
-        final_diagnosis = None
+        final_repair_history = list(checkpoint.get("finalRepairHistory") or [])
+        final_diagnosis = checkpoint.get("finalRepairDiagnosis")
         for final_round in range(1, MAX_FINAL_REVIEW_ROUNDS + 1):
             self._check_stop()
             reviewer_specs = (("a", final_a_route), ("b", final_b_route))
@@ -4024,10 +4035,12 @@ class AdTemplateGeneratorOrchestrator:
                 "round": final_round, "issue_count": len(merged_issues),
                 "mode": "targeted-repair" if final_round < 3 else "recovery",
             })
-            if final_round == 2 and diagnosis_route:
+            if final_round == 2 and diagnosis_route and not checkpoint.get("finalRepairDiagnosisRequested"):
+                checkpoint["finalRepairDiagnosisRequested"] = True
+                persist_checkpoint(self.workspace, {"finalRepairDiagnosisRequested": True}, merge=True)
                 self.emit("final-repair.diagnosis-started", "final-check", {"round": final_round})
                 diagnostic_review = {**accepted_review, "issues": merged_issues}
-                final_diagnosis = _call_json(
+                final_diagnosis = _optional_final_diagnosis(
                     self.call_agent, instance="diagnosis-stall-final-repair",
                     prompt=stall_diagnosis_prompt(
                         best_candidate=candidate, best_review=diagnostic_review,
@@ -4040,9 +4053,10 @@ class AdTemplateGeneratorOrchestrator:
                     paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
                     route=diagnosis_route, validate=validate_stall_diagnosis, emit=self.emit,
                 )
-                self.emit("final-repair.diagnosis-completed", "final-check", {
-                    "round": final_round, "next_changes": final_diagnosis["nextChanges"],
-                })
+                if final_diagnosis is not None:
+                    self.emit("final-repair.diagnosis-completed", "final-check", {
+                        "round": final_round, "next_changes": final_diagnosis["nextChanges"],
+                    })
                 persist_checkpoint(self.workspace, {"finalRepairDiagnosis": final_diagnosis}, merge=True)
             if not merged_issues:
                 raise AdTemplateProcessError("final reviewers requested revision without actionable issues")
