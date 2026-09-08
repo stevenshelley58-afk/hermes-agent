@@ -121,11 +121,20 @@ META_IMAGE_CTA_RULE = (
     "geometry, typography or effects defects: never restore or deduct scores for "
     "the source CTA or its button-only styling. A remaining embedded CTA button "
     "is an obvious production error and must block acceptance. "
+    "OUTER CANVAS POLICY: Both Meta ad images must be square-cornered, fully opaque "
+    "and full-bleed to all four canvas edges. Do not copy rounded outer card corners, "
+    "device/preview frames, transparent corners or white corner cutouts from a source. "
+    "Edge-filling hero photos and footer panels must meet the canvas corners with "
+    "rectangular masks and zero outer corner radius. Preserve interior rounded "
+    "design elements when they belong to the artwork. Removing source outer "
+    "rounding is intentional, not a geometry, masks or details defect; never "
+    "restore it or penalize its absence. Any outer corner cutout or frame is "
+    "an obvious production error and blocks acceptance. Keep other artwork unchanged. "
     "All other five section checks remain >=9.8, exact font-family identity excepted."
 )
 SOURCE_MAP_VERSION = 2
 QA_PROJECTION_VERSION = 5
-EVALUATION_POLICY_VERSION = 10
+EVALUATION_POLICY_VERSION = 11
 STAGES = (
     "source",
     "aspect-reference",

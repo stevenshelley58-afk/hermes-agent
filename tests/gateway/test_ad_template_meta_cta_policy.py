@@ -20,8 +20,11 @@ def test_meta_image_cta_policy_reaches_all_generation_and_review_stages(monkeypa
         assert 'remaining embedded CTA button is an obvious production error' in prompt
         assert 'metaCopyDefaults.cta and publishRequirements.requiredCtaTypes' in prompt
         assert 'Keep informational website/contact details' in prompt
+        assert 'square-cornered, fully opaque' in prompt
+        assert 'Preserve interior rounded' in prompt
+        assert 'Any outer corner cutout or frame is an obvious production error' in prompt
 
 
 def test_old_cta_acceptance_evidence_requires_new_policy():
-    assert process.EVALUATION_POLICY_VERSION > 9
+    assert process.EVALUATION_POLICY_VERSION > 10
     assert process.LIKENESS_THRESHOLD == 9.8
