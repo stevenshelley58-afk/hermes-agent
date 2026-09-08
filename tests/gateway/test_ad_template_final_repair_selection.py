@@ -24,7 +24,7 @@ def _reusable_validation():
     }
 
 
-def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to_best, icon_repair=False, trace=None):
+def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to_best, icon_repair=False, trace=None, recovery=False):
     source = tmp_path / "source.png"
     Image.new("RGB", (1080, 1350), "white").save(source)
     original = {"template": _template(), "assets": []}
@@ -119,7 +119,7 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
     current_description = ["initial"]
 
     def call_agent(instance, prompt, route):
-        del prompt, route
+        del route
         calls.append(instance)
         if instance == "aspect-reference":
             return {
@@ -139,7 +139,7 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
         if instance.startswith("comparator-") and instance != "comparator-final-repair":
             return _comparison(accept=True, comparison_to_best="not_applicable")
         if instance.startswith("final-reviewer-"):
-            if current_description[0] == "initial":
+            if current_description[0] == "initial" or (recovery and "diagnosis-stall-final-repair" not in calls):
                 result = _review(accept=False)
                 result["issues"][0]["targets"] = []
                 result["issues"][0]["category"] = "colourEffects"
@@ -149,10 +149,13 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
                 return result
             return _review(accept=True)
         if instance.startswith("final-merged-patch"):
+            if recovery and "diagnosis-stall-final-repair" in calls:
+                assert "Repair the accent binding once across both placements." in str(prompt)
+                trace["diagnosis_applied"] = True
             operations = [{
                 "op": "replace",
                 "path": "/template/metadata/description",
-                "value": "repaired-candidate",
+                "value": "partial-repair" if recovery and "diagnosis-stall-final-repair" not in calls else "repaired-candidate",
             }]
             if icon_repair:
                 operations.append({
@@ -165,6 +168,12 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
                     },
                 })
             return {"operations": operations}
+        if instance == "diagnosis-stall-final-repair":
+            return {
+                "diagnosis": "The previous patch did not resolve the shared accent binding.",
+                "nextChanges": ["Repair the accent binding once across both placements."],
+                "capabilityBlockers": [],
+            }
         if instance == "comparator-final-repair":
             result = _comparison(
                 accept=repair_score >= 9.8,
@@ -191,7 +200,7 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
             {"provider": "test", "model": "comparator"},
             {"provider": "test", "model": "final-a"},
             {"provider": "test", "model": "final-b"},
-        ],
+        ] + ([{"provider": "test", "model": "diagnosis"}] if recovery else []),
     )
     return result, imported, calls, events
 
@@ -220,3 +229,19 @@ def test_below_gate_final_repair_cannot_inherit_acceptance(tmp_path, monkeypatch
             tmp_path, monkeypatch, repair_score=9.6, comparison_to_best="same", trace=trace,
         )
     assert trace["imported"] == []
+
+
+def test_repeated_final_rejection_gets_diagnosis_and_successful_repair(tmp_path, monkeypatch):
+    trace = {}
+    result, imported, calls, events = _run_final_repair_case(
+        tmp_path, monkeypatch, repair_score=9.8, comparison_to_best="same",
+        recovery=True, trace=trace,
+    )
+    assert imported == ["repaired-candidate"]
+    assert trace["diagnosis_applied"] is True
+    assert calls.count("diagnosis-stall-final-repair") == 1
+    assert calls.count("final-merged-patch") == 2
+    assert result["template"]["metadata"]["description"] == "repaired-candidate"
+    verdicts = [data for kind, _, data in events if kind == "final-review.completed"]
+    assert [item["decision"] for item in verdicts] == ["revise", "revise", "accepted"]
+    assert all(min(reviewer["scores"].values()) >= 9.8 for reviewer in verdicts[-1]["reviewers"])

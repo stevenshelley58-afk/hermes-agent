@@ -61,6 +61,7 @@ from gateway.ad_template_font_catalog import available_font_files
 from gateway.ad_template_generator_photo_qa import materialize_source_photo_plan, source_photo_overrides
 from gateway.ad_template_text_evidence import build_text_alignment_evidence
 from gateway.ad_template_reusable_validation import ReusableTemplateValidationError, validate_reusable_template
+from gateway.ad_template_production_repair import repair_production_candidate
 
 
 PROCESS_ID = "exact-clone"
@@ -71,7 +72,7 @@ NORMAL_COMPARISONS = 4
 MAX_COMPARISONS = 16
 STALL_DIAGNOSIS_THRESHOLD = 5
 MAX_RECENT_REJECTS = 5
-MAX_FINAL_REVIEW_ROUNDS = 3
+MAX_FINAL_REVIEW_ROUNDS = 6
 MAX_OUTPUT_RETRIES = 1
 MAX_PATCH_REPLANS = 2
 MAX_PATCH_OPERATIONS = 64
@@ -105,7 +106,7 @@ REVIEW_FONT_SUBSTITUTION_RULE = (
 REVIEW_MEASUREMENT_RULE = 'MEASUREMENT EVIDENCE: textAlignment contains high-confidence matching glyph bounds, not editable text boxes. Its offset is candidate minus source; subtract that delta to correct displacement, then render and remeasure. Do not replace box dimensions or font sizes directly with glyph bounds. Missing OCR is unknown, not proof that text is missing or correct. Thin sourceStructuralBands indicate horizontal edges, not complete photo rectangles. Estimated sourceImageRegions are not ground truth when original source edges or text measurements contradict them. Correct major panel boundaries, overlaps, lost copy and hierarchy before small coordinate tweaks.'
 SOURCE_MAP_VERSION = 2
 QA_PROJECTION_VERSION = 5
-EVALUATION_POLICY_VERSION = 7
+EVALUATION_POLICY_VERSION = 8
 STAGES = (
     "source",
     "aspect-reference",
@@ -1573,6 +1574,7 @@ def build_ephemeral_qa_candidate(
             template["assets"][asset_key] = {"fileName": file_name, "mimeType": "image/png"}
             qa["assets"].append({"assetKey": asset_key, "fileName": file_name, "mimeType": "image/png"})
             overrides[asset_key] = clean_photos[input_key]
+    qa, _ = repair_production_candidate(qa, overrides)
     return _candidate_envelope(qa), overrides
 
 
@@ -1819,6 +1821,9 @@ def prepare_demo_assets(candidate, *, source, source_placement, workspace, route
         declaration = {"fileName": f"demo/{item['file']}", "mimeType": "image/png"}
         template["assets"][key] = declaration
         declarations[key].update(declaration)
+    document, changes = repair_production_candidate(document, overrides)
+    if changes:
+        emit("production-repair.applied", "build", {"changes": changes})
     return document, overrides
 
 def _canonical_catalog_paths(candidate: Mapping[str, Any]) -> Dict[str, Any]:
@@ -3223,6 +3228,10 @@ class AdTemplateGeneratorOrchestrator:
             iteration_root = self.workspace / "iterations" / f"{global_iteration:02d}"
             self.emit("iteration.started", "build", {"iteration": global_iteration, "cycle_iteration": cycle_comparisons + 1})
             contract_repairs = 0
+            candidate, production_repairs = repair_production_candidate(candidate, demo_overrides)
+            if production_repairs:
+                self.emit("production-repair.applied", "build", {"changes": production_repairs})
+                persist_checkpoint(self.workspace, {"candidate": candidate, "accepted": False}, merge=True)
             while True:
                 try:
                     qa_candidate, qa_asset_overrides = build_ephemeral_qa_candidate(
@@ -3889,6 +3898,8 @@ class AdTemplateGeneratorOrchestrator:
             raise
         self.emit("reusable-validation.completed", "final-check", {"scenarios": len(reusable_validation["scenarios"])})
         persist_checkpoint(self.workspace, {"reusableValidation": reusable_validation}, merge=True)
+        final_repair_history = []
+        final_diagnosis = None
         for final_round in range(1, MAX_FINAL_REVIEW_ROUNDS + 1):
             self._check_stop()
             reviewer_specs = (("a", final_a_route), ("b", final_b_route))
@@ -3902,7 +3913,13 @@ class AdTemplateGeneratorOrchestrator:
                 result = _call_json(
                     self.call_agent,
                     instance=identity,
-                    prompt=review_prompt(final=True, candidate=candidate, reference=reference, metrics=final_metrics),
+                    prompt=(review_prompt(final=True, candidate=candidate, reference=reference, metrics=final_metrics)
+                            + _review_iteration_context([
+                                {"iteration": item["round"], "comparison": {"issues": item["issues"]}}
+                                for item in final_repair_history[-2:]
+                            ], None)
+                            + "\nCheck each against CURRENT pixels; do not repeat a corrected target. "
+                            "Report all still-visible defects together. Earlier acceptance is not evidence of quality."),
                     paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
                     route=route,
                     validate=lambda value: validate_review(value, require_actionable_targets=False, candidate=candidate),
@@ -3939,6 +3956,35 @@ class AdTemplateGeneratorOrchestrator:
                     f"{MAX_FINAL_REVIEW_ROUNDS} review rounds"
                 )
             merged_issues = [issue for reviewer in reviewers for issue in reviewer["issues"]]
+            final_repair_history.append({"round": final_round, "issues": merged_issues})
+            persist_checkpoint(self.workspace, {
+                "candidate": candidate, "finalRepairHistory": final_repair_history,
+                "finalReview": final_review, "accepted": False,
+            }, merge=True)
+            self.emit("final-repair.started", "final-check", {
+                "round": final_round, "issue_count": len(merged_issues),
+                "mode": "targeted-repair" if final_round < 3 else "recovery",
+            })
+            if final_round == 2 and diagnosis_route:
+                self.emit("final-repair.diagnosis-started", "final-check", {"round": final_round})
+                diagnostic_review = {**accepted_review, "issues": merged_issues}
+                final_diagnosis = _call_json(
+                    self.call_agent, instance="diagnosis-stall-final-repair",
+                    prompt=stall_diagnosis_prompt(
+                        best_candidate=candidate, best_review=diagnostic_review,
+                        best_iteration=global_iteration,
+                        recent_rejects=final_repair_history,
+                    ) + "\nResolve repeated final-review failures from the original and CURRENT production renders. "
+                    "Reconcile contradictory targets before any edit. Give one complete coherent repair plan. "
+                    "Preserve photographic aspect ratios, source corner/mask intent and readable editable copy. "
+                    "Do not change acceptance scores, thresholds, fonts or provider routes.",
+                    paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
+                    route=diagnosis_route, validate=validate_stall_diagnosis, emit=self.emit,
+                )
+                self.emit("final-repair.diagnosis-completed", "final-check", {
+                    "round": final_round, "next_changes": final_diagnosis["nextChanges"],
+                })
+                persist_checkpoint(self.workspace, {"finalRepairDiagnosis": final_diagnosis}, merge=True)
             if not merged_issues:
                 raise AdTemplateProcessError("final reviewers requested revision without actionable issues")
             pre_repair_candidate = copy.deepcopy(candidate)
@@ -3986,6 +4032,7 @@ class AdTemplateGeneratorOrchestrator:
                     # the run outside any bounded retry.
                     repair_contract = None
             def validate_final_patch_candidate(value: Mapping[str, Any]) -> Dict[str, Any]:
+                value, _ = repair_production_candidate(value, demo_overrides)
                 run_renderer(
                     value,
                     self.workspace / "final-repair-validation" / f"{global_iteration:02d}-{final_round:02d}",
@@ -4006,7 +4053,7 @@ class AdTemplateGeneratorOrchestrator:
                 def validate_final_repair(value: Any) -> Dict[str, Any]:
                     patch = validate_refinement_patch(value, contract=repair_contract)
                     updated = apply_patch(candidate, patch)
-                    validate_final_patch_candidate(updated)
+                    updated = validate_final_patch_candidate(updated)
                     return {"patch": patch, "candidate": updated}
 
                 repair_result = _call_json(
@@ -4017,7 +4064,7 @@ class AdTemplateGeneratorOrchestrator:
                         + _best_repair_context(
                             best_candidate=pre_repair_candidate,
                             best_iteration=global_iteration,
-                            diagnosis=None,
+                            diagnosis=final_diagnosis,
                         )
                     ),
                     paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
@@ -4039,7 +4086,7 @@ class AdTemplateGeneratorOrchestrator:
                         + _best_repair_context(
                             best_candidate=pre_repair_candidate,
                             best_iteration=global_iteration,
-                            diagnosis=None,
+                            diagnosis=final_diagnosis,
                         )
                     ),
                     validate_candidate=validate_final_patch_candidate,
@@ -4048,6 +4095,9 @@ class AdTemplateGeneratorOrchestrator:
                     candidate=candidate,
                     emit=self.emit,
                 )
+            candidate, production_repairs = repair_production_candidate(candidate, demo_overrides)
+            if production_repairs:
+                self.emit("production-repair.applied", "final-check", {"changes": production_repairs})
             global_iteration += 1
             iteration_root = self.workspace / "iterations" / f"{global_iteration:02d}"
             qa_candidate, qa_asset_overrides = build_ephemeral_qa_candidate(
