@@ -2,6 +2,7 @@ import copy
 
 import gateway.ad_template_generator_process as process
 from tests.gateway.test_ad_template_generator_process import _review
+from gateway.ad_template_reusable_validation import _scenario, reusable_repair_context
 
 
 def test_revision_memory_exposes_criticism_and_attempts_without_score_anchoring():
@@ -64,3 +65,18 @@ def test_fact_first_prompt_keeps_threshold_and_production_defect_gate(monkeypatc
     low["scores"]["details"] = 9.79
     low["issues"] = defect["issues"]
     assert process.validate_review(low)["decision"] == "revise"
+
+
+def test_contract_repair_receives_actual_replacement_payloads_without_mutation():
+    candidate = {"template": {"textInputs": [{"key": "copy", "placeholder": "Original", "maxLength": 40}],
+                              "imageInputs": [], "feedLayout": {"layers": []}, "storyLayout": {"layers": []}}}
+    original = copy.deepcopy(candidate)
+    context = reusable_repair_context(candidate)
+    for scenario, payload in context.items():
+        assert payload["copy"] == _scenario(candidate, scenario)["template"]["textInputs"][0]["placeholder"]
+    prompt = process.contract_repair_prompt(candidate=candidate, reasons=["reusable scenario max failed"])
+    assert context["max"]["copy"] in prompt
+    assert "maxLines AND geometry" in prompt
+    assert "Story minimum 32px" in prompt
+    assert "lowering maxLength/maxCharacters" in prompt
+    assert candidate == original

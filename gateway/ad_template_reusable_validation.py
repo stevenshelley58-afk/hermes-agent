@@ -170,6 +170,20 @@ def _scenario(c, s):
     return r
 
 
+def reusable_repair_context(candidate):
+    """Expose the actual deterministic replacement payloads, not guessed copy."""
+    try:
+        return {
+            scenario: {
+                item["key"]: item["placeholder"]
+                for item in _scenario(candidate, scenario)["template"]["textInputs"]
+            }
+            for scenario in _SCENARIOS
+        }
+    except ReusableTemplateValidationError as exc:
+        return {"validationError": str(exc)}
+
+
 def validate_reusable_template(
     candidate: Mapping[str, Any],
     *,

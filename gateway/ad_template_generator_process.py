@@ -62,7 +62,7 @@ from gateway.ad_template_font_catalog import available_font_files
 
 from gateway.ad_template_generator_photo_qa import materialize_source_photo_plan, source_photo_overrides
 from gateway.ad_template_text_evidence import build_text_alignment_evidence
-from gateway.ad_template_reusable_validation import ReusableTemplateValidationError, validate_reusable_template
+from gateway.ad_template_reusable_validation import ReusableTemplateValidationError, reusable_repair_context, validate_reusable_template
 from gateway.ad_template_production_repair import repair_production_candidate
 
 
@@ -1112,6 +1112,8 @@ def contract_repair_prompt(*, candidate: Mapping[str, Any], reasons: Sequence[st
 CURRENT CANDIDATE: {_safe_json(candidate)}
 BLOCKWISE CONTRACT/RENDERER FAILURES: {_safe_json(list(reasons), max_bytes=40_000)}
 PATCH EXISTENCE RULE: replace requires an existing leaf property; add creates an allowed absent optional property. Resolve layer indices from CURRENT CANDIDATE. Fix every listed failure in one coherent patch without lowering readability or usable text capacity.
+REUSABLE TEXT REPAIR: The failure may come from replacement copy, NOT the default placeholder. The exact four test payloads follow. Plan for all four at once, including maxLength content, in BOTH placements. Shrinking a font already at its floor cannot help: Feed minimum 24px, Story minimum 32px. Account for font metrics, tracking, lineHeight, maxLines AND geometry height/width together. If wrapping needs two lines, change maxLines and provide height for both lines. Keep neighbouring text, checkmarks, photos and footer clear; never fix fit by introducing overlap, clipping, hiding text, shortening inputs or lowering maxLength/maxCharacters. Preserve default copy, valid fonts, source visual hierarchy and assets. Verify all listed layer IDs before returning one complete patch.
+ACTUAL REPLACEMENT PAYLOADS: {_safe_json(reusable_repair_context(candidate), max_bytes=20000) if any("reusable scenario" in reason for reason in reasons) else "not applicable"}
 SUPPORTED ICON RULE: use only arrow, check, tick, phone, mail, globe or location. For boxed checkmarks, add a separate vector rectangle behind a supported check/tick icon and put the border in effects.stroke (not a top-level stroke field). Never use check-square or invent an icon name."""
 
 
