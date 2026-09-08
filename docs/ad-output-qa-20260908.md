@@ -40,3 +40,27 @@ the skill. Both configurations passed12/12 assertions. This is a smoke test, not
 evidence of improved model accuracy, speed or visual-detection performance.
 Timing/token telemetry was unavailable. A static review viewer was generated
 in the local skill's sibling evaluation workspace.
+
+## Verified release
+
+Hermes `57d8ce6eb3410516cbdfefe6c68976d83c2bb8e5` was deployed on 8 September
+2026 to `/opt/releases/hermes-template-57d8ce6eb3`. The settled gateway process
+selected that exact import path and authenticated health returned 200. The
+default Hermes profile installed the bundled skill at startup; its skill and
+checklist match the release bytes. The shared skill link and generator entry
+point also route to this review process.
+
+The final test run passed 302 tests across 27 files. It includes a real
+orchestrator-path regression where both final reviewers return 9.9 but a defect
+in the final render prevents the import call. Other tests cover valid controls,
+horizontal/vertical displacement, missing/corrupt renders, unsupported effects,
+informational badges, explicit CTAs, stale repair evidence and review clearance
+bound to the same candidate and render hashes. No new provider calls were needed.
+
+The deployed interpreter rejected the saved example's Feed and Story alignment
+errors. Candidate and image hashes were unchanged, and the existing run remained
+`ready_for_review`; this release does not rewrite historical readiness or apply
+a correction to the current ad. Future generation/revision handoffs use the new
+gate. No template was published and the first-50 batch was not started.
+Backup and private receipts: `/srv/hermes/backups/ad-output-qa-20260908-57d8ce6eb3`.
+Rollback retained: `/opt/releases/hermes-template-00097034cb` and its selector.
