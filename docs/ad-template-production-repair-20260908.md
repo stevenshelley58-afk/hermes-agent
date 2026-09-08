@@ -184,3 +184,27 @@ context, explicitly requiring a fit-safe coordinated correction without reducing
 editable limits or suppressing defects. Health returned 200 and the same run
 resumed. Comparison four passed all five sections at 9.85 or above and all four
 reusable scenarios passed. Independent final reviews are still required.
+
+## Painted controls and payload isolation (08:53 UTC)
+
+Final review still confused invisible multiline capacity with painted glyphs,
+moving an above-center Story CTA upward. Release `78f3e200ab` added advisory
+pixel measurements for isolated high-contrast centered button labels. Real saved
+pixels measured Feed +5px and Story +28px required downward movement. Synthetic
+tests prove changing invisible box height does not change the measurement.
+Unknown/clipped evidence emits no measurement; no score or gate is derived from it.
+The full 262-test suite passed. Deployment was at 08:44:06 UTC.
+
+Two supported retries then failed with Meta HTTP 500 during final review. An
+exact smaller-output probe also failed; a small image probe succeeded. Removing
+new measurement context succeeded, and retaining it while omitting only the two
+byte-identical duplicate production images succeeded in 60.43 seconds with a
+valid review requesting the correct +5/+28px corrections. This isolates a
+payload-sensitive failure, not a proved billing problem or general outage.
+
+Release `c253ab3f232e166ce9fd7382fdb36e614b84ecea` deployed at 08:53:35 UTC
+after 263 passing tests, Ruff and whitespace checks. Distinct production renders
+and all diagnostics remain attached; only production images proven byte-identical
+to the corresponding QA render are omitted. Unknown identity retains evidence.
+Health returned 200. The same saved sample resumed at final review; successful
+quarantined import and smoke-test evidence are still pending.
