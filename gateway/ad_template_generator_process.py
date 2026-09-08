@@ -1125,6 +1125,36 @@ REUSABLE TEXT REPAIR: The failure may come from replacement copy, NOT the defaul
 ACTUAL REPLACEMENT PAYLOADS: {_safe_json(reusable_repair_context(candidate), max_bytes=20000) if any("reusable scenario" in reason for reason in reasons) else "not applicable"}
 SUPPORTED ICON RULE: use only arrow, check, tick, phone, mail, globe or location. For boxed checkmarks, add a separate vector rectangle behind a supported check/tick icon and put the border in effects.stroke (not a top-level stroke field). Never use check-square or invent an icon name."""
 
+def _verified_final_repair_progress(candidate, prior_issues, comparison):
+    """Keep measured fixes as a working draft, never as inherited acceptance."""
+    if comparison.get("comparisonToBest") not in {"better", "same"} or not prior_issues:
+        return False
+    current_issues = comparison["review"].get("issues") or []
+    prior_groups = {(i.get("category"), tuple(sorted(i.get("layerIds") or []))) for i in prior_issues}
+    current_groups = {(i.get("category"), tuple(sorted(i.get("layerIds") or []))) for i in current_issues}
+    if len(current_groups) >= len(prior_groups):
+        return False
+    old_ids = {key for issue in prior_issues for key in issue.get("layerIds", [])}
+    if any(old_ids.intersection(issue.get("layerIds", [])) for issue in current_issues):
+        return False
+    if "mismatch" in comparison["review"].get("effects", {}).values():
+        return False
+    layers = _candidate_layers(candidate)
+    for issue in prior_issues:
+        if not issue.get("targets"):
+            return False  # No measured proof for a structural repair.
+        for target in issue["targets"]:
+            value = (layers.get(target["layerId"]) or {}).get("layer")
+            try:
+                for part in target["property"].split("/"):
+                    value = value[part]
+            except (KeyError, TypeError):
+                return False
+            if value != target["value"]:
+                return False
+    return True
+
+
 
 def _preflight_review_context(checkpoint):
     failures = checkpoint.get("contractRepairFailures") or []
@@ -4122,6 +4152,7 @@ class AdTemplateGeneratorOrchestrator:
         persist_checkpoint(self.workspace, {"reusableValidation": reusable_validation}, merge=True)
         final_repair_history = list(checkpoint.get("finalRepairHistory") or [])
         final_diagnosis = checkpoint.get("finalRepairDiagnosis")
+        verified_progress = False
         for final_round in range(1, MAX_FINAL_REVIEW_ROUNDS + 1):
             self._check_stop()
             reviewer_specs = (("a", final_a_route), ("b", final_b_route))
@@ -4159,26 +4190,21 @@ class AdTemplateGeneratorOrchestrator:
                 for kind, node, data in buffered_events:
                     self.emit(kind, node, data)
                 reviewers.append(reviewer)
-            accepted = all(item["decision"] == "accept" for item in reviewers)
+            accepted = all(item["decision"] == "accept" for item in reviewers) and comparator_state_accepted
             final_review = {"decision": "accepted" if accepted else "revise", "threshold": LIKENESS_THRESHOLD, "round": final_round, "reviewers": reviewers}
             self.emit("final-review.completed", "final-check", {"decision": final_review["decision"], "round": final_round, "reviewers": reviewers})
             if accepted:
-                if comparator_state_accepted:
-                    break
-                # Reviewers accepted a candidate whose latest comparator
-                # verdict was a revision.  The evidence chain must not ship
-                # that disagreement; fail honestly so a new revision cycle
-                # can drive the candidate through the comparator gate.
-                raise AdTemplateProcessError(
-                    "final reviewers accepted a candidate the comparator still scores "
-                    f"below the {LIKENESS_THRESHOLD} gate"
-                )
+                break
             if final_round >= MAX_FINAL_REVIEW_ROUNDS:
                 raise AdTemplateProcessError(
                     "final reviewers did not accept the exact clone after "
                     f"{MAX_FINAL_REVIEW_ROUNDS} review rounds"
                 )
             merged_issues = [issue for reviewer in reviewers for issue in reviewer["issues"]]
+            if not comparator_state_accepted:
+                # A newly found comparator defect still needs repair even if
+                # both independent reviewers missed it. No disagreement ships.
+                merged_issues.extend(copy.deepcopy(accepted_review["issues"]))
             final_repair_history.append({"round": final_round, "issues": merged_issues})
             persist_checkpoint(self.workspace, {
                 "candidate": candidate, "finalRepairHistory": final_repair_history,
@@ -4188,7 +4214,7 @@ class AdTemplateGeneratorOrchestrator:
                 "round": final_round, "issue_count": len(merged_issues),
                 "mode": "targeted-repair" if final_round < 3 else "recovery",
             })
-            if final_round == 2 and diagnosis_route and not checkpoint.get("finalRepairDiagnosisRequested"):
+            if final_round == 2 and not verified_progress and diagnosis_route and not checkpoint.get("finalRepairDiagnosisRequested"):
                 checkpoint["finalRepairDiagnosisRequested"] = True
                 persist_checkpoint(self.workspace, {"finalRepairDiagnosisRequested": True}, merge=True)
                 self.emit("final-repair.diagnosis-started", "final-check", {"round": final_round})
@@ -4385,10 +4411,11 @@ class AdTemplateGeneratorOrchestrator:
                 emit=self.emit,
             )
             accepted_review = final_comparator_result["review"]
+            verified_progress = _verified_final_repair_progress(candidate, merged_issues, final_comparator_result)
             final_repair_improved = (
                 final_comparator_result["comparisonToBest"] == "better"
                 and _review_improved(accepted_review, pre_repair_review)
-            )
+            ) or verified_progress
             # A final-review repair must pass the absolute comparator gate;
             # relative "better" only decides whether a below-gate repair is
             # worth keeping, not whether a passing repair reaches final review.
@@ -4418,7 +4445,7 @@ class AdTemplateGeneratorOrchestrator:
             if not comparator_state_accepted:
                 pre_score = float(comparator_accepted_review["scores"]["overall"])
                 post_score = float(accepted_review["scores"]["overall"])
-                if not final_repair_improved or post_score < pre_score:
+                if not final_repair_improved or (post_score < pre_score and not verified_progress):
                     # The merged repair regressed the best comparator-accepted
                     # state; roll back so the next bounded round reviews the
                     # strongest evidence instead of the regression.
@@ -4472,6 +4499,11 @@ class AdTemplateGeneratorOrchestrator:
                     })
                     continue
                 # The merged repair did not reach the comparator gate yet;
+                self.emit("final-repair.progress-retained", "final-check", {
+                    "iteration": global_iteration, "accepted": False,
+                    "verified_targets_resolved": verified_progress,
+                    "remaining_issues": len(accepted_review["issues"]),
+                })
                 # the next bounded round reviews the repaired candidate
                 # instead of discarding the progress.
                 comparator_accepted_candidate = candidate

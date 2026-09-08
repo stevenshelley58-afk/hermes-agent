@@ -6,8 +6,36 @@ from pathlib import Path
 from PIL import Image
 import pytest
 
+def test_retained_progress_still_repairs_comparator_disagreement_before_import(tmp_path, monkeypatch):
+    monkeypatch.setattr(process, "_verified_final_repair_progress", lambda *args: True)
+    result, imported, calls, events = _run_final_repair_case(tmp_path, monkeypatch, repair_score=9.6, comparison_to_best="better", progression=True)
+    assert calls.count("final-merged-patch") == 2
+    assert calls.count("comparator-final-repair") == 2
+    retained = [data for kind, _, data in events if kind == "final-repair.progress-retained"]
+    assert retained and retained[0]["accepted"] is False
+    assert imported == ["repaired-candidate-2"]
+    assert result["final_review"]["decision"] == "accepted"
+    comparisons = [data for kind, _, data in events if kind == "iteration.compared"]
+    assert comparisons[-1]["scores"]["geometry"] >= 9.8
+
+
 import gateway.ad_template_generator_process as process
 from tests.gateway.test_ad_template_generator_process import _comparison, _review, _template
+def test_completed_measured_repairs_survive_new_unrelated_lower_score():
+    candidate = {"template": {"feedLayout": {"layers": [{"layerId":"label", "geometry":{"y":50}}, {"layerId":"title", "geometry":{"y":100}}]}, "storyLayout":{"layers":[]}}}
+    issues = [{"category":"geometry", "layerIds":[key], "targets":[{"layerId":key, "property":"geometry/y", "value":value}]} for key,value in (("label",50),("title",100))]
+    comparison = {"comparisonToBest":"better", "review":{"scores":{"overall":9.6}, "issues":[{"category":"geometry","layerIds":["footer"]}],"effects":{"borders":"match"}}}
+    assert process._verified_final_repair_progress(candidate,issues,comparison)
+    comparison["comparisonToBest"] = "worse"
+    assert not process._verified_final_repair_progress(candidate,issues,comparison)
+    comparison["comparisonToBest"] = "better"
+    comparison["review"]["issues"][0]["layerIds"] = ["label"]
+    assert not process._verified_final_repair_progress(candidate,issues,comparison)
+    comparison["review"]["issues"][0]["layerIds"] = ["footer"]
+    candidate["template"]["feedLayout"]["layers"][0]["geometry"]["y"] = 49
+    assert not process._verified_final_repair_progress(candidate,issues,comparison)
+
+
 
 
 def _reusable_validation():
@@ -24,7 +52,7 @@ def _reusable_validation():
     }
 
 
-def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to_best, icon_repair=False, trace=None, recovery=False, reusable_repair=False):
+def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to_best, icon_repair=False, trace=None, recovery=False, reusable_repair=False, progression=False):
     source = tmp_path / "source.png"
     Image.new("RGB", (1080, 1350), "white").save(source)
     original = {"template": _template(), "assets": []}
@@ -169,6 +197,8 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
                 "path": "/template/metadata/description",
                 "value": "partial-repair" if recovery and "diagnosis-stall-final-repair" not in calls else "repaired-candidate",
             }]
+            if progression and calls.count("final-merged-patch") > 1:
+                operations[0]["value"] = "repaired-candidate-2"
             if icon_repair:
                 operations.append({
                     "op": "add", "path": "/template/feedLayout/layers/-",
@@ -187,11 +217,14 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
                 "capabilityBlockers": [],
             }
         if instance == "comparator-final-repair":
+            current_score = (9.6 if calls.count(instance) == 1 else 9.8) if progression else repair_score
             result = _comparison(
-                accept=repair_score >= 9.8,
+                accept=current_score >= 9.8,
                 comparison_to_best=comparison_to_best,
             )
-            result["scores"] = {key: repair_score for key in result["scores"]}
+            result["scores"] = {key: current_score for key in result["scores"]}
+            if progression and current_score < 9.8:
+                result["issues"][0].update(category="colourEffects", targets=[], instruction="Rebind the shared accent semantic colour across the selected layers.")
             return result
         raise AssertionError(f"unexpected agent role: {instance}")
 
