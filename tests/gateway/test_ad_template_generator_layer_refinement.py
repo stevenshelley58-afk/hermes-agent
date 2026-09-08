@@ -674,6 +674,34 @@ def test_structured_targets_reject_unsafe_values(target, message):
         )
 
 
+def test_card_rounding_cannot_target_the_opaque_canvas_base():
+    candidate = _candidate()
+    base = {
+        "type": "plate", "layerId": "feed-base", "protected": True,
+        "colourRole": "background",
+        "geometry": {"x": 0, "y": 0, "width": 1080, "height": 1350},
+    }
+    card = {**copy.deepcopy(base), "layerId": "feed-card"}
+    candidate["template"]["feedLayout"]["layers"][0:0] = [base, card]
+    issue = {
+        **_issues()[0], "layerIds": ["feed-base"],
+        "instruction": "Round the visible card to 48px.",
+        "targets": [{"layerId": "feed-base", "property": "cornerRadius", "value": 48}],
+    }
+    with pytest.raises(AdTemplateProcessError, match="transparent corners"):
+        build_refinement_contract(candidate, [issue], source_placement="feed", available_fonts=[])
+    # A rectangular base correction remains legal, and a separate visible card
+    # can be rounded without making the canvas itself transparent.
+    issue["targets"][0]["value"] = 0
+    assert build_refinement_contract(candidate, [issue], source_placement="feed", available_fonts=[])
+    issue["layerIds"] = ["feed-card"]
+    issue["targets"] = [{"layerId": "feed-card", "property": "cornerRadius", "value": 48}]
+    contract = build_refinement_contract(candidate, [issue], source_placement="feed", available_fonts=[])
+    assert compile_refinement_patch(contract)["operations"] == [{
+        "op": "add", "path": "/template/feedLayout/layers/1/cornerRadius", "value": 48.0,
+    }]
+
+
 def test_structured_targets_reject_conflicts_and_support_bounded_effect_objects():
     candidate = _candidate()
     layer = candidate["template"]["feedLayout"]["layers"][0]

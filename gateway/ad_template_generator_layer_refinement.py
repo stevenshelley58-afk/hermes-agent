@@ -319,6 +319,18 @@ def _structured_targets(
                 "use an existing candidate property, or targets=[] for a concrete structural/semantic-colour correction"
             )
         target_value = _validate_target_value(property_path, raw_value)
+        if (
+            layer_type == "plate"
+            and layers[layer_id]["pointer"].endswith("/layers/0")
+            and property_path == "cornerRadius"
+            and target_value > 0
+        ):
+            raise AdTemplateProcessError(
+                f"review target {layer_id}/cornerRadius would round the full-canvas "
+                "background and expose transparent corners. Keep the base rectangular; "
+                "correct the visible card/photo/footer layers instead, or use targets=[] "
+                "for a concrete structural correction above the opaque base"
+            )
         if property_path == "tracking" and not -4 <= target_value <= 4:
             raise AdTemplateProcessError("review target tracking is outside renderer bounds")
         if property_path == "lineHeight" and target_value < 1:
