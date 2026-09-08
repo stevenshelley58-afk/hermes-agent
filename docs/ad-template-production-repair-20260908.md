@@ -148,3 +148,23 @@ failure is recorded once; budget failures still propagate. The supported retry
 resumed the same saved sample at policy 45. Health returned 200. Previous pinned
 releases and an online database backup remain available. A complete accepted
 run, quarantined import and matching smoke test remain required before first50.
+
+## Complete review response allowance (08:24 UTC)
+
+The preflight diagnosis completed in 149.166 seconds and its one Meta patch in
+17.542 seconds cleared all four reusable scenarios. Both first-comparator
+responses then failed structured parsing at approximately 8,178 output tokens.
+A read-only reproduction showed 7,860 reasoning tokens at the old 8,192 cap.
+Low reasoning returned quickly but contained contradictory coordinate advice.
+Medium reasoning with compact instructions and 16,384 total output room returned
+a valid review in 83.2 seconds (10,373 reasoning plus 1,064 result tokens), identifying
+real URL wrapping and above-center CTA labels without claiming acceptance.
+
+Release `5b72c07b4a82e94d21ae8226aadd0f227d9029b4`, deployed at 08:24:56 UTC,
+keeps medium reviewers with 16,384 output room, concise result instructions and
+unchanged time, total spend, provider and acceptance limits. Diagnosis flags now
+survive later full stage snapshots, covered by restart tests. A source-canvas
+label edge case is also guarded, but was not the live failure cause: the actual
+process already deduplicates the normalized source. All 259 tests, Ruff and
+whitespace checks passed; health returned 200. The same canary resumed using
+saved photos and the passing reusable result. Full end-to-end success is pending.
