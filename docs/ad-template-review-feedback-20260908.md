@@ -35,5 +35,32 @@ from nonexistent solid fill/colour fields and supplies the complete stroke
 object. No invalid target is silently converted or discarded.
 
 Follow-up verification: all 220 tests in 20 ad-template files passed; Ruff
+
+## Final live outcome
+
+Release `2fb98a5a0f125cfa82d9be6f2b6bdf0ad0fc46e0` deployed at
+05:19:11 UTC, with authenticated health and live import path verified.
+Renderer remains `cbc3f92e061477f5f2162ef816d26e130ec16fcf`.
+Protected backups are `/srv/hermes/backups/ad-template-feedback-20260908-a5c6a79567`
+and `/srv/hermes/backups/ad-template-feedback-20260908-2fb98a5a0f`.
+The two prior immutable releases and existing rollback releases are retained.
+
+The same canary progressed to five normal comparisons; the fifth scored 9.9
+in every section. All four reusable scenarios passed at that point. Two final
+repair comparisons followed (seven comparison events total; artifact numbering
+reached eight because a reverted candidate also receives a number).
+After three independent final-review rounds, it failed closed at `final-check`.
+No final acceptance, import, smoke test, approval or publishing occurred.
+All 34 recorded provider calls across this canary's lifetime have a combined
+estimated cost of USD 0.406361, including earlier failed attempts. This is
+not a claim about actual billing or successful end-to-end convergence.
+
+Both final reviewers still rejected it. Residual defects included distorted
+Story gallery images, source corner/mask mismatches and text footprint/position.
+Manual inspection of iteration-08 Story confirmed severe photographic stretching.
+The renderer's renderImageSlot maps the selected source crop directly onto the
+destination rectangle; nonmatching aspect ratios therefore distort. A high
+comparator score did not establish image correctness. The first-50 batch remains
+unstarted, and the live run collection has no active generation runs.
 and diff whitespace checks passed. Live acceptance remains a separate gate.
 test files via `scripts/run_tests.sh`; Ruff and `git diff --check` passed.
