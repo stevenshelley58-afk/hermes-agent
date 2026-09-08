@@ -249,15 +249,21 @@ def _structured_targets(
             and not _legacy_property_supported(layer, property_path)
         ):
             raise AdTemplateProcessError(
-                f"review target {property_path} is unavailable on {layer_id}"
+                f"review target {property_path} is unavailable on {layer_id}; "
+                "use an existing candidate property, or targets=[] for a concrete structural/semantic-colour correction"
             )
         target_value = _validate_target_value(property_path, raw_target.get("value"))
         if property_path == "tracking" and not -4 <= target_value <= 4:
             raise AdTemplateProcessError("review target tracking is outside renderer bounds")
         if property_path == "lineHeight" and target_value < 1:
             raise AdTemplateProcessError("review target lineHeight is below renderer minimum")
-        if property_path == "fontSize" and target_value < (24 if layers[layer_id]["placement"] == "feed" else 32):
-            raise AdTemplateProcessError("review target fontSize is below placement minimum")
+        placement = layers[layer_id]["placement"]
+        minimum_font_size = 24 if placement == "feed" else 32
+        if property_path == "fontSize" and target_value < minimum_font_size:
+            raise AdTemplateProcessError(
+                f"review target fontSize is below placement minimum: {layer_id} "
+                f"({placement}) requested {target_value:g}px; minimum {minimum_font_size}px. Resize/reflow its box instead"
+            )
         if property_path in {"geometry/x", "geometry/y"} and target_value < 0:
             raise AdTemplateProcessError("review target geometry position is negative")
         if property_path in {"geometry/width", "geometry/height"} and target_value <= 0:
