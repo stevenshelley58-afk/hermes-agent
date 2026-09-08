@@ -1259,7 +1259,7 @@ class ToolRunAPIMixin:
                     except (AdTemplateProcessError, AdTemplateStructuredOutputError, AdTemplateTransportError):
                         raise
                     except Exception as exc:
-                        raise AdTemplateTransportError("frozen structured Responses role failed") from exc
+                        raise AdTemplateTransportError(self._tool_safe_transport_error(exc)) from exc
                     finally:
                         try:
                             with usage_lock:
@@ -2305,6 +2305,13 @@ class ToolRunAPIMixin:
         if not joined:
             raise AdTemplateTransportError("structured Responses role returned no output text")
         return joined
+
+    @staticmethod
+    def _tool_safe_transport_error(exc: Exception) -> str:
+        status = getattr(exc, "status_code", None)
+        suffix = f", HTTP {status}" if type(status) is int and 100 <= status <= 599 else ""
+        # Never include exception text, URLs, request headers, or provider body.
+        return f"frozen structured Responses role failed ({type(exc).__name__}{suffix})"
 
     @staticmethod
     def _tool_response_usage(response: Any, *, provider: str, model: str, base_url: str, api_key: Any) -> Dict[str, Any]:

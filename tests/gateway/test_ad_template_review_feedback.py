@@ -9,6 +9,22 @@ from gateway.ad_template_generator_layer_refinement import (
     compile_refinement_patch,
 )
 
+@pytest.mark.parametrize("effect", [
+    '{"colourRole":"mainText","opacity":1,"width":2}',
+    {"colourRole": "mainText", "width": 2},
+    {"colourRole": "#ffffff", "opacity": 1, "width": 2},
+    {"colourRole": "mainText", "opacity": 1, "width": 0},
+])
+def test_malformed_outline_is_rejected_before_it_can_reach_renderer(effect):
+    review = _invalid_review()
+    review["issues"] = review["issues"][:1]
+    review["issues"][0]["targets"] = [
+        {"layerId": "checkbox", "property": "effects", "value": {"stroke": effect}},
+    ]
+    with pytest.raises(process.AdTemplateProcessError):
+        process.validate_review(review, candidate=_candidate())
+
+
 @pytest.mark.parametrize("existing", [None, {"rotationDegrees": 0}, {"stroke": {"colourRole": "accent", "opacity": 1, "width": 1}}])
 def test_whole_stroke_target_adds_outline_without_losing_other_effects(existing):
     candidate = {"template": _template(), "assets": []}
@@ -36,6 +52,37 @@ def test_whole_stroke_target_adds_outline_without_losing_other_effects(existing)
         assert effects["rotationDegrees"] == existing["rotationDegrees"]
     assert candidate["template"]["feedLayout"]["layers"][-1].get("effects") == existing
 
+
+
+def test_generic_repair_cannot_skip_measured_targets(monkeypatch):
+    candidate = {"template": _template(), "assets": []}
+    candidate["template"]["feedLayout"]["layers"].append(
+        copy.deepcopy(_candidate()["template"]["feedLayout"]["layers"][0])
+    )
+    issues = [{"layerIds": ["checkbox"], "targets": [
+        {"layerId": "checkbox", "property": "geometry/x", "value": 30},
+        {"layerId": "checkbox", "property": "geometry/width", "value": 40},
+    ]}, {"layerIds": ["checkbox"], "targets": [], "instruction": "Preserve the outline role."}]
+    calls = []
+    monkeypatch.setattr(process, "vision_message", lambda prompt, paths, **kwargs: prompt)
+
+    def repair(instance, prompt, route):
+        calls.append(instance)
+        ops = [{"op": "replace", "path": "/template/feedLayout/layers/2/geometry/x", "value": 30}]
+        if len(calls) > 1:
+            assert "geometry/width must equal 40" in prompt
+            ops.append({"op": "replace", "path": "/template/feedLayout/layers/2/geometry/width", "value": 40})
+        return {"operations": ops}
+
+    _, result = process._call_applied_patch(
+        repair, instance="guarded-refinement-1", prompt="Apply every target.", paths=[],
+        route={"provider": "test", "model": "builder"}, candidate=candidate,
+        validate_candidate=lambda updated: process.validate_structured_repair_candidate(candidate, updated, issues),
+        emit=lambda *_args: None,
+    )
+    assert calls == ["guarded-refinement-1", "guarded-refinement-1-format-retry"]
+    assert result["template"]["feedLayout"]["layers"][2]["geometry"]["width"] == 40
+    assert candidate["template"]["feedLayout"]["layers"][2]["geometry"]["width"] == 30
 
 
 def test_semantic_colour_target_survives_review_and_locked_patch():

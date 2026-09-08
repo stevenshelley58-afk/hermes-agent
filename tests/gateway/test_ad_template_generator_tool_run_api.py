@@ -8,6 +8,19 @@ import gateway.tool_run_api as tool_run_api
 from gateway.tool_run_api import ToolRunAPIMixin
 from gateway.tool_runs import TOOL_RUN_COMMAND_SCHEMA, ToolRunStore
 
+@pytest.mark.parametrize("status", [400, 429, 502, None])
+def test_transport_failure_keeps_status_without_secrets(status):
+    error = RuntimeError("secret-api-key and private provider response")
+    error.status_code = status
+    message = ToolRunAPIMixin._tool_safe_transport_error(error)
+    assert "RuntimeError" in message
+    assert "secret" not in message and "private" not in message
+    if status is not None:
+        assert f"HTTP {status}" in message
+    else:
+        assert "HTTP" not in message
+
+
 
 def _command(key: str) -> dict:
     return {

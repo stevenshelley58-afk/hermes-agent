@@ -147,6 +147,29 @@ def _validate_target_value(property_path: str, value: Any) -> Any:
             raise AdTemplateProcessError("review target alignment is invalid")
         return value
     if property_path in _OBJECT_TARGET_PROPERTIES:
+        if property_path in {"effects", "effects/stroke", "effects/shadow"}:
+            if not isinstance(value, dict):
+                raise AdTemplateProcessError(f"review target {property_path} must be a JSON object, not encoded JSON text")
+            effect_objects = value if property_path == "effects" else {property_path.split("/")[1]: value}
+            for effect_name in ("stroke", "shadow"):
+                if effect_name not in effect_objects:
+                    continue
+                effect = effect_objects[effect_name]
+                fields = {"colourRole", "opacity", "width"} if effect_name == "stroke" else {"colourRole", "opacity", "blur", "offsetX", "offsetY"}
+                if not isinstance(effect, dict) or set(effect) != fields:
+                    raise AdTemplateProcessError(
+                        f"review target effects/{effect_name} must be an actual JSON object with exactly "
+                        f"{', '.join(sorted(fields))}; do not encode nested objects as strings"
+                    )
+                _validate_target_value("colourRole", effect["colourRole"])
+                bounds = {"opacity": (0, 1), "width": (0, 100), "blur": (0, 100), "offsetX": (-200, 200), "offsetY": (-200, 200)}
+                for field in fields - {"colourRole"}:
+                    number = effect[field]
+                    low, high = bounds[field]
+                    if (isinstance(number, bool) or not isinstance(number, (int, float))
+                            or not math.isfinite(number) or not low <= number <= high
+                            or (field == "width" and number <= 0)):
+                        raise AdTemplateProcessError(f"review target effects/{effect_name}/{field} is outside renderer bounds")
         if not isinstance(value, (dict, list)):
             raise AdTemplateProcessError(
                 f"review target {property_path} must be a JSON object or array"
@@ -1249,6 +1272,28 @@ def is_refinement_satisfied(contract: Mapping[str, Any]) -> bool:
                 ):
                     return False
     return True
+
+
+def validate_structured_repair_candidate(before, updated, issues):
+    """Keep exact targets locked even when other issues need generic repair."""
+    original_layers = _candidate_layers(before)
+    repaired_layers = _candidate_layers(updated)
+    failures = []
+    for issue in issues:
+        if not issue.get("targets"):
+            continue
+        targets = _structured_targets(issue, original_layers) or {}
+        for layer_id, properties in targets.items():
+            layer = repaired_layers.get(layer_id, {}).get("layer", {})
+            for property_path, target in properties.items():
+                exists, current = _read_contract_path(layer, property_path)
+                if not exists or not _target_matches(property_path, current, target):
+                    failures.append(f"{layer_id}/{property_path} must equal {json.dumps(target)}")
+    if failures:
+        raise AdTemplateProcessError(
+            "repair skipped measured corrections: " + "; ".join(failures)[:8000]
+        )
+    return copy.deepcopy(updated)
 
 
 def compile_refinement_patch(

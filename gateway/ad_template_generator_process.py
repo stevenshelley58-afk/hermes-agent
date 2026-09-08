@@ -52,6 +52,7 @@ from gateway.ad_template_generator_layer_refinement import (
     find_candidate_render,
     refinement_prompt,
     validate_refinement_patch,
+    validate_structured_repair_candidate,
     validate_text_ink_regression,
     write_fixed_crop,
     write_matching_crops,
@@ -909,6 +910,7 @@ CANDIDATE CONTRACT: {_safe_json(candidate)}
 REPAIR VOCABULARY CHECK BEFORE RETURNING JSON:
 - Solid colours use colourRole, NOT fill/colour. A colour correction target is {{"layerId":"<existing layer>","property":"colourRole","value":"<existing semantic role>"}}. Choose background, primary, secondary, accent, mainText or inverseText from the candidate's semanticColours. Stroke/shadow colours use effects/stroke/colourRole or effects/shadow/colourRole. Never invent fill/colour, fill/color, stroke/colour or a hex-valued colourRole. fill is only a full linear_gradient object with angleDegrees and stops.
 - A checkbox outline on a light panel can use the panel's colourRole for its vector fill and effects.stroke={{colourRole:"mainText",opacity:1,width:<measured pixels>}}, with its separate visible check icon above it. Stroke objects require ALL THREE fields. Change only the affected layer; do not recolour shared semanticColours merely to fix one box.
+- All effect values and nested stroke/shadow values must be actual JSON objects, never quoted JSON strings. An effects value containing a string-valued stroke will be rejected before repair. Include colourRole, opacity and width for strokes, and colourRole, opacity, blur, offsetX, offsetY for shadows.
 - Adding a missing outline: use a WHOLE effects/stroke object target, not effects/stroke/colourRole alone. If effects is absent, use property effects with value {{stroke:{{colourRole:"mainText",opacity:1,width:<measured pixels>}}}}. Preserve other existing effects. Include every required change in targets, not only prose: changing the box colour without adding its requested outline is incomplete.
 - Validate every target AND corresponding patch: Feed fontSize >=24; Story fontSize >=32; lineHeight >=1; tracking between -4 and 4; actual candidate layer IDs and on-canvas geometry. Resize or reflow clipped text instead of proposing an illegal font size. Keep every observed defect in issues even when its repair requires targets=[] and a concrete structural patch."""
 
@@ -3598,6 +3600,9 @@ class AdTemplateGeneratorOrchestrator:
                     paths=revision_paths,
                     route=builder_route,
                     candidate=repair_candidate,
+                    validate_candidate=lambda updated: validate_structured_repair_candidate(
+                        repair_candidate, updated, revision_review["issues"],
+                    ),
                     emit=self.emit,
                 )
                 persist_checkpoint(self.workspace, {"candidate": candidate, "accepted": False}, merge=True)
