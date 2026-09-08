@@ -71,8 +71,10 @@ AD_TEMPLATE_GENERATOR_STAGE_INACTIVITY_MULTIPLIERS = {
 _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS = {
     "builder": 32_768,
     "patch": 8_192,
-    "comparator": 8_192,
-    "review": 4_096,
+    # Responses output allowance includes reasoning. The real medium review
+    # used 10,373 reasoning + 1,064 result tokens; 8,192 truncated the JSON.
+    "comparator": 16_384,
+    "review": 16_384,
     "aspect-reference": 4_096,
     "diagnosis": 8_192,
 }

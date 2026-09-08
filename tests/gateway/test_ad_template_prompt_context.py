@@ -6,6 +6,15 @@ import gateway.ad_template_generator_process as process
 from tests.gateway.test_ad_template_generator_process import _review
 from gateway.ad_template_reusable_validation import _scenario, reusable_repair_context
 
+def test_review_response_room_preserves_deliberate_reasoning_and_complete_findings():
+    from gateway.tool_run_api import _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS as limits
+    assert limits["comparator"] == limits["review"] == 16384
+    for final in (False, True):
+        prompt = process.review_prompt(final=final, candidate={}, reference={"sourcePlacement": "feed"}, metrics={})
+        assert "Never omit an issue to fit or inflate a score" in prompt
+        assert "at most 45 words" in prompt
+
+
 
 def test_contract_diagnosis_is_once_per_run_and_uses_the_frozen_route(tmp_path, monkeypatch):
     calls, events = [], []
@@ -20,6 +29,8 @@ def test_contract_diagnosis_is_once_per_run_and_uses_the_frozen_route(tmp_path, 
     kwargs = dict(call_agent=None, candidate=value, reasons=["reusable scenario max failed: required height 64"], paths=["source"], route=route, checkpoint=checkpoint, workspace=tmp_path, emit=lambda *args: events.append(args))
     assert process._contract_repair_diagnosis(**kwargs) == diagnosis
     # Simulate a real process restart from the durable checkpoint.
+    # A successful patch writes a new stage snapshot before that restart.
+    process.persist_checkpoint(tmp_path, {"candidate": value, "accepted": False})
     kwargs["checkpoint"] = process.load_checkpoint(tmp_path)
     assert process._contract_repair_diagnosis(**kwargs) == diagnosis
     assert len(calls) == 1 and calls[0]["route"] == route
@@ -35,6 +46,8 @@ def test_contract_diagnosis_transport_failure_is_not_repeated_but_budget_errors_
     kwargs = dict(call_agent=None, candidate={"template": {"textInputs": [], "imageInputs": [], "feedLayout": {"layers": []}, "storyLayout": {"layers": []}}}, reasons=["reusable scenario max failed"], paths=[], route={"provider":"existing"}, checkpoint={}, workspace=tmp_path, emit=lambda *args: None)
     assert process._contract_repair_diagnosis(**kwargs) is None
     assert kwargs["checkpoint"]["contractRepairDiagnosisRequested"] is True
+    process.persist_checkpoint(tmp_path, {"candidate": kwargs["candidate"]})
+    kwargs["checkpoint"] = process.load_checkpoint(tmp_path)
     def budget(*args, **kwargs):
         raise process.AdTemplateProcessError("run cost limit exceeded")
     monkeypatch.setattr(process, "_call_json", budget)
@@ -45,7 +58,7 @@ def test_contract_diagnosis_transport_failure_is_not_repeated_but_budget_errors_
 
 
 def test_review_labels_stay_adjacent_to_their_actual_images(tmp_path):
-    names = ["source.png", "iteration-03-feed.png", "iteration-03-story.png",
+    names = ["source.png", "source-canvas.png", "iteration-03-feed.png", "iteration-03-story.png",
              "iteration-03-feed-difference.png", "iteration-01-feed.png", "iteration-01-story.png"]
     paths = []
     for index, name in enumerate(names):
@@ -68,7 +81,7 @@ def test_review_labels_stay_adjacent_to_their_actual_images(tmp_path):
         label, pixels = message[1 + index * 2:3 + index * 2]
         assert name in label["text"]
         assert pixels["type"] == "image_url"
-        expected = "ORIGINAL SOURCE" if index == 0 else "CURRENT CANDIDATE" if index < 3 else "DIAGNOSTIC ONLY" if index == 3 else "SAVED BASELINE ONLY"
+        expected = "ORIGINAL SOURCE" if index < 2 else "CURRENT CANDIDATE" if index < 4 else "DIAGNOSTIC ONLY" if index == 4 else "SAVED BASELINE ONLY"
         assert expected in label["text"]
 
 

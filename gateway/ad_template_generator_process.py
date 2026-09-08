@@ -906,6 +906,7 @@ BRAND IDENTITY: Logo layers retain the actual neutral production brand asset, no
 FONT POLICY: {REVIEW_FONT_SUBSTITUTION_RULE} Keep the candidate's declared font family fixed during visual review; do not request family substitution as a likeness correction. Font-file validity is checked by the renderer.
 {REVIEW_MEASUREMENT_RULE}
 IMAGE ORDER NOTE: Neutral production images, when supplied, follow the original-source/Feed-QA/Story-QA images and precede the original-placement overlay/difference views. Iteration reviews without them inspect the current QA renders. Never interpret a difference heatmap as a customer preview.
+RESPONSE ECONOMY: Return compact JSON, no indentation. Keep each issue instruction to at most 45 words of observed evidence and correction. Do not repeat the candidate, rubric, targets or patch in prose. Group the same correction across related layers into one issue, but retain every distinct observed defect and all required targets/operations. Never omit an issue to fit or inflate a score. Keep warnings and fontSubstitution explanations brief.
 
 RECIPROCAL ASPECT REFERENCE: {_safe_json(reference)}
 DETERMINISTIC PIXEL/EDGE/COLOUR DIAGNOSTICS: {_safe_json(metrics)}. These are diagnostic differences from the comparison renders, including intentional neutral-photo differences; assess layout fidelity visually.
@@ -2475,6 +2476,8 @@ def persist_checkpoint(
             "stallDiagnosisRequested",
             "stallDiagnosisStatus",
             "stallDiagnosis",
+            "contractRepairDiagnosisRequested",
+            "contractRepairDiagnosis",
         ):
             if key not in updates and key in previous:
                 stable[key] = copy.deepcopy(previous[key])
@@ -2720,6 +2723,8 @@ def _label_review_evidence(message, paths, baseline_paths):
                 role = "DIAGNOSTIC ONLY. Not a customer render"
             elif index == 1:
                 role = "ORIGINAL SOURCE. Sole design authority"
+            elif name == "source-canvas.png":
+                role = "ORIGINAL SOURCE NORMALIZED TO CANVAS. Same design authority, NOT the current candidate"
             else:
                 role = "CURRENT CANDIDATE. Score and correct these pixels"
             result.append({"type": "text", "text": f"IMAGE {index}: {role}. Evidence name: {name}"})
