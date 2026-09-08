@@ -526,6 +526,7 @@ def test_five_non_improvements_trigger_one_frontier_diagnosis_then_resume_from_b
     Image.new("RGB", (800, 1000), "white").save(source)
     comparison_count = 0
     layer_prompts: list[list[dict]] = []
+    comparator_prompts: list[str] = []
     diagnosis_calls: list[tuple[list[dict], str]] = []
     rendered_x: list[float] = []
     events: list[tuple[str, str, dict]] = []
@@ -563,6 +564,7 @@ def test_five_non_improvements_trigger_one_frontier_diagnosis_then_resume_from_b
             return {"template": template, "assets": []}
         if instance.startswith("comparator-"):
             comparison_count += 1
+            comparator_prompts.append(prompt[0]["text"])
             accepted = comparison_count == 8
             result = _comparison(
                 accept=accepted,
@@ -678,7 +680,7 @@ def test_five_non_improvements_trigger_one_frontier_diagnosis_then_resume_from_b
     assert [Path(path).name for path in diagnosis_prompt[1]["paths"][1:]] == [
         "iteration-01-feed.png", "iteration-01-story.png",
     ]
-    assert len(layer_prompts) == 7
+    assert len(layer_prompts) == 7 - int(expect_guidance)
     assert (
         "STALL DIAGNOSIS GUIDANCE" in layer_prompts[-1][0]["text"]
     ) is expect_guidance
@@ -691,6 +693,10 @@ def test_five_non_improvements_trigger_one_frontier_diagnosis_then_resume_from_b
         "RECENT REJECTED EDITS", 1,
     )
     assert "latest-criticism-7" in active_review
+    if expect_guidance:
+        assert diagnosis_value["nextChanges"][0] in comparator_prompts[6]
+        assert any("reconcile new diagnosis" in data.get("reason", "")
+                   for kind, _, data in events if kind == "iteration.recheck-requested")
     assert "attemptOperations" in rejected_edits
 
     # Every rejected equal attempt is rebuilt from x=0 BEST. If the loop kept

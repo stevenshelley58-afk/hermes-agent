@@ -105,7 +105,7 @@ REVIEW_FONT_SUBSTITUTION_RULE = (
 REVIEW_MEASUREMENT_RULE = 'MEASUREMENT EVIDENCE: textAlignment contains high-confidence matching glyph bounds, not editable text boxes. Its offset is candidate minus source; subtract that delta to correct displacement, then render and remeasure. Do not replace box dimensions or font sizes directly with glyph bounds. Missing OCR is unknown, not proof that text is missing or correct. Thin sourceStructuralBands indicate horizontal edges, not complete photo rectangles. Estimated sourceImageRegions are not ground truth when original source edges or text measurements contradict them. Correct major panel boundaries, overlaps, lost copy and hierarchy before small coordinate tweaks.'
 SOURCE_MAP_VERSION = 2
 QA_PROJECTION_VERSION = 5
-EVALUATION_POLICY_VERSION = 6
+EVALUATION_POLICY_VERSION = 7
 STAGES = (
     "source",
     "aspect-reference",
@@ -666,6 +666,15 @@ def build_prompt(*, run_id: str, project_id: str, brief: str, placements: Any, r
 Return JSON only with exactly {{"template":{{...}},"assets":[]}}. The template object must have exactly these keys: schema, templateId, createdAt, feedLayout, storyLayout, imageInputs, textInputs, semanticColours, assets, fonts, metadata. Do not return schemaVersion, fields, placements, name or any legacy pack envelope.
 
 DIRECT BLOCKWISE CONTRACT:
+FIRST-PASS CONSTRUCTION CHECKLIST (complete before returning JSON):
+- Inventory the source from top to bottom: panel boundaries, every text block, each checklist row and its icon enclosure, all image slots, CTA and footer. Measure the source on its normalized canvas. Reproduce the ORIGINAL placement first; adapt the other placement independently without losing any content role.
+- Treat source pixels as design authority; region estimates are advisory. Do not invent pill buttons, rounded panels, borders or extra decorations. A plain check is not an outlined checkbox: where the source has a box, use a separate outlined vector behind the supported check icon. Keep a fully opaque rectangular background plate beneath any decorative rounding.
+- Choose a bundled font once and preserve its choice during positional repairs. Exact font-family identity is excluded. Prioritize matching the visible text footprint, baseline, density and line count over family resemblance. Center visible CTA glyphs inside their button, not merely the editable text box.
+- Build complete Feed and Story layouts in this response. Shared checklist inputs must bind every row in both placements; do not bind a multi-item list to its first item alone.
+- Declare usable text capacity, not optimistic character counts. Each textInputs.maxLength must fit ALL its Feed/Story layers at the stated maxLines and at least 24px/32px respectively. Layer maxCharacters must cover the shared input limit. Reserve measured width/height for long words and accents; do not rely on scale_down below the readability floor, truncation of essential copy, or a tiny maxLength that makes the field unusable.
+- The real reusable tests replace each field with short text, repeated "Maximum editable content " up to maxLength, Unicode "Ångström 東京 — café 🏡", and optional-empty text. Account for these substitutions now; matching the placeholder alone is insufficient. Preserve source-like default copy density and useful editing capacity.
+- Before emitting, self-check both layouts for missing rows/media, text overlap, CTA alignment, text capacity, unsupported properties, array bindings and font declarations. Fix these together before the first external review.
+
 - schema is "blockwise.ad-template"; templateId is a stable safe ID; createdAt is an ISO-8601 UTC datetime.
 - Every layer MUST include a literal type field: "plate", "image_slot", "overlay_patch", "text", "logo", "vector", or "icon". For example, an image layer begins {{"type":"image_slot","layerId":"hero","inputKey":"hero",...}}. Never use "image", "shape", or "rectangle" as a layer type.
 - feedLayout is {{placement:"feed",layers:[],safeZones:[]}} and storyLayout is {{placement:"story",layers:[],safeZones:[]}}. Populate layers; keep safeZones an array of {{x,y,width,height}} rectangles or []. Do not put canvas dimensions or aspect ratios in placement. Feed canvas is 1080x1350 and Story is 1080x1920. Use absolute pixel geometry {{x,y,width,height}}. The first layer is a protected full-canvas plate. Every layer requires a type field set to its literal type below. Layer IDs are unique across both placements.
@@ -845,12 +854,20 @@ When revision is required, return the exact correction as patch in this same res
 Return JSON only with exactly {output_fields}. scores must contain exactly, in this order: overall, geometry, typography, colourEffects, imageCrop, details. overall is non-gating ranking evidence only; the sole overall acceptance check is whether issues contains any obvious error. Do not lower any score for exact font-family mismatch. typography scores only size, weight, spacing, alignment, hierarchy and legibility. effects must contain exactly, in this order: shading, gradients, shadows, transparency, borders, masks, texture; each is match, not_present, or mismatch. issues is a list of objects with exactly placement (feed|story|both), layerIds (real candidate layer IDs), category (geometry|typography|colourEffects|imageCrop|details), instruction, severity (blocker|material|minor), targets (an array of {{layerId, property, value}}). For measured property corrections, targets are authoritative: use canonical layer-relative properties such as geometry/x, geometry/y, geometry/width, geometry/height, fontSize, tracking or font/file, with the exact desired value. Include a target for every listed layer and explain the correction in instruction. Use targets=[] only for structural changes or shared semantic-colour rebinding that cannot safely be represented as layer-property targets; describe the concrete correction without inventing a property or layer ID. Vague requests such as "match the source" or "fix spacing" without a concrete correction are invalid. Every visible discrepancy is an issue; acceptance requires issues=[] and every effect matched or genuinely absent. decision is evidence only; the controller derives accept/revise from the five section scores, issues and effects. fontSubstitution is informational only and is null or exactly {{source,used,reason}}.{patch_contract} Return no prose.
 
 PRODUCTION SAFETY: Do not reproduce accidental source clipping, duplicate glyphs, or missing contact text as a requested correction. Match the source structure while keeping customer replacements readable; list unavoidable source defects as warnings, never a reason to damage the production template. Repeated feature wording intentionally present in the source is not itself a stray-glyph defect.
+FACT-FIRST REVIEW, NOT TARGET-SCORE OPTIMIZATION:
+1. Inspect source and CURRENT renders before assigning numbers. Check all regions in one pass: panel geometry, headline/body footprint, every checklist row and enclosure, image roles/crops, footer and CTA. Compare BOTH placements. The numeric gate is an acceptance rule, never a score to work toward or a reason to inflate a score.
+2. Ground each issue in an observation: source feature and approximate bounds; CURRENT defect; named layer; smallest supported correction. For a numeric target, state current value, desired value and measured reason. Do not infer pill ends, outer rounding or missing borders from a previous review. Source evidence wins over all previous model opinions.
+3. Keep one issue per independently repairable defect, with only affected layers. Enumerate every observed defect now; do not drip-feed one new defect per iteration. Cover every below-threshold section with an actionable issue. Do not reopen a corrected section unless its pixels changed or you identify a specifically evidenced oversight.
+4. Correct text by its VISIBLE GLYPH position. If a CTA label sits above its button center, move the label alone by the glyph-center delta. Moving the button and label together cannot correct internal alignment. Do not lower font size below the floor or change the font family to solve a coordinate problem.
+5. Assign scores from these findings, then run the single whole-frame no-obvious-errors check. A missing checkbox enclosure, lost checklist row, clipped copy or visibly off-center button label is never compatible with acceptance, even if other sections are excellent. Never use budget, iteration number, earlier scores or a desire to finish as evidence of quality. Do not award 9.8 merely because few issues remain.
+6. If evidence contradicts a prior correction, explicitly explain the contradiction in the issue instruction. If a target already equals CURRENT, do not request it again; inspect the painted result and find the actual cause. An uncertain coordinate estimate is not a measured target. Do not copy source-specific artifacts such as privacy/redaction blocks into the design.
+
 COORDINATE AND FIT RULES: Feed is exactly 1080x1350; Story is exactly 1080x1920. The original-source comparison image is normalized to its matching canvas without cropping. All geometry targets use those canvas pixels, NEVER thumbnail/display pixels. Preserve the renderer's minimum font sizes: Feed 24px and Story 32px, multiline lineHeight >= 1. Do not request a smaller font; reflow the native adaptation or resize the editable box instead. The comparison source map and render share the same coordinate scale.
 BRAND IDENTITY: Logo layers retain the actual neutral production brand asset, not a source-advertiser crop. Different brand names/marks are intentional. Check the logo footprint, full visibility and aspect ratio; do not request copying advertiser identity or score a neutral mark as missing source artwork.
 
-AVAILABLE BUNDLED FONT FILES: {_safe_json(list(_available_font_files()))}. Existing declared asset-backed fonts may also be used. {REVIEW_FONT_SUBSTITUTION_RULE} Choose the closest available face, weight and tracking; do not repeatedly demand unavailable proprietary fonts.
+FONT POLICY: {REVIEW_FONT_SUBSTITUTION_RULE} Keep the candidate's declared font family fixed during visual review; do not request family substitution as a likeness correction. Font-file validity is checked by the renderer.
 {REVIEW_MEASUREMENT_RULE}
-IMAGE ORDER NOTE: Neutral production images follow the three original-source/QA images and precede the original-placement overlay/difference views. Never interpret a difference heatmap as a customer preview.
+IMAGE ORDER NOTE: Neutral production images, when supplied, follow the original-source/Feed-QA/Story-QA images and precede the original-placement overlay/difference views. Iteration reviews without them inspect the current QA renders. Never interpret a difference heatmap as a customer preview.
 
 RECIPROCAL ASPECT REFERENCE: {_safe_json(reference)}
 DETERMINISTIC PIXEL/EDGE/COLOUR DIAGNOSTICS: {_safe_json(metrics)}. These are diagnostic differences from the comparison renders, including intentional neutral-photo differences; assess layout fidelity visually.
@@ -867,9 +884,46 @@ def _pairwise_review_context(
 PAIRWISE BEST-SO-FAR CONTEXT: Two additional images are attached after the
 current candidate evidence: BEST Feed render, then BEST Story render, from
 iteration {best_iteration}. Score the CURRENT candidate against the source,
-but use BEST only as the improvement baseline. Do not recommend or reward a
-change that is equal to or worse than BEST. The returned patch still targets
-the CURRENT candidate. BEST EDITABLE TEMPLATE: {_safe_json(best_candidate)}"""
+but use BEST only as the improvement baseline. comparisonToBest describes the
+CURRENT pixels relative to BEST, not whether either passes the absolute gate.
+An identical candidate is same even if you previously missed a defect.
+The returned patch still targets the CURRENT candidate contract and its pointers,
+never remembered indices from BEST. Do not reward a higher score without a visible
+improvement. BEST is a baseline, not a declaration that its layers are perfect."""
+
+
+def _review_iteration_context(
+    iterations: Sequence[Mapping[str, Any]], diagnosis: Mapping[str, Any] | None,
+) -> str:
+    """Supply bounded repair history without anchoring judges to prior scores."""
+    history = []
+    for item in iterations[-3:]:
+        review = item.get("comparison") or {}
+        refinement = item.get("refinement") or {}
+        history.append({
+            "iteration": item.get("iteration"),
+            "discarded": bool(item.get("discarded")),
+            "issues": list(review.get("issues") or [])[:8],
+            "attemptOperations": list(refinement.get("operations") or [])[:32],
+        })
+    # Omit oldest oversized records rather than fail a provider call or chop JSON.
+    # Candidate contracts still carry the full current truth.
+    while history and len(json.dumps(history, ensure_ascii=False).encode("utf-8")) > 40_000:
+        history.pop(0)
+    if not history and not diagnosis:
+        return ""
+    return f"""
+
+REVISION MEMORY (prior model claims, not design authority):
+{_safe_json(history, max_bytes=60_000)}
+Do not repeat failed or already-satisfied targets. Check whether each earlier
+defect is resolved in CURRENT. Rejecting an attempt does not prove its original
+criticism was correct. Explain any reversal using visible source evidence.
+STALL DIAGNOSIS (advisory, reconcile with source before proposing targets):
+{_safe_json(diagnosis, max_bytes=20_000)}
+If the diagnosis contradicts earlier targets, resolve the conflict in this review;
+do not pass stale targets to the repair model. Return one coherent current issue
+list and patch. Do not infer acceptance from history or from missing history."""
 
 
 def validate_stall_diagnosis(value: Any) -> Dict[str, Any]:
@@ -1002,6 +1056,8 @@ def patch_prompt(*, candidate: Mapping[str, Any], issues: Sequence[Mapping[str, 
     return f"""Apply only the listed exact-clone corrections to the current valid Blockwise candidate. Do not redesign, regenerate or replace the document. Preserve every field and layer not named by the corrections. Return a bounded JSON patch only: {{"operations":[{{"op":"replace|add|remove","path":"/template/...","value":...}}]}}. Use the exact JSON Pointer map below. When a correction states an explicit numeric target ("set ... to N"), apply that exact value to the named layer; never approximate or skip part of a group shift. For a layer type change, replace the whole layer at its mapped pointer. When changing to a font not already declared, also add its {{"file":"..."}} declaration at /template/fonts/-. Append list items with /- or the current list length, EXCEPT full-canvas background frames or plates: insert those at index 1, directly above the plate layer, never on top of the content (a covering background layer blanks the render). Remove multiple list items in descending index order. Do not change schema, templateId, createdAt, asset declarations or source-free asset assignments. Maximum {MAX_PATCH_OPERATIONS} operations. A remove operation omits value; add/replace requires value. Return JSON only.
 
 LAYER POINTERS: {_safe_json(_layer_pointer_map(candidate), max_bytes=40_000)}
+PATCH EXISTENCE RULE: replace requires the complete property path to exist, not merely its parent layer. Use add for an absent optional property when allowed. Resolve every layerId against THIS candidate; no remembered array indices. Use effects.stroke, never top-level stroke. Check all paths before returning.
+Keep valid font families fixed. Preserve text capacity and the opaque full-canvas plate. Correct visible label-to-container alignment by moving the label rather than both elements. Listed issues are model claims to reconcile with source and any newer diagnosis, not permission to reproduce a known false feature.
 CURRENT CANDIDATE: {_safe_json(candidate)}
 CORRECTIONS: {_safe_json(list(issues), max_bytes=80_000)}
 MANUAL REVIEW INSTRUCTIONS: {manual_instructions[:4000]}
@@ -1013,6 +1069,7 @@ def contract_repair_prompt(*, candidate: Mapping[str, Any], reasons: Sequence[st
 
 CURRENT CANDIDATE: {_safe_json(candidate)}
 BLOCKWISE CONTRACT/RENDERER FAILURES: {_safe_json(list(reasons), max_bytes=40_000)}
+PATCH EXISTENCE RULE: replace requires an existing leaf property; add creates an allowed absent optional property. Resolve layer indices from CURRENT CANDIDATE. Fix every listed failure in one coherent patch without lowering readability or usable text capacity.
 SUPPORTED ICON RULE: use only arrow, check, tick, phone, mail, globe or location. For boxed checkmarks, add a separate vector rectangle behind a supported check/tick icon and put the border in effects.stroke (not a top-level stroke field). Never use check-square or invent an icon name."""
 
 
@@ -2779,7 +2836,10 @@ class AdTemplateGeneratorOrchestrator:
                 "preserved_iterations": len(checkpoint.get("iterations") or []),
             }))
             checkpoint["qaProjectionVersion"] = QA_PROJECTION_VERSION
-        if checkpoint and checkpoint.get("evaluationPolicyVersion") != EVALUATION_POLICY_VERSION:
+        evaluation_policy_changed = bool(
+            checkpoint and checkpoint.get("evaluationPolicyVersion") != EVALUATION_POLICY_VERSION
+        )
+        if evaluation_policy_changed:
             previous_version = checkpoint.get("evaluationPolicyVersion")
             checkpoint["accepted"] = False
             checkpoint.pop("finalReview", None)
@@ -2972,6 +3032,7 @@ class AdTemplateGeneratorOrchestrator:
             best_candidate is not None and best_review is not None
             and best_review["decision"] == "accept"
             and not manual_revision_pending
+            and not evaluation_policy_changed
         ):
             # The active cycle already produced an accepted candidate before
             # the last interruption; continue to final review instead of
@@ -3056,7 +3117,7 @@ class AdTemplateGeneratorOrchestrator:
                 rendered_best["render"]["story"],
             ]
 
-        def ensure_stall_diagnosis() -> None:
+        def ensure_stall_diagnosis() -> bool:
             nonlocal stall_diagnosis_requested, stall_diagnosis
             if (
                 consecutive_non_improving < STALL_DIAGNOSIS_THRESHOLD
@@ -3064,7 +3125,7 @@ class AdTemplateGeneratorOrchestrator:
                 or best_candidate is None
                 or best_review is None
             ):
-                return
+                return False
             if (
                 diagnosis_route is None
                 or not str(diagnosis_route.get("provider") or "").strip()
@@ -3126,7 +3187,7 @@ class AdTemplateGeneratorOrchestrator:
                     "reason": str(exc)[:2000],
                     "continuing_from_best": True,
                 })
-                return
+                return False
             checkpoint["stallDiagnosisStatus"] = "completed"
             persist_checkpoint(self.workspace, {
                 "stallDiagnosisStatus": "completed",
@@ -3137,6 +3198,7 @@ class AdTemplateGeneratorOrchestrator:
                 "next_changes": stall_diagnosis["nextChanges"],
                 "capability_blockers": stall_diagnosis["capabilityBlockers"],
             })
+            return True
 
         ensure_stall_diagnosis()
         while comparison_budget_used < MAX_COMPARISONS and accepted_review is None:
@@ -3275,6 +3337,7 @@ class AdTemplateGeneratorOrchestrator:
                         best_iteration=best_iteration,
                         best_candidate=best_candidate if best_available else None,
                     )
+                    + _review_iteration_context(iterations, stall_diagnosis)
                 ),
                 paths=[*current_vision_paths, *best_render_paths],
                 route=comparator_route,
@@ -3450,7 +3513,17 @@ class AdTemplateGeneratorOrchestrator:
                     "bestIteration": best_iteration,
                 })
                 continue
-            ensure_stall_diagnosis()
+            if ensure_stall_diagnosis():
+                # The diagnosis may disprove the current targets. Obtain one
+                # reconciled review before the deterministic compiler can apply
+                # those stale targets; do not ask a locked repair to contradict
+                # its own contract. This uses the existing comparison budget.
+                self.emit("iteration.recheck-requested", "compare", {
+                    "iteration": global_iteration,
+                    "reason": "reconcile new diagnosis before compiling further corrections",
+                    "bestIteration": best_iteration,
+                })
+                continue
             try:
                 contract = build_refinement_batch_contract(
                     candidate,
