@@ -168,3 +168,19 @@ label edge case is also guarded, but was not the live failure cause: the actual
 process already deduplicates the normalized source. All 259 tests, Ruff and
 whitespace checks passed; health returned 200. The same canary resumed using
 saved photos and the passing reusable result. Full end-to-end success is pending.
+
+## Reviewer/preflight conflict feedback (08:35 UTC)
+
+The same sample reached comparison two at 9.62 overall, but visual review
+repeatedly requested a 48px Story CTA box while Unicode needed 78px. The repair
+restored capacity and the next visual review repeated the old reduction. The
+attempt was cancelled through the supported API during comparison four, leaving
+three used lifetime comparisons and all saved evidence intact.
+
+Release `b024998097ec0de299b7baede1a0b6bf85a0d2a3` deployed at 08:35:13 UTC
+after 260 passing tests, Ruff and whitespace checks. Reviewers now receive
+bounded durable actual fit-failure feedback and the prior diagnosis as advisory
+context, explicitly requiring a fit-safe coordinated correction without reducing
+editable limits or suppressing defects. Health returned 200 and the same run
+resumed. Comparison four passed all five sections at 9.85 or above and all four
+reusable scenarios passed. Independent final reviews are still required.
