@@ -128,3 +128,23 @@ The initial Meta probe's 1,000-token allowance did not produce parseable output;
 the 4,096-token probe completed. These probes are diagnostic, not template runs.
 The Responses roles now request medium reasoning within unchanged time, output,
 cost, route and acceptance bounds. A fresh full canary must establish readiness.
+
+## Aggregated preflight repair (08:13 UTC)
+
+Canary `trun_cf767d809b8c438497a1e9bc9676ea80` stopped before comparison:
+the fourth medium-reasoning contract repair used its entire 8,192-output-token
+allowance without returning output text. A read-only low-effort repair probe
+returned a renderable patch but still failed reusable fit. These are failures,
+not readiness evidence. Direct Astra patch qualification also failed strict
+schema compatibility; the frozen provider routes were not changed.
+
+Release `f9651d6c8e7d0b0d34699865fbd51f1ab1d9535b` deployed at 08:13:33 UTC
+after 258 generator tests, Ruff and whitespace checks passed. It includes the
+preceding aggregated four-scenario feedback change, plus one durable diagnosis
+request using the existing Concentrate route to plan coordinated capacity fixes.
+Patch calls use low reasoning; builders, reviewers and diagnosis remain medium.
+No output/time/cost/score allowance was increased. Optional diagnosis transport
+failure is recorded once; budget failures still propagate. The supported retry
+resumed the same saved sample at policy 45. Health returned 200. Previous pinned
+releases and an online database backup remain available. A complete accepted
+run, quarantined import and matching smoke test remain required before first50.
