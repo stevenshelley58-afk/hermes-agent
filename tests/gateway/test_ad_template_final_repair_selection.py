@@ -101,21 +101,17 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
         return _reusable_validation()
 
     monkeypatch.setattr(process, "validate_reusable_template", reusable)
-    monkeypatch.setattr(
-        process,
-        "import_template",
-        lambda candidate, **kwargs: (
-            imported.append(candidate["template"]["metadata"]["description"])
-            or {
-                "template_id": candidate["template"]["templateId"],
-                "status": "imported",
-                "asset_count": 0,
-                "replayed": False,
-                "library_status": "quarantined",
-                "run_id": kwargs["run_id"],
-            }
-        ),
-    )
+    def import_checked(candidate, **kwargs):
+        trace["pre_import_checkpoint"] = process.load_checkpoint(tmp_path / "run")
+        if trace.get("fail_import"):
+            raise process.AdTemplateProcessError("handoff unavailable")
+        imported.append(candidate["template"]["metadata"]["description"])
+        return {
+            "template_id": candidate["template"]["templateId"],
+            "status": "imported", "asset_count": 0, "replayed": False,
+            "library_status": "quarantined", "run_id": kwargs["run_id"],
+        }
+    monkeypatch.setattr(process, "import_template", import_checked)
     monkeypatch.setattr(
         process,
         "review_template_action",
@@ -252,6 +248,23 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
         ] + ([{"provider": "test", "model": "diagnosis"}] if recovery else []),
     )
     return result, imported, calls, events
+
+
+def test_handoff_failure_preserves_comparator_accepted_repair(tmp_path, monkeypatch):
+    trace = {"fail_import": True}
+    with pytest.raises(process.AdTemplateProcessError, match="handoff unavailable"):
+        _run_final_repair_case(tmp_path, monkeypatch, repair_score=9.8,
+                               comparison_to_best="same", trace=trace)
+    saved = process.load_checkpoint(tmp_path / "run")
+    assert saved["candidate"]["template"]["metadata"]["description"] == "repaired-candidate"
+    assert saved["bestCandidate"] == saved["candidate"]
+    assert saved["bestReview"]["decision"] == "accept"
+    assert saved["bestReview"]["scores"]["overall"] == 9.8
+    assert saved["accepted"] is True
+    assert "import" not in saved and "smokeTest" not in saved
+    recovered, _, _ = process._recover_checkpoint_best(
+        saved, saved["iterations"], tmp_path / "run", lambda *args: None)
+    assert recovered == saved["candidate"]
 
 
 @pytest.mark.parametrize(("repair_score", "comparison_to_best"), [

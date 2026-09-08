@@ -4175,7 +4175,10 @@ class AdTemplateGeneratorOrchestrator:
                             + _preflight_review_context(checkpoint)
                             + "\nCheck each against CURRENT pixels; do not repeat a corrected target. "
                             "Report all still-visible defects together. Earlier acceptance is not evidence of quality."),
-                    paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
+                    # Final judges need source and current production pixels;
+                    # photo-heavy overlay/difference diagnostics stay with the
+                    # comparator, avoiding redundant final vision payloads.
+                    paths=_vision_paths(source, reciprocal_reference, final_rendered, [], production_rendered),
                     route=route,
                     validate=lambda value: validate_review(value, require_actionable_targets=False, candidate=candidate),
                     emit=lambda kind, node, data: buffered_events.append((kind, node, data)),
@@ -4512,6 +4515,15 @@ class AdTemplateGeneratorOrchestrator:
                 continue
             comparator_accepted_candidate = candidate
             comparator_accepted_review = accepted_review
+            # Preserve the actual comparator-approved repair before another
+            # provider or import call can fail. A retry must not restore the
+            # older pre-repair draft merely because it had a higher rank score.
+            best_candidate, best_review, best_iteration = candidate, accepted_review, global_iteration
+            persist_checkpoint(self.workspace, {
+                "candidate": candidate, "iterations": iterations, "accepted": True,
+                "bestCandidate": candidate, "bestReview": accepted_review,
+                "bestIteration": global_iteration, "finalReview": None,
+            }, merge=True)
 
         try:
             reusable_validation = validate_reusable_template(candidate, workspace=self.workspace, render=run_renderer, asset_overrides=demo_overrides, cached=reusable_validation, check_stop=self._check_stop)
