@@ -7,6 +7,43 @@ from tests.gateway.test_ad_template_generator_process import _review
 from gateway.ad_template_reusable_validation import _scenario, reusable_repair_context
 
 
+def test_contract_diagnosis_is_once_per_run_and_uses_the_frozen_route(tmp_path, monkeypatch):
+    calls, events = [], []
+    diagnosis = {"diagnosis": "Plan the whole row", "nextChanges": ["Increase story-label height to 64 and maxLines to 2"], "capabilityBlockers": []}
+    def call(*args, **kwargs):
+        calls.append(kwargs)
+        return diagnosis
+    monkeypatch.setattr(process, "_call_json", call)
+    checkpoint = {}
+    value = {"template": {"textInputs": [{"key": "label", "placeholder": "Label", "maxLength": 28}], "imageInputs": [], "feedLayout": {"layers": []}, "storyLayout": {"layers": []}}}
+    route = {"provider": "existing", "model": "diagnostic"}
+    kwargs = dict(call_agent=None, candidate=value, reasons=["reusable scenario max failed: required height 64"], paths=["source"], route=route, checkpoint=checkpoint, workspace=tmp_path, emit=lambda *args: events.append(args))
+    assert process._contract_repair_diagnosis(**kwargs) == diagnosis
+    # Simulate a real process restart from the durable checkpoint.
+    kwargs["checkpoint"] = process.load_checkpoint(tmp_path)
+    assert process._contract_repair_diagnosis(**kwargs) == diagnosis
+    assert len(calls) == 1 and calls[0]["route"] == route
+    assert "Maximum editable content" in calls[0]["prompt"]
+    assert "required height 64" in calls[0]["prompt"]
+    assert events[-1][0] == "contract-repair.diagnosis-completed"
+
+
+def test_contract_diagnosis_transport_failure_is_not_repeated_but_budget_errors_propagate(tmp_path, monkeypatch):
+    def fail(*args, **kwargs):
+        raise process.AdTemplateTransportError("deadline")
+    monkeypatch.setattr(process, "_call_json", fail)
+    kwargs = dict(call_agent=None, candidate={"template": {"textInputs": [], "imageInputs": [], "feedLayout": {"layers": []}, "storyLayout": {"layers": []}}}, reasons=["reusable scenario max failed"], paths=[], route={"provider":"existing"}, checkpoint={}, workspace=tmp_path, emit=lambda *args: None)
+    assert process._contract_repair_diagnosis(**kwargs) is None
+    assert kwargs["checkpoint"]["contractRepairDiagnosisRequested"] is True
+    def budget(*args, **kwargs):
+        raise process.AdTemplateProcessError("run cost limit exceeded")
+    monkeypatch.setattr(process, "_call_json", budget)
+    assert process._contract_repair_diagnosis(**kwargs) is None
+    kwargs["checkpoint"] = {}
+    with pytest.raises(process.AdTemplateProcessError, match="cost limit"):
+        process._contract_repair_diagnosis(**kwargs)
+
+
 def test_review_labels_stay_adjacent_to_their_actual_images(tmp_path):
     names = ["source.png", "iteration-03-feed.png", "iteration-03-story.png",
              "iteration-03-feed-difference.png", "iteration-01-feed.png", "iteration-01-story.png"]

@@ -1123,6 +1123,36 @@ ACTUAL REPLACEMENT PAYLOADS: {_safe_json(reusable_repair_context(candidate), max
 SUPPORTED ICON RULE: use only arrow, check, tick, phone, mail, globe or location. For boxed checkmarks, add a separate vector rectangle behind a supported check/tick icon and put the border in effects.stroke (not a top-level stroke field). Never use check-square or invent an icon name."""
 
 
+def _contract_repair_diagnosis(*, call_agent, candidate, reasons, paths, route, checkpoint, workspace, emit):
+    """Use the already-frozen diagnosis route once for reusable fit failures."""
+    if not route or not any("reusable scenario" in reason for reason in reasons):
+        return checkpoint.get("contractRepairDiagnosis")
+    if checkpoint.get("contractRepairDiagnosisRequested"):
+        return checkpoint.get("contractRepairDiagnosis")
+    checkpoint["contractRepairDiagnosisRequested"] = True
+    persist_checkpoint(workspace, {"contractRepairDiagnosisRequested": True}, merge=True)
+    emit("contract-repair.diagnosis-started", "build", {})
+    prompt = f"""Plan one coherent repair of the failed editable text boxes. Do not return a patch or scores.
+Return JSON with exactly diagnosis (string), nextChanges (list of concrete instruction strings), capabilityBlockers (list of strings, [] if none).
+The first image is the original source, the second is its reciprocal-aspect reference; any third and fourth images are CURRENT Feed and Story pixels respectively. The original source is the design authority. Use the measured fit requirements and exact replacement payloads below, not guesses about default text.
+For every affected layer, jointly calculate width, height, maxLines, font size and clearance from neighbours. Feed minimum 24px, Story 32px. Never shorten text or lower maxLength/maxCharacters; keep valid font families and image assets. Text boxes use absolute positions and do not push neighbours. Unused box height is not painted ink. Allocate maximum-content clearance while preserving the default visual hierarchy. Feed canvas 1080x1350, Story 1080x1920. List exact layer IDs and all coordinated changes needed; flag genuine impossibility instead of inventing a pass.
+CURRENT CANDIDATE: {_safe_json(candidate)}
+MEASURED FAILURES: {_safe_json(list(reasons), max_bytes=40000)}
+ACTUAL REPLACEMENT PAYLOADS: {_safe_json(reusable_repair_context(candidate), max_bytes=20000)}"""
+    try:
+        diagnosis = _call_json(
+            call_agent, instance="diagnosis-stall-contract-repair", prompt=prompt,
+            paths=paths, route=route, validate=validate_stall_diagnosis, emit=emit,
+        )
+    except AdTemplateTransportError as exc:
+        emit("contract-repair.diagnosis-failed", "build", {"reason": str(exc)[:2000]})
+        return None
+    checkpoint["contractRepairDiagnosis"] = diagnosis
+    persist_checkpoint(workspace, {"contractRepairDiagnosis": diagnosis}, merge=True)
+    emit("contract-repair.diagnosis-completed", "build", {"next_changes": diagnosis["nextChanges"]})
+    return diagnosis
+
+
 def _decode_pointer_token(token: str) -> str:
     if re.search(r"~(?![01])", token):
         raise AdTemplateProcessError("patch path contains an invalid JSON Pointer escape")
@@ -3404,10 +3434,22 @@ class AdTemplateGeneratorOrchestrator:
                         })
                         continue
                     repair_route = builder_route
+                    repair_paths = [source, reciprocal_reference] + (
+                        [contract_rendered["render"]["feed"], contract_rendered["render"]["story"]]
+                        if contract_rendered is not None else []
+                    )
+                    contract_diagnosis = _contract_repair_diagnosis(
+                        call_agent=self.call_agent, candidate=candidate, reasons=reasons,
+                        paths=repair_paths, route=diagnosis_route, checkpoint=checkpoint,
+                        workspace=self.workspace, emit=self.emit,
+                    )
                     repair, candidate = _call_applied_patch(
                         self.call_agent,
                         instance=f"contract-repair-{global_iteration}-{contract_repairs}",
-                        prompt=contract_repair_prompt(candidate=candidate, reasons=reasons),
+                        prompt=contract_repair_prompt(candidate=candidate, reasons=reasons) + (
+                            "\nDIAGNOSIS PLAN (advisory; CURRENT candidate and latest measurements take precedence): "
+                            + _safe_json(contract_diagnosis) if contract_diagnosis else ""
+                        ),
                         paths=[source, *(
                             [contract_rendered["render"][placement] for placement in ("feed", "story")]
                             if contract_rendered else []

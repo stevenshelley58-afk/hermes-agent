@@ -1237,7 +1237,7 @@ class ToolRunAPIMixin:
                                 # Visual reconstruction needs deliberate geometry
                                 # and constraint checks. Minimal reasoning produced
                                 # contradictory repairs; high diagnosis timed out.
-                                reasoning={"effort": "medium"},
+                                reasoning={"effort": "low" if role_kind == "patch" else "medium"},
                                 max_output_tokens=_AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS[role_kind],
                             )
 
