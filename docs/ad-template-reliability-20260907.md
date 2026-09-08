@@ -1,4 +1,6 @@
-# Ad template reliability verification
+# Historical: Ad template reliability verification
+
+This document is a dated verification record, not current operating guidance. For current cross-system procedures use /projects/frank/docs/AD_TEMPLATE_GENERATOR.md.
 
 ## Failure classes and intended safeguards
 

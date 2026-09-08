@@ -34,4 +34,4 @@ objects so extension monkeypatches and callers retain module identity. The old
 route/catalog symbols remain import aliases only.
 
 Existing seed-15 policies whose stored name is `Sole ad-template process`
-remain valid and are not migrated merely for display naming. New seed-15
+remain valid and are not migrated merely for display naming.

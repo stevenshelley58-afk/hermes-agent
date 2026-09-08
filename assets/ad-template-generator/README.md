@@ -1,6 +1,6 @@
 # Ad-template safe asset catalog
 
-This is the only source-free fallback catalog for the VPS ad-template generator.
+This is the repository's source-free fallback catalog for the VPS ad-template generator.
 It contains editable-input defaults, not finished ads or source-ad pixels.
 
 ## Provenance boundary
@@ -24,6 +24,8 @@ It contains editable-input defaults, not finished ads or source-ad pixels.
 - Procedural SVGs were rasterised with sharp 0.35.4 at density 144; WebP assets
   use quality 92 and effort 6. The neutral logo is a compressed PNG.
 
-`catalog/manifest.json` is the runtime allowlist. A production catalog release
-must contain exactly that manifest and the declared raster files. The SVG
+`catalog/manifest.json` records this catalog version. The live allowlist is the
+manifest in the versioned release selected by `AD_TEMPLATE_ASSET_CATALOG_DIR`;
+verify that configured release rather than assuming this checkout is deployed.
+A release must contain its manifest and exactly the declared raster files. The SVG
 masters remain source-only and are not copied into the runtime catalog root.

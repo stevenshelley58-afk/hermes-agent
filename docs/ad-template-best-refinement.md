@@ -1,4 +1,6 @@
-# Best-candidate refinement (6 September 2026)
+# Historical: Best-candidate refinement (6 September 2026)
+
+This dated evidence records a prior implementation. Use /projects/frank/docs/AD_TEMPLATE_GENERATOR.md for current cross-system procedures and live status.
 
 This change extends the existing exact-clone controller; it does not introduce a
 second generator or change Blockwise activation/publishing permissions.

@@ -31,7 +31,15 @@ first pass a small real image plus strict structured-output qualification within
 the approved budget. Until then the audited policy and its defaults remain
 unchanged.
 
-## Current process (6 September 2026)
+## Historical implementation notes
+
+The dated process descriptions below record prior implementation and provider
+evidence. They are not current deployment or endpoint instructions. Current
+cross-system operations are maintained in
+/projects/frank/docs/AD_TEMPLATE_GENERATOR.md; this document remains the
+provider route-qualification reference only.
+
+### Historical process (6 September 2026)
 
 Each run freezes its routes independently of the main chat: Meta Direct Muse
 Spark 1.3 Contributor builds/repairs; Concentrate Gemini 3.8 Flash compares;
@@ -50,14 +58,14 @@ not a mechanism for rewriting text. Patches preserve unaffected layers and the
 best candidate. No automatic geometry expansion. Six comparisons are allowed
 across automatic retries; explicit manual revision can start a new bounded cycle.
 
-Both placements need the 9.8 gate, no obvious production defects and two accepted
-completion reviews. Final reviewers inspect actual neutral renders. Scores are
+The historical run used the provider qualification and review procedure recorded
+at that time; do not use its dated threshold as current acceptance policy. Final reviewers inspect actual neutral renders. Scores are
 evidence, not proof of pixel identity. Generated photos are reused on retry;
 the same bytes are rendered, reviewed and imported into quarantine. Unknown image
 call outcomes require receipt inspection, not blind repeated charges. Only
 approval in Frank's Ready for Review activates the customer template.
 
-## Verification status
+## Historical verification status
 
 Source006 current pilot: `trun_f2b0848ec6a14308a4c08cd513422d8c`. The source is
 mapped, without cropping, onto the matching output canvas before OCR/comparison,
@@ -82,7 +90,7 @@ QA, avoiding false clipping introduced by source-advertiser crops. Restored best
 candidates receive matching saved visual evidence. The pilot still requires
 visual acceptance; deployment of these fixes does not approve a template.
 
-## Current process (6 September 2026, release 8871e1e7ab)
+## Historical process (6 September 2026, release 8871e1e7ab)
 
 Deployed from `/opt/releases/hermes-template-8871e1e7ab`
 (branch `fix/template-provider-loop-20260905`). The frozen model policy
