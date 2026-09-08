@@ -2311,6 +2311,13 @@ class ToolRunAPIMixin:
         status = getattr(exc, "status_code", None)
         suffix = f", HTTP {status}" if type(status) is int and 100 <= status <= 599 else ""
         # Never include exception text, URLs, request headers, or provider body.
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            error = body.get("error", body)
+            message = str(error.get("message", "")).lower() if isinstance(error, dict) else ""
+            markers = [word for word in ("quota", "credit", "billing", "balance", "internal", "overload", "rate limit", "capacity", "unavailable", "unsupported", "invalid", "subscription", "account", "schema", "image", "token", "timeout") if word in message]
+            if markers:
+                suffix += ", upstream categories=" + "/".join(markers)
         request = getattr(exc, "request", None)
         try:
             payload = json.loads(request.content) if request is not None else None

@@ -25,12 +25,14 @@ def test_transport_failure_keeps_status_without_secrets(status):
 
 def test_transport_request_signature_never_exposes_content_or_credentials():
     error = RuntimeError("private provider response")
+    error.body = {"error": {"message": "quota exceeded for secret-token in private-account"}}
     error.request = SimpleNamespace(content=json.dumps({
         "model": "private-model", "input": "private-content", "api_key": "secret-token",
     }).encode())
     message = ToolRunAPIMixin._tool_safe_transport_error(error)
     assert "request signatures=" in message
     assert "private" not in message and "secret" not in message
+    assert "upstream categories=quota/account" in message
     assert message == ToolRunAPIMixin._tool_safe_transport_error(error)
 
 

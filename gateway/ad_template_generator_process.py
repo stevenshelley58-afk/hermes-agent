@@ -1111,6 +1111,7 @@ def contract_repair_prompt(*, candidate: Mapping[str, Any], reasons: Sequence[st
 
 CURRENT CANDIDATE: {_safe_json(candidate)}
 BLOCKWISE CONTRACT/RENDERER FAILURES: {_safe_json(list(reasons), max_bytes=40_000)}
+IMAGE ORDER: original source first; when available, the current Feed and Story renders follow. These are CURRENT candidate pixels, not new target references. Use their neighbouring elements and free space to plan a coherent repair; replacement-text failures describe the test payloads below, not necessarily the default pixels shown.
 PATCH EXISTENCE RULE: replace requires an existing leaf property; add creates an allowed absent optional property. Resolve layer indices from CURRENT CANDIDATE. Fix every listed failure in one coherent patch without lowering readability or usable text capacity.
 REUSABLE TEXT REPAIR: The failure may come from replacement copy, NOT the default placeholder. The exact four test payloads follow. Plan for all four at once, including maxLength content, in BOTH placements. Shrinking a font already at its floor cannot help: Feed minimum 24px, Story minimum 32px. Account for font metrics, tracking, lineHeight, maxLines AND geometry height/width together. If wrapping needs two lines, change maxLines and provide height for both lines. Keep neighbouring text, checkmarks, photos and footer clear; never fix fit by introducing overlap, clipping, hiding text, shortening inputs or lowering maxLength/maxCharacters. Preserve default copy, valid fonts, source visual hierarchy and assets. Verify all listed layer IDs before returning one complete patch.
 ACTUAL REPLACEMENT PAYLOADS: {_safe_json(reusable_repair_context(candidate), max_bytes=20000) if any("reusable scenario" in reason for reason in reasons) else "not applicable"}
@@ -3288,6 +3289,7 @@ class AdTemplateGeneratorOrchestrator:
                 self.emit("production-repair.applied", "build", {"changes": production_repairs})
                 persist_checkpoint(self.workspace, {"candidate": candidate, "accepted": False}, merge=True)
             while True:
+                contract_rendered = None
                 try:
                     qa_candidate, qa_asset_overrides = build_ephemeral_qa_candidate(
                         candidate, source=source, reciprocal_reference=reciprocal_reference,
@@ -3298,6 +3300,7 @@ class AdTemplateGeneratorOrchestrator:
                         run_renderer(qa_candidate, iteration_root, asset_overrides={**demo_overrides, **qa_asset_overrides}),
                         self.workspace, global_iteration,
                     )
+                    contract_rendered = rendered
                     try:
                         preflight = validate_reusable_template(
                             candidate, workspace=self.workspace, render=run_renderer,
@@ -3355,7 +3358,10 @@ class AdTemplateGeneratorOrchestrator:
                         self.call_agent,
                         instance=f"contract-repair-{global_iteration}-{contract_repairs}",
                         prompt=contract_repair_prompt(candidate=candidate, reasons=reasons),
-                        paths=[source, reciprocal_reference],
+                        paths=[source, *(
+                            [contract_rendered["render"][placement] for placement in ("feed", "story")]
+                            if contract_rendered else []
+                        )],
                         route=repair_route,
                         candidate=candidate,
                         emit=self.emit,

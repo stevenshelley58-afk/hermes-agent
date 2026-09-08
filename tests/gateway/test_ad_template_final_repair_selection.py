@@ -140,6 +140,11 @@ def _run_final_repair_case(tmp_path, monkeypatch, *, repair_score, comparison_to
         if instance == "builder-initial":
             return copy.deepcopy(original)
         if reusable_repair and instance.startswith("contract-repair-"):
+            paths = prompt[1]["paths"]
+            assert len(paths) == 3
+            assert paths[1].endswith("feed.png") and paths[2].endswith("story.png")
+            assert all(Path(path).is_file() for path in paths)
+            trace["contract_current_views"] = True
             return {"operations": [{
                 "op": "replace", "path": "/template/metadata/description", "value": "capacity-fixed",
             }]}
