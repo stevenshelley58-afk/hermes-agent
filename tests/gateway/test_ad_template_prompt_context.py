@@ -6,6 +6,24 @@ import gateway.ad_template_generator_process as process
 from tests.gateway.test_ad_template_generator_process import _review
 from gateway.ad_template_reusable_validation import _scenario, reusable_repair_context
 
+def test_measured_fit_feedback_is_bounded_durable_and_not_a_score(tmp_path):
+    checkpoint = {}
+    assert process._preflight_review_context(checkpoint) == ""
+    process._remember_contract_failure(checkpoint, tmp_path, ["story_cta needs 78px"])
+    process._remember_contract_failure(checkpoint, tmp_path, ["story_cta needs 78px"])
+    process.persist_checkpoint(tmp_path, {"candidate": {}})
+    saved = process.load_checkpoint(tmp_path)
+    assert saved["contractRepairFailures"] == [["story_cta needs 78px"]]
+    prompt = process._preflight_review_context(saved)
+    assert "story_cta needs 78px" in prompt
+    assert "Never shorten editable limits or suppress issues" in prompt
+    assert "wider one-line text capacity" in prompt
+    process._remember_contract_failure(checkpoint, tmp_path, ["x" * 9000] * 3)
+    assert len(checkpoint["contractRepairFailures"]) == 1
+    assert len(checkpoint["contractRepairFailures"][0]) == 2
+    assert max(map(len, checkpoint["contractRepairFailures"][0])) == 6000
+
+
 def test_review_response_room_preserves_deliberate_reasoning_and_complete_findings():
     from gateway.tool_run_api import _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS as limits
     assert limits["comparator"] == limits["review"] == 16384

@@ -1124,6 +1124,28 @@ ACTUAL REPLACEMENT PAYLOADS: {_safe_json(reusable_repair_context(candidate), max
 SUPPORTED ICON RULE: use only arrow, check, tick, phone, mail, globe or location. For boxed checkmarks, add a separate vector rectangle behind a supported check/tick icon and put the border in effects.stroke (not a top-level stroke field). Never use check-square or invent an icon name."""
 
 
+def _preflight_review_context(checkpoint):
+    failures = checkpoint.get("contractRepairFailures") or []
+    diagnosis = checkpoint.get("contractRepairDiagnosis")
+    if not failures and not diagnosis:
+        return ""
+    return f"""
+MEASURED REUSABLE-CONTENT REPAIR FEEDBACK:
+{_safe_json(failures, max_bytes=20000)}
+PRIOR FIT DIAGNOSIS (advisory, not a design target): {_safe_json(diagnosis, max_bytes=20000)}
+These failures came from actual short, maximum-length, Unicode and empty-input renders. Do not repeat a box reduction that the measured text could not fit. The CURRENT candidate is the result after repair, not the failed geometry above. A text box's height is invisible capacity, not painted text height: move visible glyphs without needlessly shrinking this capacity. If a button looks oversized, correct its background and label alignment jointly while retaining replacement fit. Consider wider one-line text capacity with coordinated neighbouring footer positions when narrow multiline capacity causes the conflict; keep the native source design, on-canvas bounds and font floors. Never shorten editable limits or suppress issues to pass. Reconcile this evidence with CURRENT pixels and explain a fit-safe correction rather than bouncing between the same rejected geometries.
+"""
+
+
+def _remember_contract_failure(checkpoint, workspace, reasons):
+    item = [str(reason)[:6000] for reason in reasons[:2]]
+    previous = list(checkpoint.get("contractRepairFailures") or [])
+    if not previous or previous[-1] != item:
+        previous.append(item)
+    checkpoint["contractRepairFailures"] = previous[-1:]
+    persist_checkpoint(workspace, {"contractRepairFailures": previous[-1:]}, merge=True)
+
+
 def _contract_repair_diagnosis(*, call_agent, candidate, reasons, paths, route, checkpoint, workspace, emit):
     """Use the already-frozen diagnosis route once for reusable fit failures."""
     if not route or not any("reusable scenario" in reason for reason in reasons):
@@ -2478,6 +2500,7 @@ def persist_checkpoint(
             "stallDiagnosis",
             "contractRepairDiagnosisRequested",
             "contractRepairDiagnosis",
+            "contractRepairFailures",
         ):
             if key not in updates and key in previous:
                 stable[key] = copy.deepcopy(previous[key])
@@ -3406,6 +3429,7 @@ class AdTemplateGeneratorOrchestrator:
                         ) from rejection
                     contract_repairs += 1
                     reasons = list(rejection.reasons)
+                    _remember_contract_failure(checkpoint, self.workspace, reasons)
                     self.emit("candidate.contract-rejected", "build", {
                         "iteration": global_iteration,
                         "repair": contract_repairs,
@@ -3532,6 +3556,7 @@ class AdTemplateGeneratorOrchestrator:
                         best_candidate=best_candidate if best_available else None,
                     )
                     + _review_iteration_context(iterations, stall_diagnosis)
+                    + _preflight_review_context(checkpoint)
                 ),
                 paths=[*current_vision_paths, *best_render_paths],
                 baseline_paths=best_render_paths,
@@ -4097,6 +4122,7 @@ class AdTemplateGeneratorOrchestrator:
                                 {"iteration": item["round"], "comparison": {"issues": item["issues"]}}
                                 for item in final_repair_history[-2:]
                             ], None)
+                            + _preflight_review_context(checkpoint)
                             + "\nCheck each against CURRENT pixels; do not repeat a corrected target. "
                             "Report all still-visible defects together. Earlier acceptance is not evidence of quality."),
                     paths=_vision_paths(source, reciprocal_reference, final_rendered, final_comparison_views, production_rendered),
