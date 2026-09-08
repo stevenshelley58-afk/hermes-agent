@@ -506,19 +506,21 @@ def test_recovery_rechecks_real_orchestrator_without_empty_or_noop_repairs(
         return
     result = orchestrator.run(source=str(source), brief="clone", placements=["feed", "story"], routes=routes)
     assert len(imported) == 1
-    expected_comparisons = 3 if scenario in {"different", "rebased"} else 2
+    retained_tie = scenario == "different" and relative == "same"
+    expected_comparisons = 3 if scenario in {"different", "rebased"} and not retained_tie else 2
     assert comparison_count == expected_comparisons
     assert process.load_checkpoint(workspace)["comparisonBudgetUsed"] == 5 + expected_comparisons
-    assert result["template"]["feedLayout"]["layers"][1]["geometry"]["x"] == 0
+    assert result["template"]["feedLayout"]["layers"][1]["geometry"]["x"] == (12 if retained_tie else 0)
     assert len([name for name in calls if name.startswith("final-reviewer-")]) == (
         4 if scenario == "final-already-current" else 2
     )
     assert result["import"]["library_status"] == "quarantined"
-    assert any(kind == "iteration.recheck-requested" for kind, _, _ in events)
+    if not retained_tie:
+        assert any(kind == "iteration.recheck-requested" for kind, _, _ in events)
     assert all(not name.startswith(("guarded-refinement-", "layer-refinement-", "final-merged-patch")) for name in calls)
     if scenario in {"different", "rebased"}:
         assert 12 in observed_x
-        assert result["iterations"][1]["discarded"] is True
+        assert bool(result["iterations"][1].get("discarded")) is not retained_tie
         assert any(kind == "candidate.patch-applied" and data["source"] == "measured-targets" for kind, _, data in events)
     assert not result["iterations"][-1].get("discarded")
     if scenario == "font-reporting":

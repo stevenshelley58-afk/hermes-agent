@@ -35,6 +35,33 @@ def test_review_labels_stay_adjacent_to_their_actual_images(tmp_path):
         assert expected in label["text"]
 
 
+def test_tied_draft_can_advance_only_with_nonregressing_scores_and_fewer_defects():
+    best = _review(accept=False)
+    best["scores"] = {key: 8.9 for key in process.SCORE_FIELDS}
+    best["issues"] = [copy.deepcopy(best["issues"][0]) for _ in range(3)]
+    current = copy.deepcopy(best)
+    current["scores"] = {key: 9.4 for key in process.SCORE_FIELDS}
+    current["issues"] = current["issues"][:1]
+    assert process._tied_review_dominates(current, best)
+    # Selection does not manufacture a pass or mutate either review.
+    assert process.validate_review(current)["decision"] == "revise"
+    before = copy.deepcopy((current, best))
+    assert process._tied_review_dominates(current, best)
+    assert (current, best) == before
+    regressed = copy.deepcopy(current)
+    regressed["scores"]["typography"] = 8.8
+    assert not process._tied_review_dominates(regressed, best)
+    same_defects = copy.deepcopy(current)
+    same_defects["issues"] = copy.deepcopy(best["issues"])
+    assert not process._tied_review_dominates(same_defects, best)
+    blocker = copy.deepcopy(current)
+    blocker["issues"][0]["severity"] = "blocker"
+    assert not process._tied_review_dominates(blocker, best)
+    effect = copy.deepcopy(current)
+    effect["effects"]["masks"] = "mismatch"
+    assert not process._tied_review_dominates(effect, best)
+
+
 def test_revision_memory_exposes_criticism_and_attempts_without_score_anchoring():
     old = {
         "iteration": 1, "discarded": True,

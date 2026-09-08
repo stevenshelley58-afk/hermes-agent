@@ -2295,6 +2295,23 @@ def _review_improved(current: Mapping[str, Any], best: Mapping[str, Any]) -> boo
     )
 
 
+def _tied_review_dominates(current: Mapping[str, Any], best: Mapping[str, Any]) -> bool:
+    """Rank a tied draft without converting ranking evidence into acceptance."""
+    current_scores, best_scores = current["scores"], best["scores"]
+    return (
+        all(current_scores[field] >= best_scores[field] for field in GATED_SCORE_FIELDS)
+        and any(current_scores[field] > best_scores[field] + REGRESSION_EPSILON for field in GATED_SCORE_FIELDS)
+        and len(current.get("issues", [])) < len(best.get("issues", []))
+        and all(
+            sum(issue.get("severity") == severity for issue in current.get("issues", []))
+            <= sum(issue.get("severity") == severity for issue in best.get("issues", []))
+            for severity in ("blocker", "material")
+        )
+        and sum(value == "mismatch" for value in current.get("effects", {}).values())
+        <= sum(value == "mismatch" for value in best.get("effects", {}).values())
+    )
+
+
 def _neutral_candidate_from_iteration(workspace: Path, iteration: int) -> Dict[str, Any] | None:
     """Recover the neutral candidate from a persisted QA renderer input."""
     artifact = workspace / "iterations" / f"{iteration:02d}" / "artifact.json"
@@ -3506,6 +3523,10 @@ class AdTemplateGeneratorOrchestrator:
                 (
                     comparator_result["comparisonToBest"] == "better"
                     and _review_improved(review, best_review)
+                )
+                or (
+                    comparator_result["comparisonToBest"] == "same"
+                    and _tied_review_dominates(review, best_review)
                 )
                 or (
                     candidate == best_candidate
