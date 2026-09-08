@@ -222,3 +222,23 @@ with a valid review and correctly measured CTA corrections. Independent final
 judges now receive current evidence and measured fit, without previous model
 criticisms; the repair/comparator loop retains its history. This reduces request
 growth and stale-judgment anchoring, without changing routes or acceptance.
+
+Release b47c1d5bae5ca78bac722a63a2a7d12403f154a0 deployed at 09:14:54 UTC.
+The run then passed comparator and both independent final reviews (events
+273 and 279) after one targeted CTA repair. Handoff failed before import on
+the builder's singular objective LEAD. Release
+671e11f70c3e183513d723e7457a9e69fba2a170 deployed at 09:21:28 UTC after
+265 tests, Ruff and whitespace checks. It maps LEAD to OUTCOME_LEADS and
+normalizes before the final artifact render, keeping imported metadata aligned.
+The next attempt failed again with Meta HTTP 500, so history removal alone
+did not eliminate the transport failure. No provider-side input limit is proven.
+
+An isolated three-image final request retained source, current Feed/Story and
+all measured fit evidence, completed in 55.83 seconds, and returned correct
+CTA targets. Final judges now omit overlay/difference diagnostics; these remain
+with the comparator and as saved evidence. Distinct production images remain.
+Release d8533355682d445a1eaae6e861b42d8340c88df1 deployed at 09:26:18 UTC
+after 266 passing tests, Ruff, whitespace checks and authenticated health 200.
+It also persists comparator-approved final repairs before subsequent calls;
+an injected handoff failure test proves recovery selects the repaired candidate
+without inventing final-review/import/smoke acceptance. Full handoff is pending.
