@@ -267,3 +267,19 @@ or absent, no_obvious_errors=true and all four reusable scenarios passed.
 The actual serving first50 _quality_pass predicate returned true. The dry
 manifest contains 50 distinct IDs and hashes; its batch directory remains empty.
 No template was activated/published and the 50-template batch has not started.
+
+
+## Completed Meta-native CTA revision
+
+Run trun_cf767d809b8c438497a1e9bc9676ea80 completed its directed CTA removal:
+no embedded CTA layers or CTA-only editable inputs remain; native Meta CTA
+metadata and informational website details are retained. The initial revised
+candidate passed its first comparison (iteration 15). Retries retained that
+candidate while recovering an upstream HTTP 500 and the storage-cleanup bug;
+no further design changes were needed. Events 426/428/430/431 prove final
+review accepted, four-asset quarantined import, matching smoke pass and
+ready_for_review on Hermes dc5e088681 and Blockwise de606ac66.
+Every comparator and both final-reviewer section scores are >=9.85, issues=[],
+all effects match/not_present, no_obvious_errors=true and reusable tests 4/4.
+The serving first50 quality predicate passes. Batch not started; nothing
+activated or published. Temporary canary removed; backups retained.
