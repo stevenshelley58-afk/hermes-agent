@@ -175,5 +175,5 @@ def test_catalog_json_schema_capability_reaches_benchmark_agent(monkeypatch):
         lambda *_args, **_kwargs: {"qualified": False},
     )
 
-    benchmark._run_model("concentrate", "qwen", {"message": [], "baseline": {}, "candidate": {}}, 100)
+    benchmark._run_model("meta-direct", "qwen", {"message": [], "baseline": {}, "candidate": {}}, 100)
     assert captured["enabled"] is True

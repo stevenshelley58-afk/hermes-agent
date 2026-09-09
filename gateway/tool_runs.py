@@ -37,7 +37,7 @@ _USAGE_COST_STATUSES = frozenset({"actual", "estimated", "included", "unknown"})
 _USAGE_OUTCOMES = frozenset({"ok", "error", "cancelled"})
 _MAX_JSON_BYTES = 512 * 1024
 _KNOWN_IMAGE_ONLY = frozenset({"gemini-3.1-flash-image", "gemini-3-pro-image", "gpt-image-2"})
-_AD_TEMPLATE_GENERATOR_POLICY_SEED_REVISION = 15
+_AD_TEMPLATE_GENERATOR_POLICY_SEED_REVISION = 16
 AD_TEMPLATE_GENERATOR_POLICY_NAME = "Ad Template Generator"
 _LEGACY_AD_TEMPLATE_GENERATOR_POLICY_NAMES = frozenset({"Sole ad-template process"})
 AD_TEMPLATE_GENERATOR_ROUTE_ORDER = (
@@ -49,8 +49,7 @@ AD_TEMPLATE_GENERATOR_ROUTE_ORDER = (
 )
 AD_TEMPLATE_GENERATOR_OPTIONAL_ROUTE = "quality-escalation"
 _AUDITED_NATIVE_VISION_MODELS = frozenset({
-    ("concentrate", "gemini-3.8-flash"),
-    ("concentrate", "gpt-6-astra"),
+    ("google-direct", "gemini-3.8-flash"),
     ("deepseek", "deepseek-v4-flash-vision-exp"),
     ("meta-direct", "muse-spark-1.3-contributor"),
     ("openai-codex", "gpt-5.6-luna"),
@@ -198,10 +197,10 @@ def default_ad_template_generator_policy() -> Dict[str, Any]:
         "stages": {
             "aspect-reference-image": {"capability": "reference_image_edit", "primary": _audited_image_edit_candidate("meta-direct", "muse-image-1.0"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 180, "max_cost_usd": 0.35},
             "analyse": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("meta-direct", "muse-spark-1.3-contributor"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
-            "compare": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("concentrate", "gemini-3.8-flash"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
-            "final-review-a": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("concentrate", "gemini-3.8-flash"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
+            "compare": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("meta-direct", "muse-spark-1.3-contributor"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
+            "final-review-a": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("google-direct", "gemini-3.8-flash"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
             "final-review-b": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("meta-direct", "muse-spark-1.3-contributor"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 120, "max_cost_usd": 0.35},
-            "quality-escalation": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("concentrate", "gpt-6-astra"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 180, "max_cost_usd": 1.0},
+            "quality-escalation": {"capability": "vision_structured", "primary": _audited_native_vision_candidate("meta-direct", "muse-spark-1.3-contributor"), "fallbacks": [], "max_attempts": 1, "timeout_seconds": 180, "max_cost_usd": 1.0},
         },
         "deterministic_stages": [
             "source-map", "render", "pixel-compare", "validate", "import",

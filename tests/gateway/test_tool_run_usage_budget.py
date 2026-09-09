@@ -27,7 +27,7 @@ def test_provider_usage_is_durable_and_cumulative_across_store_reopen(tmp_path):
     first = store.record_provider_usage(
         run_id,
         call_id=f"{run_id}:compare-1:a",
-        provider="concentrate",
+        provider="meta-direct",
         model="cheap-vision",
         role="compare-1",
         duration_ms=1250,
@@ -46,7 +46,7 @@ def test_provider_usage_is_durable_and_cumulative_across_store_reopen(tmp_path):
     totals = reopened.record_provider_usage(
         run_id,
         call_id=f"{run_id}:compare-2:b",
-        provider="concentrate",
+        provider="meta-direct",
         model="cheap-vision",
         role="compare-2",
         duration_ms=750,

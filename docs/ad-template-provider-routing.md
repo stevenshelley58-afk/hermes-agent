@@ -121,3 +121,19 @@ Final-check repairs now behave as a bounded evidence chain:
 Checkpoint QA/evaluation versions are bumped to 5; restored runs from older
 checkpoints re-derive their comparison evidence rather than trusting a
 baseline produced by the faulty comparison method.
+
+## Current process (9 September 2026)
+
+Concentrate is removed from the generator entirely: its billing returns
+HTTP 402 for the configured account, so every Concentrate route failed
+before producing evidence. Policy seed 16 routes builder, comparator,
+second final reviewer and quality-escalation to Meta Direct Muse Spark
+1.3 Contributor, which already served analyse and final-review-b in
+production; the first final reviewer uses Google Direct Gemini 3.8 Flash
+so the two reviewers stay independent model routes as the policy gate
+requires. Muse Image 1.0 still generates demo photographs only. The
+audited catalogue no longer lists Concentrate entries and the pricing
+fallback table drops its rows.
+Older sections of this document describing Concentrate comparison are
+retired history, not current routing. Historical runs retain their frozen
+model policies.

@@ -215,7 +215,7 @@ def test_single_format_retry_can_correct_all_reported_issues(monkeypatch):
 
     result = process._call_json(
         call_agent, instance="comparator-1", prompt="Review both placements", paths=[],
-        route={"provider": "concentrate", "model": "test"},
+        route={"provider": "meta-direct", "model": "test"},
         validate=lambda value: process.validate_review(value, candidate=candidate),
         emit=lambda *args: events.append(args),
     )
@@ -232,7 +232,7 @@ def test_invalid_retry_still_fails_closed(monkeypatch):
     with pytest.raises(process.AdTemplateProcessError, match="minimum 32px"):
         process._call_json(
             lambda *args: _invalid_review(), instance="review", prompt="review", paths=[],
-            route={"provider": "concentrate", "model": "test"},
+            route={"provider": "meta-direct", "model": "test"},
             validate=lambda value: process.validate_review(value, candidate=_candidate()),
             emit=lambda *args: None,
         )

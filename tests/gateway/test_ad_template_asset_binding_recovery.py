@@ -1,6 +1,7 @@
 """Regression coverage for pure asset-binding validation inside patch retries."""
 
 import copy
+from types import SimpleNamespace
 
 from PIL import Image
 import pytest
@@ -122,3 +123,56 @@ def test_initial_builder_repairs_all_missing_declarations_before_freezing(tmp_pa
     assert "complete initial document" in prompts[1]
     assert result == valid
     assert invalid["assets"] == []
+
+
+def _photo_slot_candidate(file_name, mime_type="image/webp"):
+    declaration = {"fileName": file_name, "mimeType": mime_type}
+    return {
+        "template": {
+            "feedLayout": {"layers": [
+                {"type": "image_slot", "layerId": "feed-photo", "inputKey": "photo"},
+            ]},
+            "storyLayout": {"layers": [
+                {"type": "image_slot", "layerId": "story-photo", "inputKey": "photo"},
+            ]},
+            "imageInputs": [
+                {"key": "photo", "label": "Photo", "acceptedTypes": [mime_type]},
+            ],
+            "assets": {"photo-default": dict(declaration)},
+            "metadata": {"replacementAssets": [
+                {"inputKey": "photo", "assetKey": "photo-default"},
+            ]},
+        },
+        "assets": [{"assetKey": "photo-default", **declaration}],
+    }
+
+
+def _fake_catalog(monkeypatch, file_name, *, usage, roles):
+    asset = SimpleNamespace(file_name=file_name, usage=usage, roles=roles)
+    monkeypatch.setattr(
+        process, "_runtime_catalog", lambda: SimpleNamespace(assets={file_name: asset}),
+    )
+
+
+def test_neutral_photographic_placeholder_is_valid_in_image_slot(monkeypatch):
+    _fake_catalog(
+        monkeypatch, "procedural/agent-placeholder.webp",
+        usage="neutral-placeholder",
+        roles=("agent_portrait", "portrait_placeholder", "identity_placeholder"),
+    )
+    document = process._normalize_generator_asset_bindings(
+        _photo_slot_candidate("procedural/agent-placeholder.webp"),
+    )
+    assert document["template"]["imageInputs"][0]["defaultAssetKey"] == "photo-default"
+
+
+def test_brand_neutral_mark_stays_out_of_image_slot(monkeypatch):
+    _fake_catalog(
+        monkeypatch, "brand/neutral-multi-gable.png",
+        usage="neutral-placeholder",
+        roles=("brand_mark", "logo", "multi_peak"),
+    )
+    with pytest.raises(process.AdTemplateProcessError, match="requires a photo-default asset"):
+        process._normalize_generator_asset_bindings(
+            _photo_slot_candidate("brand/neutral-multi-gable.png", "image/png"),
+        )

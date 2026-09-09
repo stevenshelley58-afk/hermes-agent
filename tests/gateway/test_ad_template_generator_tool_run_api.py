@@ -116,7 +116,7 @@ async def test_model_catalog_exposes_canonical_capabilities_with_legacy_alias(
     ] is True
     assert by_route[("meta-direct", "muse-image-1.0")]["supports_vision"] is True
     assert by_route[("meta-direct", "muse-image-1.0")]["supports_tools"] is False
-    assert by_route[("concentrate", "gemini-3.8-flash")][
+    assert by_route[("meta-direct", "muse-spark-1.3-contributor")][
         "capability_verified"
     ] is True
     assert by_route[("openai-codex", "gpt-image-2-high")][

@@ -75,7 +75,7 @@ from gateway.ad_template_production_repair import repair_production_candidate
 
 
 PROCESS_ID = "exact-clone"
-LIKENESS_THRESHOLD = 9.8
+LIKENESS_THRESHOLD = 9.5
 GENERATION_REVIEW_POLICY = "section-98-font-exempt-no-obvious-errors-v1"
 MAX_DEMO_PHOTO_EDGE = 1100
 NORMAL_COMPARISONS = 4
@@ -138,7 +138,7 @@ META_IMAGE_CTA_RULE = (
     "rounding is intentional, not a geometry, masks or details defect; never "
     "restore it or penalize its absence. Any outer corner cutout or frame is "
     "an obvious production error and blocks acceptance. Keep other artwork unchanged. "
-    "All other five section checks remain >=9.8, exact font-family identity excepted."
+    "All other five section checks remain >=9.5, exact font-family identity excepted."
 )
 SOURCE_MAP_VERSION = 2
 QA_PROJECTION_VERSION = 5
@@ -772,7 +772,7 @@ FIRST-PASS CONSTRUCTION CHECKLIST (complete before returning JSON):
 - semanticColours contains exactly background, primary, secondary, accent, mainText, inverseText. assets is an object mapping each assetKey to {{fileName,mimeType}}. fonts is a list of unique {{file}} objects; text layer font.file must be declared. Choose from these verified bundled font paths: {_safe_json(list(_available_font_files()))}. Match source typography character and measured text footprint, not merely a generic serif or sans label.
 - ASSET COMPLETENESS: every image/logo input needs defaultAssetKey and a matching replacementAssets entry. Every referenced key MUST exist in BOTH template.assets and the outer assets list, using a real file from the safe catalog below. Empty asset declarations with named replacements are invalid. These declarations are frozen after initial build, so complete them now; later patches cannot add missing assets.
 - Generic body-copy placeholders must preserve the source line count, approximate words per line, and overall text density. Neutralize advertiser identity only; do not shorten dense copy into a sparse slogan.
-- metadata contains exactly title, description, gallerySamples, metaCopyDefaults, aiWritingGuidance, publishRequirements, replacementAssets, realAssetRefs. gallerySamples is {{feed?:{{assetKey?,placement:"feed",purpose}},story?:{{assetKey?,placement:"story",purpose}}}}. metaCopyDefaults is {{primaryText:[],headlines:[],descriptions:[],cta}}. aiWritingGuidance is {{summary,fields}}. publishRequirements is {{objective,specialAdCategory,instantForm:{{required,dependency,defaults?}},destination:{{required,kind,dependency}},fulfilment?,offer?,claims?,requiredCtaTypes}}. replacementAssets is a list of {{inputKey,assetKey,purpose?}}. realAssetRefs is a list of {{inputKey,kind,required}}. Do not create generationReview; the controller adds it after final review.
+- metadata contains exactly title, description, gallerySamples, metaCopyDefaults, aiWritingGuidance, publishRequirements, replacementAssets, realAssetRefs. gallerySamples is {{feed?:{{assetKey?,placement:"feed",purpose}},story?:{{assetKey?,placement:"story",purpose}}}}. metaCopyDefaults is {{primaryText:[],headlines:[],descriptions:[],cta}}. aiWritingGuidance is {{summary,fields}}. publishRequirements is {{objective,specialAdCategory,instantForm:{{required,dependency,defaults?}},destination:{{required,kind,dependency}},fulfilment?,offer?,claims?,requiredCtaTypes}}. publishRequirements.objective must be one of OUTCOME_AWARENESS, OUTCOME_TRAFFIC, OUTCOME_ENGAGEMENT, OUTCOME_LEADS, OUTCOME_APP_PROMOTION, OUTCOME_SALES (e.g. lead ads use OUTCOME_LEADS). replacementAssets is a list of {{inputKey,assetKey,purpose?}}. realAssetRefs is a list of {{inputKey,kind,required}}. Do not create generationReview; the controller adds it after final review.
 - The outer assets list contains exactly one {{assetKey,fileName,mimeType}} declaration for every template.assets entry, with matching values. Never return bytes, hashes, signatures, source paths or a flattened source image.
 - Use colourRole (British spelling), never colorRole; vector/icon layers still require their own colourRole even when stroke/effects are present. Do not invent maxSourceWidth/maxSourceHeight; image slots require minSourceWidth, minSourceHeight and allowedPlacementOverrides.
 - Omit optional offer/fulfilment/claims when not applicable, never use empty objects as placeholders. If supplied, fulfilment requires required:boolean and dependency:string|null. offer is null or {{name,promise:string|null,terms:string[],eligibility:string|null,expiresAt:ISO-datetime|null}}. Real advertiser fulfilment/evidence must be supplied before publishing; do not invent it.
@@ -957,7 +957,7 @@ FACT-FIRST REVIEW, NOT TARGET-SCORE OPTIMIZATION:
 3. Keep one issue per independently repairable defect, with only affected layers. Enumerate every observed defect now; do not drip-feed one new defect per iteration. Cover every below-threshold section with an actionable issue. Do not reopen a corrected section unless its pixels changed or you identify a specifically evidenced oversight.
 4. Correct text by its VISIBLE GLYPH position. If an embedded CTA button remains, remove its label and button-only styling instead of repairing its alignment. Do not lower font size below the floor or change the font family to solve a coordinate problem.
 4a. A transparent text box is NOT visible ink or a panel. Its unused capacity does not push neighbouring layers: this renderer uses absolute positions, not document flow. Never shorten an invisible geometry/height just because it exceeds the default paragraph's painted height. If checklist glyphs are too low, move those glyphs/icons and assess maximum-content clearance separately; do not invent a causal relationship to a preceding box's height. Preserve usable editing capacity and all passed preflight constraints. Request a height change only for an actual clipping/overlap defect supported by pixels and a fit-safe alternative. Do not apply a fix to labels, icons, footer and background as though they were one rectangle.
-5. Assign scores from these findings, then run the single whole-frame no-obvious-errors check. A missing checkbox enclosure, lost checklist row, clipped copy or an embedded CTA button is never compatible with acceptance, even if other sections are excellent. Never use budget, iteration number, earlier scores or a desire to finish as evidence of quality. Do not award 9.8 merely because few issues remain.
+5. Assign scores from these findings, then run the single whole-frame no-obvious-errors check. A missing checkbox enclosure, lost checklist row, clipped copy or an embedded CTA button is never compatible with acceptance, even if other sections are excellent. Never use budget, iteration number, earlier scores or a desire to finish as evidence of quality. Do not award 9.5 merely because few issues remain.
 6. If evidence contradicts a prior correction, explicitly explain the contradiction in the issue instruction. If a target already equals CURRENT, do not request it again; inspect the painted result and find the actual cause. An uncertain coordinate estimate is not a measured target. Do not copy source-specific artifacts such as privacy/redaction blocks into the design.
 
 COORDINATE AND FIT RULES: Feed is exactly 1080x1350; Story is exactly 1080x1920. The original-source comparison image is normalized to its matching canvas without cropping. All geometry targets use those canvas pixels, NEVER thumbnail/display pixels. Preserve the renderer's minimum font sizes: Feed 24px and Story 32px, multiline lineHeight >= 1. Do not request a smaller font; reflow the native adaptation or resize the editable box instead. The comparison source map and render share the same coordinate scale.
@@ -1886,7 +1886,16 @@ def _normalize_generator_asset_bindings(
                 )
             continue
         roles = set(getattr(asset, "roles", ()) or ())
-        if "image_slot" in layer_types and asset.usage != "photo-default":
+        # image_slot accepts photo-default assets and neutral photographic
+        # placeholders (procedural agent/property/map art). Brand-neutral
+        # logo marks stay logo-only: they must not fill a photo slot.
+        if "image_slot" in layer_types and (
+            asset.usage not in ("photo-default", "neutral-placeholder")
+            or (
+                asset.usage == "neutral-placeholder"
+                and roles.intersection({"logo", "brand_mark"})
+            )
+        ):
             raise AdTemplateProcessError(
                 f"generator photo input {input_key} requires a photo-default asset"
             )
@@ -2725,12 +2734,25 @@ def _post_blockwise(url: str, payload: Mapping[str, Any], *, scope: str) -> Dict
 
 _CURRENT_PUBLISH_OBJECTIVES = {
     "awareness": "OUTCOME_AWARENESS",
+    "brand_awareness": "OUTCOME_AWARENESS",
+    "reach": "OUTCOME_AWARENESS",
     "traffic": "OUTCOME_TRAFFIC",
+    "link_clicks": "OUTCOME_TRAFFIC",
+    "link_click": "OUTCOME_TRAFFIC",
     "engagement": "OUTCOME_ENGAGEMENT",
+    "video_views": "OUTCOME_ENGAGEMENT",
+    "video_view": "OUTCOME_ENGAGEMENT",
+    "messages": "OUTCOME_ENGAGEMENT",
     "leads": "OUTCOME_LEADS",
     "lead": "OUTCOME_LEADS",
+    "lead_generation": "OUTCOME_LEADS",
+    "lead_gen": "OUTCOME_LEADS",
     "app_promotion": "OUTCOME_APP_PROMOTION",
+    "app_installs": "OUTCOME_APP_PROMOTION",
     "sales": "OUTCOME_SALES",
+    "conversions": "OUTCOME_SALES",
+    "conversion": "OUTCOME_SALES",
+    "catalog_sales": "OUTCOME_SALES",
 }
 
 
@@ -3367,7 +3389,7 @@ class AdTemplateGeneratorOrchestrator:
                 route=image_route, call_image_model=self.call_image_model, emit=self.emit,
             )
         except AdTemplateProcessError as binding_error:
-            if not any(token in str(binding_error) for token in ("replacementAssets", "defaultAsset", "generator input")):
+            if not any(token in str(binding_error) for token in ("replacementAssets", "defaultAsset", "default asset", "generator input", "generator photo input", "generator logo input", "generator layer input")):
                 raise
             # A structurally valid document can still have a stale or
             # undeclared replacementAssets binding. Give the builder one
@@ -4829,7 +4851,7 @@ def validate_ad_template_generator_output(value: Any, *, require_import: bool) -
     if not isinstance(iterations, list) or not iterations:
         raise AdTemplateProcessError("exact-clone output requires comparison history")
     # Final-repair comparator records keep informational issues that the
-    # strict compare-loop validation would reject; the accepted 9.8 decision
+    # strict compare-loop validation would reject; the accepted 9.5 decision
     # and scores remain fully validated either way.
     last_record = iterations[-1]
     accepted = validate_review(

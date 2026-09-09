@@ -226,7 +226,7 @@ def test_review_distinguishes_unused_box_capacity_from_visible_ink():
     assert "absolute positions, not document flow" in prompt
     assert "Never shorten an invisible geometry/height" in prompt
     assert "fit-safe alternative" in prompt
-    assert "9.8" in prompt
+    assert str(process.LIKENESS_THRESHOLD) in prompt
 
 
 def test_best_context_does_not_duplicate_current_document():
