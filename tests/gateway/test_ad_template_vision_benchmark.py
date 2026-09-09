@@ -160,7 +160,7 @@ def test_catalog_json_schema_capability_reaches_benchmark_agent(monkeypatch):
     monkeypatch.setattr(
         benchmark,
         "_catalog_metadata",
-        lambda _model: {
+        lambda _provider, _model: {
             "available": True,
             "providers": {
                 "route": {

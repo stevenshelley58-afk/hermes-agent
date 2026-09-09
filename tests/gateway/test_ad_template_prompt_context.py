@@ -40,7 +40,7 @@ def test_measured_fit_feedback_is_bounded_durable_and_not_a_score(tmp_path):
 
 def test_review_response_room_preserves_deliberate_reasoning_and_complete_findings():
     from gateway.tool_run_api import _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS as limits
-    assert limits["comparator"] == limits["review"] == 16384
+    assert limits["comparator"] == 32768 > limits["review"] == 16384
     for final in (False, True):
         prompt = process.review_prompt(final=final, candidate={}, reference={"sourcePlacement": "feed"}, metrics={})
         assert "Never omit an issue to fit or inflate a score" in prompt
