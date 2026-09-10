@@ -76,7 +76,7 @@ from gateway.ad_template_production_repair import repair_production_candidate
 
 PROCESS_ID = "exact-clone"
 LIKENESS_THRESHOLD = 9.5
-GENERATION_REVIEW_POLICY = "section-98-font-exempt-no-obvious-errors-v1"
+GENERATION_REVIEW_POLICY = "section-95-font-exempt-no-obvious-errors-v1"
 MAX_DEMO_PHOTO_EDGE = 1100
 NORMAL_COMPARISONS = 4
 MAX_COMPARISONS = 16

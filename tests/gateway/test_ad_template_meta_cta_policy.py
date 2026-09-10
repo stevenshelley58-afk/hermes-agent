@@ -28,3 +28,4 @@ def test_meta_image_cta_policy_reaches_all_generation_and_review_stages(monkeypa
 def test_old_cta_acceptance_evidence_requires_new_policy():
     assert process.EVALUATION_POLICY_VERSION > 10
     assert process.LIKENESS_THRESHOLD == 9.5
+    assert process.GENERATION_REVIEW_POLICY == "section-95-font-exempt-no-obvious-errors-v1"

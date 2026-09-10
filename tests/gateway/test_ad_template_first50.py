@@ -372,8 +372,12 @@ def test_quality_gate_requires_complete_generation_and_reusable_evidence():
     assert not module._quality_pass(missing_overall_check)
 
     low_comparator = copy.deepcopy(good)
-    low_comparator["output"]["scores"]["comparator"]["details"] = 9.79
+    low_comparator["output"]["scores"]["comparator"]["details"] = 9.49
     assert not module._quality_pass(low_comparator)
+
+    at_gate_comparator = copy.deepcopy(good)
+    at_gate_comparator["output"]["scores"]["comparator"]["details"] = 9.5
+    assert module._quality_pass(at_gate_comparator)
 
     diagnostic_overall = copy.deepcopy(good)
     diagnostic_overall["output"]["scores"]["comparator"]["overall"] = 1.0
