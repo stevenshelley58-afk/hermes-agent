@@ -160,7 +160,7 @@ def test_catalog_json_schema_capability_reaches_benchmark_agent(monkeypatch):
     monkeypatch.setattr(
         benchmark,
         "_catalog_metadata",
-        lambda _model: {
+        lambda _provider, _model: {
             "available": True,
             "providers": {
                 "route": {
@@ -175,5 +175,5 @@ def test_catalog_json_schema_capability_reaches_benchmark_agent(monkeypatch):
         lambda *_args, **_kwargs: {"qualified": False},
     )
 
-    benchmark._run_model("concentrate", "qwen", {"message": [], "baseline": {}, "candidate": {}}, 100)
+    benchmark._run_model("meta-direct", "qwen", {"message": [], "baseline": {}, "candidate": {}}, 100)
     assert captured["enabled"] is True

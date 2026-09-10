@@ -208,7 +208,7 @@ def test_ad_template_generator_profile_picker_changes_only_new_runs_and_persists
     assert first["model_policy_revision"] == 1
     assert first["model_policy"]["stages"]["analyse"]["primary"]["model"] == "muse-spark-1.3-contributor"
     assert second["model_policy_revision"] == selected_record["revision"]
-    assert second["model_policy"]["stages"]["analyse"]["primary"]["model"] == "gemini-3.8-flash"
+    assert second["model_policy"]["stages"]["analyse"]["primary"]["model"] == "muse-spark-1.3-contributor"
     assert store.get_run(first["run_id"])["model_policy"] == first["model_policy"]
 
     accepted = store.events(second["run_id"])[0]
@@ -216,9 +216,9 @@ def test_ad_template_generator_profile_picker_changes_only_new_runs_and_persists
     assert accepted["data"]["model_profile"] == {
         "profile_revision": selected_record["revision"],
         "aspect-reference": {"provider": "meta-direct", "model": "muse-image-1.0"},
-        "builder": {"provider": "concentrate", "model": "gemini-3.8-flash"},
-        "comparator": {"provider": "concentrate", "model": "gemini-3.8-flash"},
-        "final-review-a": {"provider": "concentrate", "model": "gemini-3.8-flash"},
+        "builder": {"provider": "meta-direct", "model": "muse-spark-1.3-contributor"},
+        "comparator": {"provider": "meta-direct", "model": "muse-spark-1.3-contributor"},
+        "final-review-a": {"provider": "google-direct", "model": "gemini-3.8-flash"},
         "final-review-b": {"provider": "meta-direct", "model": "muse-spark-1.3-contributor"},
         "fallback": {key: selected["stages"][AD_TEMPLATE_GENERATOR_OPTIONAL_ROUTE]["primary"][key] for key in ("provider", "model")},
     }
@@ -231,12 +231,12 @@ def test_builtin_policy_uses_only_audited_native_vision_roles():
     expected = {
         "aspect-reference-image": ("meta-direct", "muse-image-1.0"),
         "analyse": ("meta-direct", "muse-spark-1.3-contributor"),
-        "compare": ("concentrate", "gemini-3.8-flash"),
-        "final-review-a": ("concentrate", "gemini-3.8-flash"),
+        "compare": ("meta-direct", "muse-spark-1.3-contributor"),
+        "final-review-a": ("google-direct", "gemini-3.8-flash"),
         "final-review-b": ("meta-direct", "muse-spark-1.3-contributor"),
-        "quality-escalation": ("concentrate", "gpt-6-astra"),
+        "quality-escalation": ("meta-direct", "muse-spark-1.3-contributor"),
     }
-    assert policy["stages"]["quality-escalation"]["primary"] != policy["stages"]["analyse"]["primary"]
+    assert policy["stages"]["quality-escalation"]["timeout_seconds"] > policy["stages"]["analyse"]["timeout_seconds"]
     assert AD_TEMPLATE_GENERATOR_ROUTE_ORDER == tuple(expected)[:-1]
     assert AD_TEMPLATE_GENERATOR_OPTIONAL_ROUTE == "quality-escalation"
     for stage_id, route in expected.items():

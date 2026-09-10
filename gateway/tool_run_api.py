@@ -79,7 +79,10 @@ _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS = {
     "patch": 8_192,
     # Responses output allowance includes reasoning. The real medium review
     # used 10,373 reasoning + 1,064 result tokens; 8,192 truncated the JSON.
-    "comparator": 16_384,
+    # Comparator/reviewer thinking models burned ~16,370 tokens and truncated
+    # structured JSON at 16,384, so the comparator gets the builder-size
+    # allowance while review keeps a strict lead below it.
+    "comparator": 32_768,
     "review": 16_384,
     "aspect-reference": 4_096,
     "diagnosis": 8_192,
@@ -88,10 +91,9 @@ _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS = {
 # Meta's audited contributor price for the new 1.3 id until models.dev catches up.
 _AD_TEMPLATE_GENERATOR_DIRECT_PRICING_PER_MILLION = {
     ("meta-direct", "muse-spark-1.3-contributor"): (0.10, 0.002, 0.20),
-    ("concentrate", "gemini-3.8-flash"): (0.75, 0.75, 3.75),
-    # Published standard rates verified 2026-09-06; Concentrate has no token markup.
+    # Published standard rates verified 2026-09-06.
     # Estimated fallback only: live endpoint pricing takes precedence.
-    ("concentrate", "gpt-6-astra"): (10.0, 1.0, 50.0),
+    ("google-direct", "gemini-3.8-flash"): (0.75, 0.75, 3.75),
 }
 
 
@@ -2511,7 +2513,7 @@ class ToolRunAPIMixin:
 
         raw_usage = response.get("usage") if isinstance(response, Mapping) else getattr(response, "usage", None)
         canonical = normalize_usage(raw_usage, provider=provider, api_mode="codex_responses")
-        pricing_provider = "google" if provider == "concentrate" and model.startswith("gemini-") else ("meta-ai" if provider == "meta-direct" else provider)
+        pricing_provider = "google" if provider == "google-direct" and model.startswith("gemini-") else ("meta-ai" if provider == "meta-direct" else provider)
         cost = estimate_usage_cost(model, canonical, provider=pricing_provider, base_url=base_url, api_key=api_key)
         amount = float(cost.amount_usd) if cost.amount_usd is not None else None
         status = cost.status

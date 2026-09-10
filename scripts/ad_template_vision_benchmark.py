@@ -285,7 +285,9 @@ def load_benchmark_case(run_root: Path, iteration: int) -> dict[str, Any]:
     }
 
 
-def _catalog_metadata(model: str) -> dict[str, Any]:
+def _catalog_metadata(provider: str, model: str) -> dict[str, Any]:
+    if provider != "concentrate":
+        return {"available": False, "error": f"no live model catalog for {provider}"}
     url = f"https://api.concentrate.ai/v1/models/{model}"
     request = urllib.request.Request(url, headers={"User-Agent": "Hermes-ad-template-benchmark/1"})
     try:
@@ -320,7 +322,7 @@ def _run_model(provider: str, model: str, case: Mapping[str, Any], max_tokens: i
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from run_agent import AIAgent
 
-    catalog = _catalog_metadata(model)
+    catalog = _catalog_metadata(provider, model)
     started = time.monotonic()
     agent = None
     try:
@@ -388,7 +390,7 @@ def _run_model(provider: str, model: str, case: Mapping[str, Any], max_tokens: i
                 "latency_seconds": round(time.monotonic() - started, 3),
                 "catalog": catalog,
                 "error_type": "insufficient_credits",
-                "error": "Concentrate rejected the read-only benchmark with HTTP 402.",
+                "error": f"{provider} rejected the read-only benchmark with HTTP 402.",
             }
         strict_json = False
         parsed: Any = None
@@ -463,7 +465,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", required=True, type=Path)
     parser.add_argument("--iteration", required=True, type=int)
-    parser.add_argument("--provider", default="concentrate")
+    parser.add_argument("--provider", default="meta-direct")
     parser.add_argument("--model", action="append", dest="models")
     parser.add_argument("--max-tokens", type=int, default=3500)
     parser.add_argument("--output", type=Path)

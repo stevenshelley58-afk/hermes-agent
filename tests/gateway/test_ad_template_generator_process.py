@@ -661,7 +661,7 @@ def test_five_non_improvements_trigger_one_frontier_diagnosis_then_resume_from_b
         {"provider": "openai-codex", "model": "comparator"},
         {"provider": "openai-codex", "model": "final-a"},
         {"provider": "deepseek", "model": "final-b"},
-        {"provider": "concentrate", "model": "gpt-6-astra"},
+        {"provider": "meta-direct", "model": "muse-spark-1.3-contributor"},
     ]
     workspace = tmp_path / "run"
 
@@ -692,7 +692,7 @@ def test_five_non_improvements_trigger_one_frontier_diagnosis_then_resume_from_b
     assert comparison_count == 8
     assert len(diagnosis_calls) == 1
     diagnosis_prompt, diagnosis_route = diagnosis_calls[0]
-    assert diagnosis_route == "concentrate/gpt-6-astra"
+    assert diagnosis_route == "meta-direct/muse-spark-1.3-contributor"
     assert "RECENT REJECTED ATTEMPTS" in diagnosis_prompt[0]["text"]
     assert "attemptOperations" in diagnosis_prompt[0]["text"]
     assert [Path(path).name for path in diagnosis_prompt[1]["paths"][1:]] == [
@@ -1806,3 +1806,28 @@ def test_text_fit_rejection_does_not_expand_authored_geometry():
     repaired, count = process._apply_deterministic_contract_repairs(candidate, reasons)
     assert repaired == before
     assert count == 0
+
+
+@pytest.mark.parametrize(("raw", "expected"), [
+    ("LEAD_GENERATION", "OUTCOME_LEADS"),
+    ("lead_generation", "OUTCOME_LEADS"),
+    ("lead_gen", "OUTCOME_LEADS"),
+    ("conversions", "OUTCOME_SALES"),
+    ("conversion", "OUTCOME_SALES"),
+    ("link_clicks", "OUTCOME_TRAFFIC"),
+    ("brand_awareness", "OUTCOME_AWARENESS"),
+    ("video_views", "OUTCOME_ENGAGEMENT"),
+    ("app_installs", "OUTCOME_APP_PROMOTION"),
+    ("leads", "OUTCOME_LEADS"),
+    ("OUTCOME_LEADS", "OUTCOME_LEADS"),
+])
+def test_normalize_publish_objective_accepts_meta_marketing_api_names(raw, expected):
+    template = {"metadata": {"publishRequirements": {"objective": raw}}}
+    process._normalize_publish_objective(template)
+    assert template["metadata"]["publishRequirements"]["objective"] == expected
+
+
+def test_normalize_publish_objective_rejects_unknown_objective():
+    template = {"metadata": {"publishRequirements": {"objective": "WEIRD_OBJECTIVE"}}}
+    with pytest.raises(process.AdTemplateProcessError, match="not a supported campaign objective"):
+        process._normalize_publish_objective(template)

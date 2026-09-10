@@ -51,7 +51,7 @@ def test_legacy_source_symbols_alias_canonical_implementations():
 def test_default_policy_uses_product_name_without_changing_seed():
     policy = default_ad_template_generator_policy()
     assert policy["name"] == "Ad Template Generator"
-    assert policy["seed_revision"] == 15
+    assert policy["seed_revision"] == 16
 
 
 def test_stored_seed_15_legacy_name_is_not_migrated(tmp_path):

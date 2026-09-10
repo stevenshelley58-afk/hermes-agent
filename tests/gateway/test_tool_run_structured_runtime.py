@@ -13,7 +13,7 @@ from gateway.tool_run_api import (
 )
 
 
-def test_frontier_diagnosis_cost_remains_accounted_when_catalog_lags(monkeypatch):
+def test_contributor_diagnosis_cost_remains_accounted_when_catalog_lags(monkeypatch):
     from agent import usage_pricing
     monkeypatch.setattr(
         usage_pricing, "estimate_usage_cost",
@@ -21,11 +21,11 @@ def test_frontier_diagnosis_cost_remains_accounted_when_catalog_lags(monkeypatch
     )
     result = ToolRunAPIMixin._tool_response_usage(
         SimpleNamespace(usage=_usage(1592, 86)),
-        provider="concentrate", model="gpt-6-astra",
-        base_url="https://api.concentrate.ai/v1", api_key=None,
+        provider="meta-direct", model="muse-spark-1.3-contributor",
+        base_url="https://api.meta.ai/v1", api_key=None,
     )
     assert result["cost_status"] == "estimated"
-    assert abs(result["estimated_cost_usd"] - 0.02022) < 1e-9
+    assert abs(result["estimated_cost_usd"] - 0.0001764) < 1e-9
     assert result["total_tokens"] == 1678
 
 
@@ -264,20 +264,27 @@ def test_meta_contributor_usage_has_audited_cost():
     assert result["total_tokens"] == 1_100
 
 
-def test_concentrate_gemini_38_uses_catalog_price():
+def test_google_direct_gemini_38_uses_catalog_price():
     result = ToolRunAPIMixin._tool_response_usage(
-        SimpleNamespace(usage=_usage(1_000, 100, 200)), provider="concentrate",
-        model="gemini-3.8-flash", base_url="https://api.concentrate.ai/v1", api_key=None)
+        SimpleNamespace(usage=_usage(1_000, 100, 200)), provider="google-direct",
+        model="gemini-3.8-flash", base_url="http://127.0.0.1:8643/v1", api_key=None)
     assert result["cost_status"] == "estimated"
     assert result["estimated_cost_usd"] == 0.001125
 
 
-def test_concentrate_gemini_uses_shared_google_pricing():
+def test_google_direct_gemini_uses_shared_google_pricing():
     result = ToolRunAPIMixin._tool_response_usage(
-        SimpleNamespace(usage=_usage(1_000, 100)), provider="concentrate",
-        model="gemini-2.5-pro", base_url="https://api.concentrate.ai/v1", api_key=None)
+        SimpleNamespace(usage=_usage(1_000, 100)), provider="google-direct",
+        model="gemini-2.5-pro", base_url="http://127.0.0.1:8643/v1", api_key=None)
     assert result["cost_status"] == "estimated"
     assert result["estimated_cost_usd"] == 0.00225
+
+
+def test_comparator_and_review_survive_reasoning_heavy_output():
+    from gateway.tool_run_api import _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS
+    assert _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS["comparator"] >= 32_768
+    assert _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS["review"] >= 16_384
+    assert _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS["comparator"] > _AD_TEMPLATE_GENERATOR_ROLE_OUTPUT_TOKENS["review"]
 
 
 def test_execute_path_does_not_construct_conversational_agent():

@@ -125,8 +125,8 @@ def main():
             im.resize((240, 300)).save(small)
         judge = f'Judge heading correction only; no patch. Source is authority. changed={dump(paths)} strict={dump(strict)} measurements={dump(measurements)}. Verify visual improvement in alignment, face, weight, size and spacing; do not accept based only on score. Images: source heading crop, before heading crop, after heading crop, small whole-frame after context.'
         (trial / 'judge-prompt.txt').write_text(judge)
-        calls.append({'provider': 'concentrate', 'model': 'gemini-3.8-flash', 'instance': 'heading-judge', 'outcome': 'attempted'})
-        review, u = call('concentrate', 'gemini-3.8-flash', 'heading-judge', judge, [src, cur, aft, small], ToolRunAPIMixin._tool_review_schema(comparator=False))
+        calls.append({'provider': 'meta-direct', 'model': 'muse-spark-1.3-contributor', 'instance': 'heading-judge', 'outcome': 'attempted'})
+        review, u = call('meta-direct', 'muse-spark-1.3-contributor', 'heading-judge', judge, [src, cur, aft, small], ToolRunAPIMixin._tool_review_schema(comparator=False))
         calls[-1] = u
         (trial / 'judge-response.json').write_text(dump(review))
         results = {'changed_paths': paths, 'strict': strict, 'review': review, 'beforeafter': {'before': base['feed'], 'after': render['feed']}}
