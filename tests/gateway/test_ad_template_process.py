@@ -127,7 +127,7 @@ def test_quality_gate_rejects_one_weak_dimension_even_when_mean_passes():
 
     reviewers = [
         {"id": "reviewer-a", "route": "a/m", **weak},
-        {"id": "reviewer-b", "route": "b/m", **evidence(9.8, "Strong")},
+        {"id": "reviewer-b", "route": "b/m", **evidence(9.5, "Strong")},
     ]
     assert validate_final_review({"reviewers": reviewers}, accepted=True)["decision"] == "revise"
 
@@ -158,7 +158,7 @@ def test_autonomous_loop_can_converge_after_thirty_iterations(tmp_path, monkeypa
 
 
 def test_source_match_and_concrete_change_list_are_hard_gates():
-    weak_match = evidence(9.8, "Header and image grid still differ")
+    weak_match = evidence(9.5, "Header and image grid still differ")
     weak_match["rubric"]["feed_source_likeness"] = 9.4
     weak_match["required_changes"] = []
     record = validate_iterations([
@@ -167,7 +167,7 @@ def test_source_match_and_concrete_change_list_are_hard_gates():
     assert record["comparison"]["score"] >= process.THRESHOLD
     assert record["decision"] == "revise"
 
-    unfinished = evidence(9.8, "Footer remains too tall")
+    unfinished = evidence(9.5, "Footer remains too tall")
     unfinished["required_changes"] = [
         "placement=feed; layers=feed-footer; current={x:72,y:1120,width:936,height:140}; "
         "target={x:72,y:1140,width:936,height:120}; change=Reduce footer height to match the source"
@@ -308,11 +308,11 @@ def test_asset_envelope_is_mechanically_mirrored_without_changing_content():
 
 def test_bare_model_scores_are_rejected():
     with pytest.raises(AdTemplateProcessError):
-        validate_iterations([iteration(9.8)]) if False else validate_iterations([{"iteration": 1, "comparison": {"score": 10, "reason": "looks good"}}])
+        validate_iterations([iteration(9.5)]) if False else validate_iterations([{"iteration": 1, "comparison": {"score": 10, "reason": "looks good"}}])
     with pytest.raises(AdTemplateProcessError):
         validate_final_review({"reviewers": [{"id": "a", "route": "a/m", "score": 10, "reason": "ok"}, {"id": "b", "route": "b/m", "score": 10, "reason": "ok"}]}, accepted=True)
     with pytest.raises(AdTemplateProcessError):
-        process._assessment({"rubric": {**evidence(9.8)["rubric"], "overall": 10}, "reason": "extra score"}, "comparator")
+        process._assessment({"rubric": {**evidence(9.5)["rubric"], "overall": 10}, "reason": "extra score"}, "comparator")
 
 def test_adversarial_reviewer_identity_route_and_self_score_fail():
     with pytest.raises(AdTemplateProcessError):
