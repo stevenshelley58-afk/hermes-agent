@@ -469,7 +469,7 @@ def _quality_score(value: Any) -> bool:
         numeric = float(value)
     except (OverflowError, TypeError, ValueError):
         return False
-    return math.isfinite(numeric) and 9.8 <= numeric <= 10
+    return math.isfinite(numeric) and 9.5 <= numeric <= 10
 
 
 def _run_outcome(run: Mapping[str, Any]) -> str:

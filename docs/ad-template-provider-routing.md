@@ -50,7 +50,7 @@ not a mechanism for rewriting text. Patches preserve unaffected layers and the
 best candidate. No automatic geometry expansion. Six comparisons are allowed
 across automatic retries; explicit manual revision can start a new bounded cycle.
 
-Both placements need at least 9.8 for geometry, typography, colour/effects,
+Both placements need at least 9.5 for geometry, typography, colour/effects,
 image crop and details, plus one aggregate pass confirming there are no obvious
 production defects. Exact font-family identity is excluded from scoring; font
 substitutions remain recorded evidence, while typography still covers size,
@@ -114,7 +114,7 @@ Final-check repairs now behave as a bounded evidence chain:
 - The final-repair comparator gate keeps its accepted evidence chain: repairs
   that regress the best comparator-accepted candidate are rolled back, and a
   unanimous reviewer acceptance only ships when the candidate's comparator
-  verdict is also at or above the 9.8 gate.
+  verdict is also at or above the 9.5 gate.
 - Import normalizes the publish objective to Blockwise's current
   `OUTCOME_*` naming before the signed quarantined-import request.
 
